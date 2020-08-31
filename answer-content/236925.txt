@@ -1,0 +1,438 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First impression is the code is well-documented and is easy to read, especially given the context of it being an interview assignment. But there are definitely places where it can be improved, so let's start with the low-hanging fruit: execution time performance and memory consumption.</p>
+
+<hr>
+
+<h1><code>requests.Session</code></h1>
+
+<p>All API calls are to the same host, so we can take advantage of this and make all calls via the same <code>requests.Session</code> object for better performance. From the <a href="https://requests.readthedocs.io/en/master/user/advanced/#session-objects" rel="nofollow noreferrer"><code>requests</code> documentation on Session Objects</a>:</p>
+
+<blockquote>
+  <p>The Session object allows you to persist certain parameters across requests. It also persists cookies across all requests made from the Session instance, and will use <code>urllib3</code>’s <a href="https://urllib3.readthedocs.io/en/latest/reference/index.html#module-urllib3.connectionpool" rel="nofollow noreferrer">connection pooling</a>. So if you’re making several requests to the same host, the underlying TCP connection will be reused, which can result in a significant performance increase (see <a href="https://en.wikipedia.org/wiki/HTTP_persistent_connection" rel="nofollow noreferrer">HTTP persistent connection</a>).</p>
+</blockquote>
+
+<p>Example:</p>
+
+<pre class="lang-python prettyprint-override"><code>with requests.Session() as session:
+    for page_number in range(1, num_pages + 1):
+        # ...
+        json_response = session.get(url, params=params).json()
+</code></pre>
+
+<p>I tested this on a refactored version of your code, and this change alone almost halved the total execution time.</p>
+
+<h1>Memory footprint</h1>
+
+<p>Your code uses generators which is great for memory efficiency, but can we do better? Let's look at a memory trace of your code using the <a href="https://docs.python.org/3/library/tracemalloc.html#pretty-top" rel="nofollow noreferrer">"Pretty top" recipe from <code>tracemalloc</code></a>:</p>
+
+<pre class="lang-none prettyprint-override"><code>Top 10 lines
+#1: json/decoder.py:353: 494.7 KiB
+    obj, end = self.scan_once(s, idx)
+#2: pymysql/connections.py:1211: 202.8 KiB
+    return tuple(row)
+#3: requests/models.py:828: 168.7 KiB
+    self._content = b''.join(self.iter_content(CONTENT_CHUNK_SIZE)) or b''
+#4: ./old_db.py:100: 67.5 KiB
+    users.sort(key=lambda user: (user['lastname'], user['firstname']))
+#5: &lt;frozen importlib._bootstrap_external&gt;:580: 57.7 KiB
+#6: python3.8/abc.py:102: 13.5 KiB
+    return _abc_subclasscheck(cls, subclass)
+#7: urllib3/poolmanager.py:297: 6.4 KiB
+    base_pool_kwargs = self.connection_pool_kw.copy()
+#8: ./old_db.py:92: 6.0 KiB
+    users += r_json['users']
+#9: urllib3/poolmanager.py:167: 5.1 KiB
+    self.key_fn_by_scheme = key_fn_by_scheme.copy()
+#10: python3.8/re.py:310: 5.0 KiB
+    _cache[type(pattern), pattern, flags] = p
+686 other: 290.4 KiB
+Total allocated size: 1317.8 KiB
+</code></pre>
+
+<p>Shown above are the 10 lines allocating the most memory. It might not be immediately obvious, but the fairly high memory usages in #1, #2, and #4 can all be attributed to using a Python dictionary as a storage container for each database/API record. Basically, using a dictionary in this way is expensive and unnecessary since we're never really adding/removing/changing fields in one of these dictionaries once we've read it into memory.</p>
+
+<p>The memory hotspots:</p>
+
+<ul>
+<li>Using <code>pymysql.cursors.DictCursor</code> to return each row in the query results as a dictionary, combined with the fact that we're making batched fetches of <code>size=5000</code> rows at a time -- that's not a small number of dictionaries to hold in memory at one time. Plus, through testing I determined that there is virtually no difference in speed (execution time) between fetching in batches from the database versus retrieving rows one at a time using the unbuffered <code>pymysql.cursors.SSCursor</code>, so <code>SSCursor</code> is probably the better choice here</li>
+<li>Reading in, accumulating, and sorting dictionaries in <code>api_endpoint_iterator</code></li>
+<li><p>Side note: #3 above can actually be eliminated by merging the following two lines into one, since we never use <code>r</code> again after calling <code>json()</code> on it:</p>
+
+<pre class="lang-python prettyprint-override"><code># Before
+r = requests.get(endpoint_url, params=payload)
+r_json = r.json()
+
+# After
+r_json = requests.get(endpoint_url, params=payload).json()
+</code></pre></li>
+</ul>
+
+<p>A better alternative in this case is to use a <a href="https://docs.python.org/3.8/library/typing.html#typing.NamedTuple" rel="nofollow noreferrer"><code>NamedTuple</code></a> to represent each record. <code>NamedTuple</code>s are immutable, have a smaller memory footprint than dictionaries, are sortable like regular tuples, and are the preferred option when you know all of your fields and their types in advance.</p>
+
+<p>Having something like the following gives us a nice, expressive, compact type that also makes the code easier to read:</p>
+
+<pre class="lang-python prettyprint-override"><code>from typing import NamedTuple
+
+
+class ExternalUser(NamedTuple):
+    last_name: str
+    first_name: str
+    user_id: int
+    last_active_date: str
+    practice_location: str
+    specialty: str
+    user_type_classification: str
+</code></pre>
+
+<p>At the end of this review is a refactored version of the code which uses <code>NamedTuple</code>s. Here's a preview of what its memory trace looks like:</p>
+
+<pre class="lang-none prettyprint-override"><code>Top 10 lines
+#1: &lt;frozen importlib._bootstrap_external&gt;:580: 54.0 KiB
+#2: python3.8/abc.py:102: 12.8 KiB
+    return _abc_subclasscheck(cls, subclass)
+#3: urllib3/poolmanager.py:297: 12.5 KiB
+    base_pool_kwargs = self.connection_pool_kw.copy()
+#4: json/decoder.py:353: 5.0 KiB
+    obj, end = self.scan_once(s, idx)
+#5: pymysql/converters.py:299: 4.5 KiB
+    return datetime.date(*[ int(x) for x in obj.split('-', 2) ])
+#6: json/encoder.py:202: 4.2 KiB
+    return ''.join(chunks)
+#7: ./new_db.py:201: 3.5 KiB
+    return {
+#8: pymysql/connections.py:1206: 3.1 KiB
+    data = data.decode(encoding)
+#9: python3.8/_strptime.py:170: 2.8 KiB
+    class TimeRE(dict):
+#10: python3.8/_strptime.py:30: 2.7 KiB
+    class LocaleTime(object):
+641 other: 276.6 KiB
+Total allocated size: 381.5 KiB
+</code></pre>
+
+<hr>
+
+<h1>Context managers</h1>
+
+<p>It's not provided out of the box by the <code>pymysql</code> module, but you should use a context manager for the database connection to ensure that the connection is always closed, even after an unexpected program halt due to an exception.</p>
+
+<p>Right now if your program were to encounter an exception anywhere in between <code>connection = pymysql.connect(...)</code> and <code>connection.close()</code>, the connection might not be closed safely.</p>
+
+<p>Here's an example of how you could make your own context manager for the connection:</p>
+
+<pre class="lang-python prettyprint-override"><code>import pymysql
+from typing import Dict, Any, Iterator
+from contextlib import contextmanager
+
+
+@contextmanager
+def database_connection(
+    config: Dict[str, Any]
+) -&gt; Iterator[pymysql.connections.Connection]:
+    connection = pymysql.connect(**config)
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+# Example usage
+with database_connection(config) as connection:
+    # Note: context managers for cursors __are__ provided by pymysql
+    with connection.cursor(pymysql.cursors.SSCursor) as cursor:
+        cursor.execute(query)
+        # ...
+
+</code></pre>
+
+<h1>Type hints</h1>
+
+<p>Consider using <a href="https://docs.python.org/3/library/typing.html" rel="nofollow noreferrer">type hints</a> to:</p>
+
+<ul>
+<li>improve code readability</li>
+<li>increase confidence in code correctness with the help of a static type checker like <a href="http://mypy-lang.org/" rel="nofollow noreferrer"><code>mypy</code></a></li>
+</ul>
+
+<p>For example, the method that provides a stream of external users from the API has some fairly dense logic in it, but with type hints we can just look at the method signature to guess what it's doing or what to expect from it:</p>
+
+<pre class="lang-python prettyprint-override"><code>def api_records(api_url: str) -&gt; Iterator[ExternalUser]:
+    # ...
+</code></pre>
+
+<h1>Generator of matching pairs</h1>
+
+<p>At the top level of code execution, there's some logic where we iterate over both internal and external users in order to find all matching pairs, where a matching pair is an internal user record and an external user record with the same first and last name.</p>
+
+<p>It would be cleaner to go one step further with generators and extract this logic into its own method that returns a generator. In other words, we could have two input streams (internal and external user records) and our output would then be a stream of matching pairs of internal and external user records:</p>
+
+<pre class="lang-python prettyprint-override"><code>def matching_users(
+    internal_users: Iterator[InternalUser],
+    external_users: Iterator[ExternalUser],
+) -&gt; Iterator[Tuple[InternalUser, ExternalUser]]:
+    # ...
+</code></pre>
+
+<p>This is a nicer abstraction to work with; the client gets direct access to all the matching pairs, and can iterate over them to get the total number of matches and/or save a subset of the matches to a report.</p>
+
+<hr>
+
+<h1>Refactored version</h1>
+
+<p>Below is the refactored version with the above suggestions incorporated:</p>
+
+<pre class="lang-python prettyprint-override"><code>#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import time
+import requests
+import datetime
+import json
+import pymysql
+from typing import (
+    NamedTuple,
+    TypeVar,
+    Dict,
+    List,
+    Iterator,
+    Callable,
+    Any,
+    Tuple,
+)
+from collections import OrderedDict
+from functools import partial
+from contextlib import contextmanager
+from textwrap import dedent
+
+
+T = TypeVar("T")
+
+
+class Config(NamedTuple):
+    host: str
+    user: str
+    password: str
+    port: int
+    database: str
+
+
+class InternalUser(NamedTuple):
+    last_name: str
+    first_name: str
+    user_id: int
+    last_active_date: datetime.date
+    platform_registered_on: str
+    practice_id: int
+    specialty: str
+    classification: str
+
+
+class ExternalUser(NamedTuple):
+    last_name: str
+    first_name: str
+    user_id: int
+    last_active_date: str
+    practice_location: str
+    specialty: str
+    user_type_classification: str
+
+
+@contextmanager
+def database_connection(
+    config: Config,
+) -&gt; Iterator[pymysql.connections.Connection]:
+    connection = pymysql.connect(
+        host=config.host,
+        user=config.user,
+        password=config.password,
+        port=config.port,
+        database=config.database,
+    )
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+def database_records(
+    config: Config, query: str, record_type: Callable[..., T]
+) -&gt; Iterator[T]:
+    with database_connection(config) as connection:
+        with connection.cursor(pymysql.cursors.SSCursor) as cursor:
+            cursor.execute(query)
+            for row in cursor:
+                yield record_type(*row)
+
+
+def api_records(api_url: str) -&gt; Iterator[ExternalUser]:
+    def load_users(
+        storage: OrderedDict[str, List[ExternalUser]],
+        users: List[Dict[str, Any]],
+    ) -&gt; None:
+        for user in users:
+            ext_user = ExternalUser(
+                last_name=user["lastname"],
+                first_name=user["firstname"],
+                user_id=user["id"],
+                last_active_date=user["last_active_date"],
+                practice_location=user["practice_location"],
+                specialty=user["specialty"],
+                user_type_classification=user["user_type_classification"],
+            )
+            storage.setdefault(ext_user.last_name, []).append(ext_user)
+
+    def available_sorted_users(
+        storage: OrderedDict[str, List[ExternalUser]], remaining: bool = False
+    ) -&gt; Iterator[ExternalUser]:
+        threshold = 0 if remaining else 1
+        while len(storage) &gt; threshold:
+            _, user_list = storage.popitem(last=False)
+            user_list.sort()
+            yield from user_list
+
+    user_dict: OrderedDict[str, List[ExternalUser]] = OrderedDict()
+    with requests.Session() as session:
+        params = {"page": 1}
+        json_response = session.get(api_url, params=params).json()
+        total_pages = json_response["total_pages"]
+
+        load_users(user_dict, json_response["users"])
+        yield from available_sorted_users(user_dict)
+
+        for current_page in range(2, total_pages + 1):
+            params = {"page": current_page}
+            json_response = session.get(api_url, params=params).json()
+            load_users(user_dict, json_response["users"])
+            yield from available_sorted_users(user_dict)
+
+        yield from available_sorted_users(user_dict, remaining=True)
+
+
+def matching_users(
+    internal_users: Iterator[InternalUser],
+    external_users: Iterator[ExternalUser],
+) -&gt; Iterator[Tuple[InternalUser, ExternalUser]]:
+    internal_user = next(internal_users, None)
+    external_user = next(external_users, None)
+
+    while internal_user and external_user:
+        internal_name = (internal_user.last_name, internal_user.first_name)
+        external_name = (external_user.last_name, external_user.first_name)
+
+        if internal_name == external_name:
+            yield (internal_user, external_user)
+            internal_user = next(internal_users, None)
+            external_user = next(external_users, None)
+        elif internal_name &lt; external_name:
+            internal_user = next(internal_users, None)
+        else:
+            external_user = next(external_users, None)
+
+
+def active_recently(
+    current_date: datetime.date, num_days: int, last_active_date: datetime.date
+) -&gt; bool:
+    return (current_date - last_active_date).days &lt;= num_days
+
+
+def create_user_dict(
+    internal_user: InternalUser,
+    external_user: ExternalUser,
+    is_active: Callable[[datetime.date], bool],
+) -&gt; Dict[str, Any]:
+    internal_user_is_active = is_active(internal_user.last_active_date)
+    external_user_last_active_date = datetime.datetime.strptime(
+        external_user.last_active_date, "%Y-%m-%d"
+    ).date()
+    external_user_is_active = is_active(external_user_last_active_date)
+
+    return {
+        "firstname": internal_user.first_name,
+        "lastname": internal_user.last_name,
+        "specialty": internal_user.specialty,
+        "practice_location": external_user.practice_location,
+        "platform_registered_on": internal_user.platform_registered_on,
+        "internal_classification": internal_user.classification,
+        "external_classification": external_user.user_type_classification,
+        "is_active_internal_platform": internal_user_is_active,
+        "is_active_external_platform": external_user_is_active,
+    }
+
+
+if __name__ == "__main__":
+    start_time = time.time()
+
+    CURRENT_DATE = datetime.date(2017, 2, 2)
+    is_active = partial(active_recently, CURRENT_DATE, 30)
+
+    WAREHOUSE_SAMPLE_USER_COUNT = 10
+    warehouse_samples = []
+
+    API_URL = "http://de-tech-challenge-api.herokuapp.com/api/v1/users"
+    DB_CONFIG = Config(
+        host="candidate-coding-challenge.dox.pub",
+        user="de_candidate",
+        password="P8MWmPPBLhhLX79n",
+        port=3316,
+        database="data_engineer",
+    )
+    DB_QUERY = """
+        SELECT lastname
+               ,firstname
+               ,id
+               ,last_active_date
+               ,platform_registered_on
+               ,practice_id
+               ,specialty
+               ,classification
+        FROM user
+        ORDER BY lastname, firstname
+    """
+
+    internal_users = database_records(DB_CONFIG, DB_QUERY, InternalUser)
+    external_users = api_records(API_URL)
+    users_in_both_systems = matching_users(internal_users, external_users)
+
+    for i, (internal_user, external_user) in enumerate(users_in_both_systems):
+        if i &lt; WAREHOUSE_SAMPLE_USER_COUNT:
+            warehouse_samples.append(
+                create_user_dict(internal_user, external_user, is_active)
+            )
+
+    # At the end of the for loop, `i` is the "index number"
+    # of the last match =&gt; `i + 1` is the total number of matches
+    total_matches = i + 1
+
+    warehouse_sample = json.dumps({"users": warehouse_samples}, indent=4)
+
+    SQL_DDL = dedent(
+        """
+    CREATE TABLE user_active_status (
+        id INT NOT NULL AUTO_INCREMENT,
+        first_name VARCHAR(50),
+        last_name VARCHAR(50),
+        specialty VARCHAR(50),
+        practice_location VARCHAR(50),
+        platform_registered_on VARCHAR(25),
+        internal_classification VARCHAR(50),
+        external_classification VARCHAR(50),
+        is_active_internal_platform TINYINT(1),
+        is_active_external_platform TINYINT(1)
+        PRIMARY KEY (id)
+    );
+    """
+    ).strip()
+
+    end_time = time.time()
+    elapsed_time = round(end_time - start_time)
+    minutes = int(elapsed_time / 60)
+    seconds = elapsed_time % 60
+
+    with open("output.txt", "w") as f:
+        f.write(f"Elapsed Time: {minutes} minutes, {seconds} seconds\n\n")
+        f.write(f"Total Matches: {total_matches}\n\n")
+        f.write(f"Sample Matches:\n{warehouse_sample}\n\n")
+        f.write(f"SQL DDL:\n{SQL_DDL}\n")
+</code></pre>
+    </div>

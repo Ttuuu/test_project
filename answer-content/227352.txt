@@ -1,0 +1,81 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><a href="https://codereview.stackexchange.com/a/227249/200133">DFriend's answer</a> is good, but it sounds like some more clarity is needed about how to use the built-in <code>password_hash</code> function, and there are some architectural things you could improve.</p>
+
+<p>Is the email address the primary key for the <code>authors</code> table? That's not an excellent choice, but we'll roll with it.</p>
+
+<p>To properly use <a href="https://www.php.net/manual/en/function.password-hash.php" rel="nofollow noreferrer">password_hash</a>, you must also use <a href="https://www.php.net/manual/en/function.password-hash.php" rel="nofollow noreferrer">password_verify and password_needs_rehash</a>. This means that you can't just re-hash the password and look for the hash in the database. You have to identify the user-row in the database, load the stored hash into the PHP layer, and check that against the provided password in question. I haven't tested the below, but it's more-or-less how I'd write it.</p>
+
+<pre class="lang-php prettyprint-override"><code>class Password_helper {
+  const ALGO =  PASSWORD_DEFAULT;
+
+  public static set_password(CI_Controller $CI, string $email, string $p):bool{
+    // We could do any password-strength rules or setting of optional arguments here,
+    // but I'll assume you're not doing that.
+    return $CI-&gt;db-&gt;update(
+      'authors',
+      ['password' =&gt; password_hash($p, self::ALGO)],
+      ['email' =&gt; $email]);
+  }
+
+  public static check_and_upkeep(CI_Controller $CI, string $email, string $p):bool{
+    $_user = $CI-&gt;db-&gt;get_where(
+      'authors',
+      ['email' =&gt; $email], 
+      1)
+      -&gt;result();
+    if($_user){
+      $user = $_user[0];
+      if(password_verify($p, $user-&gt;password)){
+        if(password_needs_rehash($user-&gt;password, self::ALGO)){
+          self::set_password($CI, $email, $p);
+        }
+        return true;
+      }
+      else{
+        return false;
+      }
+    }
+    else{
+      return false;
+    }
+  }
+}
+</code></pre>
+
+<p>The above might not jive perfectly with the concept of a "model" you're using; CodeIgniter's "model" concept is frankly problematic. Also, to use the above, you'll need to insert the user to the database <em>first</em>, then set their password. That's fine; you can just temporarily set their password to "".</p>
+
+<h3>Another security detail:</h3>
+
+<p>The business of making the first author the (an?) administrator is not good. There's hypothetically a chance someone might snipe you, and anyway it'll be cluttering up the codebase forever.<br>
+Depending what you mean by "admin", you maybe shouldn't even have "admins" in the same table as "users". In any case, remove that whole business from the registration stack; you can set your first admin manually in the database using some other tool. </p>
+
+<h3>Other stuff:</h3>
+
+<ul>
+<li>A key and specific role of the Controller "endpoint" function (<code>index()</code> for example) is to parse, sanitize, and validate input, all of it. Both you and DFriend are reading <code>POST</code> values down in the model layer; those values should be passed down as arguments. If the number of arguments starts to feel unworldly, you can make classes ("models") for different data structures like Authors.</li>
+<li>I imagine you've repeated that trio of <code>$this-&gt;load-&gt;view()</code> calls, and the associated construction of <code>$data</code>, several times throughout your site. Wrap all of that up in a single place, either as a method of a Controller base class, or as a method of a Loader extension class. Also note that you can load views from inside of views, so a single master-template may be better than having separate header and footer "partial" views.</li>
+<li>Similar to what I mentioned above, don't use <code>$this-&gt;Usermodel-&gt;get_num_rows() == 1</code> to check if the user is an admin or is active; at that point you should have the user's data on hand and be able to check literally. </li>
+<li>I don't like flashdata, I'd rather use the url hash to pass a narrow range of messages to javascript running on the target page. But that's just personal preference.</li>
+<li>You could consolidate your (de)activateAuthor functions if you want. When they're called, you should have already validated that the target exists, so getting a falsy value from the DB would be grounds to throw an error.</li>
+<li>As much as I hate CI's "models", they'll be slightly less painful if you throw them all in your auto-load config file; then you don't need to load them explicitly.</li>
+<li>Your <code>login()</code> endpoint method calls the <code>index()</code> endpoint method if validation fails. That's an odd choice.</li>
+<li>Using typed function signatures will make your code easier to read and <em>more</em> likely to break in obvious ways. The advantage being that it's <em>less</em> likely to break in <em>insidious</em> ways. <strong>I strongly recommend this.</strong></li>
+<li>In DFriend's code:
+
+<ul>
+<li><code>$inserted</code> is assigned a value in the conditional of an if statement. Don't do that.</li>
+<li>Don't rely on <code>redirect</code> or <code>load-&gt;view()</code> to stop execution. Even when it works it makes things harder to read. Use explicit return statements, or put the alternate path in an explicit <code>else</code>, or both.</li>
+</ul></li>
+</ul>
+
+<h3>Edit: Hi DFriend!</h3>
+
+<p>You raise several points; it sounded like you were hoping for a response. </p>
+
+<ul>
+<li>I like your point that brevity is part of clarity. The other point of clarity is saying what you mean, and saying it as code is briefer and stronger than leaving a comment.</li>
+<li>Sanitizing, validating, and parsing inputs isn't business logic, as I understand the phrase. <em>A</em> key role of the Controller is to handing inputs. If we take the framework for granted (as we would like to), then we conceptually enter the program in the Controller endpoint method. That method needs to know about inputs (POST values, query strings, url fragments, cookies) because that's where all further action will be directed from. The thing we can do to maintain separation of concerns is <em>make sure nobody else needs to read those input sources</em>.</li>
+<li><code>redirect()</code> stops execution, but you have to know and remember that to make sense of code that relies on it. <code>CI-&gt;load-&gt;view()</code> doesn't stop execution, but is almost always the last call in the flow. Throwing a <code>return;</code> after all of them <em>is</em> a little verbose, but it's <em>clear</em>. </li>
+<li>It's a fact of life that there will be a lot of conditionals, and I really don't think there's a single pattern that will cover all cases. That said, if you're relying on a section of code only running if a prior <code>if</code> failed, <em>then you're in an else section whether you say so or not</em>.</li>
+</ul>
+    </div>

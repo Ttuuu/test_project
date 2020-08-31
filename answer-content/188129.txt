@@ -1,0 +1,92 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This is some really nifty code. I'd be curious to see the full implementation and whether there were any improvements since this question was posted. :)</p>
+
+<h2>[code] make_aligned</h2>
+
+<p>Is there a reason for this to be a macro instead of an inline function?</p>
+
+<hr>
+
+<h2>[code] malloc</h2>
+
+<p><code>std::malloc()</code> is allowed to return <code>nullptr</code> if given a size of zero (e.g. the default capacity). On such implementations the <code>polymorphic_vector_base</code> constructor will always throw a <code>bad_alloc</code> when called with a capacity of zero.</p>
+
+<hr>
+
+<h2>[design] sections_</h2>
+
+<p>At the moment, the <code>sections_</code> / erase algorithm doesn't seem quite correct or useful.</p>
+
+<p>As I understand it: erasing an object results in an unused gap in the container memory. In a normal vector, we'd copy / move the following objects backwards to fill the gap. But since we're storing objects of different types, the next object may be larger than the object removed. If so, we can't move it into the gap because we'd be overwriting part of the memory it already occupies.</p>
+
+<p>Thus a <code>section</code> describing the gap is added. So if another object is erased at that point, we can reuse the memory.</p>
+
+<p><em>However</em>... </p>
+
+<p>In <code>polymorphic_vector_base::destroy()</code>, all the <code>section</code>s from the one belonging to the current handle to the end of the vector are erased. But, in <code>polymorphic_vector_base::transfer()</code> only the first <code>section</code> encountered is re-added. So in this code:</p>
+
+<pre><code>pv.push_back(derived_b{ { 1, 2, 3 } }); // size 20
+pv.push_back(derived_a{ "abc" }); // size 32
+pv.push_back(derived_b{ { 1, 2, 3 } }); // size 20
+pv.push_back(derived_a{ "abc" }); // size 32
+
+pv.erase(2); // adds a section (can't move size 32 into a size 20 slot)
+pv.erase(0); // removes the first section, adds another section (but the removed one isn't re-added, even though it's still relevant)
+</code></pre>
+
+<p>Neither of the erase function calls are able to move items backwards to fill the gaps. But after the second erase, we've discarded the section data we added when doing the first erase, even though the gap still exists.</p>
+
+<hr>
+
+<p>While the above issue could be fixed, and the <code>section</code> data perhaps used to provide an "insert wherever" function that found the first (or smallest) possible insertion point, it's not needed for erasing.</p>
+
+<p>We can calculate the new offset directly from the previous handle (if there's no previous handle, then the offset is zero). So the code to remove an element and consolidate the vector can be simplified:</p>
+
+<pre><code>void polymorphic_vector_base::deallocate(size_type const i)
+{
+    assert(i &lt; handles_.size());
+
+    handles_.erase(handles_.begin() + i);
+
+    auto h = handles_.begin() + i;
+
+    auto noffset = 0;
+
+    if (i != 0)
+    {
+        auto p = std::prev(h);
+        noffset = p-&gt;size() + (reinterpret_cast&lt;byte*&gt;(p-&gt;src()) - data_);
+    }
+
+    consolidate(h, noffset);
+}
+
+void polymorphic_vector_base::consolidate(std::vector&lt;handle&gt;::iterator begin, size_type offset)
+{
+    assert(handles_.cbegin() &lt;= begin);
+    assert(handles_.cend() &gt;= begin);
+    assert(offset &lt; cap_);
+
+    for (byte* blk{ data_ + offset }, *src; begin != handles_.end(); ++begin)
+    {
+        src = make_aligned(blk, begin-&gt;align());
+
+        if (src + begin-&gt;size() &gt; begin-&gt;src()) // can't move anything else, we're done!
+        {
+            return;
+        }
+        else
+        {
+            assert(reinterpret_cast&lt;std::uintptr_t&gt;(src) % begin-&gt;align() == 0);
+
+            begin-&gt;transfer(blk, src);
+            blk = data_ + (offset += begin-&gt;size() + (src - blk));
+        }
+    }
+
+    offset_ = offset;
+}
+</code></pre>
+
+<p>Note that there's no need to explicitly call <code>destroy()</code> on the erased handle, as it's called in the <code>handle</code> destructor.</p>
+    </div>

@@ -1,0 +1,169 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>The rules of five/three/zero</h1>
+
+<p>Usually, the existence of a single constructor indicates that the others should get implemented too (or explicitly forbidden/deleted). This is called the <a href="https://en.cppreference.com/w/cpp/language/rule_of_three" rel="nofollow noreferrer">rule of five (or three, depending on the standard)</a>. However, there is only one member in your class, <code>_tocc</code>, and it has well-defined constructors for all the usual cases.</p>
+
+<p>Here, we should follow the rule of <em>zero</em>: declare and define no constructors at all, as the default constructors will do the right thing. See also <a href="https://github.com/isocpp/CppCoreGuidelines/blob/master/CppCoreGuidelines.md#Rc-zero" rel="nofollow noreferrer">CppCoreGuidelines C.20</a>.</p>
+
+<h1>Use already known data</h1>
+
+<p>While there is no bug in your code, there are some optimization flaws. Let's have a look at <code>tocc&lt;int&gt;::push</code>, compiled via <code>gcc 9.2 -S -O3</code> (<a href="https://godbolt.org/z/WF_Bk9" rel="nofollow noreferrer">CompilerExplorer</a>; I had to <code>[[gnu::noinline]]</code> to keep the assembly sane).</p>
+
+<pre><code>tocc&lt;int&gt;::push(int const&amp;):
+    sub     rsp, 24
+    mov     rdx, QWORD PTR [rdi+16]
+    mov     ecx, DWORD PTR [rsi]
+    test    rdx, rdx
+    je      .L31
+    lea     r8, [rdi+8]
+    mov     rax, rdx
+    mov     rsi, r8
+    jmp     .L32
+.L48:
+    mov     rsi, rax
+    mov     rax, QWORD PTR [rax+16]
+    test    rax, rax
+    je      .L33
+.L32:
+    cmp     DWORD PTR [rax+32], ecx
+    jge     .L48
+    mov     rax, QWORD PTR [rax+24]
+    test    rax, rax
+    jne     .L32
+.L33:
+    cmp     rsi, r8
+    je      .L31
+    cmp     DWORD PTR [rsi+32], ecx
+    jg      .L31
+    mov     rax, r8
+    jmp     .L36
+.L50:
+    mov     rax, rdx
+    mov     rdx, QWORD PTR [rdx+16]
+    test    rdx, rdx
+    je      .L49
+.L36:
+    cmp     ecx, DWORD PTR [rdx+32]
+    jle     .L50
+    mov     rdx, QWORD PTR [rdx+24]
+    test    rdx, rdx
+    jne     .L36
+.L49:
+    cmp     r8, rax
+    je      .L41
+    cmp     ecx, DWORD PTR [rax+32]
+    jl      .L41
+    add     QWORD PTR [rax+40], 1
+    add     rsp, 24
+    ret
+.L31:
+    mov     rsi, rsp
+    mov     DWORD PTR [rsp], ecx
+    mov     QWORD PTR [rsp+8], 1
+    call    std::pair&lt;std::_Rb_tree_iterator&lt;std::pair&lt;int const, long&gt; &gt;, bool&gt; std::_Rb_tree&lt;int, std::pair&lt;int const, long&gt;, std::_Select1st&lt;std::pair&lt;int const, long&gt; &gt;, std::less&lt;int&gt;, std::allocator&lt;std::pair&lt;int const, long&gt; &gt; &gt;::_M_emplace_unique&lt;std::pair&lt;int, long&gt; &gt;(std::pair&lt;int, long&gt;&amp;&amp;)
+    add     rsp, 24
+    ret
+.L41:
+    mov     edi, OFFSET FLAT:.LC0
+    call    std::__throw_out_of_range(char const*)
+</code></pre>
+
+<p>That's a lot of conditional jumps. 11 jumps depend on <code>test</code> or <code>cmp</code>. However, we only have a single comparison. What happens here?</p>
+
+<p>Well, first of all, a call to <code>map&lt;T&gt;::at</code> isn't free. It always has some additional boundary check, which prevents us from undefined behaviour but exchanges this boon for some additional code and an potential exception.</p>
+
+<p>However, if we're in the second branch in <code>push</code>, then we already <em>know that there is an element</em>! After all, we <em>found it beforehand</em>:</p>
+
+<pre><code>void push(const T&amp; item)
+{
+    if(_tocc.find(item) == _tocc.end())                    
+        _tocc.insert(std::pair&lt;T, long int&gt;(item, 1));
+    else
+        _tocc.at(item)++;  // find() did not return end()!
+}
+</code></pre>
+
+<p>Instead of <code>at</code>, we should use the iterator for several reasons:</p>
+
+<ul>
+<li>we already have the element at hand,</li>
+<li>we're guaranteed to have an element, so the boundary check in <code>at()</code> is not necessary,</li>
+<li>we don't need to search the element a second time and therefore stay <span class="math-container">\$\mathcal O(1)\$</span> instead of <span class="math-container">\$\mathcal O(\log n)\$</span></li>
+</ul>
+
+<p>So let's use the iterator instead and let's replace <code>std::pair&lt;T, long int&gt;</code> with <code>std::make_pair</code> while we're at it:</p>
+
+<pre><code>void push(const T&amp; item)
+{
+    const auto it = _tocc.find(item);
+    if(it == _tocc.end()) {          
+        _tocc.insert(std::make_pair(item, 1));
+    } else {
+        it-&gt;second++;
+    }
+}
+</code></pre>
+
+<p>What's the new assembly?</p>
+
+<pre><code>tocc&lt;int&gt;::push(int const&amp;):
+    mov     rax, QWORD PTR [rdi+16]
+    mov     edx, DWORD PTR [rsi]
+    test    rax, rax
+    je      .L31
+    lea     rsi, [rdi+8]
+    mov     rcx, rsi
+    jmp     .L32
+.L44:
+    mov     rcx, rax
+    mov     rax, QWORD PTR [rax+16]
+    test    rax, rax
+    je      .L33
+.L32:
+    cmp     DWORD PTR [rax+32], edx
+    jge     .L44
+    mov     rax, QWORD PTR [rax+24]
+    test    rax, rax
+    jne     .L32
+.L33:
+    cmp     rsi, rcx
+    je      .L31
+    cmp     DWORD PTR [rcx+32], edx
+    jle     .L36
+.L31:
+    sub     rsp, 24
+    lea     rsi, [rsp+8]
+    mov     DWORD PTR [rsp+8], edx
+    mov     DWORD PTR [rsp+12], 1
+    call    std::pair&lt;std::_Rb_tree_iterator&lt;std::pair&lt;int const, long&gt; &gt;, bool&gt; std::_Rb_tree&lt;int, std::pair&lt;int const, long&gt;, std::_Select1st&lt;std::pair&lt;int const, long&gt; &gt;, std::less&lt;int&gt;, std::allocator&lt;std::pair&lt;int const, long&gt; &gt; &gt;::_M_emplace_unique&lt;std::pair&lt;int, int&gt; &gt;(std::pair&lt;int, int&gt;&amp;&amp;)
+    add     rsp, 24
+    ret
+.L36:
+    add     QWORD PTR [rcx+40], 1
+    ret
+</code></pre>
+
+<p>Only 6 conditional jumps, only ~55% the original amount. However, keep in mind that the reduction of asm instructions was <em>not</em> the goal of this section. Instead, we re-used already known values and didn't repeat ourselves (only <em>one</em> <code>find()</code> call).</p>
+
+<p>The same holds for <code>pop()</code>'s usage of <code>map::erase()</code>, which can also take an iterator instead of a <code>Key</code>, but that's left as an exercise.</p>
+
+<h1>Documentation and (internal) comments</h1>
+
+<p>Good job on the comments! However, keep in mind that <a href="http://www.doxygen.nl/manual/docblocks.html" rel="nofollow noreferrer">Doxygen</a> and other programs use special syntax to discern  documentation comments and implementation comments. </p>
+
+<h1>Naming</h1>
+
+<p>The sole member of our class almost has the same name as your class. This makes it somewhat confusing, as we use <code>_tocc</code> to actually implement <code>tocc</code>. Naming is hard, though, and I cannot come up with a nicer name; <code>counter</code>, <code>key_counter</code> or <code>key_counter_map</code> don't have the same ring to it, although the latter is the most descriptive variant.</p>
+
+<h1>Interface</h1>
+
+<p>At the moment, a user must know the name of all items in the <code>tocc</code> to check their count afterwards. An iterator interface would be tremendously helpful.</p>
+
+<p>We could even reuse <code>std::map::const_iterator</code>, if you only want constant iteration:</p>
+
+<pre><code>using iterator_type = std::map&lt;T, long int&gt;::iterator_type;
+
+iterator_type begin() { return _tocc.begin(); }
+...
+</code></pre>
+    </div>

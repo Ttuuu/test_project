@@ -1,0 +1,199 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Several things come to mind right away:</p>
+
+<ul>
+<li><p>I wouldn't make a custom <code>parseArgs</code> function, I'd use <a href="https://golang.org/pkg/flag#Parse" rel="nofollow noreferrer"><code>flag.Parse</code></a>. For just a pair of positional arguments it might be overkill but it makes it trivial to add more options, usage output, etc. And either way, it's better to only access <code>os.Args</code> from <code>main</code></p></li>
+<li><p>Instead of <code>fmt.Fprint</code> to <code>os.Stderr</code> followed by <code>os.Exit</code> it's more idomatic to just use <a href="https://golang.org/pkg/log#Fatal" rel="nofollow noreferrer"><code>log.Fatal</code></a> (or <code>Fatalf</code> or <code>Fatalln</code>).</p></li>
+<li><p>Avoid reading and writing entire files with <code>ioutil</code> if you can do work while streaming data. If the files are guarenteed to be small it's just a bad habit but if someone ever runs your tool on gigabytes or terabytes of data they'll be in for unpleasant surprise.</p></li>
+<li><p>In the same vein, I'd make your function API steam-able. Either by implementing an <a href="https://golang.org/pkg/io#Reader" rel="nofollow noreferrer"><code>io.Reader</code></a> wrapper or by a function that takes an <a href="https://golang.org/pkg/io#Writer" rel="nofollow noreferrer"><code>io.Writer</code></a> and an <code>io.Reader</code> (like <a href="https://golang.org/pkg/io#Copy" rel="nofollow noreferrer"><code>io.Copy</code></a>).</p>
+
+<p>You could also implementing it as a <a href="https://godoc.org/golang.org/x/text/transform#Transformer" rel="nofollow noreferrer"><code>transform.Transformer</code></a>; but that's probably overkill, although perhaps an interesting exercise.</p></li>
+<li><p>Typically such command line tools in unix act as pipes, that is, if not given file arguments they read from <code>stdin</code> and write to <code>stdout</code>. Either you only work with stdin/stdout and make callers use shell redirection if they want to work to work on files or you make the filenames optional. Just initialise an <code>io.Reader</code> (or <code>io.ReadCloser</code>) variable to <code>os.Stdin</code> and an <code>io.WriteCloesr</code> variable to <code>os.Stdout</code>. Then when processing the arguments, if provided, open the relevant files and change the variables. Your choice if you use positional arguments as you've done or option arguments (as <code>dd</code> does and as I did below). Make sure to check for errors closing the destination.</p></li>
+<li><p>By the way, on unix you can use the standard <code>dd</code> command to do the byte swapping for you with the <code>conv=swab</code> operand:</p>
+
+<pre><code>dd conv=swab if=someinput_file of=someoutput_file
+</code></pre>
+
+<p>using files, or in a pipe like this:</p>
+
+<pre><code>bigendian_command | dd conv=swab | littleendian_command
+</code></pre></li>
+</ul>
+
+<p>A quick stab at implementing it this way gave me the following.</p>
+
+<p>(Also available at <a href="https://gist.github.com/dchapes/9d795a04e471319abbc5ff016afbbee9" rel="nofollow noreferrer">https://gist.github.com/dchapes/9d795a04e471319abbc5ff016afbbee9</a>
+the gist also has your version as revision 1, and a version using a function with an <code>io.Copy</code> like signature as revision 2).</p>
+
+<p><code>swab.go</code>:</p>
+
+<pre><code>package main
+
+import (
+    "flag"
+    "fmt"
+    "io"
+    "log"
+    "os"
+)
+
+func main() {
+    log.SetPrefix("swab: ")
+    log.SetFlags(0)
+    infile := flag.String("in", "", "input `path`, blank for stdin")
+    outfile := flag.String("out", "", "output `path`, blank for stdout")
+    flag.Usage = func() {
+        fmt.Fprintf(flag.CommandLine.Output(),
+            "Usage: %s [options]\n", os.Args[0],
+        )
+        flag.PrintDefaults()
+    }
+    flag.Parse()
+    if flag.NArg() &gt; 0 {
+        flag.Usage()
+        os.Exit(2) // To match the exit code flag.Parse uses.
+    }
+
+    var src io.ReadCloser = os.Stdin
+    var dst io.WriteCloser = os.Stdout
+    if *infile != "" {
+        f, err := os.Open(*infile)
+        if err != nil {
+            log.Fatal(err)
+        }
+        src = f
+    }
+    // Closing the input isn't strictly required in main
+    // nor for stdio, but it's a good habit. No need to
+    // check any error; we rely on Read reporting errors of interest.
+    defer src.Close()
+
+    if *outfile != "" {
+        f, err := os.Create(*outfile)
+        if err != nil {
+            log.Fatal(err)
+        }
+        dst = f
+    }
+
+    if _, err := io.Copy(dst, NewSwabReader(src)); err != nil {
+        // Not this calls os.Exit so no defers get run
+        // and we don't close the output either, not
+        // an issue from main.
+        log.Fatal(err)
+    }
+    if err := dst.Close(); err != nil {
+        log.Fatal(err)
+    }
+}
+
+type SwabReader struct {
+    r        io.Reader
+    b        byte // extra byte, not yet swapped
+    haveByte bool // true if b is valid
+    err      error
+}
+
+// NewSwabReader returns an io.Reader that reads from r
+// swapping adjacent bytes. The trailing odd byte, if any,
+// is left as-is.
+func NewSwabReader(r io.Reader) *SwabReader {
+    return &amp;SwabReader{r: r}
+}
+
+func (sr *SwabReader) Read(p []byte) (n int, err error) {
+    if len(p) == 0 || sr.err != nil {
+        return 0, sr.err
+    }
+    i := 0
+    if sr.haveByte {
+        // Copy in the previous saved byte.
+        p[0] = sr.b
+        i = 1
+        //sr.haveByte = false // not strictly required
+    }
+    n, sr.err = sr.r.Read(p[i:])
+    n += i
+    p = p[:n]
+    for i := 1; i &lt; len(p); i += 2 {
+        p[i-1], p[i] = p[i], p[i-1]
+    }
+    // Remove and save any non-swapped trailing odd byte.
+    if sr.err == nil {
+        if sr.haveByte = (n&amp;1 != 0); sr.haveByte {
+            n--
+            sr.b = p[n]
+            //p = p[:n] // not strictly required
+        }
+    }
+    return n, sr.err
+}
+</code></pre>
+
+<p>And a simple test, 
+<code>swab_test.go</code>:</p>
+
+<pre><code>package main
+
+import (
+    "io"
+    "strings"
+    "testing"
+    "testing/iotest"
+)
+
+var readFilters = []struct {
+    name string
+    fn   func(io.Reader) io.Reader
+}{
+    {"", nil},
+    {"DataErrReader", iotest.DataErrReader},
+    {"HalfReader", iotest.HalfReader},
+    {"OneByteReader", iotest.OneByteReader},
+    //{"TimeoutReader", iotest.TimeoutReader},
+}
+
+func TestSwab(t *testing.T) {
+    const sz = 32&lt;&lt;10 + 1
+    cases := []struct{ in, out string }{
+        {"", ""},
+        {"a", "a"},
+        {"ab", "ba"},
+        {"abc", "bac"},
+        {"abcd", "badc"},
+        {strings.Repeat("\x01\x80", sz) + "x",
+            strings.Repeat("\x80\x01", sz) + "x"},
+    }
+    var dst strings.Builder
+    var r io.Reader
+    for _, rf := range readFilters {
+        for _, tc := range cases {
+            r = strings.NewReader(tc.in)
+            if rf.fn != nil {
+                r = rf.fn(r)
+            }
+            dst.Reset()
+            //t.Logf("swabbing %s %.16q", rf.name, tc.in)
+            //r = iotest.NewReadLogger("&lt;&lt;&lt; src", r)
+            n, err := io.Copy(&amp;dst, NewSwabReader(r))
+            if err != nil {
+                t.Errorf("swab on %s %q failed: %v",
+                    rf.name, tc.in, err,
+                )
+                continue
+            }
+            if want := int64(len(tc.out)); n != want {
+                t.Errorf("swab on %s %q returned n=%d, want %d",
+                    rf.name, tc.in, n, want,
+                )
+            }
+            if got := dst.String(); got != tc.out {
+                t.Errorf("swab on %s %q\n\tgave %q\n\twant %q",
+                    rf.name, tc.in, got, tc.out,
+                )
+            }
+        }
+    }
+}
+</code></pre>
+    </div>

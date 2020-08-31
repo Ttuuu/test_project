@@ -1,0 +1,60 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Without sacrifying something, you can probably gain the most (wall time) by using a hint such as  <code>posix_fadvise(POSIX_FADV_WILLNEED)</code>. Or, if portability is not paramount, something like <code>readahead</code> (Windows calls that function <code>PrefetchVirtualMemory</code>). Be sure to read the docs and watch for words like "blocking".</p>
+
+<p>The reason for wanting to prefetch is that while <code>mmap</code> is indeed awesome in its own way and totally superior to any I/O functions (let alone C++ iostream which is "slow" because it does a lot of stuff and is very general and flexible, it can do pretty much everything, including proper error reporting) in terms of performance, there is a huge misconception that people often fall for:</p>
+
+<p><code>mmap</code> is awesome, but it does <strong>not</strong> do magic.</p>
+
+<p>While <code>mmap</code> does prefetch, the algorithm is very non-ingenious, block sizes are small (usually something like 128k), and the sequence is very non-optimal (still, much better than other I/O). Also, linear scan hints do not really do "magic" either, they usually just double the prefetch size, which is still small.</p>
+
+<p>In theory, things look like this:</p>
+
+<pre><code>(OS)   read + awesome magic
+(app)  work, work, work, work
+</code></pre>
+
+<p>In practice, things look like this:</p>
+
+<pre><code>(OS)   read               ... queue, read               ... queue, read
+(app)        work, FAULT, ...              work, FAULT, ...
+       ^^^^^^      ^^^^^^^^^^^^^^^^^^^^^^^       ^^^^^^^^^^^^^^^^^^^^^^^
+                   nothing happens here!         nothing happens here!
+</code></pre>
+
+<p>Even with hinting or explicit readahead, reading from disk (or SSD) is of course still much slower than your parsing so inevitably you <strong>will</strong> stall. There is no way to avoid that. In the end, we're trying to get this:</p>
+
+<pre><code>(OS)   read, read, read, read, read, read, read
+(app)        work, work, work, work, FAULT ...   work
+                                     ^^^^^^^^^^^^
+                                     aww too bad, can't help this!
+</code></pre>
+
+<p>You can't prevent yourself from eventually outrunning the disk and blocking. However, you can reduce the number of stalls, push the time of the first stall back, and you can eliminate several round trip times between requests, maximizing throughput. Certainly, prefetching a couple of megabytes in one go is more efficient (even if broken down to smaller requests at driver level) than to do a lot of small requests ad-hoc as page faults are realized with sync-points in between, which are <em>necessarily</em> full stalls.</p>
+
+<p>Trying to tune the <em>actual</em> parsing is unlikely to give very substantial gains. Using a custom <code>isnumeric</code> as you've done is probably the single best thing to start with, but the gains beyond that won't likely be great.</p>
+
+<p>The reason is that you're trying to turn the wrong knob (for the same reason, the ideology-driven environmental craze that is so much <em>en vogue</em> is failing). Thing is, even if you reduce something that makes up 3% of the total to one half, or eliminate it altogether, the gains are not very substantial. The gains, however, <em>are substantial</em> if you reduce the other 97%. Which, unluckily, is hard to do because that's forementioned disk access, followed by memory bandwidth and memory latency.</p>
+
+<p>Parsing of very simple data (integers on a line), even badly implemented easily runs in the "dozen gigabyte per second" realm. Converting numbers is very fast and almost certainly hidden by memory latency.</p>
+
+<p>Your CPU cache is probably not much help, and prefetching most likely will not help much either. The reason being that fetching a cache line takes something around 300-400 or so cycles, and you hardly need that much to parse the data. You're still going to be memory bandwidth bound (in addition to being I/O bound).</p>
+
+<p>There's the TLB to consider, though (the CPU typically only caches ~50-60 entries). It may very much be worth it to code a "TLB primer" into the next couple of pages. That's a more or less no-op which somehow reads/accesses a memory location but doesn't use the result, and thus bears no dependency chain. The processor pipeline will thus (hopefully) make the latency invisible, but it will still do <em>something</em>. Very soon after, when you <strong>really</strong> access that location, it is guaranteed that no TLB miss happens and the to-be read cache line will, with some luck, already have been fetched already, too. TLB misses are painful. That's a few thousand or so cycles saved on every memory page.<br>
+You'll have to try. Be wary of page faults blocking your thread though, it might be an advantage of having a dedicated prefetcher thread (depends on cost of spawning vs. page faults, surely only worth it for larger data sets).</p>
+
+<p>Doing away with the hashmap would help, but that only works if you do not actually <em>need</em> a map. It's a fair assumption that you do need it (or you wouldn't be using it!) so that's probably not an option. If you <em>need</em> something, well, then you <em>need</em> it. But I would really be interested in seeing what a profiler has to say about it. My uneducated guess would be 50-70% of your "parse" time being spent somewhere inside the hash map.</p>
+
+<p>Hash maps are, contrary to theory, utterly bad data structures performance-wise. Not as bad as <em>some</em> other structures, but still...</p>
+
+<p>That is also true for Robin Hood hashing (such as what's used in the implementation that you cite). While it is one of the better, and probably one of the best implementations, still it is adverse to performance.<br>
+In theory, hash maps are O(1), in practice they're some calculations plus two guaranteed cache misses on every access, and usually more. Robin Hood hashing in theory has a guaranteed upper bound, blah blah. In practice, it <em>also</em> has guaranteed extra accesses as data is inserted. In theory, RH hashing shows low variance and thus clusters memory accesses together in a cache-friendly manner. In practice, when you parse megabytes of data, <em>there is no such thing as a cache</em>. You're reading gigabytes of data, and <em>that is what's in your cache</em>. None of the hash map is. Every access is (except for sheer random luck!) a guaranteed miss.</p>
+
+<p>There exist some very fast JSON and XML parsers which are so fast for the sole reason that they work in-place. They do zero allocations, and no jumping around in memory. Simple, sequential processing, front to back, overwriting stuff as they go. That's as good as it can get.</p>
+
+<p>Note that there are a couple of possible issues with that in your simple datafile. A single digit plus newline is two bytes, but an integer is four bytes (a <code>double</code> is 8). So, that probably doesn't work too well for the general case in your example (your life is much easier with XML since there's lots of extra <code>&lt;</code> and <code>&gt;</code>s around, and a lot of other noise, so you have no trouble storing your data in-place).</p>
+
+<p>Another issue is that you need a way of not modifying the mapped file. Private mapping works, of course, but that'll mark pages COW and may cause a fault with a memory copy on every modified page, depending on how intelligent the memory system is coded (private mappings actually only need to be copied when modified while there's more than one mapping). Which, if it happens, isn't precisely optimal. I wouldn't know if there is a way of somehow hinting the memory manager towards such a behavior either.<br>
+There is <code>MADV_DONTNEED</code> which is destructive on some platforms, so one could use that on a normal mapping, but that being destructive is not standard, not portable, and doesn't work properly (i.e. reliably) either. It might very well do something to your original file (and partly, even!) that you don't want. So that's not a real option.</p>
+
+<p>In the end, you will probably either have to do a <code>memcpy</code> or read from a readonly mapping, and write to another linear buffer (which isn't quite in-place, but still orders of magnitude better in terms of access pattern and caching).</p>
+    </div>

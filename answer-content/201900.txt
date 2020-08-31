@@ -1,0 +1,175 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The specs given to you read a little strangely. I don't know have having no external dependencies makes something a <code>*single implementation*</code> or for that matter what single implementation means (other than the obvious, only one implementation, not several). External dependencies in go aren't that uncommon. Specifically when creating an HTTP server, as you discovered the stdlib approach is quite verbose. There are minimal frameworks out there that can do a much better job at capturing function without needing so much boilerplate (and also provide nice testing utilities, something that you also could have benefited from). Further, as I understand the Go philosophy is pretty opposed to <code>Makefile</code>s. The entire point of all the care put into <code>go build</code> is so that you don't need to spend time crafting a <code>Makefile</code> and consumers of your code don't need to spend time reading it (or documentation) to understand how to use it. That request strikes me as odd.</p>
+
+<p>As a nit, you should only return 404 for endpoints that actually don't exist. <code>/messages</code> exists, so <code>DELETE /messages</code> shouldn't 404, it should 405 Method Not Allowed (and send the header <code>Allow: POST, GET</code>).</p>
+
+<p>As another nit, I just noticed they mix <code>/message</code> and <code>/messages</code>. As a rule, RESTful APIs should usually use the plural for everything. This way programmatic API access is easier. Without this rule given the endpoint <code>/message</code>, you need a pluralizer to derive the endpoint to list all messages.</p>
+
+<p>The spec is also way underspecified. Is there any requirement for persistence? Is this server standalone or meant to be run in a distributed context (the latter complicates the persistence greatly, for one)? Should <code>/users</code> return all users who have ever posted or only those in the last 100 messages? Are we allowed to discard messages beyond the last 100?</p>
+
+<p>Things I noticed scrolling through your code:</p>
+
+<ul>
+<li>In general, for an executable prefer the name <code>main.go</code>. Then <code>go build</code> will do what you want (produce a binary with the same name as the parent dir)</li>
+<li>Your <code>Makefile</code> doesn't really properly leverage <code>make</code> and instead could be a script that switches on the first arg. You should use dependencies and name targets as the files they produce, or otherwise mark as <code>.PHONY</code>. If you said that you had previous experience with a language that relies heavily on Makefiles, this would be a red flag to me as an interviewer.</li>
+</ul>
+
+
+
+<pre><code>GO:=go
+
+build: chatserver
+
+run: chatserver
+    ./chatserver
+
+chatserver: *.go
+    $(GO) build
+
+test:
+    $(GO) test
+
+.PHONY: build run test
+</code></pre>
+
+<ul>
+<li>Your code could do with some separation of concerns/Single responsibility principle. That fact that all of your logic is in one file should be a red flag. Separate this out. I'd pull out the business logic into its own <code>interface</code> and then provide an implementation to an HTTP server. In this way, when testing the HTTP server in isolation, you can pass mock of the business logic. You have somewhat implemented this already, but with global functions and state (<a href="https://softwareengineering.stackexchange.com/questions/148108/why-is-global-state-so-evil">and global state is bad</a>).</li>
+</ul>
+
+
+
+<p><strong>chat/message.go:</strong></p>
+
+<pre><code>package chat
+
+import (
+    "time"
+)
+
+// Whether you expose these is a design decision. You could choose not to,
+// and then provide User(), Text(), and SentAt(), but for simplicity I chose
+// not to.
+// For simplicity of the HTTP server, you may also choose to add the JSON
+// serialization here, but that does tie this abstract model to a concrete
+// representation, which may be undesirable if there are alternative protocols
+// that want to serialize messages (say you want to forward messages to a
+// Slack API, for example)
+type Message struct {
+    User string
+    Text string
+    SentAt time.Time
+}
+
+func NewMessage(user, text string) Message {
+    return Message{User: user, Text: text, SentAt: time.Now()}
+}
+</code></pre>
+
+<p><strong>chat/user.go:</strong></p>
+
+<pre><code>package chat
+
+type User struct {
+    Name string
+}
+</code></pre>
+
+<p><strong>chat/state.go:</strong></p>
+
+<pre><code>package chat
+
+type State interface {
+    RecentMessages() []Message
+    AddMessage(Message)
+    ActiveUsers() []User
+}
+</code></pre>
+
+<p><strong>chat/in_memory_state.go:</strong></p>
+
+<pre><code>package chat
+
+type InMemoryState struct {
+    messages []Message
+    users UserSet
+}
+
+// You may want to make this configurable by adding it to InMemoryState
+const NumRecentMessages int = 100
+
+func NewInMemoryState() *InMemoryState {
+    return &amp;InMemoryState{
+        messages: nil,
+        users: NewUserSet(),
+    }
+}
+
+func (s *InMemoryState) RecentMessages() []Message {
+    return s.messages
+}
+
+func (s *InMemoryState) AddMessage(message Message) {
+    recentMessages = s.messages[max(0, len(s.messages) - NumRecentMessage - 1)]
+    s.messages = append(recentMessages, message)
+    s.users.Append(message.User)
+}
+
+func max(x, y int) int {
+    if x &gt; y {
+        return x
+    }
+
+    return y
+}
+
+func (s *InMemoryState) ActiveUsers() []User {
+    return s.users.Slice()
+}
+</code></pre>
+
+<p>That is the extent of your business logic. Really. That's it. Simple and concise. Really easy to test. <code>UserSet</code> should just be a wrapper struct containing a <code>map[User]bool</code> and <code>[]User</code>. The former acts as a set and the later is the list of all keys in the map (provided so we have quick access to a slice of all <code>User</code>s without needing to enumerate through the keys of the map).</p>
+
+<p>With a design like this, your main should be <strong>a lot</strong> simpler:</p>
+
+<pre><code>package main
+
+import (
+    "flag"
+    "github.com/you/chat" // admittedly a pain point of go
+)
+
+var address = flag.String("address", ":8081", "the address for the chat HTTP server to listen on")
+
+func main() {
+    state := chat.NewInMemoryState()
+    server := chat.NewHTTPServer(state)
+    log.Println(server.ListenAndServe(*address))
+}
+</code></pre>
+
+<p>Note that the signature of <code>NewHTTPServer</code> is:</p>
+
+<pre><code>func NewHTTPServer(state State) *HTTPServer
+</code></pre>
+
+<p>Let's say that one of your comments for how to improve the service is you want to add persistence. You can now do that very easily. Just create a new implementation of <code>State</code>, perhaps <code>DiskPersistedState</code>. What if you decide you want to back with Postgres? Create a <code>PostgresState</code>. Separation like this allows you to individually configure the concerns where appropriate and allows the HTTP server to care about none of these implementation details. All it has to care about is that its given something that can return to it a <code>[]Message</code>, append a <code>Message</code>, and return a <code>[]User</code>. This is a lot easier to reason about than yours, which has to worry about implementing the <code>UserSet</code> logic, doing data validation, etc. alongside the HTTP-specific concerns.</p>
+
+<ul>
+<li>Good use of <code>sort.Sort</code>. As a nitpick, we'd usually say <code>ByTimestamp</code> instead of <code>MessageSorter</code>. It reads a bit nicer this way: <code>sort.Sort(ByTimestamp(messages))</code>. But, above and in your code the messages slice is already sorted, so why sort again?</li>
+<li><code>return</code> alone is unnecessary and should be eliminated</li>
+<li>As I did above, use <code>time.Time</code> for message timestamps instead of <code>float64</code>. The go community spent a lot of time perfecting that API. Use it! If you need to serialize it to some silly format to meet the spec, do that in <code>HTTPServer</code>.</li>
+<li>Decent commenting. Look into <a href="https://blog.golang.org/godoc-documenting-go-code" rel="nofollow noreferrer"><code>go doc</code></a> to see how you can easily get beautiful docs automatically.</li>
+<li>Instead of your creation of a new slice in <code>GetMostRecentMessagesSorted</code>, why not just use a slice (see above for an example)? This will be way more efficient than allocating all that memory for each request!</li>
+<li>Don't <code>panic(http.ListenAndServe())</code>. It always returns an error!</li>
+</ul>
+
+<p>Your HTTP server stuff (if you refactored out the business logic) largely looks okay. Looking at your tests, the fact that you have a <code>PostMessage</code> suggests that perhaps in your refactored <code>HTTPServer</code> perhaps you should have a struct like that for reading input JSON and then copy the relevant fields into a real <code>chat.Message</code> (perhaps by using <code>chat.NewMessage()</code> to abstract away the time stuff).</p>
+
+<p>Your tests:</p>
+
+<p>Separating out the business logic will help keep these more concise. I had a hard time groking these as <code>TestEndPoints</code> is <strong>huge</strong>. When testing the server, pass in a mocked <code>State</code>. Then you don't have to deal with setting up state via API calls. You can test endpoints in isolation.</p>
+
+<p>Your tests though long aren't very thorough. Instead, hand craft specific examples. Separate these out into different functions. Mocking out state makes this easy. Generate a state with no messages, a few messages, no users, and a few users. See if the <code>/messages</code> and <code>/users</code> endpoints return the proper thing (by hardcoding the result you expect into the test). Try calling the <code>POST /messages</code> and see if <code>state.AddMessage()</code> is called with the proper <code>Message</code>. Then exercise edge cases like improper request bodies, bad methods, and bad request paths.</p>
+
+<p>All in all, this is a very good for your first time using Go. You picked up on a lot of the idioms fairly well. There are a few jagged spots, but I would argue that language itself also has a few warts that really clash with best practices that apply to every other language. So, well done and keep chugging with go! If anything, I would look to it to do anything requiring concurrency or any sort of networking. Go's standard library is the essence of elegance.</p>
+    </div>

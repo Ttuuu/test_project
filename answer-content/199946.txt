@@ -1,0 +1,74 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You are correct to be concerned about the first method. It generates UB if <code>buf[offset]</code> doesn't happen to be at the right alignment boundary for a 32-bit value.</p>
+
+<p>The second method is the way to go, even if you don't care about portability (but as a bonus, it's portable, except for the use of <code>int32_t</code>).</p>
+
+<p>As mentioned by @AJNeufeld you need to fix up your out-of-bound checks. Once that's done, you could simplify the function quite a bit by using <code>std::swap()</code>. For example:</p>
+
+<pre><code>if (bswap) {
+    swap(buf[offset    ], buf[offset + 3]);
+    swap(buf[offset + 1], buf[offset + 2]);
+}
+return (buf[offset + 3] &lt;&lt; 24) | (buf[offset + 2] &lt;&lt; 16) |
+    (buf[offset + 1] &lt;&lt; 8) | buf[offset];
+</code></pre>
+
+<p>That's even pretty easy to generalize to any size with a couple of loops (that will almost certainly be unrolled).</p>
+
+<p><strong>EDIT:</strong> As @hoffmale notes in the comments, the return line is <em>still</em> possibly UB. The reason it technical.</p>
+
+<pre><code>auto b = int8_t{};
+auto r = b &lt;&lt; 8;
+</code></pre>
+
+<p>The above code is legal because in every arithmetic operation, <code>signed char</code>s and <code>short</code>s are always promoted to <code>int</code>. So <code>b</code> is promoted to <code>int</code>, which must be at least 16 bits, and the shift is cool, and <code>r</code> is <code>int</code>.</p>
+
+<p>The problems arise when you shift by more than 8 bits. The types will always be promoted to <code>int</code>, but <code>int</code> is only guaranteed to be 16 bits. That means if you did:</p>
+
+<pre><code>auto r = b &lt;&lt; 16; // or 24
+</code></pre>
+
+<p>now you have a problem.</p>
+
+<p>To solve it, you need to make sure the value being shifted is at least 32 bits before the shift:</p>
+
+<pre><code>auto r = uint_fast32_t{b} &lt;&lt; 16; // or 24
+</code></pre>
+
+<p>This works portably.</p>
+
+<p>So you'd need to add this cast before each shift in the return line.</p>
+
+<p>But a better way to handle this - one that scales - is to use a loop:</p>
+
+<pre><code>auto ret = int32_t{};
+for (auto i = 0; i &lt; 4; ++i)
+{
+    ret &lt;&lt; 8;
+    ret |= buf[offset + (3 - i)];
+}
+</code></pre>
+
+<p>or even:</p>
+
+<pre><code>auto ret = int32_t{};
+for (auto i = 0; i &lt; 4; ++i)
+{
+    ret &lt;&lt; 8;
+    if (bswap)
+        ret |= buf[offset + i];
+    else
+        ret |= buf[offset + (3 - i)];
+}
+</code></pre>
+
+<p>and now you don't have to worry about promotions. Any decent optimizing compiler will hoist the invariant conditional and offset out of the loop and unroll the loop (and eliminate the unnecessary shift). And you can even template the loop on the size and reuse it.</p>
+
+<p>Shifting and OR-ing is the only <em>portable</em> way to get the little-endian data in <code>buf</code> into an integer for all machines.</p>
+
+<p>@juhist describes another option: using <code>memcpy()</code>. That's not a portable solution for a number of technical reasons. First, you'll get different behaviour depending on the endianness of the machine. More technically, the machine may not always store integers the way you expect, and I'm not referring to endianness by that. You're dealing with signed values, but the type of signedness of the data may not be the same as the machine (for example, the data may be twos-complement, the machine may be signed magnitude). There may be padding bits and other weirdness going on that ends up meaning that a 32 bit value of <code>0xFFFFFFFF</code> may not necessarily be represented in memory as 4 bytes of <code>0xFF</code>. Or if your input data is "<code>0x00 0x00 0x00 0xA0</code>" which if <code>memcpy()</code>ed on a little endian machine will give you <code>0xA0000000</code> (that's its value, not its memory representation), which you <em>assume</em> is −2147483648... but that's assuming bit 31 is the sign bit, which is not necessarily true. Could be bit 0, for example, meaning this value is actually 1342177280. (Granted, if your data has a sign bit, you really need to handle it specifically in any case. That is, you'd need to calculate the high byte as something like <code>buf[offset + 3] &amp; 0x7Fu</code>, and multiply the result by −1 if <code>buf[offset + 3] &amp; 0x80u</code>... or you could dump the whole thing into an unsigned value, and then deal with the sign bit. But the point about the sign bit not being where you expect it still stands: <code>0x01 0x00 0x00 0x00</code>, if <code>memcpy()</code>ed on a little-endian machine, could produce −2147483648 rather than 1... or anything else really.)</p>
+
+<p>If performance <em>really</em> matters - and, I'll be blunt, if you're using this part of a serialization routine, it almost certainly doesn't; whatever time you spend decoding integers is going to be <em>dwarfed</em> by the I/O - you could write system-specific code. For example, if your system is little-endian, and you know the representation is the same as what's in the buffer, you could just <code>memcpy()</code>. If it's big-endian, maybe <code>memcpy()</code> and a swap intrinsic, or a loop that's basically reverse <code>memcpy()</code> (create the integer, then copy the bytes in reverse order). If it's other-endian or non-twos-complement or has some other quirck... well, you'd know how to deal with that in that case.</p>
+
+<p>The bottom line is that shifting and OR-ing is the <em>only</em> portable solution (and you'd need to handle the sign bit properly). If you don't care about portability and you want speed, well, then the "right" answer depends entirely on 1) the data representation, and 2) your machine.</p>
+    </div>

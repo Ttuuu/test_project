@@ -1,0 +1,71 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>When looking over your code I find several things I would change. It should be said that I am no expert in security, so I will forward you to places where you can get better guidance than I can about the specific issue. So without further ado, let's go!</p>
+
+<p>The first thing which pops into my mind when reading your code is the <em>singleton</em>. The singleton pattern is an anti-pattern. And it doesn't make much sense in this case either. There should only exist one instance of a session handler at any time. Since you register the handler once and then move on the singleton is obsolete. Your class provides no interface for use outside of the handler (which is good; separating concerns!), so there is not reason for a global accessor, which the singleton <code>getInstance()</code> method is.</p>
+
+<p>Next I would make your class implement the native interface <a href="http://php.net/manual/en/class.sessionhandlerinterface.php" rel="nofollow noreferrer"><code>SessionHandlerInterface</code></a>. This interface was created with the idea of userland code overwriting the native session handler implementation, which is exactly what you are doing. This also means you can simplify the handler registration inside the constructor to:</p>
+
+<pre><code>session_set_save_handler($this);
+</code></pre>
+
+<p>Then I would also rename your class. <code>SessionManager</code> is very broad and you may in the future make a handler implementation using a memory-based storage engine like Memcached or Redis. Therefore I would rename your class into <code>PDOSessionHandler</code> as this clearly shows the storage implementation used.</p>
+
+<p>I would also urge you to avoid using destructors when dealing with critical classes such as a session handlers. There are edge cases were destructors never will be executed. An example is a fatal error. You are relying on a <code>__destruct()</code> method to register a shutdown function, which is good, but could be moved into the constructor. This will ensure that when your class was successfully instantiated the shutdown function is also registered.</p>
+
+<p>Before moving on to some general things, I would like to talk about changing INI settings inside classes. You are changing almost every setting regarding sessions inside the class. As far as I know the values you are using are good, security related. But you are also hard-coding several settings. These settings will always overwrite any settings declared inside the <code>php.ini</code> file. This may be confusing and can lead to bugs. I think settings like <code>session.entrophy_file</code>, <code>session.entrophy_length</code>, <code>session.hash_function</code>, <code>session.use_only_cookies</code> and <code>session.cookie_secure</code> should only be changed from a <code>php.ini</code> file. The hashing algorithm should be changeable without modifying your class and the same goes for the previously mentioned setings. There are situations where the <code>php.ini</code> isn't under your control. If this is the case I would argue that these settings should be set in an application wide configuration file.</p>
+
+<p>Now to some code changes. There are several places where you use <code>try-catch</code> blocks. They are good for checking for errors, but can be misused. You are catching the base <code>Exception</code> class. This can lead to bugs where exceptions, which are unrelated to PDO, are thrown, then caught and silently disposed. Also echoing exception messages is bad practice. Consider an exception is thrown and the message contains sensitive information such as your database type, host or username/password. Any visitor of your site when this exception occurs will see this critical information too. A malicious user would love this.</p>
+
+<p>You are calling garbage collection (on sessions, not the PHP runtime) each time a session is closed. This may not seem like a big deal when there are a small amount of sessions stored in your database. But imagine that at some point 100 sessions are stored. Each time a request finishes your database has to loop through each of the 100 sessions to check if any of them are stale. This is unnecessary and creates a slower response time from your application as well as halt any reads from other database connections while this is done. PHP defines two INI settings which are related to garbage collection: <code>session.gc_probalility</code> and <code>session.gc_divisor</code>. By default the divisor is set to <code>100</code> and the probability is set to <code>1</code>. This means that there is a 1% chance of invoking garbage collection. If you increase the probability to 5 there is a 5% chance and so on. You can tweak these settings to the values required for your application. These settings should also be changeable outside your class preferably in the INI file or a application wide configurations.</p>
+
+<p>Instead of checking for renewal/expiration each time you read the session I would argue you should add a timestamp check to your SQL query. An example could be:</p>
+
+<pre><code>SELECT session_data FROM sessions WHERE session_id = :id AND updated &lt; :expire
+</code></pre>
+
+<p>This would effectively only fetch valid sessions. If a session has exceeded its max lifetime is should be considered invalid. The <code>read()</code> method would then return an empty set of data and the old session would linger around in the database until garbage collection cleans it up. The empty session data set would then signify that no session was previously active. An example of a <code>read()</code> method could be:</p>
+
+<pre><code>public function read($id) 
+{
+    $sth = $this-&gt;pdo-&gt;prepare('SELECT session_data FROM session WHERE session_id = :id AND updated &lt; :expire');
+
+    $expire = time() - (int) $this-&gt;lifetime;
+
+    $sth-&gt;bindParam(':id',     $id,     \PDO::PARAM_STR);
+    $sth-&gt;bindParam(':expire', $expire, \PDO::PARAM_INT);
+
+    if(!$sth-&gt;execute()) {
+        throw new \RuntimeException('Could not execute session read query.');
+    }
+
+    if($sth-&gt;numCount() &gt; 0) {
+        $row = $sth-&gt;fetch(\PDO::FETCH_ASSOC);
+
+        return $row['session_data'];
+    }
+
+    return '';
+}
+</code></pre>
+
+<p><em>This has NOT been tested!</em></p>
+
+<p><em>By the way, your current <code>_needRenewal()</code> method has a bug inside the SQL query where a placeholder is named <code>$id</code>. Nothing is interpolated since it's inside single quotes and the <code>bindParam()</code> method looks for a placeholder named <code>:session_id</code></em></p>
+
+<p>In the above example I also checked if <code>$sth-&gt;execute()</code> actually returns <code>true</code>. If <code>false</code> is returned the SQL query could not be executed. Remember to check the return values of queries and throw appropriate exceptions when necessary. This can help you find bugs easier.</p>
+
+<p>In your <code>_refresh()</code> method you call <code>session_regenerate_id()</code> and reassign the session id. Internally <code>session_regenerate_id()</code> will reassign
+the session id. There is no reason to store the current session id inside the class since PHP stores this for you. You can fetch the id using <code>session_id()</code> with no parameters. This therefore makes your <code>_refresh()</code> method obsolete.</p>
+
+<p>Now to the last thing I will talk about. As said in the start I am no security expert, but I feel like your <code>fingerprint</code> solution is fishy. Imagine two different people from the same company using your site. The company uses a load balancer, which makes their public IP addresses the same. If all the company's browsers/clients are the same your fingerprint for these people would be identical. Even though you are checking the <code>HTTP_X_FORWARDED_FOR</code> header you cannot rely on load balancers to send the header. I cannot tell you how to properly detect sessions using the fingerprint idea. You can ask on <a href="https://security.stackexchange.com/">https://security.stackexchange.com/</a> for help. The best advices I can give you is: </p>
+
+<ol>
+<li>Ensure session cookies aren't accessible through javascript using the INI settings <code>session.cookie_httponly</code> and <code>session.use_only_cookies</code></li>
+<li>Only send cookie over encrypted connections, such as TLS. The can be ensured using the INI setting <code>session.cookie_secure</code>.</li>
+<li>Ensure a sufficient source of entrophy is used. </li>
+</ol>
+
+<p>This was quite a mouthful. I hope you are still with me :) If you have any questions feel free to ask. </p>
+
+<p>Happy coding!</p>
+    </div>

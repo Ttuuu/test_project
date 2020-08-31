@@ -1,0 +1,280 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Your model classes are also doing the calculating and that hurts.</p>
+
+<p>I've been trying to understand the code for a while now and that's the main point I keep coming up with.</p>
+
+<pre><code>@Override
+public BigDecimal getRiskSurcharge() {
+    if(this.userRiskValue &gt; 200)
+        return Risk.getUnIdentifiedRiskSurcharge();
+
+    final int minAcceptableBlackSpots = 3;
+    final int maxAcceptableBlackSpots = 12;
+
+    if(Risk.isWithinRange(this.noOfBlackSpots, minAcceptableBlackSpots, maxAcceptableBlackSpots))
+        return Risk.getDefaultRiskSurcharge(); 
+
+    return Risk.getUnIdentifiedRiskSurcharge();
+}
+</code></pre>
+
+<p>This does not belong in a Banana.</p>
+
+<p>This is your business logic. It goes in the processor or parts thereof.</p>
+
+<p>When I look at the Processor itself, then I also see something strange: </p>
+
+<pre><code>public BigDecimal calculateSingleProductPremiumForUser() {
+    BigDecimal userRiskSurcharge = user.getRiskSurcharge();
+    if(Risk.getUnIdentifiedRiskSurcharge().compareTo(userRiskSurcharge)==0)
+        return Risk.getUnIdentifiedRiskSurcharge();
+
+    this.product.setRiskValue(this.user.getRiskValue());
+    BigDecimal productRiskSurcharge =this.product.getRiskSurcharge();
+    if(Risk.getUnIdentifiedRiskSurcharge().compareTo(productRiskSurcharge)==0)
+        return Risk.getUnIdentifiedRiskSurcharge();
+
+    if(Risk.getDefaultRiskSurcharge().compareTo(productRiskSurcharge)==0)
+        return this.product.getSubTotalPremium();
+
+    BigDecimal totalPremium = this.product.getSubTotalPremium().multiply(this.product.getRiskSurcharge()).multiply(user.getRiskSurcharge());
+    return totalPremium;
+}
+</code></pre>
+
+<p>Given a User (which was provided via the constructor) and a Product (which may be null)...</p>
+
+<p>Actually, let's stop there for a moment.</p>
+
+<p>Why can product be null?</p>
+
+<p>Here's one of your tests, with the code of functions inlined.</p>
+
+<pre><code>@Test
+public void testUnInsurableBananaRiskSurchargeWithUserRiskValueLargerThan200() {
+    Banana banana = new Banana(1, new BigDecimal(10));
+    Address address = new Address(1);
+    address.setRiskValue(10);
+    User user = new User(1, address);
+    user.setRiskValue(201);
+
+    banana.setRiskValue(user.getRiskValue());
+    banana.setNoOfBlackSpots(4);
+
+    BigDecimal totalPremium = UserPremiumBuilder
+        .createProfile(user)
+        .setProduct(banana)
+        .calculateSingleProductPremiumForUser();
+    assertEquals(Risk.getUnIdentifiedRiskSurcharge(), totalPremium);
+}
+</code></pre>
+
+<p>Let's look at it from this perspective.</p>
+
+<p>The Banana constructor takes an id and a product value.</p>
+
+<p>We need a User with an id and address, and the address also has an id and a risk value.</p>
+
+<p>Then we set the user's risk value, which is something like a credit score but for insurances.</p>
+
+<p>Next, we place the risk value of the user in the banana.</p>
+
+<p>That part makes no sense to me.</p>
+
+<p>Next, set amount of black spots for the banana (which is just part of test setup again).</p>
+
+<p>Then, using the UserPremiumBuilder, create a profile, set a product, and calculate the product premium.</p>
+
+<hr>
+
+<p>I'll describe the issues I have with the ideas presented in the unit test, and then draft my own interface. Afterward, I'll explain to you why I think they are a better fit for the problem domain.</p>
+
+<p>I can imagine there's an insurance company that has statistics for things. Given an address, it can find how much "bonus" it should apply. Furthermore, given some kind of history, people have scores, and these scores also define some sort of bonus. Lastly, depending on the type, different restrictions and calculations may apply. For instance, refusing to insure any car older than 40 years, or any house which has not been inspected.</p>
+
+<p>It's with that imagination that I'll build my model classes and interfaces.</p>
+
+<p>A customer rings up the company. They provide their customer id. Their score is retrieved from some database. Also retrieved from the database is their address, which has been given a score by our automatic scoring system.</p>
+
+<pre><code>Address address = new Address(1, 10); //ID, Risk value
+User user = new User(1, address, 201); //ID, address, risk value
+</code></pre>
+
+<p>Since we can't service customers properly if we don't know their scores or where they live (or what the score is for where they live), all of this is required in the constructor.</p>
+
+<p>The customer says they have a banana they wish to insure (it's very important to them). We ask them for some of the details and register the banana in our database. However, if that's the logic we follow, I'd expect a product to have a reference to a user (namely the "owner" of the product). We'll ignore that for now, I guess a Banana requires an id for SOME reason, if only due to business requirements.</p>
+
+<pre><code>Banana banana = new Banana(1, new BigDecimal(10), 4); //ID, value, black spots
+</code></pre>
+
+<p>The customer says they'd only want to insure this one banana and if we could provide them with a quote.</p>
+
+<p>So, we enter into the calculator - our user (with their address) and our banana.</p>
+
+<pre><code>BigDecimal totalPremium = PremiumCalculator.calculateFor(user, banana); //User user, Product[] products...
+</code></pre>
+
+<p>We now have a total premium which we can use.</p>
+
+<p>The full code for this section:</p>
+
+<pre><code>Address address = new Address(1, 10); //ID, Risk value
+User user = new User(1, address, 201); //ID, address, risk value
+Banana banana = new Banana(1, new BigDecimal(10), 4); //ID, value, black spots
+
+BigDecimal totalPremium = PremiumCalculator.calculateFor(user, banana); //User user, InsurableProduct[] products...
+</code></pre>
+
+<hr>
+
+<p>I did hide some of the details, though.</p>
+
+<p>I'm sure it's fine if I skip over the part where I redefined constructors for Address, User and Banana.</p>
+
+<p>I think I should explain at least part of the interfaces:</p>
+
+<pre><code>public interface InsurableProduct {
+    BigDecimal getProductValue();
+    default BigDecimal getBasePremiumMultiplier() {
+        return BigDecimal.ONE;
+    }
+    default BigDecimal getRiskSurchargeMultiplier() {
+        return BigDecimal.ONE;
+    }
+    boolean canBeInsuredFor(User user);
+}
+</code></pre>
+
+<p>This is an insurable product. It has a base value, which you can multiply by the premium multiplier to get a sub total premium, which you can multiply by the risk surcharge multiplier to get the final price.</p>
+
+<p>It also has a "canBeInsuredFor" method; this is to specify logic like "don't insure bananas that have a million black spots". It also takes a user, since for some products, we might say "If the user is living in a high risk area, we'll refuse to insure your $100k car".</p>
+
+<p>Okay, so how does this "PremiumCalculator" work?</p>
+
+<pre><code>public class PremiumCalculator {
+    private PremiumCalculator() { 
+        //No instantiation required/allowed
+    }
+    public static BigDecimal calculateFor(User user, InsurableProduct[] products...) {
+        BigDecimal total = BigDecimal.ZERO;
+        for (InsurableProduct product : products) {
+              if (!product.canBeInsuredFor(user)) { 
+                  return Risk.getUnIdentifiedRiskSurcharge(); //Left this in for now
+              }
+              BigDecimal productValue = product.getProductValue();
+              BigDecimal productSubtotal = productValue.multiply(product.getBasePremiumMultiplier());
+              BigDecimal productPremium = productSubtotal.multiply(product.getRiskSurchargeMultiplier());
+              total = total.add(productPremium);
+        }
+        return total.multiply(user.getRiskSurcharge());
+    }
+}
+</code></pre>
+
+<p>It takes the user and products, and if any of them in uninsurable, it returns the unidentified risk surcharge value - your "error" value. I don't like how it's handled, but I don't have a better solution yet.</p>
+
+<p>Start the total off at zero, and then, for each product, calculate the productPremium via value * basePremiumMultiplier * riskSurchargeMultiplier. Then add to the total.</p>
+
+<p>Finally, multiply the total by the users's risk surcharge.</p>
+
+<p>This places your calculations in a single class.</p>
+
+<p>As for the implementation of your Banana:</p>
+
+<pre><code>public class Banana implements InsurableProduct {
+    private static BigDecimal BASE_PREMIUM = new BigDecimal(1.15);
+
+    private final int id;
+    private final BigDecimal productValue;
+    private final int noOfBlackSpots;
+
+    public Banana(int id, BigDecimal productValue, int noOfBlackSpots) {
+        this.id = id;
+        this.productValue = productValue;
+        this.noOfBlackSpots = noOfBlackSpots;
+    }
+
+    public int getId() {
+        return id;
+    }
+
+    public int getNoOfBlackSpots() {
+        return noOfBlackSpots;
+    }
+
+    @Override
+    public BigDecimal getProductValue() {
+        return productValue;
+    }
+
+    @Override
+    public BigDecimal getBasePremiumMultiplier() {
+        return BASE_PREMIUM;
+    }
+
+    @Override
+    public boolean canBeInsuredFor(User user) {
+        final int minAcceptableBlackSpots = 3;
+        final int maxAcceptableBlackSpots = 12;
+
+        return Risk.isWithinRange(noOfBlackSpots, minAcceptableBlackSpots, maxAcceptableBlackSpots) &amp;&amp; user.getRiskValue() &lt;= 200;
+    }
+
+    @Override
+    public BigDecimal getRiskSurchargeMultiplier() {
+        return Risk.getDefaultRiskSurcharge(); 
+    }
+}
+</code></pre>
+
+<p>Some of this might be extractable to a base class; I don't care about that right now.</p>
+
+<hr>
+
+<p>What I have done is decouple "can be insured" and "can be insured for", for products. I have also migrated the User's risk value to be part of the user, and not individually set, first.</p>
+
+<p>By relocating the calculations to the calculator, the only thing the products still contain are the actual rules. If we remove the getters and setters from the Banana, we're left with this:</p>
+
+<pre><code>public class Banana implements InsurableProduct {
+    public final int id;
+    public final BigDecimal productValue;
+    public final int noOfBlackSpots;
+
+    public Banana(int id, BigDecimal productValue, int noOfBlackSpots) {
+        this.id = id;
+        this.productValue = productValue;
+        this.noOfBlackSpots = noOfBlackSpots;
+    }
+
+    @Override
+    public BigDecimal getProductValue() {
+        return productValue;
+    }
+
+    @Override
+    public BigDecimal getBasePremiumMultiplier() {
+        return new BigDecimal(1.15);
+    }
+
+    @Override
+    public boolean canBeInsuredFor(User user) {
+        final int minAcceptableBlackSpots = 3;
+        final int maxAcceptableBlackSpots = 12;
+
+        return Risk.isWithinRange(noOfBlackSpots, minAcceptableBlackSpots, maxAcceptableBlackSpots) &amp;&amp; user.getRiskValue() &lt;= 200;
+    }
+
+    @Override
+    public BigDecimal getRiskSurchargeMultiplier() {
+        return Risk.getDefaultRiskSurcharge(); 
+    }
+}
+</code></pre>
+
+<p>(I've made the variables public so you could still retrieve them).</p>
+
+<p>In essence, this is all the real coding required. Three of these methods are simple getters still, the last one contains your business logic, and even then it's small and to the point.</p>
+
+<p>Further more, you'll notice that the whole use of "mutation" is gone. There are no setters. A Banana is immutable. You want to change something? Get a new Banana. Whether that meets the business needs remains to be seen. But for a quote-creating application, if you don't need to be able to modify it, then you can't modify it.</p>
+
+<p>I believe this should showcase enough on how to create a better API (you must provide all values, you can't forget something) and how to reduce mutation.</p>
+    </div>

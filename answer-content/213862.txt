@@ -1,0 +1,636 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Avoid importing the whole of <code>std</code> namespace</h1>
+
+<p>Bringing all names in from a namespace is problematic; <code>namespace std</code> particularly so. See <a href="//stackoverflow.com/q/1452721">Why is “using namespace std” considered bad practice?</a>.</p>
+
+<h1>Include the right headers</h1>
+
+<p><code>Main.cpp</code> includes <code>&lt;iostream&gt;</code>, but appears not to use anything declared there.</p>
+
+<p>The same is true of <code>GameOfLife.cpp</code>.</p>
+
+<p>On the other hand, we're using <code>std::uint8_t</code> but failing to include <code>&lt;cstdint&gt;</code> to declare it.  Although it might be brought in by one of the other headers on a particular platform, we shouldn't depend on that if we want to be portable.</p>
+
+<h1>Naming conventions</h1>
+
+<p>We normally reserve all-uppercase names for preprocessor macros, to mark them as dangerous in code.  Using such names for plain constants subverts that convention, misleading the reader.</p>
+
+<h1>Fix compilation errors</h1>
+
+<p>Remove the extra qualification <code>GameOfLife::</code> on member <code>doUpdate</code>.</p>
+
+<p><code>GameOfLife::getThreadColor()</code> fails to return a value when no switch cases match.  Although we readers can tell that a case must always match, we should add a <code>return</code> statement after the <code>switch</code> to keep the compiler from reporting the error.</p>
+
+<h1>Enable and fix compilation warnings</h1>
+
+<p>You seem to be compiling with all warnings disabled.  With <code>g++ -Wall -Wextra -Weffc++</code>, we get a few extra things to fix:</p>
+
+<pre class="lang-none prettyprint-override"><code>In file included from /home/tms/stackexchange/review/213814/GameOfLife/src/GameOfLife.cpp:1:
+/home/tms/stackexchange/review/213814/GameOfLife/src/GameOfLife.h: In constructor ‘GameOfLife::GameOfLife(sf::Vector2i)’:
+/home/tms/stackexchange/review/213814/GameOfLife/src/GameOfLife.h:46:23: warning: ‘GameOfLife::worldBuffer’ will be initialized after [-Wreorder]
+  std::vector&lt;uint8_t&gt; worldBuffer;
+                       ^~~~~~~~~~~
+/home/tms/stackexchange/review/213814/GameOfLife/src/GameOfLife.h:33:12: warning:   ‘const int GameOfLife::maxThreads’ [-Wreorder]
+  const int maxThreads;
+            ^~~~~~~~~~
+/home/tms/stackexchange/review/213814/GameOfLife/src/GameOfLife.cpp:11:1: warning:   when initialized here [-Wreorder]
+ GameOfLife::GameOfLife(sf::Vector2i size) : worldSize(size), world(size.x * size.y, false), worldBuffer(world), maxThreads(std::thread::hardware_concurrency())
+ ^~~~~~~~~~
+/home/tms/stackexchange/review/213814/GameOfLife/src/GameOfLife.cpp:11:1: warning: ‘GameOfLife::aliveCells’ should be initialized in the member initialization list [-Weffc++]
+[ 60%] Building CXX object CMakeFiles/GameOfLife.dir/src/WorldRenderer.cpp.o
+/usr/bin/c++    -Wall -Wextra -Wwrite-strings -Wno-parentheses -Weffc++   -pthread -std=c++17 -o CMakeFiles/GameOfLife.dir/src/WorldRenderer.cpp.o -c /home/tms/stackexchange/review/213814/GameOfLife/src/WorldRenderer.cpp
+/home/tms/stackexchange/review/213814/GameOfLife/src/WorldRenderer.cpp: In constructor ‘WorldRenderer::WorldRenderer()’:
+/home/tms/stackexchange/review/213814/GameOfLife/src/WorldRenderer.cpp:3:1: warning: ‘WorldRenderer::m_vertexPoints’ should be initialized in the member initialization list [-Weffc++]
+ WorldRenderer::WorldRenderer()
+ ^~~~~~~~~~~~~
+/home/tms/stackexchange/review/213814/GameOfLife/src/WorldRenderer.cpp: In member function ‘void WorldRenderer::renderBackgrounds(sf::RenderWindow&amp;, GameOfLife&amp;)’:
+/home/tms/stackexchange/review/213814/GameOfLife/src/WorldRenderer.cpp:79:58: warning: unused parameter ‘window’ [-Wunused-parameter]
+ void WorldRenderer::renderBackgrounds(sf::RenderWindow &amp; window, GameOfLife &amp; world)
+                                       ~~~~~~~~~~~~~~~~~~~^~~~~~
+</code></pre>
+
+<p>These are all easily fixed.  For example, we can avoid the warning about an uninitialized member by providing a default initializer (though I'd be happier if my compiler were smart enough to know which types get constructed in a genuinely uninitialized state, and warn only about those):</p>
+
+<pre><code>std::vector&lt;sf::Vertex&gt; m_vertexPoints = {};
+</code></pre>
+
+<p>We also want to turn on some compiler optimizations here; I'll use <code>-O3</code>.  After all, there's little point conducting a <a href="/questions/tagged/performance" class="post-tag" title="show questions tagged 'performance'" rel="tag">performance</a> review on unoptimized code.</p>
+
+<h1>Don't declare empty constructors and destructors</h1>
+
+<blockquote>
+<pre><code>public:
+    WorldRenderer();
+
+    ~WorldRenderer();
+
+WorldRenderer::WorldRenderer()
+{
+}
+
+
+WorldRenderer::~WorldRenderer()
+{
+}
+</code></pre>
+</blockquote>
+
+<p>Let the compiler generate the special methods, so we don't have to:</p>
+
+<pre><code>public:
+    WorldRenderer() = default;
+</code></pre>
+
+<p>That's much simpler.  And this class:</p>
+
+<blockquote>
+<pre><code>class Cell
+{
+public:
+  Cell(sf::Vector2i position, sf::Color color);
+  ~Cell();
+  sf::Vector2i position;
+  sf::Color color;
+};
+
+Cell::Cell(sf::Vector2i position, sf::Color color)
+    : position(position), color(color)
+{
+}
+
+Cell::~Cell()
+{
+}
+</code></pre>
+</blockquote>
+
+<p>becomes simply</p>
+
+<pre><code>struct Cell
+{
+    sf::Vector2i position;
+    sf::Color color;
+};
+</code></pre>
+
+<p>if we change the constructor calls to plain aggregate initialization.</p>
+
+<h1>Reduce copying</h1>
+
+<p>Instead of taking a copy of <code>game.aliveCells</code>, it might be better to expose a read-only reference:</p>
+
+<pre><code>private:
+    // Update the cells from position start(inclusive) to position end(exclusive).
+    std::vector&lt;Cell&gt; doUpdate(int start, int end, int coreIdx);
+
+    // A cache of all the alive cells at the end of the update() call.
+    std::vector&lt;Cell&gt; aliveCells = {};
+
+public:
+    auto const&amp; getLivingCells() const { return aliveCells; }
+</code></pre>
+
+
+
+<pre><code>    // populate m_cellVertexPoints
+    for (auto const&amp; cell: game.getLivingCells()) {
+        addQuad(cell.position.x, cell.position.y, cell.color);
+    }
+</code></pre>
+
+<p>The <code>const&amp;</code> qualifier on the return type lets client code view the contents of our vector without being able to modify it and without needing to make a copy.</p>
+
+<p>And <code>addQuad</code> can accept a <code>const Cell&amp;</code> instead of unpacking it here:</p>
+
+<pre><code>void WorldRenderer::addQuad(const Cell&amp; cell)
+{
+    float gridXFloat = cell.position.x * 1.0f;
+    float gridYFloat = cell.position.y * 1.0f;
+
+    m_vertexPoints.emplace_back(sf::Vector2f{gridXFloat,     gridYFloat    }, cell.color); // top-left
+    m_vertexPoints.emplace_back(sf::Vector2f{gridXFloat,     gridYFloat + 1}, cell.color); // bottom-left
+    m_vertexPoints.emplace_back(sf::Vector2f{gridXFloat + 1, gridYFloat + 1}, cell.color); // bottom-right
+    m_vertexPoints.emplace_back(sf::Vector2f{gridXFloat + 1, gridYFloat    }, cell.color); // top-right
+}
+</code></pre>
+
+<p>Here, I've used <code>emplace_back</code> to reduce the likelihood of copying (that said,  <code>push_back()</code> is overloaded to move-from an rvalue argument, so there's likely no real difference in the optimized binary).  That takes us neatly to the next member, which can similarly be reduced:</p>
+
+<pre><code>void WorldRenderer::addBackgroundQuad(sf::Vector2f topLeft, sf::Vector2f bottomRight, sf::Color color)
+{
+    auto topRight = topLeft;
+    auto bottomLeft = bottomRight;
+    std::swap(topRight.x, bottomLeft.x);
+
+    m_vertexPoints.emplace_back(topLeft, color);
+    m_vertexPoints.emplace_back(bottomLeft, color);
+    m_vertexPoints.emplace_back(bottomRight, color);
+    m_vertexPoints.emplace_back(topRight, color);
+}
+</code></pre>
+
+<h1>Prefer declarative threading to hand-built parallelism</h1>
+
+<p>I can see that great care has been put into dividing the work into threads and collating the results, so it's hard to recommend throwing that away.  But I'm going to (don't worry; having written it gives you a better understanding of what will happen behind the scenes).  If we enable OpenMP (i.e. add <code>-fopenmp</code> to our GCC arguments, or equivalent on other compilers; use <code>find_package(OpenMP)</code> in CMake), then we don't need to explicitly code the mechanism of parallelisation, and instead we can focus on the content.</p>
+
+<p>Here's the new <code>update()</code> (which also replaces <code>doUpdate()</code>) using OpenMP:</p>
+
+<pre><code>#include &lt;omp.h&gt;
+
+void GameOfLife::update()
+{
+    // clear aliveCells cache
+    aliveCells.clear();
+
+#pragma omp parallel
+    {
+        // private, per-thread variables
+        auto this_thread_color = getThreadColor(omp_get_thread_num());
+        std::vector&lt;Cell&gt; next_generation;
+
+#pragma omp for
+        for (int i = 0;  i &lt; worldSize.x * worldSize.y;  ++i) {
+        auto pos = get2D(i);
+
+        int aliveCount = 0;
+
+        // check all 8 neighbors
+        for (int nX = -1; nX &lt;= 1; ++nX) {
+            for (int nY = -1; nY &lt;= 1; ++nY) {
+                // skip the current cell
+                if (nX == 0 &amp;&amp; nY == 0) continue;
+
+                // wrap around to other side if neighbor would be outside world
+                int newX = (nX + pos.x + worldSize.x) % worldSize.x;
+                int newY = (nY + pos.y + worldSize.y) % worldSize.y;
+
+                aliveCount += getCell(newX, newY);
+            }
+        }
+
+        // Evaluate game rules on current cell
+        bool dies = aliveCount == 2 || aliveCount == 3;
+        bool lives = aliveCount == 3;
+        worldBuffer[i] = world[i] ? dies : lives;
+
+        // if the cell's alive push it into the vector
+        if (worldBuffer[i])
+            next_generation.emplace_back(Cell{pos, this_thread_color});
+        }
+
+#pragma omp critical
+        aliveCells.insert(aliveCells.end(), next_generation.begin(), next_generation.end());
+    }
+
+    // apply updates
+    world.swap(worldBuffer);
+}
+</code></pre>
+
+<p>We can now play with things such as dynamic or guided scheduling without perturbing the logic.  And we can control the maximum number of threads without recompiling (using <code>OMP_NUM_THREADS</code> environment variable).</p>
+
+<p>The <code>pragma omp critical</code> is required when combining results in order to ensure that the threads don't try to modify the shared <code>aliveCells</code> simultaneously.  The other shared variables are read but not modified within the parallel section.</p>
+
+<h1>Fix an arithmetic bug</h1>
+
+<p>This conversion doesn't work after the display window has been resized by the user:</p>
+
+<blockquote>
+<pre><code>        // normalize mouse pos
+        int x = (mousePosition.x / 512.0f) * WORLD_SIZE_X;
+        int y = (mousePosition.y / 512.0f) * WORLD_SIZE_Y;
+</code></pre>
+</blockquote>
+
+<h1>Minor/style issues</h1>
+
+<p>There's no need to explicitly return 0 from <code>main()</code> if we always succeed - a common convention is to do so only when there's another code path that returns non-zero.</p>
+
+<hr>
+
+<h1>Modified code</h1>
+
+<h2>Main.cpp</h2>
+
+<pre><code>#include "GameOfLife.h"
+#include "WorldRenderer.h"
+
+#include &lt;SFML/Graphics.hpp&gt;
+
+static const sf::Vector2i World_Size = { 256, 256 };
+
+int main()
+{
+    // create the window
+    sf::RenderWindow window({256, 256}, "Game of Life");
+    // scale the image up 2x size
+    window.setSize({512, 512});
+
+    // disable vsync and uncap framerate limit
+    window.setVerticalSyncEnabled(false);
+    window.setFramerateLimit(0);
+
+    // Create the game
+    GameOfLife game(World_Size);
+
+    // Create a world renderer
+    WorldRenderer worldRenderer;
+
+    // Track if mouse button is being held down
+    bool mouseHeld = false;
+
+    // run the program as long as the window is open
+    while (window.isOpen()) {
+        // check all the window's events that were triggered since the last iteration of the loop
+        sf::Event event;
+        while (window.pollEvent(event)) {
+            // "close requested" event: we close the window
+            if (event.type == sf::Event::Closed)
+                window.close();
+
+            // capture if the user is holding left mouse button down
+            if (event.type == sf::Event::MouseButtonPressed) {
+                if (event.mouseButton.button == sf::Mouse::Left)
+                    mouseHeld = true;
+            } else if (event.type == sf::Event::MouseButtonReleased) {
+                if (event.mouseButton.button == sf::Mouse::Left)
+                    mouseHeld = false;
+            }
+        }
+
+        // clear the window with black color
+        window.clear(sf::Color::Black);
+
+        // if left mouse button held down then make cells under cursor alive and pause simulation
+        if (mouseHeld) {
+            auto mousePosition = sf::Mouse::getPosition(window);
+
+            // normalize mouse pos
+            int x = mousePosition.x * World_Size.x / window.getSize().x;
+            int y = mousePosition.y * World_Size.y / window.getSize().y;
+
+            // set cell under cursor to alive
+            game.setCell(x, y, true);
+        } else {
+            // update the game world
+            game.update();
+        }
+
+        // render the game
+        worldRenderer.render(window, game);
+
+        // end the current frame
+        window.display();
+    }
+}
+</code></pre>
+
+<h2>GameOfLife.h</h2>
+
+<pre><code>#pragma once
+
+#include "Cell.h"
+
+#include &lt;SFML/System/Vector2.hpp&gt;
+
+#include &lt;cstdint&gt;
+#include &lt;vector&gt;
+
+class GameOfLife
+{
+public:
+    GameOfLife(sf::Vector2i size);
+
+    // Set the value of the cell at the given grid position to the given alive state.
+    void setCell(int x, int y, bool alive);
+
+    // Updates the state of the game world by one tick.
+    void update();
+
+    // Returns a reference to the cell value at the given grid position.
+    std::uint8_t &amp; getCell(int x, int y);
+
+    // Returns a vector of the given cell's grid position by its cell index.
+    sf::Vector2i get2D(int index) const;
+
+    auto const&amp; getLivingCells() const { return aliveCells; }
+
+    // Returns a color to use for cells/backgrounds based on the thread ID #.
+    static sf::Color getThreadColor(int index);
+
+    // Represents the width and height of the simulated world.
+    const sf::Vector2i worldSize;
+
+private:
+
+    // A cache of all the alive cells at the end of the update() call.
+    std::vector&lt;Cell&gt; aliveCells = {};
+
+    // A 1D representation of the 2D grid that is the world.
+    std::vector&lt;std::uint8_t&gt; world;
+
+    // A buffer where the next world state is prepared, swapped with world at end of update().
+    std::vector&lt;std::uint8_t&gt; worldBuffer;
+};
+</code></pre>
+
+<h2>GameOfLife.cpp</h2>
+
+<pre><code>#include "GameOfLife.h"
+
+#include &lt;omp.h&gt;
+
+#include &lt;array&gt;
+
+GameOfLife::GameOfLife(sf::Vector2i size)
+    : worldSize(size),
+      world(size.x * size.y, false),
+      worldBuffer(world)
+{
+    aliveCells.reserve(size.x * size.y); // reserve space for worst-case(all cells are alive)
+
+    // place an "acorn"
+    int midX = worldSize.x / 2;
+    int midY = worldSize.y / 2;
+    getCell(midX + 0, midY + 0) = 1;
+    getCell(midX + 1, midY + 0) = 1;
+    getCell(midX + 4, midY + 0) = 1;
+    getCell(midX + 5, midY + 0) = 1;
+    getCell(midX + 6, midY + 0) = 1;
+    getCell(midX + 3, midY + 1) = 1;
+    getCell(midX + 1, midY + 2) = 1;
+}
+
+std::uint8_t&amp; GameOfLife::getCell(int x, int y)
+{
+
+    return world[y * worldSize.x + x];
+}
+
+sf::Vector2i GameOfLife::get2D(int index) const
+{
+    int y = index / worldSize.x;
+    int x = index % worldSize.x;
+    return { x, y };
+}
+
+sf::Color GameOfLife::getThreadColor(int index)
+{
+    switch (index % 4) {
+    case 0:
+        return sf::Color::Red;
+    case 1:
+        return sf::Color::Green;
+    case 2:
+        return sf::Color::Blue;
+    case 3:
+        return sf::Color::Yellow;
+    }
+
+    return sf::Color::White;
+}
+
+void GameOfLife::update()
+{
+    // clear aliveCells cache
+    aliveCells.clear();
+
+#pragma omp parallel
+    {
+        // private, per-thread variables
+        auto this_thread_color = getThreadColor(omp_get_thread_num());
+        std::vector&lt;Cell&gt; next_generation;
+
+#pragma omp for
+        for (int i = 0;  i &lt; worldSize.x * worldSize.y;  ++i) {
+            auto const pos = get2D(i);
+            int aliveCount = 0;
+
+            // check all 8 neighbors
+            static const std::array&lt;std::array&lt;int, 2&gt;, 8&gt; neighbours{{{-1, -1}, {0, -1}, {1, -1},
+                                                                       {-1,  0},          {1,  0},
+                                                                       {-1,  1}, {0,  1}, {1,  1}}};
+            for (auto const [nX, nY]: neighbours) {
+                // wrap around to other side if neighbor would be outside world
+                int newX = (nX + pos.x + worldSize.x) % worldSize.x;
+                int newY = (nY + pos.y + worldSize.y) % worldSize.y;
+
+                aliveCount += getCell(newX, newY);
+            }
+
+            // Evaluate game rules on current cell
+            bool dies = aliveCount == 2 || aliveCount == 3;
+            bool lives = aliveCount == 3;
+            worldBuffer[i] = world[i] ? dies : lives;
+
+            // if the cell's alive push it into the vector
+            if (worldBuffer[i])
+                next_generation.emplace_back(Cell{pos, this_thread_color});
+        }
+
+#pragma omp critical
+        aliveCells.insert(aliveCells.end(), next_generation.begin(), next_generation.end());
+    }
+
+    // apply updates
+    world.swap(worldBuffer);
+}
+
+void GameOfLife::setCell(int x, int y, bool alive)
+{
+    // constrain x and y
+    x = std::max(std::min(x, (int) worldSize.x - 1), 0);
+    y = std::max(std::min(y, (int) worldSize.y - 1), 0);
+    getCell(x, y) = alive;
+    aliveCells.push_back(Cell{sf::Vector2i(x, y), sf::Color::White});
+}
+</code></pre>
+
+<h2>WorldRenderer.h</h2>
+
+<pre><code>#pragma once
+
+#include &lt;SFML/Graphics.hpp&gt;
+#include &lt;vector&gt;
+#include "GameOfLife.h"
+
+class WorldRenderer
+{
+public:
+    WorldRenderer() = default;
+
+    // Renders the given game to the given window.
+    void render(sf::RenderWindow&amp; window, GameOfLife&amp; world);
+
+private:
+    // Vertex points for the pending draw call.
+    std::vector&lt;sf::Vertex&gt; m_vertexPoints = {};
+
+    // Adds a cell-sized quad in the "grid position" specified.
+    void addQuad(const Cell&amp; cell);
+
+    // Adds a darker colored quad in the given coordinates.
+    void addQuad(sf::Vector2f topLeft, sf::Vector2f bottomRight, sf::Color color);
+
+    // Renders the background colors which correspond to the thread ID and the cells they are updating.
+    void renderBackgrounds(GameOfLife&amp; world);
+
+    // Returns a darker variant of the given color.
+    sf::Color darkenColor(sf::Color input);
+};
+</code></pre>
+
+<h2>WorldRenderer.cpp</h2>
+
+<pre><code>#include "WorldRenderer.h"
+
+#include &lt;omp.h&gt;
+
+void WorldRenderer::addQuad(const Cell&amp; cell)
+{
+
+    sf::Vector2f topLeft{cell.position.x * 1.0f, cell.position.y * 1.0f};
+    sf::Vector2f bottomRight{topLeft.x + 1, topLeft.y + 1};
+    addQuad(topLeft, bottomRight, cell.color);
+}
+
+void WorldRenderer::addQuad(sf::Vector2f topLeft, sf::Vector2f bottomRight, sf::Color color)
+{
+    auto topRight = topLeft;
+    auto bottomLeft = bottomRight;
+    std::swap(topRight.x, bottomLeft.x);
+
+    m_vertexPoints.emplace_back(topLeft, color);
+    m_vertexPoints.emplace_back(bottomLeft, color);
+    m_vertexPoints.emplace_back(bottomRight, color);
+    m_vertexPoints.emplace_back(topRight, color);
+}
+
+void WorldRenderer::render(sf::RenderWindow &amp; window, GameOfLife &amp; game)
+{
+    // clear m_cellVertexPoints
+    m_vertexPoints.clear();
+
+    // draw backgrounds for "core zones"
+    renderBackgrounds(game);
+
+    // populate m_cellVertexPoints
+    for (auto const&amp; cell: game.getLivingCells()) {
+        addQuad(cell);
+    }
+
+    // draw quads to window
+    window.draw(m_vertexPoints.data(), m_vertexPoints.size(), sf::Quads);
+}
+
+void WorldRenderer::renderBackgrounds(GameOfLife &amp; world)
+{
+    auto const maxThreads = omp_get_max_threads();
+    auto const threadHeight = world.worldSize.y / maxThreads;
+
+    for (int i = 0;  i &lt; maxThreads;  ++i) {
+        sf::Vector2f topLeft{0, 1.f * i * threadHeight};
+        sf::Vector2f bottomRight{1.f * world.worldSize.x + 1, topLeft.y + 1.f * world.worldSize.y / maxThreads + 1};
+        addQuad(topLeft, bottomRight, darkenColor(world.getThreadColor(i)));
+    }
+}
+
+sf::Color WorldRenderer::darkenColor(sf::Color input)
+{
+    return sf::Color(input.r / 4, input.g / 4, input.b / 4);
+}
+</code></pre>
+
+<h2>Cell.h</h2>
+
+<pre><code>#pragma once
+
+#include &lt;SFML/Graphics/Color.hpp&gt;
+#include &lt;SFML/System/Vector2.hpp&gt;
+
+struct Cell
+{
+    sf::Vector2i position;
+    sf::Color color;
+};
+</code></pre>
+
+<h2>CMakeLists.txt</h2>
+
+<pre><code># CMakeList.txt : CMake project for GameOfLife
+#
+cmake_minimum_required (VERSION 3.8)
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -Werror -Wall -Wextra -Wshadow -Wwrite-strings -Wno-parentheses -Weffc++")
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Give the project a name
+project(GameOfLife)
+
+find_package(OpenMP)
+find_package(SFML 2.5 COMPONENTS graphics REQUIRED)
+
+set(SOURCES 
+    src/Main.cpp
+        src/GameOfLife.cpp
+    src/GameOfLife.h
+    src/WorldRenderer.cpp
+    src/WorldRenderer.h
+    src/Cell.h
+)
+
+add_executable(GameOfLife ${SOURCES})
+
+target_link_libraries(GameOfLife sfml-graphics OpenMP::OpenMP_CXX)
+</code></pre>
+
+<p>Some minor changes I introduced while refactoring:</p>
+
+<ul>
+<li>I changed the loop with the <code>neighbours</code> array to avoid the branch for the {0,0} case and to make it a single loop rather than nested loops.  I think this is clearer, and it <em>might</em> be a tiny bit faster (but I didn't profile that).</li>
+<li>I tend to prefer snake_case for identifiers, and that has crept into the code where I should have been consistent with the original camelCase - sorry about that!  The same goes for spacing around operators and the <code>&amp;</code> that indicates a reference variable.  Being consistent is more important than any particular style, and I broke that rule because I was rushing.</li>
+</ul>
+    </div>

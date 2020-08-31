@@ -1,0 +1,144 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><em>(self-answer)</em></p>
+<hr>
+<h3>Simplified the API</h3>
+<p>You were right, the API was too verbose so I drastically simplified it. It now presents itself like that:</p>
+<pre><code>    [Fact]
+    public void Simplified()
+    {
+        var rules =
+            ValidationRuleCollection
+                .For&lt;Person&gt;()
+                .Reject(b =&gt; b.Null(x =&gt; x).Hard())
+                .Reject(b =&gt; b.NullOrEmpty(x =&gt; x.FirstName))
+                .Accept(b =&gt; b.Pattern(x =&gt; x.FirstName, "^cookie", RegexOptions.IgnoreCase))
+                .Accept(b =&gt; b.When(x =&gt; x.FirstName.Length &gt; 3));
+
+        var results = default(Person).ValidateWith(rules);
+
+        Assert.Equal(0, results.OfType&lt;Information&gt;().Count());
+        Assert.Equal(1, results.OfType&lt;Error&gt;().Count());
+
+        
+        Assert.ThrowsAny&lt;DynamicException&gt;(() =&gt; default(Person).ValidateWith(rules).ThrowIfValidationFailed());
+    }
+</code></pre>
+<p>I was not able to incorporate the ROP here this time, but the many other ideas where very helpful. Here's the summary:</p>
+<h3>Changes</h3>
+<p>There are only two main extensions <code>Accept</code> that enforces a rule and <code>Reject</code> that negates it (internally), so there is no need for other extensions prefixed with <code>Not</code>.</p>
+<p>I also liked <a href="https://codereview.stackexchange.com/a/222854/59161">@Flater</a>'s idea from the  other question by <a href="https://codereview.stackexchange.com/questions/222821/fluently-validation-of-objects">@Henrik Hansen</a> where it was suggested picking something more general than <code>IsTrue/IsFalse</code> etc. I decided here to use <code>When</code>. All other extensions have only one overload now. Consequently I could rename <code>Match</code> to <code>Pattern</code> for <code>RegEx</code>.</p>
+<p>The last extension, or rather a <em>modifier</em> is called <code>Hard</code>. This one yields a different rule, one that when failed aborts the validation. This also means that I now have two rules which are descendants of the <code>abstract class ValidationRule&lt;T, TContext&gt;</code>:</p>
+<pre><code>public class Hard&lt;T, TContext&gt; : ValidationRule&lt;T, TContext&gt;
+{
+    public Hard
+    (
+        [NotNull] Expression&lt;ValidationPredicate&lt;T, TContext&gt;&gt; predicate,
+        [NotNull] Expression&lt;MessageCallback&lt;T, TContext&gt;&gt; message
+    ) : base(predicate, message) { }
+
+    protected override IValidationResult CreateResult(bool success, string expression, string message)
+    {
+        return
+            success
+                ? (IValidationResult)new Information(expression, message)
+                : (IValidationResult)new Error(expression, message);
+    }
+}
+
+public class Soft&lt;T, TContext&gt; : ValidationRule&lt;T, TContext&gt;
+{
+    public Soft
+    (
+        [NotNull] Expression&lt;ValidationPredicate&lt;T, TContext&gt;&gt; predicate,
+        [NotNull] Expression&lt;MessageCallback&lt;T, TContext&gt;&gt; message
+    ) : base(predicate, message) { }
+
+    protected override IValidationResult CreateResult(bool success, string expression, string message)
+    {
+        return
+            success
+                ? (IValidationResult)new Information(expression, message)
+                : (IValidationResult)new Warning(expression, message);
+    }
+}
+</code></pre>
+<p>When evaluated they return one of three possible results: <code>Information</code>, <code>Warning</code>, <code>Error</code>.</p>
+<pre><code>public class Information : ValidationResult
+{
+    public Information([NotNull] string expression, [NotNull] string message)
+        : base(expression, message) { }
+}
+
+public class Warning : ValidationResult
+{
+    public Warning([NotNull] string expression, [NotNull] string message)
+        : base(expression, message) { }
+}
+
+public class Error : ValidationResult
+{
+    public Error([NotNull] string expression, [NotNull] string message)
+        : base(expression, message) { }
+}
+</code></pre>
+<p>An internal API uses it to break the validation:</p>
+<pre><code>    public static ValidationResultCollection&lt;T&gt; ValidateWith&lt;T, TContext&gt;(this T obj, IImmutableList&lt;IValidationRule&lt;T, TContext&gt;&gt; rules)
+    {
+        return obj.ValidateWith(rules, default);
+    }
+
+    private static IEnumerable&lt;IValidationResult&gt; Evaluate&lt;T, TContext&gt;(this IImmutableList&lt;IValidationRule&lt;T, TContext&gt;&gt; rules, T obj, TContext context)
+    {
+        var result = default(IValidationResult);
+        foreach (var rule in rules)
+        {
+            yield return result = rule.Evaluate(obj, context);
+            if (result is Error) yield break;
+        }
+    }
+</code></pre>
+<p>There is also a new <code>ValidationResultCollection</code> that replaces the tuple I used previously:</p>
+<pre><code>public class ValidationResultCollection&lt;T&gt; : IEnumerable&lt;IValidationResult&gt;
+{
+    private readonly IImmutableList&lt;IValidationResult&gt; _results;
+
+    public ValidationResultCollection(T value, IImmutableList&lt;IValidationResult&gt; results)
+    {
+        Value = value;
+        _results = results;
+    }
+
+    public T Value { get; }
+
+    public IEnumerator&lt;IValidationResult&gt; GetEnumerator() =&gt; _results.GetEnumerator();
+
+    IEnumerator IEnumerable.GetEnumerator() =&gt; GetEnumerator();
+
+    public static implicit operator T(ValidationResultCollection&lt;T&gt; results) =&gt; results.Value;
+}
+</code></pre>
+<p>I use it to chain extensions for throwing exception:</p>
+<pre><code>default(Person)
+    .ValidateWith(rules) // &lt;-- ValidationResultCollection
+    .ThrowIfValidationFailed(); // autocast to T or throw
+</code></pre>
+<p>Generating messages internally still has to be improved, but as far as the main API is concerned, I'm happy with it.</p>
+<p>End-users can add thier own extension to <code>b</code>. It is a <code>ValidationRuleBuilder&lt;T, TContext&gt;</code> that lets them modify the validation expression: (like I use it for</p>
+<pre><code>    public ValidationRuleBuilder&lt;T, TContext&gt; Predicate(Func&lt;LambdaExpression, LambdaExpression&gt; expression)
+    {
+        _predicate = expression(_predicate);
+        return this;
+    }
+    
+</code></pre>
+<p>I use this too, e.g. for <code>Reject</code>, that <code>Negate</code>s the expression:</p>
+<pre><code>    public static IImmutableList&lt;IValidationRule&lt;T, object&gt;&gt; Reject&lt;T&gt;
+    (
+        this IImmutableList&lt;IValidationRule&lt;T, object&gt;&gt; rules,
+        Func&lt;ValidationRuleBuilder&lt;T, object&gt;, ValidationRuleBuilder&lt;T, object&gt;&gt; builder
+    )
+    {
+        return rules.Add(builder(ValidationRule&lt;T, object&gt;.Ensure).Negate().Build());
+    }
+</code></pre>
+    </div>

@@ -1,0 +1,136 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Wrapping SDL_Surface like this to get automatic cleanup in the destructor is a good idea. However, the current implementation makes a few assumptions that aren't necessarily correct.</p>
+
+<hr>
+
+<h2>Surface Creation</h2>
+
+<p>There are lots of ways to get hold of a surface. Getting it from a <code>Window</code>, loading from a file, manually creating it with <code>SDL_CreateSurface</code>, or using something like SDL_TTF to render a font.</p>
+
+<p>The <code>Surface</code> class shouldn't care about how the surface is created. It only needs to accept a surface, and know whether that surface should be cleaned up on destruction, e.g.:</p>
+
+<pre><code>Surface(SDL_Surface* surface, bool freeOnDestruction);
+</code></pre>
+
+<p>should replace the current <code>Window</code> and <code>string</code> constructors. The LoadBMP function could be made a free function that takes a <code>string</code> and returns a <code>Surface</code>.</p>
+
+<hr>
+
+<h2>Window</h2>
+
+<p>The dependency of <code>Surface</code> on <code>Window</code> seems backwards. Since an <code>SDL_Window</code> owns an <code>SDL_Surface</code> of its own, it would make more sense for the dependency to be the other way around. Thus the <code>Window</code> class could have a <code>GetSurface()</code> function, returning a <code>Surface</code>, and the <code>Update()</code> function would make more sense as <code>UpdateSurface()</code> in the <code>Window</code> class (it doesn't make sense for non-window surfaces anyway).</p>
+
+<hr>
+
+<h2>Interface and Error Checking</h2>
+
+<p><code>BlitSurface</code> is confusing because you have to remember whether to call <code>source.BlitSurface</code> or <code>dest.BlitSurface</code>. As member functions it might be better to have both a <code>BlitFrom(source)</code> and <code>BlitTo(dest)</code>, that both call a single <code>Blit</code> function.</p>
+
+<p>It might be better to use free functions instead:</p>
+
+<pre><code>void FillSurface(Surface&amp; surface, Color const&amp; color); // fill entire surface!
+void FillSurface(Surface&amp; surface, Rect const&amp; rect, Color const&amp; color); // fill a rect on the surface
+void BlitSurface(Surface&amp; source, Surface const&amp; dest); // blit whole surfaces
+// TODO: rect versions...
+</code></pre>
+
+<p><code>SDL_BlitSurface</code> has some conditions you should check before and after (it doesn't work on locked / null surfaces, it returns an error code on failure). These should be handled and output a message / throw an error / terminate the program.</p>
+
+<p>It would make sense to have a <code>GetSDLSurface()</code> function in the <code>Surface</code> class (similar to the <code>GetSDLWindow()</code> function). We can check (assert / throw / print message) that the surface pointer is non-null in this function before returning it. If the <code>Blit</code> and <code>Fill</code> functions are free functions, and not members, they can't access the private member directly and must use this function. This means they will automatically do the non-null error check when using the surface.</p>
+
+<hr>
+
+<h2>Using the Standard Library</h2>
+
+<p>The C++ Standard Library already contains a class to manage an object's lifetime like this: <code>std::unique_ptr</code>.</p>
+
+<p>Instead of checking whether we have to free the surface in copy / move constructors, we can wrap it in a <code>unique_ptr</code> with a custom deleter. We can then use the default move constructor and move operators:</p>
+
+<pre><code>#include &lt;iostream&gt;
+#include &lt;functional&gt;
+#include &lt;memory&gt;
+#include &lt;cassert&gt;
+
+// placeholder for testing...
+struct SDL_Surface
+{
+    SDL_Surface() { std::cout &lt;&lt; "constructor" &lt;&lt; std::endl; }
+    ~SDL_Surface() { std::cout &lt;&lt; "destructor" &lt;&lt; std::endl; }
+};
+
+// placeholder for testing...
+void SDL_FreeSurface(SDL_Surface* surface)
+{
+    delete surface;
+}
+
+class Surface
+{
+public:
+
+    Surface(SDL_Surface* sdlSurface, bool freeOnDestruction);
+
+    Surface(Surface&amp;&amp;) = default;
+    Surface&amp; operator=(Surface&amp;&amp;) = default;
+
+    Surface(Surface const&amp;) = delete;
+    Surface&amp; operator=(Surface const&amp;) = delete;
+
+    SDL_Surface* GetSDLSurface() const; // Blit / Fill etc. should use this to get the SDL_Surface.
+
+private:
+
+    using SDLSurfacePtrDeleterT = std::function&lt;void(SDL_Surface*)&gt;;
+    using SDLSurfacePtrT = std::unique_ptr&lt;SDL_Surface, SDLSurfacePtrDeleterT&gt;;
+    SDLSurfacePtrT m_sdlSurfacePtr;
+};
+
+Surface::Surface(SDL_Surface* sdlSurface, bool freeOnDestruction)
+{
+    assert(sdlSurface != nullptr); // no null surfaces!
+    // (means we don't have to check the inner pointer every time we e.g. blit).
+
+    auto deleter = freeOnDestruction ?
+        SDLSurfacePtrDeleterT([] (SDL_Surface* surface) { SDL_FreeSurface(surface); }) :
+        SDLSurfacePtrDeleterT([] (SDL_Surface*) { });
+
+    m_sdlSurfacePtr = SDLSurfacePtrT(sdlSurface, deleter);
+}
+
+SDL_Surface* Surface::GetSDLSurface() const
+{
+    assert(m_sdlSurfacePtr != nullptr); // check this surface hasn't been moved from
+    // (if the m_sdlSurfacePtr is valid, the inner surface should be valid (or at least non-null) due to the assert in the constructor).
+
+    return m_sdlSurfacePtr.get();
+}
+
+int main()
+{
+    std::cout &lt;&lt; "Construct + Destruct:" &lt;&lt; std::endl;
+
+    {
+        auto sdlSurface = new SDL_Surface();
+        auto surface = Surface(sdlSurface, true);
+        // should get destructor call...
+    }
+
+    std::cout &lt;&lt; "Construct + Leak:" &lt;&lt; std::endl;
+
+    {
+        auto sdlSurface = new SDL_Surface();
+        auto surface = Surface(sdlSurface, false);
+        // will not get destructor call...
+    }
+
+    std::cout &lt;&lt; "Construct + Move + Destruct:" &lt;&lt; std::endl;
+
+    {
+        auto sdlSurface = new SDL_Surface();
+        auto surface = Surface(sdlSurface, true);
+        auto surface2 = std::move(surface);
+        // should get destructor call...
+    }
+}
+</code></pre>
+    </div>

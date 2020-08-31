@@ -1,0 +1,154 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>Using built-ins</h3>
+
+<p>You can use built-in comparators instead of creating your own. For example</p>
+
+<blockquote>
+<pre><code>final Iterator&lt;Collection&lt;T&gt;&gt; allLists = stream.sorted(
+      (l1, l2) -&gt; l1.size() - l2.size()
+).iterator();
+</code></pre>
+</blockquote>
+
+<p>can be written more simply using the <a href="https://docs.oracle.com/javase/8/docs/api/java/util/Comparator.html#comparingInt-java.util.function.ToIntFunction-" rel="nofollow noreferrer"><code>comparingInt</code></a> comparator, which compares elements according to the result of applying the given function (returning an <code>int</code>) to each element. In this case, you could have:</p>
+
+<pre><code>final Iterator&lt;Collection&lt;T&gt;&gt; allLists =
+    stream.sorted(Comparator.comparingInt(Collection::size)).iterator();
+</code></pre>
+
+<p>The function returning the integer to compare is written as a method-reference refering to <a href="https://docs.oracle.com/javase/8/docs/api/java/util/Collection.html#size--" rel="nofollow noreferrer"><code>Collection.size()</code></a>. Also, it gets rid of the comparison by subtracting the two <code>int</code> values, <a href="https://codereview.stackexchange.com/a/141039/95296">which has a corner-case</a>.</p>
+
+<h3>Bug if the stream is empty</h3>
+
+<p>There is a bug in the current method if the given stream is empty. This is because of</p>
+
+<blockquote>
+<pre><code>final Set&lt;T&gt; result = new HashSet&lt;&gt;(allLists.next());
+</code></pre>
+</blockquote>
+
+<p>which unconditionally invokes <code>next()</code> on the iterator of the stream. You can call <code>intersect(Stream.empty())</code> to verify it; it will throw a <code>NoSuchElementException</code>. In the case of an empty stream, the method should return an empty collection instead.</p>
+
+<h3>Better generics</h3>
+
+<p>With the current signature of </p>
+
+<pre><code>&lt;T&gt; Collection&lt;T&gt; intersect(Stream&lt;Collection&lt;T&gt;&gt; stream)
+</code></pre>
+
+<p>the issue is that passing for example a <code>Stream&lt;List&lt;Integer&gt;&gt;</code> <a href="https://stackoverflow.com/q/2745265/1743880">will not compile</a>. To verify this, you can have</p>
+
+<pre><code>intersect(Arrays.asList(Arrays.asList(1)).stream())
+</code></pre>
+
+<p>Instead, we can introduce a second generic type <code>C</code> for the collection with the following signature:</p>
+
+<pre><code>&lt;T, C extends Collection&lt;T&gt;&gt; Collection&lt;T&gt; intersect(Stream&lt;C&gt; stream)
+</code></pre>
+
+<p>This makes sure that you can pass any collection for the elements of the input stream. With such a signature, you can verify that the above compilation error is not there anymore.</p>
+
+<h3>Huge performance improvement</h3>
+
+<p>If you're not dealing with sets, the <code>retainAll</code> process is very inefficient:</p>
+
+<blockquote>
+<pre><code>result.retainAll(allLists.next());
+</code></pre>
+</blockquote>
+
+<p>Since this method checks to see if the collection given as parameter doesn't contain the elements of this collection (in order to remove them), using this on a <code>List</code> is O(n), making the whole operation O(n²). Instead, pass a new <code>HashSet</code>:</p>
+
+<pre><code>result.retainAll(new HashSet&lt;&gt;(allLists.next()));
+</code></pre>
+
+<p>Since the <code>contains</code> operation is constant time for sets, this will always be O(n), and, thus, a lot faster (at the expense of more memory).</p>
+
+<h3>Why sort?</h3>
+
+<p>The comment in your code says that the sorting step is used as an optimization, to ensure that shorter collections comes first. Intrigued, I made a benchmark comparing the code with and without sorting. It applied the two methods to a stream having 1000 and 10.000 elements where each inner collections had 100 and 1.000 elements. The elements chosen were random integers. Here are the results (<em>Windows 10 x64, JDK 1.8.0_102, i5, 2.90 GHz</em>):</p>
+
+<pre><code>Benchmark                 (lengthOfEach)  (totalLength)  Mode  Cnt    Score   Error  Units
+StreamTest.intersect                 100           1000  avgt   30    1,757 ± 0,069  ms/op
+StreamTest.intersect                 100          10000  avgt   30   18,876 ± 0,954  ms/op
+StreamTest.intersect                1000           1000  avgt   30   17,287 ± 0,378  ms/op
+StreamTest.intersect                1000          10000  avgt   30  177,633 ± 7,043  ms/op
+StreamTest.intersectSort             100           1000  avgt   30    1,805 ± 0,080  ms/op
+StreamTest.intersectSort             100          10000  avgt   30   18,434 ± 0,621  ms/op
+StreamTest.intersectSort            1000           1000  avgt   30   19,472 ± 0,981  ms/op
+StreamTest.intersectSort            1000          10000  avgt   30  184,440 ± 5,380  ms/op
+</code></pre>
+
+<p>For the values tested, this shows that there is really no measurable difference between the two, so I'd just get rid of this sorting.</p>
+
+<p>Code of benchmark for completeness:</p>
+
+<pre><code>@Warmup(iterations = 10, time = 700, timeUnit = TimeUnit.MILLISECONDS)
+@Measurement(iterations = 10, time = 700, timeUnit = TimeUnit.MILLISECONDS)
+@BenchmarkMode(Mode.AverageTime)
+@OutputTimeUnit(TimeUnit.MILLISECONDS)
+@Fork(3)
+public class StreamTest {
+
+    public static &lt;T, U extends Collection&lt;T&gt;&gt; Collection&lt;T&gt; intersectSort(Stream&lt;U&gt; stream) {
+        final Iterator&lt;U&gt; allLists = stream.sorted(Comparator.comparingInt(Collection::size)).iterator();
+
+        if (!allLists.hasNext()) return Collections.emptySet();
+
+        final Set&lt;T&gt; result = new HashSet&lt;&gt;(allLists.next());
+        while (allLists.hasNext()) {
+            result.retainAll(new HashSet&lt;&gt;(allLists.next()));
+        }
+        return result;
+    }
+
+    public static &lt;T, C extends Collection&lt;T&gt;&gt; Collection&lt;T&gt; intersect(Stream&lt;C&gt; stream) {
+        final Iterator&lt;C&gt; allLists = stream.iterator();
+
+        if (!allLists.hasNext()) return Collections.emptySet();
+
+        final Set&lt;T&gt; result = new HashSet&lt;&gt;(allLists.next());
+        while (allLists.hasNext()) {
+            result.retainAll(new HashSet&lt;&gt;(allLists.next()));
+        }
+        return result;
+    }
+
+    @State(Scope.Benchmark)
+    public static class Container {
+
+        @Param({ "100", "1000" })
+        private int totalLength;
+
+        @Param({ "1000", "5000" })
+        private int lengthOfEach;
+
+        private List&lt;List&lt;Integer&gt;&gt; list;
+        private Stream&lt;List&lt;Integer&gt;&gt; stream;
+
+        @Setup(Level.Trial)
+        public void setUp() {
+            ThreadLocalRandom rnd = ThreadLocalRandom.current();
+            list = rnd.ints(totalLength).mapToObj(i -&gt; rnd.ints(lengthOfEach).boxed().collect(Collectors.toList())).collect(Collectors.toList());
+        }
+
+        @Setup(Level.Invocation)
+        public void makeStream() {
+            stream = list.stream();
+        }
+
+    }
+
+    @Benchmark
+    public Collection&lt;Integer&gt; intersectSort(Container a) {
+        return intersectSort(a.stream);
+    }
+
+    @Benchmark
+    public Collection&lt;Integer&gt; intersect(Container a) {
+        return intersect(a.stream);
+    }
+
+}
+</code></pre>
+    </div>

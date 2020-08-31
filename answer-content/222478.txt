@@ -1,0 +1,348 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'll start the serious bug, then work inwards from <code>main()</code>.</p>
+<hr>
+<h1>Biggest bug</h1>
+<p>The biggest problem with the code is that it only reads one command from each connection, leaving any subsequent commands for the next client to execute.  Even if we read more commands, by looping until <code>handle()</code> returns false before closing the client socket, this still won't help if the client has commands after <code>exit</code>:</p>
+<pre class="lang-sh prettyprint-override"><code>netcat -4 localhost 7070  &lt;&lt;&lt;$'exit\nstop\n'
+</code></pre>
+<hr>
+<h1><code>main()</code></h1>
+<blockquote>
+<pre><code>}catch(Exception e){
+    std::cout&lt;&lt; e.getMessage();
+    return -1;
+}
+</code></pre>
+</blockquote>
+<p>-1 is a strange exit code - we normally use small <em>positive</em> numbers.</p>
+<p>Error messages should go to <code>std::cerr</code>, not to standard output.</p>
+<p>Most C++ runtime environments already do something similar - there's probably no need to catch all exceptions at this level.</p>
+<blockquote>
+<pre><code>    TCPServer server(7070, "127.0.0.1", &amp;c);
+</code></pre>
+</blockquote>
+<p>Port and bind address should be configurable - ideally from command arguments, but a short-term start would be to define file-scope constants.</p>
+<blockquote>
+<pre><code>return 0;
+</code></pre>
+</blockquote>
+<p>Although not wrong, there's little benefit to explicitly returning zero from <code>main()</code>.</p>
+<p>For a real Internet server, you'll normally want to daemonize the process (but retain user option to run in foreground, for debugging).</p>
+<hr>
+<h1><code>TCPServer::TCPServer()</code></h1>
+<blockquote>
+<pre><code>TCPServer::TCPServer(int port,std::string address, ConnectionHandler *c)
+:port(port){
+</code></pre>
+</blockquote>
+<p>We initialize <code>port</code>, but not the other members of the object.</p>
+<p>That said, <code>port</code> and <code>ServAddr</code> don't need to be members - they are used only to create <code>servSock</code> and then never used again.  Member <code>c</code> needs a better name - remember, variable name verbosity should be proportional to the scope of the variable; members need more descriptive names than two-line locals.  Here's how I'd write the initializer list:</p>
+<pre><code>TCPServer::TCPServer(int port, const std::string&amp;, ConnectionHandler *connection)
+    : servSock(socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)),
+      connection(connection)
+{
+</code></pre>
+<p>Perhaps consider passing a <em>reference</em> to the connection handler.  This will have the side effect of making <code>TCPServer</code> non-assignable - but you probably want it to be non-copyable anyway.</p>
+<p>It's idiomatic to use the truthiness of a pointer to test for null pointers:</p>
+<pre><code>if (!connection) {
+   throw Exception("You should provide a connection Handler"); 
+}
+</code></pre>
+<p>There's a lot of unnecessary qualification of members with <code>this-&gt;</code> - you should almost never need to use <code>this</code> with <code>-&gt;</code> like that.</p>
+<p><code>memset</code> should be <code>std::memset</code>.</p>
+<blockquote>
+<pre><code>    throw NetworkException(std::string("SOCKET Error: could not create basic socket"));
+</code></pre>
+</blockquote>
+<p>No need to explicitly construct <code>std::string</code> there - there's an implicit constructor that will be used.  It might be nice to incorporate the error message from <code>errno</code> (use <code>errstr()</code> to create a human-friendly version).  That applies to the checks after <code>bind()</code> and <code>listen()</code>, too.</p>
+<hr>
+<h1><code>TCPServer::listen</code></h1>
+<blockquote>
+<pre><code>    std::cout &lt;&lt; "Handling client: " &lt;&lt; inet_ntoa(address.sin_addr) &lt;&lt; std::endl;
+</code></pre>
+</blockquote>
+<p>Status messages should go to <code>std::clog</code>, not standard output.  And for this error, we don't want to use the bad client socket descriptor, so return immediately.</p>
+<blockquote>
+<pre><code>   send(client, "WELCOME\n", 6, 0);
+</code></pre>
+</blockquote>
+<p>Why write only <code>WELCOM</code> here?  We probably want to send all 8 characters:</p>
+<pre><code>    static auto constexpr message = "WELCOME\n";
+    send(client, message, std::strlen(message), 0);
+</code></pre>
+<hr>
+<h1><code>SimpleCommandHandler::readLine()</code></h1>
+<blockquote>
+<pre><code>char buffer[buffLen];
+</code></pre>
+</blockquote>
+<p>That's not valid C++, as <code>buffLen</code> isn't a compile-time constant expression.  We could perhaps use a vector for this:</p>
+<pre><code>std::vector&lt;char&gt; storage(buffLen);
+char *const buffer = storage.data();
+</code></pre>
+<p>Again, <code>std::memset()</code> needs its namespace qualification.</p>
+<p>Remember that <code>sizeof</code> reports in units of <code>char</code>, so <code>sizeof (char)</code> must be 1 by definition.  Adding <code>* sizeof (char)</code> just serves to make the code harder to read.</p>
+<p>There's no need to null out the whole of the buffer every time we read a line.  All that's required is to pass the correct length to the <code>addData()</code>:</p>
+<pre><code>std::string SimpleCommandHandler::readLine(int socketid){
+    int recvSize=0;
+    char buffer[buffLen];
+
+    while ((recvSize = recv(socketid, buffer, buffLen-1, 0)) &gt; 0) {
+        parser-&gt;addData(socketid, buffer, recvSize);
+    }
+
+    return parser-&gt;getCommand(socketid);
+}
+</code></pre>
+<p>I'm not sure why we need a map of client socket to command string, since we have a <em>blocking server</em>, that services only one client at a time.  And since we don't clear the command buffer after a client disconnects, we end up executing old commands of previous sessions when a new client connects.  (Part of the cause is that <code>readLine()</code> actually reads entire transmissions, not necessarily a single line).</p>
+<hr>
+<h1><code>CommandParser::getCommand()</code></h1>
+<p>Instead of repeatedly looking up in the map, it's better to make a local reference to the command buffer:</p>
+<pre><code>std::string CommandParser::getCommand(int socketid)
+{
+    std::string&amp; buffer = commandBuff[socketid];
+
+    std::size_t pos = buffer.find('\n');
+    if (pos == std::string::npos) {
+        return "";
+    }
+
+    std::string fetchedCommand = buffer.substr(0, pos);
+    buffer = buffer.substr(pos+1);
+    return fetchedCommand;
+}
+</code></pre>
+<hr>
+<h1>Other bits and pieces</h1>
+<p><code>ConnectionHandler</code> has virtual methods; that's normally a sign that you want a <code>virtual</code> destructor.  Conversely, <code>SimpleCommandHandler</code> doesn't need to specify that its destructor is virtual.  It should declare its override with <code>override</code>, though.</p>
+<p><code>Exception</code> would be simpler if it just inherits <code>std::exception</code> - or better, <code>std::runtime_error</code>.</p>
+<hr>
+<h1>Modified code</h1>
+<p>Incorporating some of the improvements suggested above (and all as one source file, because that's how I built it):</p>
+<pre><code>#include &lt;string&gt;
+#include &lt;map&gt;
+
+class CommandParser
+{
+private:
+    std::map&lt;int,std::string&gt; commandBuff = {};
+
+public:
+    std::string getCommand(int socketid);
+    void addData(int socketid, const char* data, int length);
+    void clear(int socketid);
+};
+
+//A generic way to handle Network Connections
+class ConnectionHandler
+{
+public:
+    virtual ~ConnectionHandler() = default;
+
+    /**
+     * @return true if we should read more commands, else false
+     */
+    virtual bool handle(int socketid) = 0;
+
+    bool finished = false;
+};
+
+class SimpleCommandHandler: public ConnectionHandler
+{
+public:
+    SimpleCommandHandler(std::size_t readBufferSize, CommandParser&amp; commandParser)
+        : buffLen(readBufferSize),
+          parser(commandParser)
+    {}
+    SimpleCommandHandler(const SimpleCommandHandler&amp;) = delete;
+    bool handle(int socketid) override;
+
+private:
+    std::string readLine(int socketid);
+    void sendResult(int socketid, std::string result);
+    const std::size_t buffLen;
+    CommandParser&amp; parser;
+};
+
+#include &lt;string&gt;
+
+//Dummy Value to be changed
+#define MAXPENDING 5
+
+class Exception
+{
+public:
+    Exception(std::string message)
+        : message(message)
+    {}
+    std::string getMessage();
+private:
+    std::string message;
+};
+
+#include &lt;cstring&gt;
+#include &lt;exception&gt;
+
+class NetworkException: public std::runtime_error {
+public:
+    NetworkException(std::string message)
+        : std::runtime_error(message + ": " + std::strerror(errno))
+    {}
+};
+
+class TCPServer
+{
+public:
+    TCPServer(int port, const std::string&amp;, ConnectionHandler&amp; connection);
+    ~TCPServer();
+    void listen();
+private:
+    //Socket file Descriptor
+    int socket;
+    ConnectionHandler&amp; connection;
+};
+
+
+int main()
+{
+    CommandParser p;
+    SimpleCommandHandler connection(10, p);
+    TCPServer server(7070, "127.0.0.1", connection);
+    server.listen();
+}
+
+
+#include &lt;sys/socket.h&gt;
+#include &lt;arpa/inet.h&gt;
+#include &lt;unistd.h&gt;
+
+#include &lt;cstring&gt;
+#include &lt;iostream&gt;
+#include &lt;string&gt;
+
+std::string Exception::getMessage() {
+    return message;
+}
+
+TCPServer::TCPServer(int port, const std::string&amp; address, ConnectionHandler&amp; connection)
+    : socket(::socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)),
+      connection(connection)
+{
+    if (socket &lt; 0) {
+        throw NetworkException("SOCKET Error: could not create basic socket");
+    }
+
+    struct sockaddr_in s_address; // server address
+    std::memset(&amp;s_address, 0, sizeof s_address);
+    s_address.sin_family = AF_INET;
+    s_address.sin_addr.s_addr = ::inet_addr(address.c_str());
+    s_address.sin_port = ::htons(port);
+
+    if (::bind(socket, (struct sockaddr*)&amp;s_address, sizeof s_address) &lt; 0) {
+        throw NetworkException("SOCKET Error: Failed to bind a socket");
+    }
+
+    if (::listen(socket, MAXPENDING) &lt; 0) {
+        throw NetworkException("SOCKET Error: Failed to listen");
+    }
+
+}
+
+void TCPServer::listen()
+{
+    while (!connection.finished) {
+        struct sockaddr_in address;     /* Client address */
+        socklen_t length = sizeof address;
+        int client;                    /* Socket descriptor for client */
+        if ((client = ::accept(socket, (struct sockaddr*)&amp;address, &amp;length)) &lt; 0) {
+            std::cerr &lt;&lt; "Failed to accept: " &lt;&lt; std::strerror(errno) &lt;&lt; std::endl;
+            return;
+        }
+        std::clog &lt;&lt; "Handling client: " &lt;&lt; ::inet_ntoa(address.sin_addr) &lt;&lt; std::endl;
+
+        static auto constexpr message = "WELCOME\n";
+        send(client, message, std::strlen(message), 0);
+
+        while (connection.handle(client))
+            ;
+        close(client);
+
+        // discard remaining received commands
+
+    }
+}
+
+TCPServer::~TCPServer()
+{
+    ::close(socket);
+}
+
+
+#include &lt;cstring&gt;
+#include &lt;iostream&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+std::string SimpleCommandHandler::readLine(int socketid)
+{
+    std::vector&lt;char&gt; storage(buffLen);
+    char *const buffer = storage.data();
+
+    int recvSize = 0;
+    while ((recvSize = ::recv(socketid, buffer, buffLen-1, 0)) &gt; 0) {
+        parser.addData(socketid, buffer, recvSize);
+    }
+
+    return parser.getCommand(socketid);
+}
+
+void SimpleCommandHandler::sendResult(int socketid, std::string result) {
+    send(socketid, result.c_str(), result.length() + 1, 0);
+}
+
+bool SimpleCommandHandler::handle(int socketid)
+{
+    std::string command = readLine(socketid);
+    std::clog &lt;&lt; "Command received: " &lt;&lt; command &lt;&lt; std::endl;
+
+    if (command == "exit") {
+        sendResult(socketid, "Thank You Very Much.\nBye.\n");
+        parser.clear(socketid);
+        return false;
+    } else if (command == "stop") {
+        sendResult(socketid, "Server exiting.\n");
+        parser.clear(socketid);
+        finished = true;
+        return false;
+    } else {
+        sendResult(socketid, "Ignoring command '" + command + "'.\n");
+        return true;
+    }
+}
+
+#include &lt;string&gt;
+
+void CommandParser::addData(int socketid, const char* data, int length) {
+    commandBuff[socketid].append(data,length);
+}
+
+std::string CommandParser::getCommand(int socketid)
+{
+    std::string&amp; buffer = commandBuff[socketid];
+
+    std::size_t pos = buffer.find('\n');
+    if (pos == std::string::npos) {
+        return "";
+    }
+
+    std::string fetchedCommand = buffer.substr(0, pos);
+    buffer = buffer.substr(pos+1);
+    return fetchedCommand;
+}
+
+void CommandParser::clear(int socketid)
+{
+    commandBuff[socketid].clear();
+}
+</code></pre>
+    </div>

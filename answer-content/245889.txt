@@ -1,0 +1,86 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Freebies</h1>
+<p>Looking at the performance profile for the 16x16 puzzle (there is a profiler built into Visual Studio 2017, which you said you are using, and I used that, so you can reproduce this), I see that <code>deleted_from.push_back(ptr2);</code> is hotter than it deserves. That indicates the vector is growing too often.</p>
+<p>So change this:</p>
+<pre><code>vector&lt;int*&gt; deleted_from;
+</code></pre>
+<p>To this:</p>
+<pre><code>vector&lt;int*&gt; deleted_from(8);
+</code></pre>
+<p>Before: 6 seconds. After: 5.5 seconds. That's significant, but a trivial change to the code.</p>
+<p>Reading between the lines of the profile, it turns out that <code>isLower</code> is taking a substantial amount of time. It is not directly implicated by the profile, but the places where it is called are redder than they ought to be. It really should be trivial, but it's not.</p>
+<p>Here is an other way to write it:</p>
+<pre><code>#include &lt;intrin.h&gt;
+
+...
+
+// function used by heap to order it's elements based on the contents of `*ptr1` and `*ptr2`
+bool isLower(const int* ptr1, const int* ptr2)
+{
+    return _mm_popcnt_u32(*ptr1) &lt; _mm_popcnt_u32(*ptr2);
+}
+</code></pre>
+<p>Before: 5.5 seconds. After: 5.0 seconds. That's nice, and it even made the code simpler.</p>
+<h1>The Heap</h1>
+<p>It should be no surprise that a lot of time is spent on modifying the heap. So let's tinker with it.</p>
+<p>This logic:</p>
+<blockquote>
+<pre><code>   if (l &lt; heap_size &amp;&amp; isLower(A[l], A[i]))
+       smallest = l;
+   if (r &lt; heap_size &amp;&amp; isLower(A[r], A[smallest]))
+       smallest = r;
+</code></pre>
+</blockquote>
+<p>Can be rewritten to:</p>
+<pre><code>if (r &lt; heap_size)
+{
+    smallest = isLower(A[l], A[r]) ? l : r;
+    smallest = isLower(A[i], A[smallest]) ? i : smallest;
+}
+else if (l &lt; heap_size)
+    smallest = isLower(A[l], A[i]) ? l : i;
+</code></pre>
+<p>It looks like it should be about the same, but it's not.</p>
+<p>Before: 5.0 seconds. After: 2.0 seconds.</p>
+<p>What?! The biggest difference I saw in the disassembly of the function was that <code>cmovl</code> was used this way, but not before. Conditional-move is better than a badly-predicted branch, but worse than a well-predicted branch - it makes sense that these branches would be badly predicted, after all they depend on which path the data item takes "down the heap", which is some semi-randomly zig-zagging path.</p>
+<p>This on the other hand does <em>not</em> help:</p>
+<pre><code>smallest = (l &lt; heap_size &amp;&amp; isLower(A[l], A[i])) ? l : i;
+smallest = (r &lt; heap_size &amp;&amp; isLower(A[r], A[smallest])) ? r : smallest;
+</code></pre>
+<p>When MSVC chooses to use a cmov or not is a mystery. Clearly it has a large impact, but there seems to be no reliable way to ask for a cmov.</p>
+<p>An extra trick is using that what this "minHeapify" is doing is moving items up the heap along a path, and dropping the item which it was originally called on into the open spot at the end. That isn't <em>how</em> it's doing it though: it's doing a lot of swaps. In total it's doing twice as many assignments as are necessary. That could be changed such as this:</p>
+<pre><code>void minHeapify(int i)
+{
+    int l, r, smallest;
+    int* item = A[i];
+    do {
+        l = left(i);
+        r = right(i);
+        smallest = i;
+
+        if (r &lt; heap_size)
+        {
+            smallest = isLower(A[l], A[r]) ? l : r;
+            smallest = isLower(item, A[smallest]) ? i : smallest;
+        }
+        else if (l &lt; heap_size)
+            smallest = isLower(A[l], item) ? l : i;
+
+        if (smallest == i)
+            break;
+
+        A[i] = A[smallest];
+        mapping[A[i]] = i;
+        i = smallest;
+    } while (1);
+
+    A[i] = item;
+    mapping[item] = i;
+}
+</code></pre>
+<p>Before: 2.0 seconds. After: 1.85 seconds.</p>
+<h1><code>unordered_map</code></h1>
+<p>Often some other hash map can do better than the default <code>unordered_map</code>. For example you could try Boost's version of <code>unordered_map</code>, or Abseil's <code>flat_hash_map</code>, or various others. There are too many to list.</p>
+<p>In any case, with Skarupke's <code>flat_hash_map</code>, the time went from 1.85 seconds to 1.8 seconds. Not amazing, but it's as simple as including a header and changing <code>unordered_map</code> to <code>ska::flat_hash_map</code>.</p>
+<p>By the way, for MSVC specifically, <code>unordered_map</code> is a common reason for poor performance of the Debug build. It's not nearly as bad for the Release build.</p>
+    </div>

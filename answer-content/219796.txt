@@ -1,0 +1,109 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p>I am currently using the RK-4 method to update position</p>
+</blockquote>
+
+<p>Firstly, the naming is unhelpful here. A name like <code>RK4_1</code> implies that the method does the quadrature. I think that function is really <code>dx_dt</code>, <code>RK4_2</code> is really <code>dvx_dt</code>, and there would be room to pull out a function like</p>
+
+<pre><code>def RK4_step(t, x, dx_dt, dt):
+    k1 = dt * dx_dt(x, t)
+    k2 = dt * dx_dt(x + k1 / 2, t + dt / 2)
+    k3 = dt * dx_dt(x + k2 / 2, t + dt / 2)
+    k4 = dt * dx_dt(x + k3, t + dt)
+    return x + (1/6) * (k1 + 2 * k2 + 2 * k3 + k4)
+</code></pre>
+
+<p>But secondly, RK4 is completely overkill here. If we inline</p>
+
+<blockquote>
+<pre><code>@jit(nopython=True)
+def RK4_1(x, vx):
+    return vx
+
+@jit(nopython=True)
+def RK4_2(x, vx):
+    return 0
+
+@jit(nopython=True)
+def iterate(x1, x2, vx1, vx2, col):
+    k1 = dt*RK4_1(x1, vx1)
+    k2 = dt*RK4_1(x1 + k1/2, vx1)
+    k3 = dt*RK4_1(x1 + k2/2, vx1)
+    k4 = dt*RK4_1(x1 + k3, vx1)
+    x1 += (1/6)*(k1 + 2*k2 + 2*k3 + k4)
+
+    ...
+
+    k1 = dt*RK4_2(x1, vx1)
+    k2 = dt*RK4_2(x1, vx1 + k1/2)
+    k3 = dt*RK4_2(x1, vx1 + k2/2)
+    k4 = dt*RK4_2(x1, vx1 + k3)
+    vx1 += (1/6)*(k1 + 2*k2 + 2*k3 + k4)
+</code></pre>
+</blockquote>
+
+<p>we get</p>
+
+<pre><code>def iterate(x1, x2, vx1, vx2, col):
+    x1 += dt*vx1
+
+    ...
+
+    vx1 += 0
+</code></pre>
+
+<p>It seems that it would be <em>much</em> quicker to solve simultaneous linear equations to work out when the collision will happen rather than to use quadrature. In fact, <a href="https://tio.run/##bZHJboQwDIbveQprpNEkLNOEisuoHHvtqS/AlKCJhk0QKH16aidiUdUcEtn@/HtJ92MfbfO6LLWKoE4gA3yVlEGQslqRXSsIMcJmDEyz8oRkc0KmS7iqNIJYMfbVVmhLZpoS37Jqc8svIVoXwdj3w1QaPvtR3xjgsRIZ1HuBmGRN6dTfQIKuBg2YxRxXTMhRpZgAn0pdcOealSAFhFAA73/yLQ1hGm5lhJnCe4nGQEac74fOvdf50wPYS5gRE2xlseDuSpyLJkaf@iNq5a7pViY3068wXjWp1wObuJ1sduf371pwv3AovYvxbo0VE20D/@1AJJ6IvdBOsK43jeWnj7G@6x7akoapzGDaZrjBuTjBGTi6hFjJ98GaOre6gCmvRk0pnUG0XFFU5tRHAPKaCiGW5Rc" rel="nofollow noreferrer">I had a go</a>, and the actual simulation takes less than a second for <code>N = 5</code>.</p>
+
+<hr>
+
+<blockquote>
+  <p>My code shows that I have tried to use Numba to speed up the runtime, but that doesn't seem to be helping.</p>
+</blockquote>
+
+<p>The jit is on the wrong parts. I added some debug printing and observed that it slowed down over time, at which point I very quickly spotted the real problem:</p>
+
+<blockquote>
+<pre><code>    x1arr = np.append(x1arr, x1)
+    x2arr = np.append(x2arr, x2)
+    y1arr = np.append(y1arr, y1)
+    y2arr = np.append(y2arr, y2)
+    vx1arr = np.append(vx1arr, vx1)
+    vx2arr = np.append(vx2arr, vx2)
+    colarr = np.append(colarr, col)
+</code></pre>
+</blockquote>
+
+<p>This is copying the entire array every time, so the length of a step is proportional to the number of steps taken.</p>
+
+<p>Solution: use normal lists rather than numpy arrays. numpy is not a panacea: it's good for parallel processing, but that's not what you want here.</p>
+
+<p><strong>However</strong>, the one advantage that numpy arrays give you here is that they don't have length bounds. In testing with <code>N = 3</code> using normal Python lists I got a memory error after slightly more than 245 million steps and 3140 collisions. It might need a 2D structure to handle the large quantities of data. Of course, that doesn't prevent the extremely likely problem of the plot running into memory problems too. A complete structural rethink may be necessary.</p>
+
+<hr>
+
+<p>If you do decide to implement RK4, it's more correct to do a single multi-variable quadrature rather than multiple single-variable ones. Here is where there is a good reason to use numpy arrays. What I mean by multi-variable quadrature is something like</p>
+
+<pre><code>k1_x, k1_vx = dt * RK4(x, vx), dt * RK4(vx, ax)
+k2_x, k2_vx = dt * RK4(x + k1_x / 2, vx + k1_vx / 2), dt * RK4(vx + k1_vx / 2, ax)
+</code></pre>
+
+<p>etc. (NB For clarity I separated out the variables. For speed you'd put <code>x</code> and <code>vx</code> in a single numpy array).</p>
+
+<hr>
+
+<p>It makes no sense to start timing before taking the input: the time I take to type <code>3</code> and press <code>Enter</code> is not really runtime.</p>
+
+<hr>
+
+<p>In terms of general readability, the inline mixing of functions and top-level code is not helpful. It's good to put constants like <code>dt</code> at the top, so that when the reader comes to the usage of <code>dt</code> in <code>iterate</code> they've already seen it. The main loop should probably be a function which returns the arrays (or perhaps a single 2D array) with intermediate values; the plot creation should be a function, and then Python best practice is for the "main" functionality to go at the end with a guard:</p>
+
+<pre><code>if __name__ == "__main__":
+    N = int(input("Enter an integer N that will determine the mass of the second block: "))
+    start = time.time()
+    data = generate_collisions(N)
+    plot = graph_collisions(data)
+    end = time.time()
+    print("Total runtime in seconds:  ", end - start)
+    plot.show()
+</code></pre>
+    </div>

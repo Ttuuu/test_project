@@ -1,0 +1,80 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>To state the problem:</strong>
+You have a large sum of operations that are repetitive and mostly similar(?) that are long running, and you want to reduce that run time.
+</p><hr>
+<strong>If I have that right:</strong>
+
+<p><strong>If order is not a concern</strong> You could consider inserting in parallel. If you can represent the 50,000 updates as a List, say, <code>List&lt;InsertCriteriaPojo&gt;</code>, and can represent the insert as a Consumer lambda, like so: <code>((InsertCriteriaPojo item) -&gt; myDao.insert(item))</code>, then this could be a one line call:</p>
+
+<pre><code>List&lt;InsertCriteriaPojo&gt; items = ...;
+
+items.stream().parallel().map((InsertCriteriaPojo item) -&gt; myDao.insert(item));
+</code></pre>
+
+<p>This creates a Stream of InsertCriteriaPojos, converts that to a ParallelStream, and them maps each item in the List to a Consumer and runs the Consumer/item tasks in a set of threads belonging to the common ForkJoinPool</p>
+
+<hr>
+
+<p><strong>While short, there are problems with this</strong></p>
+
+<p>The main problem <a href="https://dzone.com/articles/think-twice-using-java-8" rel="nofollow noreferrer">as explained here</a> is that <s>you can't specify an Executor to ParallelStreams (as of Java 1.8*).</s></p>
+
+<p><strong>UPDATE:</strong> The above is inaccurate. This can be done like so:</p>
+
+<pre><code>List&lt;InsertCriteriaPojo&gt; items = ...;
+ForkJoinPool customThreadPool = new ForkJoinPool(threadCount);
+customThreadPool.submit(
+    () -&gt; items.stream().parallel().map(
+        (InsertCriteriaPojo item) -&gt; myDao.insert(item)
+    )
+).get;
+</code></pre>
+
+<hr>
+
+<p>Another, more complex way to run these tasks in parallel is to use an Executor you configure:</p>
+
+<pre><code>@Bean(name = "myExecutor")
+public Executor executor(){
+    ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+    executor.setCorePoolSize(yourProperties.getCorePoolCount());
+    executor.setMaxPoolSize(yourProperties.getMaxPoolCount());
+    executor.setQueueCapacity(yourProperties.getMaxQueueSize());
+    executor.setThreadNamePrefix(yourProperties.getThreadNamePrefix());
+    executor.initialize();
+    return threadPoolTaskExecutor;
+}
+</code></pre>
+
+<p>To run your consumers asynchronously:</p>
+
+<pre><code>...
+@Autowire
+@Qualifier("myExecutor")
+Executor executor;
+...
+List&lt;InsertCriteriaPojo&gt; items = ...
+//Make a Future for each task
+List&lt;CompletableFuture&lt;Void&gt;&gt; asyncTaskFutures = list.stream().map(
+    (InsertCriteriaPojo item) -&gt;{
+        CompletableFuture.runAsync(
+            () -&gt; myDao.insert(item), executor
+        ).handle(
+            (asyncVoidFuture, possibleError)-&gt;{
+                if(possibleError != null){ //Handle your errors here }
+                else{return asyncVoidFuture;}
+        })
+    }
+).collect(Collectors.toList());
+
+//Create a Future that is complete when allOf your task futures are complete
+CompletableFuture&lt;Void&gt; process = CompletableFuture.allOf(
+    asyncTaskList.toArray(new CompletableFuture[asyncTaskList.size()])
+).thenRun(() -&gt; asyncTaskList.stream().map(future -&gt; future.join()));
+
+//Complete the process-level future, blocks until complete
+process.get();
+</code></pre>
+
+<p>While significantly more complex, the second is a more configurable and reusable way to solve your problem, but depending on your case either approach could serve your goal.</p>
+    </div>

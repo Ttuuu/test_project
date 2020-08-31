@@ -1,0 +1,169 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p>Is my code exposed to some kind of SQL injection</p>
+</blockquote>
+
+<p>You're using parameterized queries, as you should be, so it shouldn't be an issue. (though, I don't see where you're using the <code>[username]</code> in the query?)</p>
+
+<blockquote>
+  <p>Is any part of the code improvable?</p>
+</blockquote>
+
+<p>Some of it. IMO, in Javascript, <code>class</code>es are generally useful when you want to bundle together <em>instance data</em> with <em>operations on that data</em>. If you don't have any instance data, using a class is potentially confusing and doesn't accomplish anything over using an ordinary function instead. Consider changing the service to:</p>
+
+<pre><code>module.exports = async function loginService({ login }) {
+  //Parameters
+  const { username, password } = login;
+  // etc
+</code></pre>
+
+<pre><code>const loginService = require('../../services/auth/login');
+</code></pre>
+
+<p>(make sure the spelling is correct, continuing to use <code>LoginServive</code> could cause bugs later)</p>
+
+<p>If you do decide to keep using classes, make sure not to put semicolons at the end of methods or the class definitions - they do not belong there. Maybe consider <a href="http://eslint.org/" rel="nofollow noreferrer">a linter</a>.</p>
+
+<p>Does your <code>validationHandler</code> ensure that requests contain a <code>username</code> and <code>password</code>? If so, then in the <code>login</code> function, there's no need to test it like you do below:</p>
+
+<pre><code>const { username, password } = login;
+if (username &amp;&amp; password) {
+</code></pre>
+
+<p>If the validator <em>doesn't</em> ensure that requests contain those properties, then you have a bug: if a request is made without those properties, the current <code>login</code> function will not return anything, which means that in the route:</p>
+
+<pre><code>const response = await loginService.login({ login });
+const data     = response[0];
+</code></pre>
+
+<p>an error will be thrown, because <code>response</code> is <code>undefined</code>. Maybe only call <code>loginService</code> if credentials are provided - otherwise, call <code>next()</code> to go to the next route.</p>
+
+<p>You have a few cases when you define an object and then test its truthyness, eg:</p>
+
+<pre><code>const authenticationId = {
+  status: 401,
+  message:'Wrong password.'
+};
+return authenticationId || [];
+</code></pre>
+
+<p>This is superfluous, because objects are always truthy; the object you just created will always be returned. It'll never return an empty array instead.</p>
+
+<p>But this points to another problem. You're sometimes returning an object, and you're sometimes returning an array. This makes the shape of the return value more difficult to parse, understand, and test. Consider consistently returning an object which is always the same shape, and if you want to examine it, check possible different properties.</p>
+
+<p>The above points to yet another problem. In the route, the only thing you do with the response is try to use its <code>0</code> and <code>1</code> properties. If it returns a <code>{ status: 401, message:'Wrong password.' }</code> object instead, your script will throw an error when trying to access <code>response[1].id</code>, because <code>response[1]</code> doesn't exist. Instead, use the consistent shape of the object to check the return value from <code>login</code> and figure out what to call <code>res.status</code> with. (See below for full code)</p>
+
+<p><code>response</code> is a potentially confusing variable name in a route for a variable which is <em>not</em> the <code>res</code> parameter. Maybe call it <code>loginResult</code> instead.</p>
+
+<p>Rather than a bunch of nested conditions:</p>
+
+<pre><code>  if (...) {
+    if (...) {
+      if (...) {
+        return authenticationId || [];
+      }
+    }
+  }
+};
+</code></pre>
+
+<p>The logic would probably be easier to follow if, when a condition is <em>not</em> met, handle the problem <em>immediately</em> and return. This way, readers of the code don't have to keep in their head, <em>for every block</em>: "This block is entered if X condition is reached, so when the block ends, need to remember to handle when X condition isn't reached."</p>
+
+<p>Regarding</p>
+
+<pre><code>const response = [
+  // ...
+];
+const authenticationId = await Promise.resolve(response);
+</code></pre>
+
+<p>There's no need to do <code>await Promise.resolve</code> on something - <code>await</code> will unwrap a Promise, and can be used on non-Promises. But since <code>response</code> is an array literal, nothing asynchronous is going on, so there's no reason to <code>await</code> there.</p>
+
+<p>Rather than having <code>login</code> format the row to be returned to the route, and for the route to reformat it again to set to <code>req.session.user</code>, consider taking the row and formatting it as needed for the session <em>just once</em>, reducing superfluous object reorganization.</p>
+
+<p>In full:</p>
+
+<pre><code>// route
+router.post(
+  '/',
+  validationHandler(authenticationSchema),
+  async (req, res, next) =&gt; {
+    const { body } = req;
+    if (!body.username &amp;&amp; !body.password) {
+      next();
+      return;
+    }
+    try {
+      const loginResult = await loginService.login(body);
+      if (loginResult.errorMessage) {
+        res.status(401).json({
+          message: loginResult.errorMessage
+        });
+        return;
+      }
+      // Login succeeded:
+      const { userSession, responseData } = loginResult;
+      req.session.user = userSession;
+      console.log("Session: ", req.session.user);
+      res.status(201).json(responseData);
+    } catch (err) {
+      // Are you sure you want to go to the next route here?
+      // If there's an error, maybe respond with status 500 instead
+      next(err);
+    }
+  }
+);
+</code></pre>
+
+<pre><code>// service
+// You can put the constants up here so they don't mix with the main login logic
+const SECRET_API  = config.secretApi;
+const userQuery = `SELECT usr.id,
+                           usr.username,
+                           usr.email,
+                           usr.hash,
+                           CONCAT(pple.name, ' ', pple.lastname) AS full_username,
+                           usr.user_status_id,
+                           usr.user_type_id
+                    FROM users usr
+                    INNER JOIN people pple
+                    ON pple.id = usr.people_id
+                    INNER JOIN user_states usts
+                    ON usts.id = usr.user_status_id
+                    INNER JOIN user_types utps
+                    ON utps.id = usr.user_type_id
+                    WHERE usr.data_status_id = '1'
+                      AND usr.email = ?`;
+module.exports = async ({ username, password }) =&gt; {
+  const rows = await pool.query(userQuery, [username]);
+  if (rows.length === 0) {
+    return { errorMessage: 'The user does not exist.' };
+  }
+  const { id, email, hash, full_username, user_type_id } = rows[0];
+  // Compare hash with the plain text password
+  const match = await bcrypt.compare(password, hash);
+  if (!match) {
+    return { errorMessage: 'Wrong password.' };
+  }
+  //Get the access token
+  const token = jwt.sign({ _id: id }, SECRET_API, {
+    expiresIn: 60 * 60 * 8
+  });
+  return {
+    responseData: {
+      status: 201,
+      message:'You are welcome.',
+      role: user_type_id,
+      token
+    },
+    userSession: {
+      _id: id,
+      _username: username,
+      _name: full_username,
+      _role: user_type_id
+    }
+  };
+};
+
+</code></pre>
+    </div>

@@ -1,0 +1,316 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Here is a much longer implementation that handles scientific notation, NaN, Infinity, Negative Infinity, and leading positive signs. I also added a lot of comments to help visually break it into chunks.</p>
+<p>It manages to be almost as fast as the previous method - most of the logic takes place in the body of previous <code>if</code> checks that simply returned false before.</p>
+<p>I found a few places where I could avoid repeated checks for non-digit characters, and use the first digit character to initialize the result directly to avoid unnecessary additions/multiplcations with zero on the first iteration of the loop.</p>
+<pre><code>/// &lt;summary&gt;High performance double parser with rudimentary flexibility.&lt;/summary&gt;
+/// &lt;returns&gt;Returns true only if we can be certain we parsed the string correctly.&lt;/returns&gt;
+/// &lt;remarks&gt;Does not support thousand separators or whitespace.&lt;/remarks&gt;
+/// &lt;remarks&gt;Supports all culture-specific symbols specified by the NumberFormatInfo of the
+/// &lt;see cref="CultureInfo.CurrentCulture"/&gt; at the time this static class is instantiated.
+/// So long as all culture symbols are a single character in length.
+/// TODO: In theory, this class could be made instantiable, take the culture as an argument,
+///       and support changing the culture at runtime in case the file the user is uploading
+///       was generated on a machine with different culture settings.&lt;/remarks&gt;
+/// &lt;remarks&gt;Supports leading negative signs and positive signs, scientific notation,
+/// as well as Infinity, Negative Infinity, and NaN, string representations.&lt;/remarks&gt;
+/// &lt;remarks&gt;A string containing only a negative sign (usually "-") intentionally returns a
+/// value of zero. This is because it's a common representation of 0 in accounting.&lt;/remarks&gt;
+public static bool FastTryParseDouble(string input, out double result)
+{
+    int length = input.Length;
+    if (length &lt;= 0)
+    {
+        result = Double.NaN;
+        return false;
+    }
+    double sign = 1d;
+    int currentIndex = 0;
+    char nextChar = input[0];
+
+    /**************** Sign (+/-) and Special Case String Representations *****************/
+    // Handle all cases where the string does not start with a numeric character
+    if (nextChar &lt; '0' || nextChar &gt; '9')
+    {
+        // Non-numeric 1-character strings must match one of the supported special cases.
+        if (length == 1)
+            return CheckForSpecialCaseDoubleStrings(input, out result);
+        // For anything more than one character, this should be a sign character.
+        if (nextChar == CharNegative)
+            sign = -1d;
+        // The very next character may also be the decimal separator.
+        else if (nextChar == CharDecimalSeparator)
+        {
+            // In this case, we treat the integer part as 0 and skip to the fractional part.
+            result = 0d;
+            goto SkipIntegerPart;
+        }
+        // Finally, unless it was a '+' sign, input must match one of a set of special cases.
+        else if (nextChar != CharPositive)
+            return CheckForSpecialCaseDoubleStrings(input, out result);
+
+        // Once the sign is consumed, advance to the next character for further parsing
+        nextChar = input[unchecked(++currentIndex)];
+        // We must once more check whether the character is numeric before proceeding.
+        if (nextChar &lt; '0' || nextChar &gt; '9')
+        {
+            // If not numeric, at this point, the character can only be a decimal separator
+            // (as in "-.123" or "+.123"), or else it must be part of a special case string
+            // (as in "-∞"). So check for those.
+            if (nextChar != CharDecimalSeparator)
+                return CheckForSpecialCaseDoubleStrings(input, out result);
+            result = 0d;
+            goto SkipIntegerPart;
+        }
+    }
+
+    /********************************** "Integer Part" ***********************************/
+    // Treat all subsequent numeric characters as the "integer part" of the result.
+    // Since we've already checked that the next character is numeric,
+    // We can save 2 ops by initializing the result directly.
+    unchecked
+    {
+        result = nextChar - '0';
+        while (++currentIndex &lt; length)
+        {
+            nextChar = input[currentIndex];
+            if (nextChar &lt; '0' || nextChar &gt; '9') break;
+            result = result * 10d + (nextChar - '0');
+        }
+    }
+
+    // This label and corresponding goto statements is a performance optimization to
+    // allow us to efficiently skip "integer part" parsing in cases like ".123456"
+    // Please don't be mad.
+    SkipIntegerPart:
+
+    // The expected case is that the next character is a decimal separator, however
+    // this section might be skipped in normal use cases (e.g. as in "1e18")
+    // TODO: If we broke out of the while loop above due to reaching the end of the
+    //       string, this operation is superfluous. Is there a way to skip it?
+    if (nextChar == CharDecimalSeparator)
+    {
+        /******************************* "Fractional Part" *******************************/
+        // Track the index at the start of the fraction part.
+        unchecked
+        {
+            int fractionPos = ++currentIndex;
+            // Continue shifting and adding to the result as before
+            do
+            {
+                nextChar = input[currentIndex];
+                // Note that we flip the OR here, because it's now more likely that
+                // nextChar &gt; '9' ('e' or 'E'), leading to an early exit condition.
+                if (nextChar &gt; '9' || nextChar &lt; '0') break;
+                result = result * 10d + (nextChar - '0');
+            } while (++currentIndex &lt; length);
+
+            // Update this to store the number of digits in the "fraction part".
+            // We will use this to adjust down the magnitude of the double.
+            fractionPos = currentIndex - fractionPos;
+            // Use our tiny array of negative powers of 10 if possible, but fallback to
+            // our larger array (still fast), whose higher indices store negative powers.
+            // Finally, while practically unlikely, ridiculous strings (&gt;300 characters)
+            // can still be supported with a final fallback to native Math.Pow
+            // TODO: Is it possible to combine this magnitude adjustment with any
+            //       applicable adjustment due to scientific notation?
+            result *= fractionPos &lt; NegPow10Length ?
+                NegPow10[fractionPos] : fractionPos &lt; MaxDoubleExponent ?
+                Pow10[MaxDoubleExponent + fractionPos] : Math.Pow(10, -fractionPos);
+        }
+    }
+
+    // Apply the sign now that we've added all digits that belong to the significand
+    result *= sign;
+    // If we have consumed every character in the string, return now.
+    if (currentIndex &gt;= length) return true;
+
+    // The next character encountered must be an exponent character
+    if (nextChar != 'e' &amp;&amp; nextChar != 'E')
+        return false;
+
+    /**************************** "Scientific Notation Part" *****************************/
+    unchecked
+    {
+        // If we're at the end of the string (last character was 'e' or 'E'), that's an error
+        if (++currentIndex &gt;= length) return false;
+        // Otherwise, advance the current character and begin parsing the exponent
+        nextChar = input[currentIndex];
+        bool exponentIsNegative = false;
+        // The next character can only be a +/- sign, or a numeric character
+        if (nextChar &lt; '0' || nextChar &gt; '9')
+        {
+            if (nextChar == CharNegative)
+                exponentIsNegative = true;
+            else if (nextChar != CharPositive)
+                return false;
+            // Again, require there to be at least one more character in the string after the sign
+            if (++currentIndex &gt;= length) return false;
+            nextChar = input[currentIndex];
+            // And verify that this next character is numeric
+            if (nextChar &lt; '0' || nextChar &gt; '9') return false;
+        }
+
+        // Since we know the next character is a digit, we can initialize the exponent int
+        // directly and avoid 2 wasted ops (multiplying by and adding to zero).
+        int exponent = nextChar - '0';
+        // Shift and add any additional digit characters
+        while (++currentIndex &lt; length)
+        {
+            nextChar = input[currentIndex];
+            // If we encounter any non-numeric characters now, it's definitely an error
+            if (nextChar &lt; '0' || nextChar &gt; '9') return false;
+            exponent = exponent * 10 + nextChar - '0';
+        }
+        // Apply the exponent. If negative, our index jump is a little different.
+        if (exponentIsNegative)
+            result *= exponent &lt; Pow10Length - MaxDoubleExponent ?
+                // Fallback to Math.Pow if the lookup array doesn't cover it.
+                Pow10[exponent + MaxDoubleExponent] : Math.Pow(10, -exponent);
+        // If positive, our array covers all possible positive exponents - ensure its valid.
+        else if (exponent &gt; MaxDoubleExponent)
+            return false;
+        else
+            result *= Pow10[exponent];
+    }
+    // Doubles that underwent scientific notation parsing should be checked for overflow
+    // (Otherwise, this isn't really a risk we don't expect strings of &gt;308 characters)
+    return !Double.IsInfinity(result);
+}
+
+/// &lt;summary&gt;Checks if the string matches one of a few supported special case
+/// double strings. If so, assigns the result and returns true.&lt;/summary&gt;
+public static bool CheckForSpecialCaseDoubleStrings(string input, out double result)
+{
+    if (input == NumberFormat.PositiveInfinitySymbol)
+        result = Double.PositiveInfinity;
+    else if (input == NumberFormat.NegativeInfinitySymbol)
+        result = Double.NegativeInfinity;
+    else if (input == NumberFormat.NaNSymbol)
+        result = Double.NaN;
+    // Special Case: Excel has been known to format zero as "-".
+    // We intentionally support it by returning zero now (most parsers would not)
+    else if (input == NumberFormat.NegativeSign)
+        result = 0d;
+    // Special Case: Our organization treats the term "Unlimited" as referring
+    // to Double.MaxValue (most parsers would not)
+    else if (input.Equals("unlimited", StringComparison.OrdinalIgnoreCase))
+        result = Double.MaxValue;
+    // Anything else is not a valid input
+    else
+    {
+        result = Double.NaN;
+        return false;
+    }
+    return true;
+}
+
+/// &lt;summary&gt;The largest exponent (or smallest when negative) that can be given to a Double.&lt;/summary&gt;
+private const int MaxDoubleExponent = 308;
+
+/// &lt;summary&gt;The number of elements that will be generated in the Pow10 array.&lt;/summary&gt;
+private const int Pow10Length = MaxDoubleExponent * 2 + 1;
+
+/// &lt;summary&gt;A cache of all possible positive powers of 10 that might be required to
+/// apply an exponent to a double (Indices 0-308), as well as the first 308 negative
+/// exponents. (Indices 309-616)&lt;/summary&gt;
+private static readonly double[] Pow10 =
+    Enumerable.Range(0, MaxDoubleExponent + 1).Select(i =&gt; Math.Pow(10, i))
+        .Concat(Enumerable.Range(1, MaxDoubleExponent).Select(i =&gt; Math.Pow(10, -i)))
+        .ToArray();
+
+/// &lt;summary&gt;The number of negative powers to pre-compute and store in a small array.&lt;/summary&gt;
+private const int NegPow10Length = 16;
+
+/// &lt;summary&gt;A cache of the first 15 negative powers of 10 for quick
+/// magnitude adjustment of common parsed fractional parts of doubles.&lt;/summary&gt;
+/// &lt;remarks&gt;Even though this overlaps with the Pow10 array, it is kept separate so that
+/// users that don't use scientific notation or extremely long fractional parts
+/// might get a speedup by being able to reference the smaller array, which has a better
+/// chance of being served out of L1/L2 cache.&lt;/remarks&gt;
+private static readonly double[] NegPow10 =
+    Enumerable.Range(0, NegPow10Length).Select(i =&gt; Math.Pow(10, -i)).ToArray();
+</code></pre>
+<p>This new method matches all of the following test cases:</p>
+<pre><code>// Numbers without a fractional part
+TestSuccess("0", 0d);
+TestSuccess("1", 1d);
+TestSuccess("-1", -1d);
+TestSuccess("12345678901234", 12345678901234d);
+TestSuccess("-12345678901234", -12345678901234d);
+// Numbers with a fractional part
+TestSuccess("123.45678", 123.45678);
+TestSuccess("-123.45678", -123.45678);
+// Numbers without an integer part
+TestSuccess(".12345678901234", 0.12345678901234);
+TestSuccess("-.12345678901234", -0.12345678901234);
+// Various high-precision numbers
+TestSuccess("0.12345678901234", 0.12345678901234);
+TestSuccess("-0.12345678901234", -0.12345678901234);
+TestSuccess("0.00000987654321", 0.00000987654321);
+TestSuccess("-0.00000987654321", -0.00000987654321);
+TestSuccess("1234567890123.0123456789", 1234567890123.0123456789);
+TestSuccess("-1234567890123.0123456789", -1234567890123.0123456789);
+// Numbers with very long fractional parts (more than 16 characters)
+TestSuccess("0.00826499999979784", 0.00826499999979784);
+TestSuccess("-0.00826499999979784", -0.00826499999979784);
+TestSuccess("1.0123456789012345678901234567890", 1.0123456789012345678901234567890);
+TestSuccess("-1.0123456789012345678901234567890", -1.0123456789012345678901234567890);
+// Numbers with a leading positive sign
+TestSuccess("+1", 1d);
+TestSuccess("+12345678901234", 12345678901234d);
+TestSuccess("+.12345678901234", 0.12345678901234);
+TestSuccess("+0.00826499999979784", 0.00826499999979784);
+// Very large numbers without scientific notation
+TestSuccess("123456789000000000000000", 123456789000000000000000d);
+TestSuccess("-123456789000000000000000", -123456789000000000000000d);
+// Very small numbers without scientific notation
+TestSuccess("0.00000000000000000123456789", 0.00000000000000000123456789);
+TestSuccess("-0.00000000000000000123456789", -0.00000000000000000123456789);
+// Scientific notation without a sign
+TestSuccess("1.2345678e5", 1.2345678e5);
+TestSuccess("1.2345678e5", 1.2345678e5);
+TestSuccess("-1.2345678e5", -1.2345678e5);
+// Scientific notation with a sign
+TestSuccess("1.2345678e+25", 1.2345678e25);
+TestSuccess("-1.2345678e+25", -1.2345678e25);
+TestSuccess("1.2345678e-255", 1.2345678e-255);
+TestSuccess("-1.2345678e-255", -1.2345678e-255);
+// Epsilon, and other tiny doubles
+// TODO: Known "failure" scenarios. Our parsing logic results in a return value of 0
+// for these, but the native parser returns Double.Epsilon (smallest number greater
+// than zero). I think we can live with this shortcoming.
+//TestSuccess("4.94065645841247e-324", 4.94065645841247e-324);
+//TestSuccess("-4.94065645841247e-324", -4.94065645841247e-324);
+TestSuccess("3.33E-333", 3.33E-333);
+TestSuccess("-3.33E-333", -3.33E-333);
+TestSuccess("1E-1022", 1E-1022);
+TestSuccess("-1E-1022", -1E-1022);
+// Boundary cases
+TestSuccess("1e0", 1);
+TestSuccess("1e1", 10);
+TestSuccess("1e-1", 0.1);
+TestSuccess("1e-308", 1e-308);
+TestSuccess("1e308", 1e308);
+// Min and Max Double
+TestSuccess("1.7976931348623157E+308", 1.7976931348623157E+308);
+TestSuccess("-1.7976931348623157E+308", -1.7976931348623157E+308);
+// Large Negative Exponents (Near-epsilon) doubles.
+TestSuccess("1.23E-999", 1.23E-999);
+TestSuccess("-1.23E-999", -1.23E-999);
+// Special keywords
+TestSuccess("∞", Double.PositiveInfinity);
+TestSuccess("-∞", Double.NegativeInfinity);
+TestSuccess("NaN", Double.NaN);
+// Special case: "Unlimited" is used in our organization to refer to Double.MaxValue
+TestSuccess("Unlimited", Double.MaxValue);
+// Special case: "-" character only means zero in accounting formats.
+TestSuccess("-", 0d);
+</code></pre>
+<p><strong>Benchmark Results</strong></p>
+<p>Using a <code>Stopwatch</code> this time, and ran with 1,000,000,000 (a billion) strings just to quell any debate about timing sensitivity:</p>
+<blockquote>
+<p>Native parser took 26220 ms.</p>
+<p>Custom parser took 6471 ms.</p>
+<p>Performance gain was 305.19%</p>
+</blockquote>
+    </div>

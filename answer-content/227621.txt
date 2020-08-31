@@ -1,0 +1,286 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2><code>File</code> class:</h2>
+
+<pre><code>rw_s(T &amp;value, size_t arr_size = 1);
+...
+template&lt;typename T&gt; rw_s&lt;T&gt; rw_soft(T &amp;value, size_t arr_size = 1);
+...
+File &amp;read(T *val, size_t data_size = 1);
+</code></pre>
+
+<p>The default size argument is likely to cause problems. I'd suggest separating the interface for reading / writing arrays from single values. </p>
+
+<ul>
+<li>Reading / writing a single value can be done by taking a reference argument and no size argument.</li>
+<li>Reading and writing an array should take both parameters, and not have a default size (because the user will <em>always</em> want to specify it).</li>
+</ul>
+
+<p>They can still use the same underlying implementation.</p>
+
+<hr>
+
+<pre><code>template&lt;class T&gt;
+File &amp;File::operator &gt;&gt; (std::vector&lt;T&gt; &amp;data) {
+    return read(data);
+}
+</code></pre>
+
+<p>These operators are unnecessary duplication of the read and write functions.</p>
+
+<p>Note that the C++ standard streams use <code>operator&gt;&gt;</code> and <code>operator&lt;&lt;</code> for formatted (text) input and output, whereas your file class only does binary input and output. This may cause confusion.</p>
+
+<p><code>std::vector</code> is only one type of container, and users are likely to require support for data structures or their own custom classes. It might be better to implement the stream operators as free functions rather than member functions. That would allow users to specify their own custom versions. All these implementations can then use the <code>read()</code> and <code>write()</code> member functions (or other stream operators).</p>
+
+<hr>
+
+<pre><code>    file_ptr.read((char *)(val), sizeof(T) * data_size); // note: missing reinterpret_cast?
+    file_ptr.read(reinterpret_cast&lt;char *&gt;(val.data()), sizeof(T) * val.size());
+    file_ptr.read(reinterpret_cast&lt;char *&gt;(val.data()), sizeof(T) * val.size());
+    file_ptr.write(reinterpret_cast&lt;const char *&gt;(val), sizeof(T) * data_size);
+</code></pre>
+
+<p>T must be a trivially copyable type for these to work. I suggest adding a <code>static_assert(std::is_trivially_copyable_v&lt;T&gt;, ..."");</code></p>
+
+<hr>
+
+<pre><code>template&lt;class T&gt;
+File &amp;File::read(std::vector&lt;T&gt; &amp;val) {
+    if (!is_file_ready(0)) {
+        return *this;
+    }
+    open(read_flags, FileAction::READ);
+    std::lock_guard&lt;std::mutex&gt; guard(read_write_mutex);
+
+    file_ptr.read(reinterpret_cast&lt;char *&gt;(val.data()), sizeof(T) * val.size());
+
+    update_rwm();
+    return *this;
+}
+
+template&lt;typename T&gt;
+File &amp;File::write(const std::vector&lt;T&gt; &amp;val) {
+    if (!is_file_ready(0)) {
+        return *this;
+    }
+    open(write_flags, FileAction::WRITE);
+    std::lock_guard&lt;std::mutex&gt; guard(read_write_mutex);
+
+    file_ptr.write(reinterpret_cast&lt;const char *&gt;(val.data()), sizeof(T) * val.size());
+
+    update_rwm();
+    return *this;
+}
+</code></pre>
+
+<p>One often uses a dynamic container like <code>std::vector</code> when one does not know the required size in advance. It would be more helpful to store the size of the vector too, instead of forcing users to deal with this themselves.</p>
+
+<hr>
+
+<pre><code>    template&lt;class T&gt;
+    File &amp;read(T *val, size_t data_size = 1);
+</code></pre>
+
+<p>Note that even basic types are different sizes on different platforms, and may be big or little endian. This may not matter to you right now, but it does make your read and write implementations inherently dangerous.</p>
+
+<p>A safer interface would ensure that the user specifies the size of the type they wish to write, and convert to a specific endianness before writing (and do the opposite for reading).</p>
+
+<hr>
+
+<pre><code>File::File(const std::string &amp;file_name, bool exceptions, const std::string &amp;file_path) {
+    name = file_name;
+    path = file_path;
+    is_ready = !name.empty();
+    use_exceptions = exceptions;
+    is_open = false;
+    file_mode = FileMode::OPEN_IN_ACTION;
+    read_write_mode = ReadWriteMode::DONE;
+    file_action = FileAction::NONE;
+    write_flags = std::ios::out | std::ios::binary | std::ios::in;
+    read_flags = std::ios_base::in;
+}
+</code></pre>
+
+<p>Prefer to use a constructor initializer-list, instead of initializing members in the body of the constructor, so that initialization only happens once:</p>
+
+<pre><code>File::File(const std::string &amp;file_name, bool exceptions, const std::string &amp;file_path):
+    is_ready(!file_name.empty()),
+    name(file_name),
+    path(file_path),
+    ...
+</code></pre>
+
+<hr>
+
+<p><code>is_ready</code> and <code>is_open</code> are unnecessary duplication. We could instead write them as functions that return <code>!name.empty()</code> and <code>file_ptr.is_open()</code>.</p>
+
+<hr>
+
+<pre><code>File::~File() {
+    std::lock_guard&lt;std::mutex&gt; guard(read_write_mutex);
+    close();
+}
+</code></pre>
+
+<p>Shouldn't the guard be inside the <code>close</code> function, since the user can call <code>close</code> themselves?</p>
+
+<hr>
+
+<pre><code>    std::string get_name();
+    bool is_file_ready();
+    // ... and others
+</code></pre>
+
+<p>Member functions that don't change member data must be <code>const</code>.</p>
+
+<hr>
+
+<pre><code>    bool is_file_ready(int);
+</code></pre>
+
+<p>Use a function with a different name (e.g. <code>throw_if_not_ready</code>), instead of an unused <code>int</code> parameter.</p>
+
+<hr>
+
+<pre><code>    void init_read_write_mode(const ReadWriteMode &amp;mode, int multiple_times = -1);
+</code></pre>
+
+<p>This function does not really do any "initialization". Perhaps <code>set_...</code> would be better.</p>
+
+<hr>
+
+<pre><code>void File::set_name(const std::string &amp;new_name)
+</code></pre>
+
+<p>It's extremely inconsistent and confusing to allow the user to change this while a file is open! The same issue exists with several other functions in the class.</p>
+
+<hr>
+
+<pre><code>File &amp;File::operator=(const std::string &amp;new_name) {
+    set_name(new_name);
+    return *this;
+}
+</code></pre>
+
+<p>A file name string is not logically a file. This is unnecessary duplication of <code>set_name</code>.</p>
+
+<hr>
+
+<pre><code>    void init_write_flags(std::ios_base::openmode write_flags = std::ios::out | std::ios::binary | std::ios::in);
+</code></pre>
+
+<p>Why <code>in</code> for writing?</p>
+
+<hr>
+
+<pre><code>void File::open(std::ios_base::openmode mode_flags, const FileAction &amp;new_file_action)
+</code></pre>
+
+<p><code>FileAction</code> should probably be determined by checking the flags. As it is, we have duplicate information that could be inconsistent.</p>
+
+<hr>
+
+<h2><code>FilesManager</code> class:</h2>
+
+<pre><code>std::map&lt;std::string, std::shared_ptr&lt;File&gt;&gt; files;
+</code></pre>
+
+<p>The file ownership is not shared with anything, so we have no reason to use a <code>shared_ptr</code>.</p>
+
+<hr>
+
+<pre><code>    std::string files_path;
+</code></pre>
+
+<p>It turns out we are setting the <code>path</code> member of <code>File</code> to this same value for every single file! That's a huge amount of unnecessary duplication.</p>
+
+<hr>
+
+<pre><code>void FilesManager::operator+=(const add_data &amp;data) {
+    add(std::get&lt;0&gt;(data), std::get&lt;1&gt;(data));
+}
+
+File &amp;FilesManager::operator[](const std::string &amp;id) {
+    return get(id);
+}
+
+void FilesManager::operator-=(const std::string &amp;id) {
+    remove(id);
+}
+</code></pre>
+
+<p>We're duplicating code here, and also adding complexity with the <code>add_data</code> struct. Generally in C++ we should avoid overloading operators, unless it's for very common and unambiguous mathematical operations.</p>
+
+<p>We would expect const versions of <code>get()</code> and <code>operator[]</code>. The behavior of adding a missing file is very surprising for a <code>get()</code> function.</p>
+
+<hr>
+
+<pre><code>void FilesManager::remove_unusable_files()
+</code></pre>
+
+<p>This function seems to be called whenever we access or do anything with the files. It would be simpler to just avoid storing any unusable files in the first place.</p>
+
+<hr>
+
+<pre><code>void FilesManager::add(const std::string &amp;id, const std::string &amp;file)
+File &amp;FilesManager::get(const std::string &amp;id)
+void FilesManager::remove(const std::string &amp;id)
+</code></pre>
+
+<p>Do we not call these from different threads? If the <code>File</code> class needs to be thread-safe, doesn't the <code>FilesManager</code> too?</p>
+
+<hr>
+
+<pre><code>void FilesManager::add(const std::string &amp;id, const std::string &amp;file)
+</code></pre>
+
+<p>It seems the user has to know the file name to add it to the <code>FilesManager</code>. In that case, they already have the means to get the filename for a given id, and there is probably no need to store the filename in the <code>File</code>.</p>
+
+<hr>
+
+<h2>Purpose:</h2>
+
+<p>Overall it's unclear what the purpose of any of this code is. It seems a mixture of the following:</p>
+
+<ul>
+<li>Binary IO - this is useful, but the current implementation isn't platform independent, and has other flaws.</li>
+<li>Thread-safe reading and writing - but being thread-safe in itself doesn't really help with anything, and the <code>FileManager</code> isn't thread-safe.</li>
+<li>Associating file paths with ids - but we can do that more clearly with a separate map.</li>
+<li>Some sort of automatic file opening and closing system - but we can do that better with simple RAII (<code>std::fstream</code> file handles close the file when the handle goes out of scope - the user can simply hold the handle for as long as they need).</li>
+</ul>
+
+<hr>
+
+<h2>Writing binary data:</h2>
+
+<p>Utilities for writing binary data are definitely helpful. But we can implement these around the existing <code>std::ostream</code> and <code>std::istream</code> through a simpler interface:</p>
+
+<pre><code>enum class Endian { Big, Little };
+
+void WriteBinary(std::ostream&amp; stream, Endian endian, bool value);
+void WriteBinary(std::ostream&amp; stream, Endian endian, char value);
+void WriteBinary(std::ostream&amp; stream, Endian endian, signed char value);
+void WriteBinary(std::ostream&amp; stream, Endian endian, unsigned char value);
+// ... (same for other pod types)
+
+void ReadBinary(std::istream&amp; stream, Endian endian, bool&amp; value);
+// ... (similar for reading)
+</code></pre>
+
+<p>Note that correct platform independence is quite difficult. Internally these functions would need to:</p>
+
+<ul>
+<li>Decide on a fixed number of bits to write for each type (and handle issues with types being different sizes on different platforms).</li>
+<li>Use <code>std::memcpy</code> to convert to the unsigned type of the corresponding fixed size.</li>
+<li>Change the byte order from system endianness to the output endianness (if needed).</li>
+<li>Finally call stream.write();</li>
+</ul>
+
+<p>We (or users of the library) can extend this by defining similar functions for custom types:</p>
+
+<pre><code>template&lt;class T&gt;
+void WriteBinary(std::ostream&amp; stream, Endian endian, std::vector&lt;T&gt; const&amp; value);
+
+template&lt;class KeyT, class ValueT, class PredicateT, class AllocatorT&gt;
+void WriteBinary(std::ostream&amp; stream, Endian endian, std::std::map&lt;KeyT, ValueT, PredicateT, AllocatorT&gt; const&amp; value);
+</code></pre>
+    </div>

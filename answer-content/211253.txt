@@ -1,0 +1,155 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Undefined type</h1>
+
+<p>We use <code>size_t</code> with no definition.  It seems like we want to use <code>std::size_t</code>, in which case, we need a suitable include, such as <code>&lt;cstddef&gt;</code>.</p>
+
+<p>We also need to include <code>&lt;utility&gt;</code> for <code>std::move()</code> and <code>&lt;stdexcept&gt;</code> for <code>std::exception</code>.</p>
+
+<h1>Missing types</h1>
+
+<p>This template accepts only one argument, but a standard vector also has an <code>Allocator</code> template argument (which defaults to <code>std::allocator&lt;T&gt;</code>).  There's quite a lot that will need to be changed to accept and use a provided allocator class.</p>
+
+<p><code>std::vector</code> must provide member types <code>value_​type</code>, <code>allocator_t​ype</code>, <code>size_t​ype</code>, <code>difference_​type</code>, <code>reference</code>, <code>const_​reference</code>, <code>pointer</code>, <code>const_​pointer</code>, <code>reverse_​iterator</code> and <code>const_​reverse_​iterator</code>, but these are all missing from this implementation.</p>
+
+<h1>Missing member functions</h1>
+
+<p>There's no public <code>assign()</code>, <code>at()</code>, <code>data()</code>, <code>empty()</code>, <code>max_​size()</code>, <code>reserve()</code>, <code>shrink_​to_​fit()</code>, <code>clear()</code>, <code>insert()</code>, <code>emplace()</code>, <code>erase()</code>, <code>emplace_​back()</code>, <code>resize()</code> or <code>swap()</code> members.  Were also missing the const/reverse versions of <code>begin()</code> and <code>end()</code>, such as <code>rbegin()</code> and <code>crend()</code>.</p>
+
+<h1>Constructors and assignment</h1>
+
+<p>We're missing the initializer-list versions of the constructor and assignment operator.</p>
+
+<p>The line lengths are very long - consider using a separate line for each initializer, like this:</p>
+
+<pre><code>template&lt;typename Ty&gt;
+vector&lt;Ty&gt;::vector()
+    : buffer(new Ty[10]),
+      m_first(buffer),
+      m_last(buffer),
+      m_end(buffer + 10)
+{
+}
+</code></pre>
+
+<p>I'm not sure where the magic number <code>10</code> comes from in the above - it's probably worth defining a private constant <code>default_initial_capacity</code> for this.</p>
+
+<p>The constructor that accepts a single <code>count</code> argument fails to initialize its elements (<code>std::vector&lt;int&gt;(5)</code> will create a vector containing five zeros, but our equivalent will have five uninitialized values, which may well cause bugs).  This could be avoided by delegating to <code>vector(count, T{})</code>.  We should also check for a size of zero and either avoid allocating, or round up to our default capacity in that case.</p>
+
+<p>The <code>(count, val)</code> constructor won't compile, as it attempts to modify <code>const count</code>.  We could make <code>count</code> mutable, but I think we should simply use <code>std::fill()</code> (from <code>&lt;algorithm&gt;</code>):</p>
+
+<pre><code>template&lt;typename Ty&gt;
+vector&lt;Ty&gt;::vector(const std::size_t count, const Ty&amp; val)
+    : buffer(new Ty[count]),
+      m_first(buffer),
+      m_last(buffer + count),
+      m_end(buffer + count)
+{
+    std::fill(m_first, m_last, val);
+}
+</code></pre>
+
+<p>Copy constructor could usefully shrink to fit, using the size rather than the capacity of the source vector to determine the new vector's capacity:</p>
+
+<pre><code>template&lt;typename Ty&gt;
+vector&lt;Ty&gt;::vector(const vector&amp; other)
+    : buffer(new Ty[other.size()]),
+      m_first(buffer),
+      m_last(buffer + other.size()),
+      m_end(m_last)
+{
+    std::copy(other.m_first, other.m_last, m_first);
+}
+</code></pre>
+
+<p>Again, I use a standard algorithm to avoid hand-coding my own loop.</p>
+
+<p>Move-construction and move-assignment are most easily implemented using <code>swap()</code>:</p>
+
+<pre><code>template&lt;typename Ty&gt;
+vector&lt;Ty&gt;::vector(vector&amp;&amp; other)
+    : vector()
+{
+    swap(other);
+}
+
+template&lt;typename Ty&gt;
+vector&lt;Ty&gt;&amp; vector&lt;Ty&gt;::operator=(vector&lt;Ty&gt;&amp;&amp; other)
+{
+    swap(other);
+    return *this;
+}
+</code></pre>
+
+<p>It certainly looks wrong to explicitly call the destructor in the assignment operator.  All we're using it for is to <code>delete[] buffer</code>, so just do that.  Better still, use the copy-and-swap idiom:</p>
+
+<pre><code>template&lt;typename Ty&gt;
+vector&lt;Ty&gt;&amp; vector&lt;Ty&gt;::operator=(const vector&lt;Ty&gt;&amp; other)
+{
+    swap(vector&lt;Ty&gt;(other)); // copy and swap
+    return *this;
+}
+</code></pre>
+
+<h1>Destructor</h1>
+
+<p>There's no need to assign <code>nullptr</code> to the members - they are about to go out of scope, so can't be accessed after the destructor finishes.  Also, there's no need to test that <code>buffer</code> is non-null, for two reasons: first, our logic never allows a non-null buffer to exist, and secondly, <code>delete[]</code> will happily do nothing if its argument is null.</p>
+
+<h1>Modifiers</h1>
+
+<p>Look at <code>push_back()</code>:</p>
+
+<blockquote>
+<pre><code>template&lt;typename Ty&gt;
+void vector&lt;Ty&gt;::push_back(const Ty&amp; val) {
+    if (size() &lt; capacity()) {
+        *(m_last++) = val;
+        return;
+    }
+    realloc(2, 2);
+    *(m_last++) = val;
+}
+</code></pre>
+</blockquote>
+
+<p>See how <code>*(m_last++) = val;</code> is common to both paths?  We can reorder the test so that we don't duplicate that; to my eyes at least, that makes a more natural expression ("ensure there's room, then add the element"):</p>
+
+<pre><code>template&lt;typename Ty&gt;
+void vector&lt;Ty&gt;::push_back(const Ty&amp; val)
+{
+    if (capacity() &lt;= size()) {
+        realloc(2, 2);
+    }
+    *(m_last++) = val;
+}
+</code></pre>
+
+<p>Once <code>rbegin()</code> is implemented, <code>back()</code> can be re-written to use that rather than doing arithmetic on the result of <code>end()</code>.</p>
+
+<h1>Exceptions</h1>
+
+<p><code>std::exception</code> has no constructor that accepts a string literal - we need to use a more specific sub-class, such as <code>std::out_of_range</code>.  We should consider whether we have range-checking at all, outside of methods such as <code>at()</code> which mandate it - standard C++ practice is to impose minimum overhead unless it's asked for.</p>
+
+<h1>Private members</h1>
+
+<p>Mostly looks okay, though <code>alloc</code> could be improved using <code>std::move()</code> algorithm instead of a hand-written copy loop, and simple <code>delete[] buffer</code> instead of calling destructor, as described above.  It's also wise to allow this function to shrink the buffer; we'll need that for some of the as-yet-unimplemented code:</p>
+
+<pre><code>template&lt;typename Ty&gt;
+void vector&lt;Ty&gt;::alloc(const std::size_t cap) {
+    Ty* new_buffer = new Ty[cap];
+    auto sz = size();
+    if (sz &lt; cap) {
+        sz = cap;
+    }
+    std::move(m_first, m_first + sz, new_buffer);
+    delete[] buffer;
+    buffer = new_buffer;
+    m_first = buffer;
+    m_last = buffer + sz;
+    m_end = buffer + cap;
+}
+</code></pre>
+
+<h1>Redundant member</h1>
+
+<p>Is there any need for separate <code>buffer</code> and <code>m_first</code> members?  They have the same type, and as far as I can see, they always hold the same value.</p>
+    </div>

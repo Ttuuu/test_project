@@ -1,0 +1,87 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Easy Stuff you already know.</h2>
+
+<p>Probably part of your automated scripts to build new files.</p>
+
+<pre><code>#pragma once
+</code></pre>
+
+<p>But for new comers I would point out the more standard include guards are compatible everywhere.</p>
+
+<h2>Don't be lazy</h2>
+
+<pre><code>         std::lock_guard&lt;xtd::fast_recursive_mutex&gt; _(m_mutex);
+</code></pre>
+
+<p>Though not technically wrong as an identifier (<code>_</code>). How many people do you think know the rules about them that well? Also you use <code>lk</code> nearly everywhere else, why change up the style right at the end?</p>
+
+<h2>Opinion based Comments</h2>
+
+<p>When you have standard constructor/destructor but you disable copying, then I would group them that way as well. I would put the constructor/destructor together and then the copy operators together:</p>
+
+<pre><code>shared_mutex() = default;
+shared_mutex(const shared_mutex&amp;) = delete;
+~shared_mutex() = default;
+
+shared_mutex&amp; operator = (const shared_mutex&amp;) = delete;
+</code></pre>
+
+<p>I would have done this:</p>
+
+<pre><code>shared_mutex() = default;
+~shared_mutex() = default;
+
+// Disable copy semantics.
+shared_mutex(const shared_mutex&amp;) = delete;
+shared_mutex&amp; operator = (const shared_mutex&amp;) = delete;
+</code></pre>
+
+<h2>Don't like your state</h2>
+
+<p>You combine two pieces of state into a single variable <code>m_state</code>. Which makes reading the code harder. Optimize for readability or put some more comments around the code here:</p>
+
+<p>It took me a few minutes to work out what you are achieving here. A nice comment would have been nice.</p>
+
+<pre><code>            static const unsigned m_write_entered = 1U &lt;&lt; (sizeof(unsigned)*CHAR_BIT - 1);
+            static const unsigned m_num_readers = ~m_write_entered;
+                            //    ^^^^^^^^^^^^^  don't like that name it needs "max" in it.
+</code></pre>
+
+<p>Basically, you use these constants to help combine the state into <code>m_state</code> where the top bit is used to indicate an exclusive lock and all the other bits are used to count the number of shared locks.</p>
+
+<h2>Bug</h2>
+
+<pre><code>bool shared_mutex_base::no_one_has_any_lock() const { return m_state != 0; }
+                                                                    ^^^^ Should that not be `==`?
+</code></pre>
+
+<h2>Issue</h2>
+
+<p>You use <code>m_exclusive_release</code> for threads waiting for an exclusive lock in <code>do_exclusive_lock()</code> and as an overflow list for threads trying to get a shared lock in <code>do_lock_shared()</code>. Depending on your semantics on the priority of exclusive locks this may not work as you intended.</p>
+
+<p>I would expect threads waiting for an exclusive locks to get priority over those waiting for a shared locks; but any waiting thread has an equal opportunity to grab a lock when the current exclusive lock releases.</p>
+
+<p>Thus several, but not necessarily all, threads waiting for shared locks may be able to get locks before the thread needing an exclusive lock gets an opportunity to grab the lock. Thus the exclusive lock may need to wait again.</p>
+
+<p>Scenario:</p>
+
+<ul>
+<li>We have a lot of threads with shared locks and reached the maximum.</li>
+<li>We add one (or a couple) more shared_locks.<br>
+These are queued up on <code>m_exclusive_release</code>.</li>
+<li>We now have a thread that wants an exclusive lock and gets it.<br>
+Now waiting on <code>m_shared_release</code> for all the shared locks to be released.</li>
+<li>We now have a thread that wants an exclusive lock (but it is already taken).<br>
+So this thread is put on the <code>m_exclusive_release</code> list (with one or more threads waiting for a shared lock).</li>
+</ul>
+
+<p>As the threads with shared locks finish their work they call <code>do_unlock_shared()</code> until there are no more shared locks left. This forces a call to <code>m_shared_release.notify_one();</code> and the first thread with an exclusive lock (waiting on <code>m_shared_release</code>) is released and runs normally until it releases the lock with a call to <code>unlock()</code> which calls <code>m_exclusive_release.notify_all();</code>. This releases all the threads attempting to get a shared_lock <strong>and</strong> all the threads attempts to get an exclusive lock. You can not tell which thread will get a lock first so it is random if an exclusive lock is next to get the lock.</p>
+
+<p>Because of this exclusive locks may be starved of resources as they may have to wait for shared locks to be released twice before they get the opportunity to run.</p>
+
+<p>I am pretty sure you will never deadlock or actually prevent an exclusive lock from happening but I don't see this as favorable behavior.</p>
+
+<h2>Design</h2>
+
+<p>Would the shared locking not work the same on both <code>shared_mutex</code> and <code>recursive_shared_mutex</code>? Could you not push that code into a shared base class?</p>
+    </div>

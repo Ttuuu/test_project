@@ -1,0 +1,175 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'd like to recommend condensing some of your script so that it is easier on the eyes.</p>
+
+<p>This:</p>
+
+<pre><code>if($location) {
+    $locations = [];
+    if(is_array($location)) {
+        foreach ($location as $name) {
+            $locations[] = $name;
+        }
+    } else $locations[] = $location;
+    $jobs = $jobs-&gt;whereMetaIn("location", $locations);
+}
+
+if($employment) {
+    $employments = [];
+    if(is_array($employment)) {
+        foreach ($employment as $name) {
+            $employments[] = $name;
+        }
+    } else $employments[] = $employment;
+    $jobs = $jobs-&gt;withAnyTag($employments);
+}
+</code></pre>
+
+<p>is more simply written as:</p>
+
+<pre><code>if ($location) {
+    $jobs = $jobs-&gt;whereMetaIn("location", (array)$location);
+}
+
+if ($employment) {
+    $jobs = $jobs-&gt;withAnyTag((array)$employment);
+}
+</code></pre>
+
+<p>because casting the input as an array will convert a string into a single-element array.  If the variable is already an array, then nothing changes.</p>
+
+<p>But do you <em>really</em> want to overwrite the <code>$jobs</code> data formed from <code>$location</code>, if <code>$employment</code> is truthy?  Either way that you answer that question, I think an <code>elseif()</code> is in order.</p>
+
+<p>Please be precise with your conditionals.  <code>$jobs == null</code> is more concisely written as <code>!$jobs</code>, but is not the same as <code>$jobs === null</code>.  Likewise regarding <code>$jobsBy != null</code>.</p>
+
+<p>Since <code>$jobs</code> is unconditionally declared, you can omit the <code>isset()</code> check.</p>
+
+<p>Unless I misunderstand, it also feels like a good idea to execute and cache the following as a variable so that it can be used multiple times:</p>
+
+<pre><code>['user' =&gt; function($user) { $user-&gt;without('roles', 'companies')-&gt;select('id', 'name'); }]
+</code></pre>
+
+<p>You should also cache <code>count($jobs)</code> before or within your conditional, so that you are not making the same <code>count()</code> call twice.</p>
+
+<hr>
+
+<p>Some more thoughts after initially posting my review:</p>
+
+<ol>
+<li><p><code>withAnyTag()</code> will happily accept mixed data (string or array).<br>
+<a href="https://github.com/rtconner/laravel-tagging/blob/laravel-5/docs/usage-examples.md" rel="nofollow noreferrer">https://github.com/rtconner/laravel-tagging/blob/laravel-5/docs/usage-examples.md</a></p></li>
+<li><p>When executing method calls on an object, just use the arrow syntax without <code>=</code>.  In other words, you don't need to re-declare <code>$jobs</code> each time.</p></li>
+</ol>
+
+<p>I don't have a Laravel project to play/test with (so there is no guarantee that this will work seamlessly, just consider it a collection of suggestions), but these are some of my thoughts on a script rewrite:</p>
+
+<pre><code>public function search(Request $request)
+{
+    $position = $request-&gt;get("position") ?? null;
+    $location = $request-&gt;get("location") ?? null;
+    $employment = $request-&gt;get("employment") ?? null;
+
+    $jobsBy = null;
+    $jobs = null;
+    if ($position) {
+        $jobs = Job::where('title', 'LIKE', '%' . $position . '%');
+        $jobs-&gt;where('status', '&lt;', 2);
+        if ($location) {
+             $jobs-&gt;whereMetaIn("location", (array)$location);
+        }
+        if ($employment) {
+            $jobs-&gt;withAnyTag($employment);
+        }
+        if ($jobs-&gt;get()-&gt;count()) {
+            $jobsBy = "position";
+        }
+    }
+
+    // if no jobs by position, try with location...
+    if ($location &amp;&amp; !$jobsBy) {
+        $jobs = Job::whereMetaIn('location', (array)$location);
+        $jobs-&gt;where('status', '&lt;', 2);
+        if ($employment) {
+             $jobs-&gt;withAnyTag($employment);
+        }
+        if ($jobs-&gt;get()-&gt;count()) {
+            $jobsBy = "location";
+        }
+    }
+
+    // if no jobs by location, try with employment...
+    if ($employment &amp;&amp; !$jobsBy) {
+        $jobs = Job::withAnyTag($employment);
+        $jobs-&gt;where('status', '&lt;', 2);
+        if ($jobs-&gt;get()-&gt;count()) {
+            $jobsBy = "employment";
+        }
+    }
+
+    // if not jobs, fallback to latest jobs...
+    if (!$jobsBy) {
+        $jobs = Job::where("status", '&lt;', 2);
+        $jobsBy = "latest";
+    }
+
+    if ($jobs !== null &amp;&amp; $jobs instanceof \Illuminate\Database\Eloquent\Builder) {
+        $ids = $jobs-&gt;pluck('id');
+
+        $userFilter = ['user' =&gt; function($user) {
+            $user-&gt;without('roles', 'companies')
+                 -&gt;select('id', 'name');
+        }];
+
+        $partnerCompanyJobs = Job::with($userFilter)
+            -&gt;withCount('views')
+            -&gt;where('type', 0)
+            -&gt;whereIn('id', $ids)
+            -&gt;where('status', 1)
+            -&gt;orderBy('updated_at', 'DESC')
+            -&gt;get();
+
+        $companyJobs = Job::with($userFilter)
+            -&gt;withCount('views')-&gt;where('type', 1)
+            -&gt;where('status', 1)
+            -&gt;whereIn('id', $ids)
+            -&gt;orderBy('updated_at', 'DESC')
+            -&gt;get();
+
+        $sampleJobs = Job::with($userFilter)
+            -&gt;withCount('views')-&gt;where('type', 2)
+            -&gt;where('status', 1)
+            -&gt;whereIn('id', $ids)
+            -&gt;orderBy('updated_at', 'DESC')
+            -&gt;get();
+
+        $somonJobs = Job::withCount('views')
+            -&gt;whereIn('type', [3, 4])
+            -&gt;whereIn('id', $ids)
+            -&gt;where('status', 1)
+            -&gt;orderBy('updated_at', 'DESC')
+            -&gt;get();
+
+        $jobs = $partnerCompanyJobs
+            -&gt;merge($companyJobs)
+            -&gt;merge($sampleJobs)
+            -&gt;merge($somonJobs);
+
+        $jobCount = count($jobs);
+        if ($jobCount) {
+            $page = $request-&gt;page ?? 1;
+            $items = $jobs-&gt;forPage($page, 5);
+            return response()-&gt;json([
+                'data' =&gt; JobResource::collection($items),
+                'total' =&gt; $jobCount,
+                'jobsBy' =&gt; $jobsBy
+            ]);
+        }
+    }
+
+    return response()-&gt;json([
+        'data' =&gt; [],
+        'total' =&gt; 0,
+        'jobsBy' =&gt; ""
+    ]);
+}
+</code></pre>
+    </div>

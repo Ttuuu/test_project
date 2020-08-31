@@ -1,0 +1,169 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Fix for Latex Encoding</h2>
+<p>Thank you to <a href="https://chat.stackexchange.com/users/31162/david-carlisle">David Carlisle</a> for helping me figure out this one.</p>
+<p>The problems encoding <span class="math-container">\$\gamma\$</span> and similar unicode characters arrives not from the <code>latexencode.unicode_to_latex(...)</code> function, but rather from reading in the files incorrectly. Rather than using <code>open(filePath)</code>, <code>open(filePath,encoding="utf-8")</code> should be used to ensure that the unicode characters are read in properly.</p>
+<p>Additionally, this unicode conversion should be applied to the <code>keywords</code> field as this may also contain unicode characters, as shown by the Langhals Example.</p>
+<p>When implemented, this renders a python file, <code>cas2bibtex.py</code> of the form</p>
+ 
+<pre class="lang-py prettyprint-override"><code>r"""Simple sctipt to convert Scifinder refernces for patents into bibtex entries for my customized acspat.bst bibtex style. 
+
+    note: acspat.bst complies with the ACS format as outlined by The ACS Style Guide, 3rd Edition
+
+    usage 
+        python "c:\...\cas2bibtex.py" "c:\...\ref.txt" &gt; "c:\...\ref.bib"
+"""
+
+import sys
+import re
+import inspect
+import httplib2
+import pycountry 
+from datetime import datetime
+from tkinter import Tk
+from tkinter.filedialog import askopenfilename
+from pylatexenc import latexencode
+
+# method to convert patents to bibtex
+def convert_Patent(fields):
+    """Convert the passed dictionary from SciFinder `Tagged Format (*.txt)` to Custom @Patent bibtex entry
+
+    Args:
+        fields (dict): dictionary verions of Scifinder CAS reference sheet
+    """
+
+    assert isinstance(fields, dict)
+    assert fields["Document Type"]=="Patent"
+
+    # ACS spec uses application and publication date interchangably. I am not sure which to use, so the code for both is provided below.
+    pub_date = datetime.strptime(fields["Publication Date"],"%Y%m%d")
+    app_date = datetime.strptime(fields["Patent Application Date"],"%Y%m%d")
+
+    # construct a google patent url from the text file data
+    google_pat_url =("https://patents.google.com/patent/" + 
+            fields["Patent Country"].strip() + 
+            fields["Patent Number"].strip() + 
+            fields["Patent Kind Code"].strip())
+
+    # check if the url is valid, if not, ditch it. store result as url
+    url = google_pat_url if int(httplib2.Http().request(google_pat_url, "HEAD")[0]["status"])&lt;400 else ''
+
+    bib_str = inspect.cleandoc(
+            # Key, abstract and keywords - stuf to make finding the right doc easier when writing
+        r"""@Patent{{{citation_key},
+            abstract    = {{{abstract}}},
+            keywords    = {{{keywords}}},
+            """
+            # Basic Publication Info  
+        r"""author      = {{{author}}},
+            assignee    = {{{assignee}}},
+            title       = {{{title}}},
+            date        = {{{date}}},
+            year        = {{{year}}},
+            month       = {{{month}}},
+            day         = {{{day}}},
+            """
+            # Document info
+        r"""pages       = {{{pages}}},
+            language    = {{{language}}},
+            """
+            # patent-specific info
+        r"""type        = {{{patent_type}}},
+            number      = {{{patent_number}}}, 
+            """
+            # Search-related info
+        r"""CODEN       = {{{CODEN}}},
+            CAS_AN      = {{{accession_number}}},
+            CAS_CAN     = {{{chemical_abstracts_number}}}, 
+            url         = {{{url}}}
+        }}""".format(
+            citation_key                = fields["Inventor Name"].split(maxsplit=1)[0].replace(',','') +
+                                        app_date.strftime("%Y"), 
+            abstract                    = latexencode.unicode_to_latex(fields["Abstract"].strip()),
+            keywords                    = latexencode.unicode_to_latex(fields["Index Terms"]),
+            author                      = fields["Inventor Name"].replace('; '," and "),
+            assignee                    = fields["Patent Assignee"] if 
+                                            pycountry.countries.get(name=fields["Patent Assignee"].strip('()'))==None
+                                            else '',
+            title                       = latexencode.unicode_to_latex(fields["Title"]).title(),
+
+            date                        = app_date.strftime("%Y-%m-%d"),
+            year                        = app_date.strftime("%Y"),
+            month                       = app_date.strftime("%m"),
+            day                         = app_date.strftime("%d"), 
+            
+            pages                       = fields["Page"],
+            language                    = fields["Language"],
+
+            patent_type                 = fields["Journal Title"]   # this holds the abbreviation for patent type
+                                            + '.' if str(fields["Journal Title"]).find('.') &gt; 0 else '',
+                                                                    # period added if the entry is a period - subject to change
+            patent_number               = fields["Patent Number"],
+            
+            CODEN                       = fields["CODEN"],
+            accession_number            = fields["Accession Number"],
+            chemical_abstracts_number   = fields["Chemical Abstracts Number(CAN)"],
+
+            url                         = fields["URL"] if fields["URL"] != '' else url # use the cas specified url, if it exists, else use the url selected above
+            ))
+
+    return(bib_str)
+
+# Main method - runs at execution-time
+def main():
+    """ Check if any command-line arguments for what files to look at are passed, 
+        if not, prompt user for what files to use
+
+        Assert that the file is of the appropriate scifinder format
+
+        extract records, and one by one, convert those records to the bibtex entries 
+        using `convert_Patent()`
+    """
+
+    if len(sys.argv)&lt;2:
+        tk = Tk()
+        tk.withdraw()
+        tk.call('wm', 'attributes', '.', '-topmost', True)
+        files = askopenfilename(title="Choose File(s) to Convert",multiple=True)
+    else:
+        files = sys.argv[1:]
+
+    # Define patterns to seek out the records
+    rec_pattern = r"""START_RECORD\n    # Begins with start record
+                    (?P&lt;Fields&gt;.+?)     # Capture as few lines as possible between 
+                    END_RECORD"""       # Ends with End Record
+    fld_pattern = r"""FIELD\s           # Begins with 
+                    (?P&lt;Key&gt;.+?)\:      # Capture the key (everything before the `:` - newlines excluded)
+                    (?P&lt;Def&gt;.+?)?\.?    # Capture the definition (everything after the `:` - trailing periods excluded)
+                    \n"""               # Ends with a non-optional newline
+
+    # Compile the patterns into regex objects
+    rec_regex = re.compile(rec_pattern, re.VERBOSE | re.MULTILINE | re.DOTALL)
+    fld_regex = re.compile(fld_pattern, re.VERBOSE | re.MULTILINE)
+
+    # iter over all passed files
+    for filePath in files:
+
+        # open and read the file into memory
+        file = open(filePath,encoding="utf-8")
+        fileTxt = file.read()
+        file.close()
+        
+        # find records using regexp and iter over them 
+        for record in rec_regex.findall(fileTxt):
+            # convert the records into dicts
+            fields = dict(fld_regex.findall(record))
+            
+            # decision tree for converting based off of doc type
+            # print result with intention that this can be used 
+            # at the shell and piped into a file
+            if fields["Document Type"]=="Patent":
+                print(convert_Patent(fields))
+            else:
+                print("Attempted to covert file: {}\nHowever, document type &lt;{}&gt; is yet not supported".format(
+                    filePath, fields["Document Type"]))
+
+# Force auto-run of main
+if __name__ == "__main__": main()
+</code></pre>
+<p><a href="https://pastebin.com/Z81JKAyT" rel="nofollow noreferrer">Updated Sample Output</a></p>
+    </div>

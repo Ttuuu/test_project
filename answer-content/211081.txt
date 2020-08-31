@@ -1,0 +1,715 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This covers an interesting topic. Great work!</p>
+
+<p>Because I am unfamiliar with this area, I utilized your unit testing to ensure changes I make did not break functionality. If they do, I apologize and please let me know.</p>
+
+<h2>Utilize implicit repetition and <code>iota</code></h2>
+
+<p>Rather than manually defining the type and value of <code>nCode</code>, <code>aCode</code>, etc. we an implicitly get the value using <a href="https://golang.org/ref/spec#Iota" rel="nofollow noreferrer"><code>iota</code></a>. This also simplifies the assignment of <code>arrayCodeSize</code>.</p>
+
+<pre><code>const (
+    nCode = uint8(0)
+    aCode = uint8(1)
+    cCode = uint8(2)
+    tCode = uint8(3)
+    uCode = uint8(3)
+    gCode = uint8(4)
+
+    stopByte = '*'
+    unknown  = 'X'
+    // Length of the array to store code/bytes
+    // uses gCode because it's the biggest uint8 of all codes
+    arrayCodeSize = (uint32(gCode) | uint32(gCode)&lt;&lt;8 | uint32(gCode)&lt;&lt;16) + 1
+)
+</code></pre>
+
+<p>Becomes:</p>
+
+<pre><code>const (
+    nCode = iota
+    aCode
+    cCode
+    tCode
+    uCode
+    gCode
+
+    stopByte = '*'
+    unknown  = 'X'
+
+    // Length of the array to store code/bytes
+    // uses gCode because it's the biggest of all codes
+    arrayCodeSize = (gCode | gCode&lt;&lt;8 | gCode&lt;&lt;16) + 1
+)
+</code></pre>
+
+<h2>Check <code>error</code> return values</h2>
+
+<p>There are fourteen places in your code where the <code>error</code> return value is unchecked. If this is intentional, it's common practice to assign it to the <a href="https://golang.org/ref/spec#Blank_identifier" rel="nofollow noreferrer">blank identifier</a>: <code>_</code>.</p>
+
+<p>Here is a list of occurrences:</p>
+
+<ul>
+<li><s><code>w.buf.WriteByte()</code> in <code>addByte()</code></s></li>
+<li><s><code>w.buf.WriteByte()</code> in <code>addUnknown()</code></s></li>
+<li><s><code>w.buf.WriteByte()</code> in <code>newLine()</code></s></li>
+<li><s>Many <code>Write</code> and <code>WriteByte</code> calls in <code>Translate()</code></s></li>
+<li><s><code>feeder.idBuffer.Write()</code> and such, in <code>readSequenceFromFasta</code></s></li>
+</ul>
+
+<p><strong>Update:</strong> These always return <code>nil</code>.</p>
+
+<h2>Reduce complexity of <code>Translate()</code></h2>
+
+<p>The <code>Translate()</code> function is complex. It's current cyclomatic complexity is 45. (By the end of this, it's complexity is 27).</p>
+
+<p>I notice that you define a <code>go</code> statement, which acts as a worker. I will leave it up to you to choose a fitting name, but for now "<code>worker()</code>" is sufficient.</p>
+
+<pre><code>func worker(wg *sync.WaitGroup, fnaSequences chan encodedSequence,
+    ctx context.Context, framesToGenerate []int, arrayCode []byte,
+    options Options, reverse bool, out io.Writer, errs chan error,
+    cancel context.CancelFunc) {
+    defer wg.Done()
+
+    startPosition := make([]int, 3)
+
+    w := &amp;writer{
+        buf:            bytes.NewBuffer(nil),
+        bytesToTrim:    0,
+        currentLineLen: 0,
+    }
+
+    for sequence := range fnaSequences {
+
+        select {
+        case &lt;-ctx.Done():
+            return
+        default:
+        }
+
+        frameIndex := 0
+        startPosition[0], startPosition[1], startPosition[2] = 0, 1, 2
+
+        idSize := int(binary.LittleEndian.Uint32(sequence[0:4]))
+        nuclSeqLength := len(sequence) - idSize
+
+    Translate:
+        for _, startPos := range startPosition {
+
+            if framesToGenerate[frameIndex] == 0 {
+                frameIndex++
+                continue
+            }
+
+            // sequence id should look like
+            // &gt;sequenceID_&lt;frame&gt; comment
+            idEnd := bytes.IndexByte(sequence[4:idSize], ' ')
+            if idEnd != -1 {
+                w.buf.Write(sequence[4 : 4+idEnd])
+                w.buf.WriteByte('_')
+                w.buf.WriteByte(suffixes[frameIndex])
+                w.buf.Write(sequence[4+idEnd : idSize])
+            } else {
+                w.buf.Write(sequence[4:idSize])
+                w.buf.WriteByte('_')
+                w.buf.WriteByte(suffixes[frameIndex])
+            }
+            w.newLine()
+
+            // if in trim mode, nb of bytes to trim (nb of successive 'X', '*' and '\n'
+            // from right end of the sequence)
+            w.bytesToTrim = 0
+            w.currentLineLen = 0
+
+            // read the sequence 3 letters at a time, starting at a specific position
+            // corresponding to the frame
+            for pos := startPos + 2 + idSize; pos &lt; len(sequence); pos += 3 {
+
+                if w.currentLineLen == maxLineSize {
+                    w.newLine()
+                }
+                // create an uint32 from the codon, to retrieve the corresponding
+                // AA from the map
+                codonCode := uint32(sequence[pos-2]) | uint32(sequence[pos-1])&lt;&lt;8 | uint32(sequence[pos])&lt;&lt;16
+
+                b := arrayCode[codonCode]
+                if b != byte(0) {
+                    w.addByte(b)
+                } else {
+                    w.addUnknown()
+                }
+            }
+
+            // the last codon is only 2 nucleotid long, try to guess
+            // the corresponding AA
+            if (nuclSeqLength-startPos)%3 == 2 {
+
+                if w.currentLineLen == maxLineSize {
+                    w.newLine()
+                }
+                codonCode := uint32(sequence[len(sequence)-2]) | uint32(sequence[len(sequence)-1])&lt;&lt;8
+
+                b := arrayCode[codonCode]
+                if b != byte(0) {
+                    w.addByte(b)
+                } else {
+                    w.addUnknown()
+                }
+            }
+
+            // the last codon is only 1 nucleotid long, no way to guess
+            // the corresponding AA
+            if (nuclSeqLength-startPos)%3 == 1 {
+                if w.currentLineLen == maxLineSize {
+                    w.newLine()
+                }
+                w.addUnknown()
+            }
+
+            if options.Trim &amp;&amp; w.bytesToTrim &gt; 0 {
+                // remove the last bytesToTrim bytes of the buffer
+                // as they are 'X', '*' or '\n'
+                w.buf.Truncate(w.buf.Len() - w.bytesToTrim)
+                w.currentLineLen -= w.bytesToTrim
+            }
+
+            if w.currentLineLen != 0 {
+                w.newLine()
+            }
+            frameIndex++
+        }
+
+        if reverse &amp;&amp; frameIndex &lt; 6 {
+
+            // get the complementary sequence.
+            // Basically, switch
+            //   A &lt;-&gt; T
+            //   C &lt;-&gt; G
+            // N is not modified
+            for i, n := range sequence[idSize:] {
+
+                switch n {
+                case aCode:
+                    sequence[i+idSize] = tCode
+                case tCode:
+                    // handle both tCode and uCode
+                    sequence[i+idSize] = aCode
+                case cCode:
+                    sequence[i+idSize] = gCode
+                case gCode:
+                    sequence[i+idSize] = cCode
+                default:
+                    //case N -&gt; leave it
+                }
+            }
+            // reverse the sequence
+            for i, j := idSize, len(sequence)-1; i &lt; j; i, j = i+1, j-1 {
+                sequence[i], sequence[j] = sequence[j], sequence[i]
+            }
+
+            if !options.Alternative {
+                // Staden convention: Frame -1 is the reverse-complement of the sequence
+                // having the same codon phase as frame 1. Frame -2 is the same phase as
+                // frame 2. Frame -3 is the same phase as frame 3
+                //
+                // use the matrix to keep track of the forward frame as it depends on the
+                // length of the sequence
+                switch nuclSeqLength % 3 {
+                case 0:
+                    startPosition[0], startPosition[1], startPosition[2] = 0, 2, 1
+                case 1:
+                    startPosition[0], startPosition[1], startPosition[2] = 1, 0, 2
+                case 2:
+                    startPosition[0], startPosition[1], startPosition[2] = 2, 1, 0
+                }
+            }
+            // run the same loop, but with the reverse-complemented sequence
+            goto Translate
+        }
+
+        if w.buf.Len() &gt; maxBufferSize {
+            _, err := out.Write(w.buf.Bytes())
+            if err != nil {
+                select {
+                case errs &lt;- fmt.Errorf("fail to write to output file: %v", err):
+                default:
+                }
+                cancel()
+                return
+            }
+            w.buf.Reset()
+        }
+        pool.Put(sequence)
+    }
+
+    if w.buf.Len() &gt; 0 {
+        _, err := out.Write(w.buf.Bytes())
+        if err != nil {
+            select {
+            case errs &lt;- fmt.Errorf("fail to write to output file: %v", err):
+            default:
+            }
+            cancel()
+            return
+        }
+    }
+}
+</code></pre>
+
+<p>But that's a ton of arguments for the worker, can more be done? Sure! But first, let's get rid of <code>goto</code>.</p>
+
+<h2><code>goto</code></h2>
+
+<p>You use a <code>goto</code> statement to re-run a block of code again. That says to me: recursive function.</p>
+
+<p>So, let's move this to a separate function. Again, I have no idea the proper name, and will leave that to you. For now, I'll call it <code>getComplexityAndReverse()</code> -- a verbose name, but it should suffice.</p>
+
+<pre><code>func getComplexityAndAlternate(startPosition []int, framesToGenerate []int,
+    frameIndex int, sequence encodedSequence, idSize int, w writer,
+    arrayCode []byte, nuclSeqLength int, options Options, reverse bool) {
+    for _, startPos := range startPosition {
+        if framesToGenerate[frameIndex] == 0 {
+            frameIndex++
+            continue
+        }
+
+        // sequence id should look like
+        // &gt;sequenceID_&lt;frame&gt; comment
+        idEnd := bytes.IndexByte(sequence[4:idSize], ' ')
+        if idEnd != -1 {
+            w.buf.Write(sequence[4 : 4+idEnd])
+            w.buf.WriteByte('_')
+            w.buf.WriteByte(suffixes[frameIndex])
+            w.buf.Write(sequence[4+idEnd : idSize])
+        } else {
+            w.buf.Write(sequence[4:idSize])
+            w.buf.WriteByte('_')
+            w.buf.WriteByte(suffixes[frameIndex])
+        }
+        w.newLine()
+
+        // if in trim mode, nb of bytes to trim (nb of successive 'X', '*' and '\n'
+        // from right end of the sequence)
+        w.bytesToTrim = 0
+        w.currentLineLen = 0
+
+        // read the sequence 3 letters at a time, starting at a specific position
+        // corresponding to the frame
+        for pos := startPos + 2 + idSize; pos &lt; len(sequence); pos += 3 {
+
+            if w.currentLineLen == maxLineSize {
+                w.newLine()
+            }
+            // create an uint32 from the codon, to retrieve the corresponding
+            // AA from the map
+            codonCode := uint32(sequence[pos-2]) | uint32(sequence[pos-1])&lt;&lt;8 | uint32(sequence[pos])&lt;&lt;16
+
+            b := arrayCode[codonCode]
+            if b != byte(0) {
+                w.addByte(b)
+            } else {
+                w.addUnknown()
+            }
+        }
+
+        // the last codon is only 2 nucleotid long, try to guess
+        // the corresponding AA
+        if (nuclSeqLength-startPos)%3 == 2 {
+
+            if w.currentLineLen == maxLineSize {
+                w.newLine()
+            }
+            codonCode := uint32(sequence[len(sequence)-2]) | uint32(sequence[len(sequence)-1])&lt;&lt;8
+
+            b := arrayCode[codonCode]
+            if b != byte(0) {
+                w.addByte(b)
+            } else {
+                w.addUnknown()
+            }
+        }
+
+        // the last codon is only 1 nucleotid long, no way to guess
+        // the corresponding AA
+        if (nuclSeqLength-startPos)%3 == 1 {
+            if w.currentLineLen == maxLineSize {
+                w.newLine()
+            }
+            w.addUnknown()
+        }
+
+        if options.Trim &amp;&amp; w.bytesToTrim &gt; 0 {
+            // remove the last bytesToTrim bytes of the buffer
+            // as they are 'X', '*' or '\n'
+            w.buf.Truncate(w.buf.Len() - w.bytesToTrim)
+            w.currentLineLen -= w.bytesToTrim
+        }
+
+        if w.currentLineLen != 0 {
+            w.newLine()
+        }
+        frameIndex++
+    }
+
+    if reverse &amp;&amp; frameIndex &lt; 6 {
+
+        // get the complementary sequence.
+        // Basically, switch
+        //   A &lt;-&gt; T
+        //   C &lt;-&gt; G
+        // N is not modified
+        for i, n := range sequence[idSize:] {
+
+            switch n {
+            case aCode:
+                sequence[i+idSize] = tCode
+            case tCode:
+                // handle both tCode and uCode
+                sequence[i+idSize] = aCode
+            case cCode:
+                sequence[i+idSize] = gCode
+            case gCode:
+                sequence[i+idSize] = cCode
+            default:
+                //case N -&gt; leave it
+            }
+        }
+        // reverse the sequence
+        for i, j := idSize, len(sequence)-1; i &lt; j; i, j = i+1, j-1 {
+            sequence[i], sequence[j] = sequence[j], sequence[i]
+        }
+
+        if !options.Alternative {
+            // Staden convention: Frame -1 is the reverse-complement of the sequence
+            // having the same codon phase as frame 1. Frame -2 is the same phase as
+            // frame 2. Frame -3 is the same phase as frame 3
+            //
+            // use the matrix to keep track of the forward frame as it depends on the
+            // length of the sequence
+            switch nuclSeqLength % 3 {
+            case 0:
+                startPosition[0], startPosition[1], startPosition[2] = 0, 2, 1
+            case 1:
+                startPosition[0], startPosition[1], startPosition[2] = 1, 0, 2
+            case 2:
+                startPosition[0], startPosition[1], startPosition[2] = 2, 1, 0
+            }
+        }
+        // run the same loop, but with the reverse-complemented sequence
+        getComplexityAndAlternate(startPosition, framesToGenerate, frameIndex,
+            sequence, idSize, w, arrayCode, nuclSeqLength, options, reverse)
+    }
+}
+</code></pre>
+
+<p>And we can simplify <code>worker()</code> even more:</p>
+
+<pre><code>func worker(wg *sync.WaitGroup, fnaSequences chan encodedSequence,
+    ctx context.Context, framesToGenerate []int, arrayCode []byte,
+    options Options, reverse bool, out io.Writer, errs chan error,
+    cancel context.CancelFunc) {
+    defer wg.Done()
+
+    startPosition := make([]int, 3)
+
+    w := &amp;writer{
+        buf:            bytes.NewBuffer(nil),
+        bytesToTrim:    0,
+        currentLineLen: 0,
+    }
+
+    for sequence := range fnaSequences {
+
+        select {
+        case &lt;-ctx.Done():
+            return
+        default:
+        }
+
+        frameIndex := 0
+        startPosition[0], startPosition[1], startPosition[2] = 0, 1, 2
+
+        idSize := int(binary.LittleEndian.Uint32(sequence[0:4]))
+        nuclSeqLength := len(sequence) - idSize
+
+        getComplexityAndAlternate(startPosition, framesToGenerate, frameIndex,
+            sequence, idSize, *w, arrayCode, nuclSeqLength, options, reverse)
+
+        if w.buf.Len() &gt; maxBufferSize {
+            _, err := out.Write(w.buf.Bytes())
+            if err != nil {
+                select {
+                case errs &lt;- fmt.Errorf("fail to write to output file: %v", err):
+                default:
+                }
+                cancel()
+                return
+            }
+            w.buf.Reset()
+        }
+        pool.Put(sequence)
+    }
+
+    if w.buf.Len() &gt; 0 {
+        _, err := out.Write(w.buf.Bytes())
+        if err != nil {
+            select {
+            case errs &lt;- fmt.Errorf("fail to write to output file: %v", err):
+            default:
+            }
+            cancel()
+            return
+        }
+    }
+}
+</code></pre>
+
+<p>But, there's still loads of long arguments. However, now that things are broken into functions, I recommend shortening these variable names. These long names make the code very verbose.</p>
+
+<p>With my limited knowledge, I see the following:</p>
+
+<ul>
+<li><code>fnaSequences</code> → <code>fnaSeqs</code></li>
+<li><code>framesToGenerate</code> → <code>frames</code></li>
+<li><code>arrayCode</code> → <code>codes</code> (†)</li>
+<li><code>startPosition</code> → <code>starts</code> (or <code>sPos</code>)</li>
+<li><code>sequence</code> → <code>s</code> (changed in some places)</li>
+</ul>
+
+<p>† This may be incorrect jargon.</p>
+
+<h2>Move things to the lowest scope</h2>
+
+<p>For example, <code>startPosition</code> (now <code>starts</code>) can be declared in a lower scope.</p>
+
+<p>While we're at it, <code>starts</code> can be declared as such:</p>
+
+<pre><code>starts := []int{0, 1, 2}
+</code></pre>
+
+<p>Resulting in:</p>
+
+<p>(Within <code>worker()</code>)</p>
+
+<pre><code>for sequence := range fnaSequences {
+
+    select {
+    case &lt;-ctx.Done():
+        return
+    default:
+    }
+
+    frameIndex := 0
+    starts := []int{0, 1, 2}
+
+    idSize := int(binary.LittleEndian.Uint32(sequence[0:4]))
+    nuclSeqLength := len(sequence) - idSize
+
+    getComplexityAndAlternate(starts, framesToGenerate, frameIndex,
+        sequence, idSize, *w, arrayCode, nuclSeqLength, options, reverse)
+
+    if w.buf.Len() &gt; maxBufferSize {
+        _, err := out.Write(w.buf.Bytes())
+        if err != nil {
+            select {
+            case errs &lt;- fmt.Errorf("fail to write to output file: %v", err):
+            default:
+            }
+            cancel()
+            return
+        }
+        w.buf.Reset()
+    }
+    pool.Put(sequence)
+}
+</code></pre>
+
+<p>(Within <code>getComplexityAndAlternate()</code>)</p>
+
+<pre><code>if !options.Alternative {
+    // Staden convention: Frame -1 is the reverse-complement of the sequence
+    // having the same codon phase as frame 1. Frame -2 is the same phase as
+    // frame 2. Frame -3 is the same phase as frame 3
+    //
+    // use the matrix to keep track of the forward frame as it depends on the
+    // length of the sequence
+    switch nuclSeqLength % 3 {
+    case 0:
+        starts = []int{0, 2, 1}
+    case 1:
+        starts = []int{1, 0, 2}
+    case 2:
+        starts = []int{2, 1, 0}
+    }
+}
+</code></pre>
+
+<h2>Duplicate code</h2>
+
+<p>The following code is used twice and should instead be a function:</p>
+
+<pre><code>_, err := out.Write(w.buf.Bytes())
+if err != nil {
+    select {
+    case errs &lt;- fmt.Errorf("fail to write to output file: %v", err):
+    default:
+    }
+    cancel()
+    return
+}
+</code></pre>
+
+<p>Becomes a function (again, choose whatever name you want):</p>
+
+<pre><code>func writeOrCancel(w writer, out io.Writer, errs chan error,
+    cancel context.CancelFunc) {
+    if _, err := out.Write(w.buf.Bytes()); err != nil {
+        select {
+        case errs &lt;- fmt.Errorf("fail to write to output file: %v", err):
+        default:
+        }
+        cancel()
+        return
+    }
+}
+</code></pre>
+
+<h2>Unroll short loops</h2>
+
+<pre><code>case "F":
+    for i := 0; i &lt; 3; i++ {
+        frames[i] = 1
+    }
+</code></pre>
+
+<p>And</p>
+
+<pre><code>case "R":
+    for i := 3; i &lt; 6; i++ {
+        frames[i] = 1
+    }
+    reverse = true
+</code></pre>
+
+<p>Shouldn't be loops. By using loops you use more magic numbers. Instead, unroll them:</p>
+
+<pre><code>case "F":
+    frames[0] = 1
+    frames[1] = 1
+    frames[2] = 1
+// ...
+case "R":
+    frames[3] = 1
+    frames[4] = 1
+    frames[5] = 1
+    reverse = true
+</code></pre>
+
+<p>There's probably an even easier way to clean up the switch statement in <code>computeFrames()</code>.</p>
+
+<h2>Don't name return arguments unless it simplifies code</h2>
+
+<p>In <code>computeFrames()</code> your return arguments are named, but they don't need to be.</p>
+
+<h2>Use straightforward conditions</h2>
+
+<pre><code>// generate 2 letter code
+codes, ok := twoLetterMap[codon[0:2]]
+
+if !ok {
+    twoLetterMap[codon[0:2]] = []byte{aaCode}
+} else {
+    twoLetterMap[codon[0:2]] = append(codes, aaCode)
+}
+</code></pre>
+
+<p>Is more clearly:</p>
+
+<pre><code>// generate 2 letter code
+if codes, ok := twoLetterMap[codon[0:2]]; ok {
+    twoLetterMap[codon[0:2]] = append(codes, aaCode)
+} else {
+    twoLetterMap[codon[0:2]] = []byte{aaCode}
+}
+</code></pre>
+
+<h2>Exit loops early</h2>
+
+<p>You can break early upon the condition <code>codes[i] != codes[0]</code>.</p>
+
+<pre><code>for twoLetterCodon, codes := range twoLetterMap {
+    uniqueAA := true
+    for i := 0; i &lt; len(codes); i++ {
+        if codes[i] != codes[0] {
+            uniqueAA = false
+        }
+    }
+    if uniqueAA {
+        first := letterCode[twoLetterCodon[0]]
+        second := letterCode[twoLetterCodon[1]]
+
+        uint32Code := uint32(first) | uint32(second)&lt;&lt;8
+        resultMap[uint32Code] = codes[0]
+    }
+}
+</code></pre>
+
+<p>Becomes:</p>
+
+<pre><code>for twoLetterCodon, codes := range twoLetterMap {
+    uniqueAA := true
+
+    for _, c := range codes {
+        if c != codes[0] {
+            uniqueAA = false
+            break
+        }
+    }
+
+    if uniqueAA {
+        first := letterCode[twoLetterCodon[0]]
+        second := letterCode[twoLetterCodon[1]]
+
+        uint32Code := uint32(first) | uint32(second)&lt;&lt;8
+        resultMap[uint32Code] = codes[0]
+    }
+}
+</code></pre>
+
+<h2>Combine global <code>const</code> declarations</h2>
+
+<p>It's common practice to combine them, so readers of your code don't need to search the entire document.</p>
+
+<h2>Move things to separate files</h2>
+
+<p>Your <code>writer</code> structure is relatively separate from everything else. I've moved it to a <code>writer.go</code> file -- moving the two constants it uses along with it.</p>
+
+<p>You can also simplify the field names. If you feel explanation is needed, that's the purpose of documentation, not the field names themselves.</p>
+
+<p>Rather than writing the following:</p>
+
+<pre><code>w := &amp;writer{
+    buf:    bytes.NewBuffer(nil),
+    toTrim: 0,
+    clen:   0,
+}
+</code></pre>
+
+<p>We can use a <code>newWriter()</code> function, which follows Go APIs:</p>
+
+<pre><code>func newWriter(buf []byte) *writer {
+    return &amp;writer{buf: bytes.NewBuffer(buf)}
+}
+</code></pre>
+
+<p>Also note that specifying the default values (<code>0</code>) is not needed.</p>
+
+<h2>Conclusion: More to be done</h2>
+
+<p>I was not able to address all of the things I saw, but you should get the gist.</p>
+
+<p>I would urge you to continue to break concrete operations into functions. Even though you may end up with lots of function arguments, in my opinion that's better than hard-to-read deep nesting and long functions. Perhaps once seeing how things break up, you can simplify the whole architecture of the package.</p>
+
+<p><a href="https://gist.github.com/esote/24e6c0e641e1af9502f1c3a0caf03c11" rel="nofollow noreferrer">Here</a> is a GitHub Gist of the final code. It includes other formatting things I did not mention explicitly.</p>
+
+<p>Hope this helped. Your project looks promising, best of luck!</p>
+    </div>

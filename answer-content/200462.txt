@@ -1,0 +1,60 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'm with you that <code>std::pointer_traits</code> and C++ standard library smart pointers in general have some drawbacks (e.g. ownership semantics of <code>pointer_to</code>) that might need to be addressed.</p>
+
+<p>That said, I don't think that this implementation is working towards that goal:</p>
+
+<ul>
+<li><p>Memory management: Different forms of <code>extra_pointer_traits&lt;T&gt;::make</code> acquire pointers to memory, but most specializations have no way to release said memory (and the <code>std::unique_ptr</code> one only releases ownership, not the backing memory).</p>
+
+<p>This is no "trivial" problem, either: When given a <code>T*</code> (allocated using one of the overloads of <code>extra_pointer_traits&lt;T*&gt;::make</code>), do you know whether to call <code>delete</code> or <code>delete[]</code> on it?</p>
+
+<p>And this is just the tip of the iceberg: Once allocators enter the picture there is no general way of keeping track how to delete every pointer without somehow storing a reference to the allocator with each pointer.</p></li>
+<li><p>Uniformity: There's no clear standard feature set. Some specializations provide <code>make()</code>, others provide <code>make(size_t)</code>, some provide <code>release()</code> - but there is no easy way (other than failure of compilation) to query which operations are actually available.</p>
+
+<p>For example: You cannot simply call <code>make()</code>, as <code>extra_pointer_traits&lt;std::unique_ptr&lt;T[], Deleter&gt;&gt;</code> doesn't provide it.</p></li>
+<li><p>Trait deduction: Most standard library traits have an ability to deduce traits from any type as long as said type adheres to some interface (e.g. <code>std::iterator_traits</code> automatically gives the correct traits if a class implements <code>value_type</code>, <code>pointer</code>, <code>reference</code>, <code>difference_type</code> and <code>iterator_category</code>).</p>
+
+<p>There doesn't seem to be an easy way to generally deduce <code>make()</code> or similar for any custom pointer-like type.</p></li>
+<li><p>Object construction: Ignoring the memory release problems mentioned above, some types simply don't have a default constructor (or any <code>public</code> constructors, for that matter), which means <code>extra_pointer_traits&lt;PointerType&gt;::make</code> overloads now compile conditionally not only on the pointer type itself, but also on the pointees type. This seems counter-intuitive on a trait that should be as general as possible.</p>
+
+<blockquote>
+  <p>Yes, some of these problems (non-default constructors) could be overcome with perfect forwarding of parameters, but others (non-<code>public</code> constructors, <code>T(...)</code> vs <code>T{...}</code>) are unsolvable (without modifying the pointee) or require additional design space (e.g. special functions for <code>make_array</code>, <code>make_with_braces</code>, <code>make_with_parens</code>, ...).</p>
+  
+  <p>Then you'd again need special handling for some cases, e.g. if the pointee is of type <code>void</code> (possibly cv-qualified). This means you get an combinatorial explosion of specializations (number of pointer-like types times types requiring soecial handling).</p>
+</blockquote></li>
+<li><p>Ownership semantics: <code>extra_pointer_trais&lt;T&gt;::make</code> overloads always create a new owning pointer - even for pointer types (e.g. raw pointers) that don't have any concrete ownership semantics associated with themselves. This is just waiting for ownership conflicts (and all the surrounding problems, e.g. memory leaks, use-after-free, dangling pointers, ...) to happen.</p></li>
+<li><p>Incomplete specializations: <code>std::weak_ptr</code> as another standard library pointer-like type is missing, as are <code>std::shared_ptr&lt;T[]&gt;</code> (which might be different from <code>std::shared_ptr&lt;T&gt;</code>) and <code>T[N]</code>.</p>
+
+<blockquote>
+  <p>Also, specializations for <code>const</code> and <code>volatile</code> qualified pointer-like types are missing. What specialization would be used for a <code>const std::unique_ptr&lt;T&gt;</code>? What about <code>const volatile T* const volatile</code>?</p>
+</blockquote></li>
+<li><p>Allocator support: Most of the time, the standard library goes out of its way to allow users to bring their own allocators, which allows for some cool features that would otherwise be unavailable (e.g. control over memory allocations at an overarching level, relocatable heaps or tracing object collection). There is currently no support for allocators inside <code>extra_pointer_traits</code>.</p></li>
+</ul>
+
+<p>As glimpsed from this overview, the implementation introduces more problems than it solves (and the latter would have to be defined more clearly, as it currently is far too vague and open to interpretation).</p>
+
+<p>As long as these points remain unaddressed (no pun intended), I can't see any committee approving of this.</p>
+
+<blockquote>
+  <h1>Food for thoughts:</h1>
+  
+  <p>There are several orthogonal concerns that pointers have to deal with:</p>
+  
+  <ul>
+  <li><p>Allocation: How is memory acquired and released?</p></li>
+  <li><p>Lifetime: What object is at that pointer referring to?</p></li>
+  <li><p>Ownership: When does the memory get acquired/released and who is responsible for doing so?</p></li>
+  <li><p>Representation (aka address model): How is the pointer value represented in memory? Examples: An address (raw pointer), an offset (e.g. <code>boost::offset_ptr</code>) or segmented (16 bit <code>far</code> pointers).</p></li>
+  </ul>
+  
+  <p>Some of my personal gripes with the standard library arise from the fact that these concerns are not cleanly separated, e.g. </p>
+  
+  <ul>
+  <li><p>allocators have to deal with types instead of just managing memory (mixing of allocation and lifetime concerns). This makes it hard to reuse allocators for different types, and tightly couples them to the implementation of the type that might be placed in the allocated memory.</p></li>
+  <li><p><code>std::shared_ptr</code> by itself is only usable with raw pointer representation (mixing ownership, representation and lifetime). There's no way to have a <code>shared_ptr</code> contain a <code>boost::offset_ptr</code> internally, or to know whether the object being pointed to is actually initialized.</p></li>
+  <li><p><code>std::unique_ptr</code> is slightly better off: It can be used with arbitrary pointer representations (via <code>Deleter::pointer</code>), but it is hard to do so. It still mixes ownership and lifetime, though: There will be problems with a <code>std::unique_ptr&lt;T&gt;</code> (with <code>T</code> not being <code>void</code>) referring to uninitialized memory upon assignment/destruction.</p></li>
+  </ul>
+  
+  <p>The <code>extra_pointer_traits</code> implementation goes beyond that: It mixes allocation, ownership and lifetime concerns, and does so in a fashion that none of those concerns are fully realized.</p>
+</blockquote>
+    </div>

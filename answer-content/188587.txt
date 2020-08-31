@@ -1,0 +1,118 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Apart from the improvements suggested by <a href="https://codereview.stackexchange.com/a/188534/59161">Henrik Hansen</a> and a couple of null checks I changed the list with tuples into <code>SortedDictionary</code> to avoid repetitive <code>OrderBy</code> and added a null check before calling <code>getFingerprint</code> for a property.</p>
+
+<p>This is the updated builder:</p>
+
+<pre><code>public class FingerprintBuilder&lt;T&gt;
+{
+    private readonly Func&lt;byte[], byte[]&gt; _computeHash;
+
+    private readonly SortedDictionary&lt;string, Func&lt;T, object&gt;&gt; _fingerprints;
+
+    public FingerprintBuilder(Func&lt;byte[], byte[]&gt; computeHash)
+    {
+        _computeHash = computeHash ?? throw new ArgumentNullException(nameof(computeHash));
+        _fingerprints = new SortedDictionary&lt;string, Func&lt;T, object&gt;&gt;(StringComparer.OrdinalIgnoreCase);    
+    }
+
+    public static FingerprintBuilder&lt;T&gt; Create(Func&lt;byte[], byte[]&gt; computeHash)
+    {
+        return new FingerprintBuilder&lt;T&gt;(computeHash);
+    }
+
+    public FingerprintBuilder&lt;T&gt; For&lt;TProperty&gt;(Expression&lt;Func&lt;T, TProperty&gt;&gt; expression, Expression&lt;Func&lt;TProperty, TProperty&gt;&gt; fingerprint)
+    {
+        if (!(expression.Body is MemberExpression memberExpression))
+        {
+            throw new ArgumentException("Expression must be a member expression");
+        }
+
+        if (_fingerprints.ContainsKey(memberExpression.Member.Name))
+        {
+            throw new ArgumentException($"Member {memberExpression.Member.Name} has already been added.");
+        }
+
+        var getValue = expression.Compile();
+        var getFingerprint = fingerprint.Compile();
+
+        _fingerprints[memberExpression.Member.Name] = (Func&lt;T, object&gt;)(obj =&gt;
+        {
+            var value = getValue(obj);
+            return value == null ? default(TProperty) : getFingerprint(getValue(obj));
+        });
+
+        return this;
+    }
+
+    public Func&lt;T, byte[]&gt; Build()
+    {
+        var binaryFormatter = new BinaryFormatter();
+
+        return obj =&gt;
+        {
+            using (var memory = new MemoryStream())
+            {
+                foreach (var item in _fingerprints)
+                {
+                    binaryFormatter.Serialize(memory, item.Value(obj));
+                }
+                return _computeHash(memory.ToArray());
+            }
+        };
+    }
+}
+</code></pre>
+
+<p>For anonymous objects I added a non-generic class:</p>
+
+<pre><code>public class FingerprintBuilder
+{
+    public static FingerprintBuilder&lt;T&gt; Create&lt;T&gt;(Func&lt;byte[], byte[]&gt; computeHash, T obj)
+    {
+        return new FingerprintBuilder&lt;T&gt;(computeHash);
+    }
+}
+</code></pre>
+
+<p>It can be used like that:</p>
+
+<blockquote>
+<pre><code>var anonymousFingerprint = FingerprintBuilder
+    .Create(SHA1.ComputeSHA1, new { FirstName = default(string), LastName = default(string) })
+    .For(p =&gt; p.FirstName, ignoreCase: true, ignoreWhiteSpace: true)
+    .For(p =&gt; p.LastName, ignoreCase: true, ignoreWhiteSpace: true)
+    .Build();
+
+anonymousFingerprint(new { FirstName = "John", LastName = "Doe" }).ToHexString().Dump();
+</code></pre>
+</blockquote>
+
+<p>This is supported by convenience extensions:</p>
+
+<pre><code>public static class FingerprintBuilderExtensions
+{
+    public static FingerprintBuilder&lt;T&gt; For&lt;T, TProperty&gt;(this FingerprintBuilder&lt;T&gt; builder, Expression&lt;Func&lt;T, TProperty&gt;&gt; expression)
+    {
+        return builder.For(expression, _ =&gt; _);
+    }
+
+    public static FingerprintBuilder&lt;T&gt; For&lt;T&gt;(this FingerprintBuilder&lt;T&gt; builder, Expression&lt;Func&lt;T, string&gt;&gt; expression, bool ignoreCase, bool ignoreWhiteSpace)
+    {
+        var format = (Func&lt;string, string&gt;)(input =&gt;
+        {
+            if (ignoreCase)
+            {
+                input = input.ToUpperInvariant();
+            }
+            if (ignoreWhiteSpace)
+            {
+                input = input.Trim();
+            }
+            return input;
+        });
+
+        return builder.For(expression, input =&gt; format(input));
+    }
+}
+</code></pre>
+    </div>

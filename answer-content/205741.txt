@@ -1,0 +1,254 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Includes</h1>
+<p><code>&lt;iostream&gt;</code> isn't needed by the header, so don't include it there.</p>
+<h1>Null pointer</h1>
+<p>When I try to run the code, I get an attempt to dereference a null pointer at the first <code>remove(0)</code>, which crashes the program.  This is because <code>remove()</code> returns a <em>reference</em> to local variable <code>value</code>, which is no longer in scope.  Return it by <em>value</em> instead:</p>
+<pre><code>    T remove(int pos);
+ //^^^ not T&amp;
+</code></pre>
+<h1>Memory leak</h1>
+<p>If I add <code>return 0;</code> before the crash (or fix the bug), I do see a memory leak:</p>
+<pre class="lang-none prettyprint-override"><code>==29576== 168 (24 direct, 144 indirect) bytes in 1 blocks are definitely lost in loss record 7 of 7
+==29576==    at 0x4835E2F: operator new(unsigned long) (in /usr/lib/valgrind/vgpreload_memcheck-amd64-linux.so)
+==29576==    by 0x109362: LList&lt;double&gt;::LList() (205728.cpp:27)
+==29576==    by 0x10917F: main (205728.cpp:92)
+</code></pre>
+<p>I think <code>~LList()</code> needs to do more cleanup:</p>
+<pre><code>template&lt;typename T&gt;
+LList&lt;T&gt;::~LList()
+{
+    for (auto p = head-&gt;next;  p != tail;  ) {
+        auto next = p-&gt;next;
+        delete p;
+        p = next;
+    }
+    delete head;
+    delete tail;
+}
+</code></pre>
+<h1>Copy construction</h1>
+<pre class="lang-none prettyprint-override"><code>205728.cpp:11:7: warning: ‘class LList&lt;double&gt;’ has pointer data members [-Weffc++]
+205728.cpp:11:7: warning:   but does not override ‘LList&lt;double&gt;(const LList&lt;double&gt;&amp;)’ [-Weffc++]
+205728.cpp:11:7: warning:   or ‘operator=(const LList&lt;double&gt;&amp;)’ [-Weffc++]
+</code></pre>
+<p>We need to fix this, and either make the list safely copyable, or totally uncopyable.</p>
+<h1>Prefer initialization to assignment</h1>
+<pre><code>LList&lt;T&gt;::LList() : n_elements{0}
+                   /^^^^^^^^^^^^^
+</code></pre>
+<p>Or just provide a default initializer, as with <code>prev</code> and <code>next</code>.</p>
+<h1>Don't pass primitive types by reference</h1>
+<pre><code>T&amp; get(const int&amp; pos) const;
+//             ^^^
+</code></pre>
+<p>Built-in types such as <code>int</code> are best passed <em>by value</em> rather than by const reference (and prefer size type to int for counting objects).  Also, in this case, we probably want to return a reference to <code>const T</code> from a const list, and a reference to mutable <code>T</code> from a mutable list (<em>do as the standard containers do</em>):</p>
+<pre><code>T const&amp; get(std::size_t pos) const;
+T&amp; get(std::size_t pos);
+</code></pre>
+<h1>Copying</h1>
+<p>Prefer to <code>std::move()</code> values where possible.  It's not hard to make the list able to accept move-only types:</p>
+<pre><code>template &lt;typename T&gt;
+struct node
+{
+    T value;
+    node* prev;
+    node* next;
+    node(T value, node *prev = nullptr, node *next = nullptr)
+        : value{std::move(value)}, prev{prev}, next{next}
+    {}
+};
+</code></pre>
+
+<pre><code>template&lt;typename T&gt;
+void LList&lt;T&gt;::insert(T value, const int pos)
+{
+    node&lt;T&gt; *temp = new node&lt;T&gt;(std::move(value), prev, next);
+</code></pre>
+<h1>Exception safety</h1>
+<p>Constructing a linked list requires memory to be allocated for <code>head</code> and <code>tail</code>.  If the first <code>new</code> succeeds, but the second fails, we end up leaking memory when the <code>std::bad_alloc</code> is thrown.</p>
+<p>There's no reason not to make <code>head</code> and <code>tail</code> be plain sub-objects:</p>
+<pre><code>private:
+    int n_elements = 0;
+    node&lt;T&gt; head = { T{}, nullptr, &amp;tail };
+    node&lt;T&gt; tail = { T{}, &amp;head, nullptr };
+</code></pre>
+<p>(adjust all <code>head-&gt;</code> to <code>head.</code> and other <code>head</code> to <code>&amp;head</code>; the same for <code>tail</code>).</p>
+<h1>Remove doesn't need to track <code>prev</code> and <code>next</code></h1>
+<p>Once we've found the target for remove, we can easily access its neighbours:</p>
+<pre><code>template&lt;typename T&gt;
+T LList&lt;T&gt;::remove(const int pos)
+{
+    node&lt;T&gt; *curr = head.next;
+    for (int i = 0; i &lt; pos; i++) {
+        curr = curr-&gt;next;
+    }
+    curr-&gt;prev-&gt;next = curr-&gt;next;
+    curr-&gt;next-&gt;prev = curr-&gt;prev;
+    T value = std::move(curr-&gt;value);
+    delete curr;
+    --n_elements;
+    return value;
+}
+</code></pre>
+<p>The insert method can be simplified in a similar way.</p>
+<h1>The node type needn't be public</h1>
+<p>Since <code>node</code> isn't exposed in the public interface, it can be a private type within <code>LList</code>:</p>
+<pre><code>template &lt;typename T&gt;
+class LList
+{
+    struct node
+    {
+        T value;
+        node* prev;
+        node* next;
+        node(T value, node *prev = nullptr, node *next = nullptr)
+            : value{std::move(value)}, prev{prev}, next{next}
+        {}
+    };
+
+    // ...
+
+    node head = { T{}, nullptr, &amp;tail };
+    node tail = { T{}, &amp;head, nullptr };
+
+};
+</code></pre>
+<hr>
+<h1>Modified code</h1>
+<p>I've made some other minor changes to simplify further.</p>
+<pre><code>#include &lt;cstddef&gt;
+#include &lt;utility&gt;
+
+template &lt;typename T&gt;
+class LList
+{
+    struct node
+    {
+        T value;
+        node* prev;
+        node* next;
+        node(T value, node *prev = nullptr, node *next = nullptr)
+            : value{std::move(value)}, prev{prev}, next{next}
+        {}
+        node(const node&amp;) = delete;
+        void operator=(const node&amp;) = delete;
+
+        friend void swap(node&amp; a, node&amp; b) {
+            using std::swap;
+            swap(a.value, b.value);
+            swap(a.prev, b.prev);
+            swap(a.next, b.next);
+        }
+    };
+
+public:
+    LList() = default;
+    LList(const LList&lt;T&gt;&amp;);
+    LList(const LList&lt;T&gt;&amp;&amp;);
+    LList&amp; operator=(LList&lt;T&gt;);
+    ~LList();
+
+    T const&amp; get(std::size_t pos) const;
+    T&amp; get(std::size_t pos);
+
+    void insert(T value, std::size_t pos);
+    T remove(std::size_t pos);
+
+    template&lt;typename U&gt;
+    friend void swap(LList&lt;U&gt;&amp;, LList&lt;U&gt;&amp;);
+
+private:
+    std::size_t n_elements = 0;
+    node head = { T{}, nullptr, &amp;tail };
+    node tail = { T{}, &amp;head, nullptr };
+};
+
+template&lt;typename T&gt;
+LList&lt;T&gt;::LList(const LList&lt;T&gt;&amp; other)
+{
+    // work from back to front, so we always insert at position 0
+    // (which is the cheapest)
+    for (auto i = other.n_elements;  i &gt; 0;  --i) {
+        insert(other.get(i-1), 0);
+    }
+}
+
+template&lt;typename T&gt;
+LList&lt;T&gt;::LList(const LList&lt;T&gt;&amp;&amp; other)
+{
+    swap(*this, other);
+}
+
+template&lt;typename T&gt;
+LList&lt;T&gt;&amp; LList&lt;T&gt;::operator=(LList&lt;T&gt; other)
+{
+    swap(*this, other);
+    return *this;
+}
+
+template&lt;typename T&gt;
+LList&lt;T&gt;::~LList()
+{
+    for (auto p = head.next;  p != &amp;tail;  ) {
+        auto next = p-&gt;next;
+        delete p;
+        p = next;
+    }
+}
+
+template&lt;typename T&gt;
+void swap(LList&lt;T&gt;&amp; a, LList&lt;T&gt;&amp; b)
+{
+    using std::swap;
+    swap(a.head, b.head);
+    swap(a.tail, b.tail);
+    swap(a.n_elements, b.n_elements);
+}
+
+
+template&lt;typename T&gt;
+const T&amp; LList&lt;T&gt;::get(std::size_t pos) const
+{
+    auto p = head.next;
+    while (pos--)
+        p = p-&gt;next;
+    return p-&gt;value;
+}
+
+template&lt;typename T&gt;
+T&amp; LList&lt;T&gt;::get(std::size_t pos)
+{
+    auto p = head.next;
+    while (pos--)
+        p = p-&gt;next;
+    return p-&gt;value;
+}
+
+template&lt;typename T&gt;
+void LList&lt;T&gt;::insert(T value, std::size_t pos)
+{
+    auto p = &amp;head;
+    while (pos--)
+        p = p-&gt;next;
+    auto next = p-&gt;next;
+    next-&gt;prev = p-&gt;next = new node(std::move(value), p, next);
+    ++n_elements;
+}
+
+template&lt;typename T&gt;
+T LList&lt;T&gt;::remove(std::size_t pos)
+{
+    auto p = head.next;
+    while (pos--)
+        p = p-&gt;next;
+    p-&gt;prev-&gt;next = p-&gt;next;
+    p-&gt;next-&gt;prev = p-&gt;prev;
+    auto value = std::move(p-&gt;value);
+    delete p;
+    --n_elements;
+    return value;
+}
+</code></pre>
+<p>From this position, you could consider more advanced topics, such as providing iterators.  Actually, providing full iterator support is quite a lot of work - 12 methods and a pair of classes - but there are some good reviews here that may give you a metaphorical "leg-up".</p>
+<p>Or you might consider your own choice of next steps - don't let me constrain you!</p>
+    </div>

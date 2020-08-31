@@ -1,0 +1,66 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I believe that might be too much stuff happening here, with a sole purpose of solving a rather simple problem: "I need an in-memory cache". The .NET standard library already has a cache class (<code>System.Runtime.Caching.MemoryCache</code>), so the only reason why you would want to replace it is if you tested it and found out that is doesn't fit your needs for certain reasons.</p>
+
+<p>Also, while abstract classes allow you to reuse code, they also tend to create strong dependencies on their interface - you have a lot of plumbing here necessary just to get things going. So my suggestion would be to start with a more generic data structure, instead of adding a layer of methods in an abstract base class:</p>
+
+<ol>
+<li><p>For the simpler case (without weak references), the entire code could be (almost) replaced with a single method:</p>
+
+<pre><code>public static Func&lt;T, TResult&gt; Memoize&lt;T, TResult&gt;(this Func&lt;T, TResult&gt; func)
+{
+    var dict = new ConcurrentDictionary&lt;T, TResult&gt;();
+    return key =&gt; dict.GetOrAdd(key, func);
+}
+</code></pre>
+
+<p>The <code>ConcurrentDictionary</code> class is lockless, thread-safe, and usually outperforms a plain <code>Mutex</code> or a <code>ReaderWriterLockSlim</code> (<code>ReaderWriterLockSlim</code> being the slowest of the three in most cases).</p>
+
+<p>So the only difference you would have with the method above is that <code>ConcurrentDictionary</code> doesn't lock the call to <code>func</code> (but only one result is atomically stored to the dictionary at the end). To resolve this, you could start by writing a <code>ConcurrentDictionary</code> extension method similar to:</p>
+
+<pre><code>// This basically extends ConcurrentDictionary.GetOrAdd to 
+// acquire a mutex before calling func.
+
+/// &lt;summary&gt;
+/// Returns the value associated with the specified key if there already is
+/// one, or calls the specified delegate to create a new value which is
+/// stored and returned. This method will not lock if the value already
+/// exists, but it will lock the entire transaction if a new value needs to
+/// be instantiated.
+/// &lt;/summary&gt;
+public static TValue GetOrAddSafe&lt;TKey, TValue&gt;(
+    this ConcurrentDictionary&lt;TKey, TValue&gt; @this,
+    object lockInstance,
+    TKey key,
+    Func&lt;TKey, TValue&gt; valueProvider)
+{
+    TValue value;
+
+    // note that we don't need to lock here at all,
+    // ConcurrentDictionary does all the lockless magic
+    if (@this.TryGetValue(key, out value))
+    {
+        return value;
+    }
+
+    // fallback to mutex
+    lock (lockInstance)
+    {
+        return @this.GetOrAdd(key, valueProvider);
+    }
+}
+</code></pre>
+
+<p>and then</p>
+
+<pre><code>static readonly object _dictlock = new object();    
+public static Func&lt;T, TResult&gt; Memoize&lt;T, TResult&gt;(this Func&lt;T, TResult&gt; func)
+{
+    var dict = new ConcurrentDictionary&lt;T, TResult&gt;();
+    return key =&gt; dict.GetOrAddSafe(_dictlock, key, func);
+}
+</code></pre>
+
+<p>So you end up with a reusable generic extension method and get rid of everything else at the same time.</p></li>
+<li><p>Regarding the weak-referenced version, you could also easily squeeze the functionality in a single method using a similar approach to the one above. But a more important question is whether this functionality will be useful, since GC will probably collect these items very soon, and you don't have any control over the process. Are you sure you don't want to check out <code>MemoryCache</code> instead?</p></li>
+</ol>
+    </div>

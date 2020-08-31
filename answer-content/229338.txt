@@ -1,0 +1,96 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p>Are there some cases in <code>std::bind_front</code> that I missed?</p>
+</blockquote>
+
+<p>There are several significant differences between <code>std::bind_front</code>'s behavior and your implementations.</p>
+
+<hr>
+
+<p>First, your implementation unconditionally returns a value. But what if the callable in question returned a reference? The behavior is just incorrect.</p>
+
+<hr>
+
+<p>Second, <code>std::bind_front</code> is SFINAE-friendly but yours is not. That is, I can check to see if I can invoke the result with a certain set of arguments. Here is a silly example demonstrating this:</p>
+
+<pre><code>auto f = [](int i, int j) { return i + j; };
+auto g = std::bind_front(f, 1);
+auto g2 = your::bind_front(f, 1);
+
+// this is ok, static assertion doesn't trigger
+static_assert(!std::is_invocable_v&lt;decltype(g), int, int&gt;);
+
+// this is a compile error
+static_assert(!std::is_invocable_v&lt;decltype(g2), int, int&gt;);
+</code></pre>
+
+<p>Basically, asking the question "Can I call you with two <code>int</code>s?" leads to an instantiation failure outside of the immediate context, and will always be a hard error.</p>
+
+<p>You can fix this and the reference issue described above by specified the correct return type instead of <code>auto</code>:</p>
+
+<pre><code>template &lt;class... Args&gt;
+inline std::invoke_result_t&lt;F&amp;, A, Args...&gt; operator()(Args&amp;&amp;... a) { ... }
+</code></pre>
+
+<hr>
+
+<p>Third, you're capturing your arguments differently. Consider:</p>
+
+<pre><code>std::string s = "Hello";
+auto f = [](std::string const&amp; s, int i) { return s[i]; }
+
+auto g = std::bind_front(f, s);
+auto g2 = your::bind_front(f, s);
+s = "Goodbye";
+
+assert(g(0) == 'H'); // ok
+assert(g2(0) == 'H'); // fails
+</code></pre>
+
+<p><code>std::bind_front</code> owns everything. You keep references to all the lvalues. The way the standard library works is if you want to capture by reference, you use <code>std::ref</code>.</p>
+
+<p>Basically, this:</p>
+
+<pre><code>template &lt;class F, class A&gt;
+auto bind_front(F &amp;&amp;func, A &amp;&amp;arg){
+    return _bind_obj&lt;F, A&gt;(
+        std::forward&lt;F&gt;(func),
+        std::forward&lt;A&gt;(arg)
+    );
+}
+</code></pre>
+
+<p>should be:</p>
+
+<pre><code>template &lt;class F, class A&gt;
+auto bind_front(F &amp;&amp;func, A &amp;&amp;arg){
+    return _bind_obj&lt;std::decay_t&lt;F&gt;, std::decay_t&lt;A&gt;&gt;(
+        std::forward&lt;F&gt;(func),
+        std::forward&lt;A&gt;(arg)
+    );
+}
+</code></pre>
+
+<hr>
+
+<p>Fourth, your result is <em>only</em> invocable on a non-<code>const</code> object. But if the callable I'm <code>bind_front()</code>-ing has a <code>const</code> <code>operator()</code>, I should be able to invoke it as <code>const</code> too right?</p>
+
+<p>The same can be said for ref-qualifiers: if I have a function object with <code>&amp;</code>- and <code>&amp;&amp;-</code>qualified overloads, <code>bind_front</code> should respect that.</p>
+
+<p>The solution is actually to write four overloads of <code>operator()</code>:</p>
+
+<pre><code>template &lt;class... Args&gt;
+inline std::invoke_result_t&lt;F&amp;, A, Args...&gt; operator()(Args&amp;&amp;... a) &amp;;
+
+template &lt;class... Args&gt;
+inline std::invoke_result_t&lt;F const&amp;, A, Args...&gt; operator()(Args&amp;&amp;... a) const&amp;;
+
+template &lt;class... Args&gt;
+inline std::invoke_result_t&lt;F, A, Args...&gt; operator()(Args&amp;&amp;... a) &amp;&amp;;
+
+template &lt;class... Args&gt;
+inline std::invoke_result_t&lt;F const, A, Args...&gt; operator()(Args&amp;&amp;... a) const &amp;&amp;;
+</code></pre>
+
+<p>Note that I'm also adjusting the type of <code>F</code> in the type trait, and be sure to move the callable in the rvalue cases.</p>
+    </div>

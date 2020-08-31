@@ -1,0 +1,882 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Here's a better algorithm:</p>
+
+<p>It has been benchmarked and reduces the time from 29 hours to <strong>1.1 seconds</strong></p>
+
+<p>This is approximately 95,000 times faster.</p>
+
+<p><strong>Edit:</strong> Faster version, described below, reduces the execution time to <strong>0.68 seconds</strong>, which is 153,500 times faster.</p>
+
+<hr>
+
+<p>We only need to consider the number of each type of honor and then combinations of remaining spot cards.</p>
+
+<p>Using a state vector for the honors, we calculate all possible honor distributions [based on count]. The state vector is similar to a 4 digit base 5 number: <code>nA|nK|nQ|nJ</code> where each digit represents the number of the given card we are "dealing"</p>
+
+<p>We reject any state that has more than 13 honors.</p>
+
+<p>We reject any state that has a different HCP than we want (we loop on all desired HCP in the range 0-37).</p>
+
+<p><strong>Edit:</strong> Added an output vector, indexed by HCP, that accumulates all intermediate hand deal results, so that the honors state vector only needs to be cycled once, instead of a full pass for each given/desired HCP. (i.e. looping on the "desired" HCP is no longer required). The original behavior can be seen by adding a command line option of <code>-v</code></p>
+
+<p>We get the total number of combinations of honors:</p>
+
+<pre><code>honornCk = nCk(4,nJ) * nCk(4,nQ) * nCk(4,nK) * nCk(4,nA)
+</code></pre>
+
+<p>We calculate the number of slots left for spot cards:</p>
+
+<pre><code>nslot = 36 - (nJ + nQ + nK + nA)
+</code></pre>
+
+<p>We calculate the number of combinations of spots:</p>
+
+<pre><code>spotnCk = nCk(36,nslot)
+</code></pre>
+
+<p>We get the total number of combinations of cards for this hand:</p>
+
+<pre><code>curhand = spotnCk * honornCk
+</code></pre>
+
+<p>We accumulate the total number of hand combinations:</p>
+
+<pre><code>tothand += curhand
+</code></pre>
+
+<p>This is the final result</p>
+
+<hr>
+
+<p>Here is the [working] code</p>
+
+<p>It is written in C. Many combinations of caching/memoization and other [failed] attempts before coming up with this final version were tried. <em>Side note:</em> The primary criterion was on the algorithm vs. use of STL or style, so go easy on the niceties.</p>
+
+<p>It used <code>gmp</code> for large integers, so it must be linked with <code>-lgmp</code></p>
+
+<p>The algorithm is primarily in the <code>handinc</code> and <code>handhcp</code> functions.</p>
+
+<pre><code>// bridgehcp/bridgehcp.c -- calculate HCP of bridge hand
+
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;gmp.h&gt;
+
+#define NHONOR              4               // number of different honor types
+#define NSUIT               4               // number of suits
+#define DECKSIZE            52
+#define MAXHONOR            (NHONOR * NSUIT)
+#define MAXSPOT             (DECKSIZE - MAXHONOR)
+#define CARDS_PER_HAND      13
+#define HCPMAX              38
+
+#define SPT                 0
+
+typedef unsigned long long u64;
+typedef unsigned long ui_t;
+typedef unsigned char byte;
+typedef int inum_t;
+typedef inum_t *inum_p;
+
+typedef mpz_t qnum_t;
+typedef mpz_t qnum_p;
+
+int opt_d = 0;
+int opt_b = 0;
+int opt_t = 0;
+int opt_v = 0;
+int opt_commatst = 0;
+
+#define OPTCMP(_str) \
+    if (optcmp(cp,#_str,&amp;opt_##_str)) \
+        continue
+
+// honor state/slot control
+typedef struct {
+    int slot_ctype;                     // card type 0=J, 1=Q, 2=Q, 3=A
+    int slot_count;                     // number of cards of given type (0-4)
+    inum_t slot_nCk;                    // multiplier for slot_count
+} slot_t;
+typedef slot_t *slot_p;
+
+slot_t honors[NHONOR];                  // honor counts in given dealt hand
+
+typedef struct {
+    qnum_t hand_tot;                    // total for hand
+} handvec_t;
+typedef handvec_t *handvec_p;
+
+handvec_t handvec[HCPMAX];              // vector of final values
+
+#define HANDVEC(_hcp) \
+    handvec_p hand = &amp;handvec[_hcp]
+
+const char *hcpstr[HCPMAX] = {
+    [0] = "2,310,789,600",
+    [1] = "5,006,710,800",
+    [2] = "8,611,542,576",
+    [3] = "15,636,342,960",
+    [4] = "24,419,055,136",
+    [5] = "32,933,031,040",
+    [6] = "41,619,399,184",
+    [7] = "50,979,441,968",
+    [8] = "56,466,608,128",
+    [9] = "59,413,313,872",
+    [10] = "59,723,754,816",
+    [11] = "56,799,933,520",
+    [12] = "50,971,682,080",
+    [13] = "43,906,944,752",
+    [14] = "36,153,374,224",
+    [15] = "28,090,962,724",
+    [16] = "21,024,781,756",
+    [17] = "14,997,082,848",
+    [18] = "10,192,504,020",
+    [19] = "6,579,838,440",
+    [20] = "4,086,538,404",
+    [21] = "2,399,507,844",
+    [22] = "1,333,800,036",
+    [23] = "710,603,628",
+    [24] = "354,993,864",
+    [25] = "167,819,892",
+    [26] = "74,095,248",
+    [27] = "31,157,940",
+    [28] = "11,790,760",
+    [29] = "4,236,588",
+    [30] = "1,396,068",
+    [31] = "388,196",
+    [32] = "109,156",
+    [33] = "22,360",
+    [34] = "4,484",
+    [35] = "624",
+    [36] = "60",
+    [37] = "4",
+};
+
+#define FOR_ALL_HONORS(_hon) \
+    _hon = &amp;honors[0];  _hon &lt; &amp;honors[NHONOR];  ++_hon
+
+#define MPZALL(_cmd) \
+    _cmd(qtmp,"temp variable") \
+    _cmd(kfac,"k!") \
+    _cmd(nkfac,"(n - k)!") \
+    _cmd(abstot,"absolute total number of hands (e.g. ~650G)") \
+    _cmd(spotnCk,"current number of combinations of spot cards") \
+    _cmd(curhand,"spotnCk * honornCk") \
+    _cmd(totspot,"total number of spot cards") \
+    _cmd(tothand,"totspot * honornCk") \
+    _cmd(expres,"expected result") \
+    _cmd(exptot,"expected total")
+
+#define _MPXDEF(_sym,_reason) \
+    qnum_t _sym;
+MPZALL(_MPXDEF)
+
+#define _MPXINIT(_sym,_reason) \
+    mpz_init(_sym);
+#define _MPXCLEAR(_sym,_reason) \
+    mpz_clear(_sym);
+
+#define outf(_fmt...) \
+    do { \
+        if (! opt_t) \
+            printf(_fmt); \
+    } while (0)
+
+#ifdef DEBUG
+#define dbgprt(_lvl,_fmt...) \
+    do { \
+        if (opt_d &gt;= _lvl) \
+            outf(_fmt); \
+    } while (0)
+#else
+#define dbgprt(_lvl,_fmt...) \
+    do { \
+    } while (0)
+#endif
+
+#define TLSMAX      10
+
+char *
+strtls(void)
+{
+    static char bufpool[TLSMAX][1024];
+    static int bufidx = 0;
+    char *buf;
+
+    buf = bufpool[bufidx];
+    bufidx += 1;
+    bufidx %= TLSMAX;
+
+    *buf = 0;
+
+    return buf;
+}
+
+int
+optcmp(char *cp,const char *str,int *opt)
+{
+    int len;
+    int matchflg;
+
+    len = strlen(str);
+
+    do {
+        matchflg = (strncmp(cp,str,len) == 0);
+        if (! matchflg)
+            break;
+
+        cp += len;
+
+        if (*cp == 0) {
+            *opt = ! *opt;
+            break;
+        }
+
+        if (*cp == '=')
+            ++cp;
+
+        *opt = atoi(cp);
+    } while (0);
+
+    return matchflg;
+}
+
+void
+commaprt(char *dst,const char *src,int len)
+{
+    const char *dot;
+    char *bp;
+    int sep;
+    int off;
+
+    if (len &lt; 0)
+        len = strlen(src);
+
+    dot = strchr(src,'.');
+    if (dot == NULL)
+        dot = &amp;src[len];
+
+    len = dot - src;
+
+    bp = dst;
+    off = 0;
+    sep = 0;
+
+    for (;  src &lt; dot;  ++src, ++off) {
+        int chr = *src;
+
+        if (((len - off) % 3) == 0) {
+            if (sep)
+                *bp++ = ',';
+        }
+        sep = 1;
+
+        *bp++ = chr;
+    }
+
+    for (int chr = *src++;  chr != 0;  chr = *src++)
+        *bp++ = chr;
+
+    *bp = 0;
+}
+
+static inline void
+qnum_init(qnum_p num)
+{
+
+    mpz_init(num);
+}
+
+static inline void
+qnum_set_ui(qnum_p num,ui_t val)
+{
+
+    mpz_set_ui(num,val);
+}
+
+static inline void
+qnum_mul_ui(qnum_p dst,qnum_p src,ui_t val)
+{
+
+    mpz_mul_ui(dst,src,val);
+}
+
+static inline void
+qnum_set(qnum_p num,qnum_p val)
+{
+
+    mpz_set(num,val);
+}
+
+static inline void
+qnum_add(qnum_p dst,qnum_p src,qnum_p val)
+{
+
+    mpz_add(dst,src,val);
+}
+
+static inline void
+qnum_mul(qnum_p dst,qnum_p src,qnum_p val)
+{
+
+    mpz_mul(dst,src,val);
+}
+
+static inline void
+qnum_div(qnum_p dst,qnum_p src,qnum_p val)
+{
+
+    mpz_div(dst,src,val);
+}
+
+void
+_qnumprt(char *buf,qnum_p num)
+{
+    char tmp[1000];
+    int len;
+
+    len = gmp_sprintf(tmp,"%Zd",num);
+
+    commaprt(buf,tmp,len);
+}
+
+char *
+qnumprt(qnum_p num)
+{
+    char *buf;
+
+    buf = strtls();
+    _qnumprt(buf,num);
+
+    return buf;
+}
+
+void
+qnumset(qnum_p num,const char *str)
+{
+    char *dst;
+    char tmp[1000];
+
+    dst = tmp;
+
+    for (int chr = *str++;  chr != 0;  chr = *str++) {
+        switch (chr) {
+        case ',':
+            break;
+        default:
+            *dst++ = chr;
+            break;
+        }
+    }
+
+    *dst = 0;
+
+    mpz_set_str(num,tmp,10);
+}
+
+void
+commatst(const char *src)
+{
+    char buf[1000];
+
+    if (opt_commatst) {
+        commaprt(buf,src,-1);
+        outf("\n");
+        outf("commatst: SRC '%s'\n",src);
+        outf("commatst: DST '%s'\n",buf);
+    }
+}
+
+// qnumfac -- get n!
+void
+qnumfac(qnum_p num,int n)
+{
+
+    qnum_set_ui(num,1);
+    for (int idx = 2;  idx &lt;= n;  ++idx)
+        qnum_mul_ui(num,num,idx);
+}
+
+// qnumnCk -- get nCk (combinations of n things taken k at a time)
+void
+qnumnCk(qnum_p rtn,int n,int k)
+{
+
+    // rtn = n! / (k! (n - k)!)
+
+    // get n!
+    qnumfac(rtn,n);
+
+    // get k!
+    qnumfac(kfac,k);
+
+    // get (n - k)!
+    qnumfac(nkfac,n - k);
+
+    // get k! * (n - k)!
+    qnum_mul(kfac,kfac,nkfac);
+
+    // get n! / (k! * (n - k)!)
+    qnum_div(rtn,rtn,kfac);
+}
+
+// qnumnPk -- get nPk (permutations of n things taken k at a time)
+void
+qnumnPk(qnum_p rtn,int n,int k)
+{
+
+    // rtn = n! / (n - k)!
+
+    // get n!
+    qnumfac(rtn,n);
+
+    // get (n - k)!
+    qnumfac(nkfac,n - k);
+
+    // get n! / (n - k)!
+    qnum_div(rtn,rtn,nkfac);
+}
+
+inum_t
+inumfac(int n)
+{
+    inum_t rtn;
+
+    rtn = 1;
+    for (int idx = 2;  idx &lt;= n;  ++idx)
+        rtn *= idx;
+
+    return rtn;
+}
+
+inum_t
+inumnCk(int n,int k)
+{
+    inum_t kfac;
+    inum_t nkfac;
+    inum_t rtn;
+
+    // rtn = n! / (k! (n - k)!)
+
+    // get n!
+    rtn = inumfac(n);
+
+    // get k!
+    kfac = inumfac(k);
+
+    // get (n - k)!
+    nkfac = inumfac(n - k);
+
+    // get k! * (n - k)!
+    kfac *= nkfac;
+
+    // get n! / (k! * (n - k)!)
+    rtn /= kfac;
+
+    return rtn;
+}
+
+inum_t
+inumnPk(int n,int k)
+{
+    inum_t nkfac;
+    inum_t rtn;
+
+    // rtn = n! / (n - k)!
+
+    // get n!
+    rtn = inumfac(n);
+
+    // get (n - k)!
+    nkfac = inumfac(n - k);
+
+    // get n! / (n - k)!
+    rtn /= nkfac;
+
+    return rtn;
+}
+
+int
+honortag(slot_p hon)
+{
+    static char *tag = "JQKA";
+
+    return tag[hon-&gt;slot_ctype];
+}
+
+char *
+honorshow(void)
+{
+    slot_p hon;
+    static char buf[100];
+    char *bp = buf;
+    char *sep = "";
+
+    bp += sprintf(bp,"(");
+
+    for (FOR_ALL_HONORS(hon)) {
+        bp += sprintf(bp,"%s%c%d/%d",
+            sep,honortag(hon),
+            hon-&gt;slot_count,hon-&gt;slot_nCk);
+        sep = " ";
+    }
+
+    bp += sprintf(bp,")");
+
+    return buf;
+}
+
+// handhcp -- get HCP and number of hands for a given deal of honor cards
+int
+handhcp(int hcpneed)
+{
+    slot_p hon;
+    int hcptot = 0;
+    int nslot = CARDS_PER_HAND;
+    int hontot = 0;
+    int slotnCk;
+    int honornCk = 1;
+
+    dbgprt(2,"handhcp: ENTER hcpneed=%d\n",hcpneed);
+
+    do {
+        // get number of honors in this hand
+        for (FOR_ALL_HONORS(hon)) {
+            // get number of slots that this honor needs
+            int honcnt = hon-&gt;slot_count;
+
+            // accumulate number of honors for this dealt hand
+            hontot += honcnt;
+        }
+
+        // impossible hand -- there are more honors dealt than the number of
+        // cards in a hand (e.g. 14 honors dealt)
+        if (hontot &gt; CARDS_PER_HAND) {
+            hcptot = -1;
+            break;
+        }
+
+        // get HCP for this hand
+        for (FOR_ALL_HONORS(hon)) {
+            int honcnt = hon-&gt;slot_count;
+
+            // get number of HCP for this honor
+            int hcpcur = honcnt * (hon-&gt;slot_ctype + 1);
+
+            // accumulate total number of HCP for all honors in this hand
+            hcptot += hcpcur;
+        }
+
+        // insufficient/incorrect HCP -- doesn't match the _desired_ HCP
+        if (hcpneed &gt;= 0) {
+            if (hcptot != hcpneed)
+                break;
+        }
+
+        // get number of combinations of honor cards
+        for (FOR_ALL_HONORS(hon)) {
+            int honcnt = hon-&gt;slot_count;
+
+            // number of combinations of honors of the given type
+            slotnCk = inumnCk(NSUIT,honcnt);
+
+            // accumulate number of combinations of all honors
+            honornCk *= slotnCk;
+        }
+
+        // reduce number of available slots for spot cards in this hand by
+        // number of honors in this hand
+        nslot -= hontot;
+
+        // get number of combinations of remaining spot cards
+        qnumnCk(spotnCk,MAXSPOT,nslot);
+
+        // accumlate total for this
+        // FIXME -- really not needed anymore
+        qnum_add(totspot,totspot,spotnCk);
+
+        // get number of hands that have the given distribution of honors and
+        // spots [for the desired HCP]
+        qnum_mul_ui(curhand,spotnCk,honornCk);
+
+        // accumulate total for all hands for the given HCP
+        qnum_add(tothand,tothand,curhand);
+
+        // save in vector
+        HANDVEC(hcptot);
+        qnum_add(hand-&gt;hand_tot,hand-&gt;hand_tot,curhand);
+
+        // brief output
+        if (opt_b)
+            break;
+
+        outf("handhcp: STATE honors=%s",honorshow());
+
+        outf(" hcptot=%d",hcptot);
+        outf(" hontot=%d",hontot);
+        outf(" honornCk=%d",honornCk);
+
+        outf(" nspot=%d",MAXSPOT);
+        outf(" nslot=%d",nslot);
+        outf(" spotnCk=%s",qnumprt(spotnCk));
+
+#if SPT
+        outf(" totspot=%s",qnumprt(totspot));
+#endif
+        outf(" curhand=%s",qnumprt(curhand));
+        outf(" tothand=%s",qnumprt(tothand));
+
+        outf("\n");
+    } while (0);
+
+    dbgprt(2,"handhcp: EXIT hcptot=%d\n",hcptot);
+
+    return hcptot;
+}
+
+// handinit -- initialize honors state vector
+void
+handinit(void)
+{
+    slot_p hon;
+    int idx;
+
+    // set initial state of all honors (e.g. all honor counts are zero
+    // J=0, Q=0, K=0, A=0)
+    idx = 0;
+    for (FOR_ALL_HONORS(hon), ++idx) {
+        hon-&gt;slot_ctype = idx;
+        hon-&gt;slot_count = 0;
+    }
+
+    qnum_set_ui(totspot,0);
+    qnum_set_ui(tothand,0);
+
+    qnum_set_ui(exptot,0);
+}
+
+// _handinc -- increment single digit in honors state vector
+int
+_handinc(slot_p hon)
+{
+    int cout;
+
+    // NOTE: we only care about the _number_ of honors of a given type
+    int val = hon-&gt;slot_count;
+
+    dbgprt(3,"_handinc: ctype=%d val=%d",hon-&gt;slot_ctype,val);
+
+    val += 1;
+
+    cout = (val &gt; NSUIT);
+    if (cout)
+        val = 0;
+
+    hon-&gt;slot_count = val;
+
+    dbgprt(3," val=%d cout=%d\n",val,cout);
+
+    return cout;
+}
+
+// handinc -- increment honors state vector
+int
+handinc(void)
+{
+    slot_p hon;
+    int cout = 0;
+
+    for (FOR_ALL_HONORS(hon)) {
+        cout = _handinc(hon);
+        if (! cout)
+            break;
+    }
+
+    return cout;
+}
+
+// prettyprt -- define result output
+void
+prettyprt(const char *tag,qnum_p num)
+{
+
+    outf("%s: %s\n",tag,qnumprt(num));
+}
+
+// dotest -- perform algorithm for given HCP
+void
+dotest(int hcpneed,const char *str)
+// hcpneed -- desired HCP
+// str -- expected result
+{
+
+    handinit();
+
+    int handgud = 0;
+    int handtot = 0;
+
+    outf("\n");
+    outf("HCP: %d\n",hcpneed);
+
+    while (1) {
+        int hcpcur = handhcp(hcpneed);
+
+        if (hcpcur == hcpneed)
+            handgud += 1;
+
+        handtot += 1;
+
+        // increment to next state for number of honors of each type
+        int cout = handinc();
+
+        // stop after the _last_ state (i.e. we just did: J=4, Q=4, K=4, A=4
+        // and we incremented back to the start (J=0, Q=0, K=0, A=0)
+        if (cout)
+            break;
+    }
+
+    outf("HANDS: %d of %d\n",handgud,handtot);
+
+    // pretty print the numbers
+    prettyprt("EXP",expres);
+#if SPT
+    prettyprt("SPT",totspot);
+#endif
+    prettyprt("ACT",tothand);
+}
+
+void
+doall(void)
+{
+
+    handinit();
+
+    while (1) {
+        handhcp(-1);
+
+        // increment to next state for number of honors of each type
+        int cout = handinc();
+
+        // stop after the _last_ state (i.e. we just did: J=4, Q=4, K=4, A=4
+        // and we incremented back to the start (J=0, Q=0, K=0, A=0)
+        if (cout)
+            break;
+    }
+}
+
+void
+doany(int hcpneed,const char *str)
+{
+
+    do {
+        qnumset(expres,str);
+
+        // accumulate expected results -- check OP's result, when done,
+        // this should be 52C13
+        qnum_add(exptot,exptot,expres);
+
+        if (opt_v) {
+            dotest(hcpneed,str);
+            break;
+        }
+
+        outf("\n");
+        outf("HCP: %d\n",hcpneed);
+
+        // pretty print the numbers
+        prettyprt("EXP",expres);
+#if SPT
+        prettyprt("SPT",totspot);
+#endif
+        HANDVEC(hcpneed);
+        prettyprt("ACT",hand-&gt;hand_tot);
+    } while (0);
+}
+
+int
+main(int argc,char **argv)
+{
+    char *cp;
+
+    --argc;
+    ++argv;
+
+    for (;  argc &gt; 0;  --argc, ++argv) {
+        cp = *argv;
+        if (*cp != '-')
+            break;
+
+        ++cp;
+
+        OPTCMP(commatst);
+        OPTCMP(d);
+        OPTCMP(b);
+        OPTCMP(t);
+        OPTCMP(v);
+
+        printf("bridgehcp: unknown option -- '%s'\n",cp);
+        exit(1);
+    }
+
+    // test the commaprt routine
+    const char *digits = "1234567890";
+    for (const char *lhs = digits;  *lhs != 0;  ++lhs)
+        commatst(lhs);
+    for (const char *lhs = digits;  *lhs != 0;  ++lhs) {
+        for (const char *rhs = digits;  *rhs != 0;  ++rhs) {
+            char buf[100];
+            sprintf(buf,"%s.%s",lhs,rhs);
+            commatst(buf);
+        }
+    }
+
+    MPZALL(_MPXINIT)
+
+    // show all factorials
+    for (int n = 1;  n &lt;= 52;  ++n) {
+        qnumfac(qtmp,n);
+        dbgprt(1,"qnumfac: n=%d %s\n",n,qnumprt(qtmp));
+    }
+
+    // total number of possible hands
+    qnumnCk(abstot,DECKSIZE,CARDS_PER_HAND);
+    outf("qnumnCk: %s\n",qnumprt(abstot));
+
+    // show nCk 4C0-4C4
+    for (int n = 1;  n &lt;= 4;  ++n) {
+        for (int k = 0;  k &lt;= 4;  ++k) {
+            qnumnCk(qtmp,n,k);
+            dbgprt(1,"%dC%d: %s\n",n,k,qnumprt(qtmp));
+        }
+    }
+
+    // when we're done this will match the number of possible hands
+    qnum_set_ui(exptot,0);
+
+    // initialize hand total vector
+    for (int hcpneed = 0;  hcpneed &lt; HCPMAX;  ++hcpneed) {
+        HANDVEC(hcpneed);
+        memset(hand,0,sizeof(handvec_t));
+        qnum_init(hand-&gt;hand_tot);
+        qnum_set_ui(hand-&gt;hand_tot,0);
+    }
+
+    // precalc all
+    if (! opt_v)
+        doall();
+
+    for (int hcpneed = 0;  hcpneed &lt; HCPMAX;  ++hcpneed)
+        doany(hcpneed,hcpstr[hcpneed]);
+
+    // NOTE: these should match
+    outf("\n");
+    outf("abstot: %s\n",qnumprt(abstot));
+    outf("exptot: %s\n",qnumprt(exptot));
+
+    MPZALL(_MPXCLEAR)
+
+    return 0;
+}
+</code></pre>
+    </div>

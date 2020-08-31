@@ -1,0 +1,278 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>In Go, measure performance. Run benchmarks using the Go <code>testing</code> package.</p>
+
+<p>For example,</p>
+
+<pre><code>$ go test transpose_test.go -bench=. -benchmem
+BenchmarkTranspose-4       2471407    473 ns/op    320 B/op    13 allocs/op
+BenchmarkTransposeOpt-4    9023720    136 ns/op    224 B/op     2 allocs/op
+$
+</code></pre>
+
+<p>As you can see, minimizing allocations is important. Efficient memory cache usage probably helps too.</p>
+
+<p><code>transpose_test.go</code>:</p>
+
+<pre><code>package main
+
+import "testing"
+
+func transpose(a [][]int) [][]int {
+    newArr := make([][]int, len(a))
+    for i := 0; i &lt; len(a); i++ {
+        for j := 0; j &lt; len(a[0]); j++ {
+            newArr[j] = append(newArr[j], a[i][j])
+        }
+    }
+    return newArr
+}
+
+func BenchmarkTranspose(b *testing.B) {
+    a := [][]int{{1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}}
+    b.ResetTimer()
+    for N := 0; N &lt; b.N; N++ {
+        _ = transpose(a)
+    }
+}
+
+func NewMatrix(d2, d1 int) [][]int {
+    a := make([]int, d2*d1)
+    m := make([][]int, d2)
+    lo, hi := 0, d1
+    for i := range m {
+        m[i] = a[lo:hi:hi]
+        lo, hi = hi, hi+d1
+    }
+    return m
+}
+
+func transposeOpt(a [][]int) [][]int {
+    b := NewMatrix(len(a[0]), len(a))
+    for i := 0; i &lt; len(b); i++ {
+        c := b[i]
+        for j := 0; j &lt; len(c); j++ {
+            c[j] = a[j][i]
+        }
+    }
+    return b
+}
+
+func BenchmarkTransposeOpt(b *testing.B) {
+    a := [][]int{{1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}, {4, 4, 4, 4}}
+    b.ResetTimer()
+    for N := 0; N &lt; b.N; N++ {
+        _ = transposeOpt(a)
+    }
+}
+</code></pre>
+
+<hr>
+
+<p>Goroutines have overhead. For a small task (4 x 4 matrix), the overhead may outweigh any gains. </p>
+
+<p>Let's look at a 1920 x 1080 matrix (the size of an FHD display).</p>
+
+<p>For this type of problem, we examine the optimized transpose function (<code>transposeOpt</code>) and see if it can be subdivided into smaller, concurrent pieces. For example, by row (<code>transposeRow</code>), or the number of available CPUs (<code>transposeCPU</code>).</p>
+
+<pre><code>$ go test goroutine_test.go -bench=. -benchmem
+BenchmarkTranspose-4       37   31848320 ns/op   63354443 B/op   15121 allocs/op
+BenchmarkTransposeOpt-4   202    5921065 ns/op   16616065 B/op       2 allocs/op
+BenchmarkTransposeRow-4   229    5307156 ns/op   16616159 B/op       3 allocs/op
+BenchmarkTransposeCPU-4   360    3347992 ns/op   16616083 B/op       3 allocs/op
+$
+</code></pre>
+
+<p>A row is still a small task. Twice the number of CPUs amortizes the goroutine overhead over a number of rows.  By any measure -- CPU, memory, allocations -- <code>transposeCPU</code> is considerably more efficient than the original transpose for a 1920 x 1080 matrix.</p>
+
+<pre><code>func NewMatrix(d2, d1 int) [][]int {
+    a := make([]int, d2*d1)
+    m := make([][]int, d2)
+    lo, hi := 0, d1
+    for i := range m {
+        m[i] = a[lo:hi:hi]
+        lo, hi = hi, hi+d1
+    }
+    return m
+}
+
+var numCPU = runtime.NumCPU()
+
+func transposeCPU(a [][]int) [][]int {
+    b := NewMatrix(len(a[0]), len(a))
+    var wg sync.WaitGroup
+    n := 2 * numCPU
+    stride := (len(b) + n - 1) / n
+    for lo := 0; lo &lt; len(b); lo += stride {
+        hi := lo + stride
+        if hi &gt; len(b) {
+            hi = len(b)
+        }
+        wg.Add(1)
+        go func(b [][]int) {
+            defer wg.Done()
+            for i := 0; i &lt; len(b); i++ {
+                c := b[i]
+                for j := 0; j &lt; len(c); j++ {
+                    c[j] = a[j][i]
+                }
+            }
+        }(b[lo:hi])
+    }
+    wg.Wait()
+    return b
+}
+</code></pre>
+
+<p>However, for a amall, 4 x 4 matrix, the goroutine overhead outweighs any gains.</p>
+
+<pre><code>BenchmarkTranspose-4      2570755    463 ns/op   320 B/op   13 allocs/op
+BenchmarkTransposeOpt-4   8241715    145 ns/op   224 B/op    2 allocs/op
+BenchmarkTransposeRow-4    908217   1318 ns/op   240 B/op    3 allocs/op
+BenchmarkTransposeCPU-4    881936   1330 ns/op   240 B/op    3 allocs/op
+</code></pre>
+
+<p>As always, when we are exploiting concurrency, we use the Go race detector to check for data races. The overhead to check for data races is considerable. Therefore, we discard any benchmark results.</p>
+
+<pre><code>$ go test goroutine_test.go -bench=. -benchmem -race
+</code></pre>
+
+<p>By design, there are no data races.</p>
+
+<p><code>goroutine_test.go</code>:</p>
+
+<pre><code>package main
+
+import (
+    "runtime"
+    "sync"
+    "testing"
+)
+
+func transpose(a [][]int) [][]int {
+    newArr := make([][]int, len(a))
+    for i := 0; i &lt; len(a); i++ {
+        for j := 0; j &lt; len(a[0]); j++ {
+            newArr[j] = append(newArr[j], a[i][j])
+        }
+    }
+    return newArr
+}
+
+func BenchmarkTranspose(b *testing.B) {
+    for N := 0; N &lt; b.N; N++ {
+        _ = transpose(a)
+    }
+}
+
+func NewMatrix(d2, d1 int) [][]int {
+    a := make([]int, d2*d1)
+    m := make([][]int, d2)
+    lo, hi := 0, d1
+    for i := range m {
+        m[i] = a[lo:hi:hi]
+        lo, hi = hi, hi+d1
+    }
+    return m
+}
+
+func transposeOpt(a [][]int) [][]int {
+    b := NewMatrix(len(a[0]), len(a))
+    for i := 0; i &lt; len(b); i++ {
+        c := b[i]
+        for j := 0; j &lt; len(c); j++ {
+            c[j] = a[j][i]
+        }
+    }
+    return b
+}
+
+func BenchmarkTransposeOpt(b *testing.B) {
+    for N := 0; N &lt; b.N; N++ {
+        _ = transposeOpt(a)
+    }
+}
+
+func transposeRow(a [][]int) [][]int {
+    b := NewMatrix(len(a[0]), len(a))
+    var wg sync.WaitGroup
+    for i := 0; i &lt; len(b); i++ {
+        wg.Add(1)
+        c := b[i]
+        go func(c []int, i int) {
+            defer wg.Done()
+            for j := 0; j &lt; len(c); j++ {
+                c[j] = a[j][i]
+            }
+        }(c, i)
+    }
+    wg.Wait()
+    return b
+}
+
+func BenchmarkTransposeRow(b *testing.B) {
+    for N := 0; N &lt; b.N; N++ {
+        _ = transposeRow(a)
+    }
+}
+
+var numCPU = runtime.NumCPU()
+
+func transposeCPU(a [][]int) [][]int {
+    b := NewMatrix(len(a[0]), len(a))
+    var wg sync.WaitGroup
+    n := 2 * numCPU
+    stride := (len(b) + n - 1) / n
+    for lo := 0; lo &lt; len(b); lo += stride {
+        hi := lo + stride
+        if hi &gt; len(b) {
+            hi = len(b)
+        }
+        wg.Add(1)
+        go func(b [][]int) {
+            defer wg.Done()
+            for i := 0; i &lt; len(b); i++ {
+                c := b[i]
+                for j := 0; j &lt; len(c); j++ {
+                    c[j] = a[j][i]
+                }
+            }
+        }(b[lo:hi])
+    }
+    wg.Wait()
+    return b
+}
+
+func BenchmarkTransposeCPU(b *testing.B) {
+    b.ResetTimer()
+    for N := 0; N &lt; b.N; N++ {
+        _ = transposeCPU(a)
+    }
+}
+
+var a = func() [][]int {
+    b := NewMatrix(1920, 1080)
+    for i := range b {
+        for j := range b[0] {
+            b[i][j] = i&lt;&lt;16 + j
+        }
+    }
+    return b
+}()
+</code></pre>
+
+<hr>
+
+<p>You might want to look at <code>gonum</code>, the Go numeric module. It's open source.</p>
+
+<p>For matrices: </p>
+
+<blockquote>
+  <p>package mat</p>
+
+<pre><code>import "gonum.org/v1/gonum/mat"
+</code></pre>
+  
+  <p>Package mat provides implementations of float64 and complex128 matrix
+  structures and linear algebra operations on them.</p>
+</blockquote>
+    </div>

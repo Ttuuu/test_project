@@ -1,0 +1,120 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><em>(self-answer)</em></p>
+
+<hr>
+
+<p>This thing has grown a little bit since I have posted it. I followed most of the suggestions and added some new features: dynamic parameter resolution for middleware constructor and for the <code>Invoke</code> methods. I now throw exceptions when <em>contract</em> conventions have not been met like invalid middleware constructor, too few or too many invokes or having invalid signatures. </p>
+
+<hr>
+
+<p>Something for my <em>fans</em> of the <code>DynamicException</code>: it saved me from creating five unnecessary exception classes here.</p>
+
+<hr>
+
+<pre><code>public class MiddlewareBuilder
+{
+    private readonly Stack&lt;(Type MiddlewareType, object[] Parameters)&gt; _middleware = new Stack&lt;(Type MiddlewareType, object[] Parameters)&gt;();
+
+    public Func&lt;Type, object&gt; Resolve { get; set; } = _ =&gt; throw new InvalidOperationException("No service for resolving middleware dependencies has been registered.");
+
+    public MiddlewareBuilder Add&lt;T&gt;(params object[] parameters)
+    {
+        _middleware.Push((typeof(T), parameters));
+        return this;
+    }
+
+    public RequestCallback&lt;TContext&gt; Build&lt;TContext&gt;()
+    {
+        var previous = default(object);
+        while (_middleware.Any())
+        {
+            var current = _middleware.Pop();
+            var nextCallback = CreateNext&lt;TContext&gt;(previous);
+            var parameters = new object[] { nextCallback };
+            if (current.Parameters.Any())
+            {
+                parameters = parameters.Concat(current.Parameters).ToArray();
+            }
+
+            var middlewareCtor = current.MiddlewareType.GetConstructor(parameters.Select(p =&gt; p.GetType()).ToArray());
+            if (middlewareCtor is null)
+            {
+                throw DynamicException.Create
+                (
+                    "ConstructorNotFound",
+                    $"Type '{current.MiddlewareType.ToPrettyString()}' does not have a constructor with these parameters: [{parameters.Select(p =&gt; p.GetType().ToPrettyString()).Join(", ")}]"
+                );
+            }
+
+            previous = middlewareCtor.Invoke(parameters);
+        }
+
+        return CreateNext&lt;TContext&gt;(previous);
+    }
+
+
+    // Using this helper to "catch" the "previous" middleware before it goes out of scope and is overwritten by the loop.
+    private RequestCallback&lt;TContext&gt; CreateNext&lt;TContext&gt;(object middleware)
+    {
+        // This is the last last middleware and there is nowhere to go from here.
+        if (middleware is null)
+        {
+            return _ =&gt; Task.CompletedTask;
+        }
+
+        var invokeMethods = new[]
+        {
+            middleware.GetType().GetMethod("InvokeAsync"),
+            middleware.GetType().GetMethod("Invoke")
+        };
+
+        var nextInvokeMethod = invokeMethods.Where(Conditional.IsNotNull).SingleOrThrow
+        (
+            onEmpty: () =&gt; DynamicException.Create("InvokeNotFound", $"{middleware.GetType().ToPrettyString()} must implement either 'InvokeAsync' or 'Invoke'."),
+            onMany: () =&gt; DynamicException.Create("AmbiguousInvoke", $"{middleware.GetType().ToPrettyString()} must implement either 'InvokeAsync' or 'Invoke' but not both.")
+        );
+
+        var parameters = nextInvokeMethod.GetParameters();
+
+        if (parameters.First().ParameterType != typeof(TContext))
+        {
+            throw DynamicException.Create
+            (
+                "InvokeSignature",
+                $"{middleware.GetType().ToPrettyString()} Invoke(Async)'s first parameters must be of type '{typeof(RequestCallback&lt;TContext&gt;).ToPrettyString()}'."
+            );
+        }
+
+        return context =&gt;
+        {
+            var parameterValues =
+                parameters
+                    .Skip(1) // TContext is always there.
+                    .Select(parameter =&gt; Resolve(parameter.ParameterType)) // Resolve other Invoke(Async) parameters.
+                    .Prepend(context);
+
+            // Call the actual invoke with its parameters.
+            return (Task)nextInvokeMethod.Invoke(middleware, parameterValues.ToArray());
+        };
+
+        // I leave this here in case I need it later...
+        //return next.CreateDelegate&lt;RequestCallback&lt;TContext&gt;&gt;(middleware);
+    }
+}
+</code></pre>
+
+<p>I also moved the <code>Autofac</code> dependency into a new class. This way I can easily test the main class and use this one with more complex scenarios in production.</p>
+
+<pre><code>public class MiddlewareBuilderWithAutofac : MiddlewareBuilder
+{
+    public MiddlewareBuilderWithAutofac(IComponentContext componentContext)
+    {
+        Resolve =
+            type =&gt;
+                componentContext.IsRegistered(type)
+                    ? componentContext.Resolve(type)
+                    : throw DynamicException.Create("TypeNotFound", $"Could not resolve '{type.ToPrettyString()}'.");
+    }
+}
+</code></pre>
+    </div>

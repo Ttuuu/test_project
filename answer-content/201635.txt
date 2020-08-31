@@ -1,0 +1,134 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Preface</h2>
+
+<p>For this review, we shall need to refer to the <a href="https://plugins.trac.wordpress.org/browser/simmer/tags/1.3.11/core/class-simmer-installer.php#L176" rel="nofollow noreferrer">database schema for the WordPress Simmer plugin</a>:</p>
+
+<blockquote>
+<pre><code>if ( $items_table_name != $wpdb-&gt;get_var( "SHOW TABLES LIKE '$items_table_name'" ) ) {
+        // The recipe items table.
+        $query .= "CREATE TABLE $items_table_name (
+               recipe_item_id bigint(20) NOT NULL auto_increment,
+               recipe_item_type varchar(200) NOT NULL DEFAULT '',
+               recipe_id bigint(20) NOT NULL,
+               recipe_item_order int(11) NOT NULL DEFAULT '0',
+               PRIMARY KEY  (recipe_item_id),
+               KEY recipe_id (recipe_id)
+               ) $charset_collate;";
+}
+
+if ( $item_meta_table_name != $wpdb-&gt;get_var( "SHOW TABLES LIKE '$item_meta_table_name'" ) ) {
+
+        // The recipe item meta table.
+        $query .= "CREATE TABLE $item_meta_table_name (
+               meta_id bigint(20) NOT NULL auto_increment,
+               recipe_item_id bigint(20) NOT NULL,
+               meta_key varchar(255) NULL,
+               meta_value longtext NULL,
+               PRIMARY KEY  (meta_id),
+               KEY recipe_item_id (recipe_item_id),
+               KEY meta_key (meta_key)
+               ) $charset_collate;";
+}
+</code></pre>
+</blockquote>
+
+<h2>Querying</h2>
+
+<p>To start, let's format your first <code>query</code> for readability:</p>
+
+<pre><code>query = """
+    SELECT a.recipe_id, a.recipe_item_type
+         , b.meta_key, b.meta_value, b.recipe_item_id
+        FROM wp_simmer_recipe_items a, wp_simmer_recipe_itemmeta b
+        WHERE a.recipe_item_id = b.recipe_item_id
+        GROUP BY a.recipe_item_id
+"""
+</code></pre>
+
+<p>Your <code>query</code> has a <strong>non-sensical <code>GROUP BY</code> clause</strong>.  The only way that this query could be legal is if the schema and query are formulated so as to guarantee that each <code>recipe_item_id</code> only appears at most once in the query result.  While the <code>wp_simmer_recipe_items</code> table does have a <code>PRIMARY KEY (recipe_item_id)</code> constraint, there is no such uniqueness guarantee in the <code>wp_simmer_recipe_itemmeta</code> table.  MySQL &lt; 5.7.5 somehow executes the query despite the fact that it makes no sense; <a href="https://dev.mysql.com/doc/refman/5.7/en/group-by-handling.html" rel="nofollow noreferrer">in MySQL ≥ 5.7.5, it should fail with an error</a>, as it should in any sane SQL implementation:</p>
+
+<blockquote>
+  <p>ERROR 1055 (42000): Expression #3 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'somedb.b.meta_key' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by</p>
+</blockquote>
+
+<p>Based on the query results, you build the <code>ingredients</code> and <code>instructions</code> lists by appending entries.  However, you fail to <code>ORDER BY recipe_item_order</code>, so the <strong>ingredients and instructions may appear in any order</strong>.  (Try baking the bread before mixing the dough!)</p>
+
+<p>When joining tables, write the query using <code>JOIN</code>. It's more readable than implicitly joining tables using the <code>WHERE</code> clause.</p>
+
+<p>The worst sin in this code is <strong>executing <code>query1</code> for each recipe found by <code>query</code></strong>.  This is a bad idea for two reasons:</p>
+
+<ul>
+<li><p>For good performance, you should <strong>never execute queries in a loop</strong>, especially when the number of secondary queries depends on the length of the results of the primary query.  Each additional query necessitates a round trip to the server, and takes time to interpret and execute.</p></li>
+<li><p>The information returned by <strong><code>query1</code> is entirely redundant</strong> — all of the information you need from it (namely, the <code>meta_key</code> and <code>meta_value</code> for each <code>recipe_item_id</code>) is already contained within the results of <code>query</code>!</p></li>
+</ul>
+
+<p>Furthermore, you don't need to make <strong>two connections to the same database</strong>.  All you need is two cursors, which can be created from just one connection.</p>
+
+<h2>Suggested solution</h2>
+
+<p>Execute two queries: one to get the instructions, one to get the ingredients. (Here, I've taken a shortcut and assumed that every recipe will have at least one instruction and at least one ingredient.)</p>
+
+<p>Take advantage of <a href="https://docs.python.org/3/library/itertools.html#itertools.groupby" rel="nofollow noreferrer"><code>itertools.groupby()</code></a> to help construct the inner lists and dictionaries.</p>
+
+<pre><code>from itertools import groupby
+import json
+from operator import itemgetter
+import mysql.connector
+
+cnx = mysql.connector.connect(
+    database='somedb', user='root', password='root', host='localhost'
+)
+cursor = cnx.cursor()
+data = {}
+
+cursor.execute("""
+    SELECT item.recipe_id
+         , meta.meta_value AS instruction_text
+        FROM wp_simmer_recipe_items item
+            INNER JOIN wp_simmer_recipe_itemmeta meta
+                ON item.recipe_item_id = meta.recipe_item_id
+        WHERE
+            item.recipe_item_type = 'instruction'
+            AND meta.meta_key &lt;&gt; 'is_heading'
+        ORDER BY item.recipe_id, item.recipe_item_order
+""")
+for recipe_id, instructions in groupby(cursor.fetchall(), itemgetter(0)):
+    data[recipe_id] = {
+        'instructions': [row[1] for row in instructions],
+        'ingredients': [],
+    }
+
+cursor.execute("""
+    SELECT item.recipe_id
+         , meta.recipe_item_id
+         , meta.meta_key
+         , meta.meta_value
+        FROM wp_simmer_recipe_items item
+            INNER JOIN wp_simmer_recipe_itemmeta meta
+                ON item.recipe_item_id = meta.recipe_item_id
+        WHERE
+            item.recipe_item_type &lt;&gt; 'instruction'
+        ORDER BY item.recipe_id, item.recipe_item_order, meta.meta_key
+""")
+for (recipe_id, item_id), item in groupby(cursor.fetchall(), itemgetter(0, 1)):
+    data[recipe_id]['ingredients'].append({row[2]: row[3] for row in item})
+
+cursor.close()
+cnx.close()
+
+with open('data.json', 'w') as outfile:
+    json.dump(data, outfile, sort_keys=True, indent=4)
+</code></pre>
+
+<h2>Further discussion</h2>
+
+<p>MySQL, since version 5.7.22, has JSON support.  It would be nice to rewrite the SQL such that the entire JSON result could be returned from just a single query.  Unfortunately, the <a href="https://dev.mysql.com/doc/refman/5.7/en/group-by-functions.html#function_json-arrayagg" rel="nofollow noreferrer"><code>JSON_ARRAYAGG()</code> function</a> does not let you specify the order of its results:</p>
+
+<blockquote>
+  <p><code>JSON_ARRAYAGG(<strong><i>col_or_expr</i></strong>)</code></p>
+  
+  <p>Aggregates a result set as a single JSON array whose elements consist of the rows. <em>The order of elements in this array is undefined.</em></p>
+</blockquote>
+
+<p>That, to me, would be a deal-breaker for exporting a recipe.</p>
+    </div>

@@ -1,0 +1,162 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>General impressions - nice neat code, well commented.  It's good that you use <code>trap</code> to clean up on exit.</p>
+
+<p>Shellcheck picks up a couple of oversights:</p>
+
+<pre class="lang-none prettyprint-override"><code>206596.sh:11:11: note: Check exit code directly with e.g. 'if mycmd;', not indirectly with $?. [SC2181]
+206596.sh:22:1: warning: Use 'cd ... || exit' or 'cd ... || return' in case cd fails. [SC2164]
+206596.sh:27:5: note: read without -r will mangle backslashes. [SC2162]
+206596.sh:44:1: warning: Use 'find .. -print0 | xargs -0 ..' or 'find .. -exec .. +' to allow non-alphanumeric filenames. [SC2011]
+</code></pre>
+
+<hr>
+
+<p>Let's do a walk-through:</p>
+
+<ul>
+<li><pre><code>#!/bin/bash
+</code></pre>
+
+<p>Why <code>bash</code>?  I don't think there's anything here that can't be achieved with standard POSIX shell.</p></li>
+<li><pre><code>NUM_PROCS=4
+</code></pre>
+
+<p>What's special about 4?  If it's the number of cores you have available, then we could automate that:</p>
+
+<pre><code>NUM_PROCS=$(getconf _NPROCESSORS_ONLN)
+</code></pre></li>
+<li><pre><code>PIDFILE="/tmp/cleanup.pid"
+</code></pre>
+
+<p>I'm not sure about CentOS, but on the platforms I'm more familiar with, pidfiles normally live under <code>/run</code> (or <code>/var/run</code> on older installations).</p></li>
+<li><pre><code>PID_NOW="$$"
+</code></pre>
+
+<p>Never modified; I think it's clearer to simply use <code>$$</code> where it's needed.</p></li>
+<li><pre><code>echo "$1" &gt; "$PIDFILE"
+
+if [[ "$?" -ne 0 ]]; then
+</code></pre>
+
+<p>Instead of testing <code>$?</code>, we should use the result directly (and since we never call this with anything other than our own pid, let's just embed that in the function rather than passing as argument).  Give the function a POSIX-compliant name, and declare it without the deprecated <code>function</code> keyword:</p>
+
+<pre><code>save_pid() {
+    if ! echo <span class="math-container">$$ &gt;"$PIDFILE"
+    then
+        # If we couldn't save the PID to the lockfile...
+        echo &gt;&amp;2 "Failed to create PID file for PID $$</span> in $PIDFILE; exiting"
+        exit 1
+    fi
+}
+</code></pre>
+
+<p>Note that the message is printed to standard error (stream 2) rather than standard output.</p></li>
+<li><pre><code>cd /scratch
+</code></pre>
+
+<p>There's no checking that this command succeeded.  We could append <code>|| exit 1</code> or similar, but we can catch more errors by setting shell flags <code>-e</code> and <code>-u</code> at the beginning of the script.</p>
+
+<p>There's really no need to change working directory at all; we could just omit this command, and use the directory name where we need it.</p></li>
+<li><pre><code>if [[ -f "$PIDFILE" ]]
+</code></pre>
+
+<p>The comment says we're testing for existence, so we should be using <code>-e</code> (or change the comment).  And we can use the standard <code>[</code> command; there's nothing to be gained from Bash-specific <code>[[</code>.</p></li>
+<li><pre><code>    read PID_SAVED &lt; "$PIDFILE"
+</code></pre>
+
+<p>Shellcheck complains about using <code>read</code> without <code>-r</code> option.  Whilst we don't expect to see shell escapes in this file, there's no harm in pacifying the warning.  Or, we could just interpolate the file directly:</p>
+
+<pre><code>if ps --quick-pid "$(cat $PIDFILE)" &amp;&gt; /dev/null
+</code></pre>
+
+<p>Or just test for the existence in procfs:</p>
+
+<pre><code>if [ -e "/proc/$(cat $PIDFILE)" ]
+</code></pre>
+
+<p>We could add further tests to ensure that we don't have a re-used pid that's running a different program, but I won't pursue that here.</p></li>
+<li><p>This structure can be simplified:</p>
+
+<pre><code>if a
+then
+    if b
+    then exit 1
+    else do-c
+    fi
+else do-c
+fi
+</code></pre>
+
+<p>It's exactly equivalent to</p>
+
+<pre><code>if a &amp;&amp; b
+then exit 1
+fi
+do-c
+</code></pre>
+
+<p>That simplification gives us:</p>
+
+<pre><code>if [ -e "$PIDFILE" ] &amp;&amp; [ -e "/proc/$(cat $PIDFILE)" ]
+then
+    # A process exists with our saved PID
+    echo &gt;&amp;2 "Cleanup script is already running with PID $PID_SAVED; exiting"
+    exit 1
+fi
+
+save_pid
+</code></pre></li>
+<li><pre><code>trap clean-up HUP INT QUIT ILL ABRT BUS SEGV PIPE TERM ERR
+</code></pre>
+
+<p>Instead of listing all these signals, we just want to clean up however the shell exits:</p>
+
+<pre><code>trap clean_up EXIT
+</code></pre></li>
+<li><pre><code>ls | xargs -P "$NUM_PROCS" -I{} \
+</code></pre>
+
+<p>It's dangerous to pipe the output of <code>ls</code> like that.  Files not under your control can contain almost anything, including newlines and other significant space.  I don't think we really want to ignore dot-files, either.  I recommend <code>find -maxdepth 1 -mindepth 1</code>, which can then write safely to <code>xargs</code> using <code>--print0</code>.  We might want to eliminate symlinks from the listing, although we know that the inner <code>find</code> won't follow them without <code>-H</code> or <code>-L</code>.</p></li>
+<li><code>save_pid</code> and <code>clean_up</code> are only used once each now, so could be usefully inlined.</li>
+</ul>
+
+<hr>
+
+<h1>Modified code</h1>
+
+<pre><code>#!/bin/sh
+
+set -eu
+
+LIMIT_TIME=30 # days
+NUM_PROCS=$(getconf _NPROCESSORS_ONLN)
+PIDFILE="/var/run/cleanup.pid"
+
+# check pidfile
+if [ -e "$PIDFILE" ] &amp;&amp; [ -e "/proc/$(cat $PIDFILE)" ]
+then
+    # A process exists with our saved PID
+    echo &gt;&amp;2 "Cleanup script is already running with PID $PID_SAVED; exiting"
+    exit 1
+fi
+
+# write pidfile
+    if ! echo <span class="math-container">$$ &gt;"$PIDFILE"
+then
+    # If we couldn't save the PID to the lockfile...
+    echo &gt;&amp;2 "Failed to create PID file for PID $$</span> in $PIDFILE; exiting"
+        exit 1
+    fi
+
+trap 'rm "$PIDFILE"' EXIT
+
+# Now start working
+find /scratch -maxdepth 1 -mindepth 1 \! -type l --print0 \
+     | xargs -0 -P "$NUM_PROCS" -I{} \
+             find {} -xdev -type f -mtime "+$LIMIT_TIME" -delete
+</code></pre>
+
+<hr>
+
+<p>After all that, consider that you might be reinventing a wheel.  Most likely, you have a <code>tmpreaper</code> package available that can be configured to do exactly this task.</p>
+    </div>

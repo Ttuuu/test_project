@@ -1,0 +1,156 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'm ignoring all the testing stuff, and just focusing on the two conversion functions.</p>
+
+<pre><code>std::string operator"" _str(unsigned long long int num)
+{
+    std::deque&lt;char&gt; digits;
+</code></pre>
+
+<p>There's really no need for the deque. You can <code>push_back()</code> all the digits directly into a <code>std::string</code>, and then use <code>std::reverse()</code>.</p>
+
+<p>To make it even better, you could use the max value of an <code>unsigned long long</code> and calculate the maximum number of digits you'll need, then use <code>reserve()</code>. But that probably won't net you any real gains in reality, since you'll likely always be under the small-string optimization size where <code>std::string</code> won't actually allocate any memory... another reason to ditch the deque and stick with strings.</p>
+
+<pre><code>for(char i = 0; num != 0;num = num / 10)
+</code></pre>
+
+<p>Have you tested your conversion functions with zero? Because if <code>num</code> is zero, this loop won't fire at all, and <code>digits</code> will be empty. So <code>"0"_str</code> will result in <code>""</code>.</p>
+
+<p>This is a pretty weird and confusing loop in general. <code>i</code> <em>looks</em> like it's going to be some kind of loop counter, but it's not. All-in-all, this just looks like a case of trying to be too clever, and outsmarting yourself (due to the zero issue).</p>
+
+<p>This could be expressed much more simply and clearly as something like:</p>
+
+<pre><code>do
+{
+    digits.push_front('0' + (num % 10));
+    num /= 10;
+} while (num != 0);
+</code></pre>
+
+<p>and it won't have the zero bug. (<code>do</code> loops are less common than <code>while</code>, but the reason to use one here - and this should be documented in a comment - is to guarantee that even if <code>num</code> is zero, the loop will fire at least once.)</p>
+
+<p>{snipped section about digit character codes}</p>
+
+<pre><code>std::string converternum;
+</code></pre>
+
+<p>I already mentioned that the deque is unnecessary, but if you're really going to use it, you should take advantage of the fact that you know <code>digits.size()</code>, and use <code>reserve()</code> for this string to prevent unnecessary allocations.</p>
+
+<pre><code>char * operator"" _cstr(unsigned long long int num)
+</code></pre>
+
+<p>This function is mostly identical to the first one, and thus has the same problems. Again, I would ditch the deque and just work with a string. The digits will be in reverse order, but in this case you can fix that with <code>std::reverse_copy()</code> when you copy them into your output buffer.</p>
+
+<pre><code>char * string = (char *)converternum.c_str();
+return string;//converternum.c_str();
+</code></pre>
+
+<p>Here is where you get into <em>real</em> trouble.</p>
+
+<p>First, never, ever use C-style casts. In this case, you've cast away the constness of <code>c_str()</code>... that's bad. Prior to C++17, if you want a non-<code>const</code> pointer to <code>std::string</code>'s data, you have to jump through some hoops - you have to do something like <code>&amp;convertnum[0]</code> or <code>&amp;convertnum.front()</code> - and I agree that's a pain. But casting away constness is a red flag that won't pass most code reviews, because it is <em>extremely</em> dangerous.</p>
+
+<p>Second, you are taking a pointer to <code>convertnum</code>'s internal data, and returning that... even though <code>convertnum</code> is being destroyed. In other words, you are returning a pointer to freed memory, which is UB.</p>
+
+<p>How do you solve these problems? Well, the don't answer is: Don't use C-style strings. In other words, don't have a <code>_cstr</code> UDL. It's only going to give you grief (it already has!).</p>
+
+<p>But if you really, really <em>must</em>... one option is to do what @hoffmale suggests, and instead of <code>char*</code>, return <code>std::unique_ptr&lt;char[]&gt;</code>. That might look something like this:</p>
+
+<pre><code>char* operator"" _cstr(unsigned long long int num)
+{
+    auto digits = std::string{};
+    do
+    {
+        digits += '0' + (num % 10);
+        num /= 10;
+    } while (num != 0);
+
+    auto p = std::make_unique&lt;char[]&gt;(digits.size() + 1);
+
+    std::reverse_copy(digits.cbegin(), digits.cend(), p.get());
+    p[digits.size()] = '\0'; // have to manually add the null terminator
+
+    return p;
+}
+</code></pre>
+
+<p>The problem with that is you're now longer returning a C-string, which makes "<code>_cstr</code>" kind of a lie.</p>
+
+<p>So another option is to have some kind of storage with a lifetime longer than the function that will retain the memory for you. Something like:</p>
+
+<pre><code>char* operator"" _cstr(unsigned long long int num)
+{
+    // Note: you *can't* use a vector&lt;string&gt;, because string's
+    // memory may be invalidated on moves, like if the vector
+    // resizes.
+    static auto storage = std::vector&lt;std::unique_ptr&lt;char[]&gt;&gt;{};
+
+    auto digits = std::string{};
+    do
+    {
+        digits += '0' + (num % 10);
+        num /= 10;
+    } while (num != 0);
+
+    auto p = std::make_unique&lt;char[]&gt;(digits.size() + 1);
+
+    std::reverse_copy(digits.cbegin(), digits.cend(), p.get());
+    p[digits.size()] = '\0';
+
+    // Get the char*, and then move the unique_ptr into storage
+    // to let it be managed there.
+    auto result = p.get();
+    storage.push_back(std::move(p));
+
+    return result;
+}
+</code></pre>
+
+<p>This will "work", and it's basically what some C libraries do (when they don't simply leak). But with no way to release the memory, it will just grow and grow. You <em>could</em> add a mechanism to release the memory, but you would need a way to be sure it's safe for every string. This solution is possible, but unwieldy.</p>
+
+<p>The last solution - the worst case (other than outright UB) - is to define some sort of contract that client code must follow. In plain English, document the function by saying "you must <code>delete[]</code> the memory when you're done with it". That requires programmers to behave, and is very easy to break, so it is <em>not</em> recommended. But... if you <em>really</em> want a C-string function, it's an option. A bad one, but an option nonetheless.</p>
+
+<h1>Summary</h1>
+
+<p>You have one critical error in your code:</p>
+
+<ul>
+<li>In <code>""_cstr(unsigned long long)</code>, you return a pointer to the internal memory of a <code>std::string</code> that gets destroyed at the end of the function, meaning you're returning a pointer to invalid memory.</li>
+</ul>
+
+<p>You have a couple of logical errors in your code:</p>
+
+<ul>
+<li>Both functions will return an empty string when the number is zero, instead of <code>"0"</code>.</li>
+</ul>
+
+<p>You have a few inefficiencies:</p>
+
+<ul>
+<li>You use deques because you want to add the numbers in reverse order, and reason that makes sense because neither strings nor vectors have <code>push_front()</code>. But that's all unnecessary. You can simply <code>push_back()</code> directly into your result string, and then use <code>std::reverse()</code>. (Or <code>push_back()</code> into a string buffer, and <code>std::reverse_copy()</code> into your final buffer.)</li>
+</ul>
+
+<p>And here are some tips to keep in mind:</p>
+
+<p>It's really good that you're doing testing, but if you're going to do that, you might as well go all in and use something like Google Test. It's header-only, a single include, and it produces very pretty output. A full battery of tests can give you great confidence in your code. Using Google Test might look something like (fair warning, I don't actually use Google Test that often):</p>
+
+<pre><code>TEST(StrTest, HandlesZero) {
+    EXPECT_EQ(0_str, "0");
+}
+</code></pre>
+
+<p>To test that the types are right, rather than trying to demangle the names (which, by the way, it's been a long time since I've used <code>abi::__cxa_demangle()</code>, but I'm pretty sure you're not using it correctly), it's so much easier to just use type traits:</p>
+
+<pre><code>TEST(StrTest, ReturnType) {
+    EXPECT_TRUE((std::is_same_v&lt;decltype(0_str), std::string&gt;));
+}
+</code></pre>
+
+<p>Another dirty trick you can use to examine types is deliberately generating errors:</p>
+
+<pre><code>template &lt;typename T&gt;
+struct TD; // note, never define TD
+
+TD&lt;decltype(0_str)&gt; t; // will trigger an error
+</code></pre>
+
+<p>The error generated will print the <em>exact</em> type of whatever is in the angle brackets, on every compiler. This is a hackish way to check types, but it can help when you're experimenting.</p>
+    </div>

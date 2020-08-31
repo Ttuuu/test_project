@@ -1,0 +1,253 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Hopefully this example will help you to organize and simplify your project design. Overall, your code is fairly clean but it can be simplified mostly by focused on what parts of your code are repeated and redundant. In particular, you have several code sections that collect the loan details using <code>Offset</code> on the worksheet. All of the offsets are the same, plus you have encapsulated all of the loan details into it's own class. So make the class do the work:</p>
+
+<p><strong>Class Module: LoanData</strong></p>
+
+<pre><code>Option Explicit
+
+'--- Class: LoanData
+Public LoanAmount As String
+Public TitleCompany As String
+Public Notes As String
+Public CloseDate As String
+Public PurchasePrice As String
+Public Product As String
+Public LoanNumber As String
+Public CustomerName As String
+
+Public Sub Populate(ByRef loanDetails As Range)
+    With loanDetails
+        LoanAmount = Format(Trim(.Offset(0, 14).Value), "Currency")
+        CloseDate = Trim(.Offset(0, 8).Value)
+        Notes = Trim(.Offset(0, 17).Value)
+        LoanNumber = Trim(.Offset(0, -2).Value)
+        Product = Trim(.Offset(0, 15).Value)
+        PurchasePrice = Format(Trim(.Offset(0, 13).Value), "Currency")
+        TitleCompany = Trim(.Offset(0, 2).Value)
+        CustomerName = Trim(Split(.Offset(0, -1).Value, " - ")(0))
+    End With
+End Sub
+</code></pre>
+
+<p>And by the way, my personal preference is to NOT prefix custom classes with <code>cls</code>. There's no reason for it and you can distinguish your own classes from the VBA built-ins anyway. Trust me, no one will be confused thinking that <code>LoanData</code> is built in to the language. Notice how the class supplies a method to populate itself, given a cell <code>Range</code> as a reference for your <code>Offset</code>.</p>
+
+<blockquote>
+  <p><strong>SIDE NOTE 1</strong>: I would likely have declared the <code>LoanAmount</code> and <code>PurchasePrice</code> variables as <code>Double</code>, then deferred to the calling routine to decide how to format those values for output. By forcing those values as <code>String</code> here, you've prevented possible future operations if you wanted to, for example, sum all the loan values for a given zip code or something.</p>
+  
+  <p><strong>SIDE NOTE 2</strong>: the dictionary code is implemented as you presented it, but I am concerned that your "Key" value for the <code>Dictionary</code> is not guaranteed to be unique for all possibilities. Your key looks like it is the CustomerName (recipient?). You might consider what field or fields you'd need to consider for a truly unique identifier. I would think the <code>LoanNumber</code> would be unique enough. Or a combination of <code>LoanNumber</code> and <code>CustomerName</code> perhaps.</p>
+</blockquote>
+
+<p>It's easiest to describe the general methods that deal with the <code>Dictionary</code> directly before considering the worksheet change events.</p>
+
+<p>First, I recommend using early binding for the <code>Microsoft Scripting Runtime</code>, at least to start your coding and debugging. It will make the <code>Dictionary</code> easier to work with.</p>
+
+<p>Next, when you need to reference a (semi-)persistent (global) variable, you declare this at the top of a regular VBA code module. In my example, the variable <code>allLoans</code> is declared as <code>Private</code>. All interactions with this dictionary are performed from publicly available routines (which is desirable), so keep the dictionary private here. The basic workhorse of the project is <code>UpdateLoanDictionary</code>. This is the routine that will create a new entry or modify an existing entry:</p>
+
+<pre><code>Private allLoans As Dictionary
+
+Public Sub UpdateLoanDictionary(ByRef thisCustomer As Range)
+    '--- just in case this Sub is called before the dictionary is created
+    If allLoans Is Nothing Then CreateLoanDictionary
+    If IsEmpty(thisCustomer.Value) Then Exit Sub
+
+    Dim thisLoan As LoanData
+    Set thisLoan = New LoanData
+    thisLoan.Populate thisCustomer
+
+    If Not allLoans.Exists(thisLoan.CustomerName) Then
+        '--- create a new loan entry
+        allLoans.Add thisLoan.CustomerName, thisLoan
+    Else
+        '--- update the existing loan entry
+        allLoans(thisLoan.CustomerName) = thisLoan
+    End If
+End Sub
+</code></pre>
+
+<p><em>(the whole module is given in a single block below)</em></p>
+
+<p>Notice that is takes a single-cell range as the input parameter. This will be used to check the data and to create an object with the <code>LoanData</code> we need. (More about how to create the whole dictionary below.)</p>
+
+<blockquote>
+  <p><strong>SIDE NOTE 3 - VERY IMPORTANT</strong>: create your new <code>LoanData</code> object with a separate <code>New</code> statement as shown above. Your method is <code>Dim oLoan As New clsLoanData</code> in a single statement. This declares a "static" class, i.e. an object that is created ONCE and only once. You want to create many of these <code>LoanData</code> objects, so you want a dynamic declaration that will create a new object each time.</p>
+</blockquote>
+
+<p>Now, there are two conditions in which you want to create your dictionary: when the workbook opens for the first time and also when the worksheet containing the data is activated. So these methods are simple.</p>
+
+<p><strong>Workbook Module: ThisWorkbook</strong></p>
+
+<pre><code>Option Explicit
+
+Private Sub Workbook_Open()
+    CreateLoanDictionary
+End Sub
+</code></pre>
+
+<p><strong>Worksheet Module: Sheet1</strong></p>
+
+<pre><code>Option Explicit
+
+Private Sub Worksheet_Activate()
+    CreateLoanDictionary
+End Sub
+</code></pre>
+
+<p>So back in the VBA Code Module, there is an additional routine to support these conditions:</p>
+
+<pre><code>Public Sub CreateLoanDictionary(Optional ByVal forceNewDictionary As Boolean = False)
+    '--- if the dictionary already exists, we don't have to recreate it
+    '    unless it's forced
+    If forceNewDictionary Or (allLoans Is Nothing) Then
+        Set allLoans = New Dictionary
+        Dim customerNames As Range
+        Set customerNames = ActiveSheet.Range("pNames")
+        Dim customer As Range
+        For Each customer In customerNames
+            UpdateLoanDictionary customer
+        Next customer
+    End If
+End Sub
+</code></pre>
+
+<p>This is where the code will loop through all the data on your worksheet and create all the entries in your dictionary using the <code>UpdateLoanDictionary</code> method we defined earlier. (functional isolation FTW!)</p>
+
+<p>The last bit is back in the worksheet module code, to respond to changes on the worksheet. Since we have the <code>LoanData</code> object doing all the work of setting up the loan details and the <code>UpdateLoanDictionary</code> method taking care of interacting with the dictionary, the <code>Worksheet_Change</code> event code is greatly simplified:</p>
+
+<pre><code>Private Sub Worksheet_Change(ByVal Target As Range)
+    Dim customerNames As Range
+    Set customerNames = ActiveSheet.Range("pNames")
+
+    Dim allChangedCells As Range
+    Set allChangedCells = Intersect(Target, customerNames)
+    If Not allChangedCells Is Nothing Then
+        Dim changedCell As Range
+        For Each changedCell In allChangedCells
+            AddLoanToDictionary changedCell
+        Next changedCell
+    End If
+End Sub
+</code></pre>
+
+<blockquote>
+  <p><strong>SIDE NOTE 4</strong>: it's best in event code to make it as short and efficient as possible. That includes making your range <code>Intersect</code> check the very first thing in the Sub. Any other logic you need can work after you determine that you really need to do that work.</p>
+</blockquote>
+
+<p>So here are the code modules in whole:</p>
+
+<p><strong>Class Module: LoanData</strong></p>
+
+<pre><code>Option Explicit
+
+'--- Class: LoanData
+Public LoanAmount As String
+Public TitleCompany As String
+Public Notes As String
+Public CloseDate As String
+Public PurchasePrice As String
+Public Product As String
+Public LoanNumber As String
+Public CustomerName As String
+
+Public Sub Populate(ByRef loanDetails As Range)
+    With loanDetails
+        LoanAmount = Format(Trim(.Offset(0, 14).Value), "Currency")
+        CloseDate = Trim(.Offset(0, 8).Value)
+        Notes = Trim(.Offset(0, 17).Value)
+        LoanNumber = Trim(.Offset(0, -2).Value)
+        Product = Trim(.Offset(0, 15).Value)
+        PurchasePrice = Format(Trim(.Offset(0, 13).Value), "Currency")
+        TitleCompany = Trim(.Offset(0, 2).Value)
+        CustomerName = Trim(Split(.Offset(0, -1).Value, " - ")(0))
+    End With
+End Sub
+</code></pre>
+
+<p><strong>Workbook Module: ThisWorkbook</strong></p>
+
+<pre><code>Option Explicit
+
+Private Sub Workbook_Open()
+    CreateLoanDictionary
+End Sub
+</code></pre>
+
+<p><strong>Worksheet Module: Sheet1</strong></p>
+
+<pre><code>Option Explicit
+
+Private Sub Worksheet_Activate()
+    CreateLoanDictionary
+End Sub
+
+Private Sub Worksheet_Change(ByVal Target As Range)
+    Dim customerNames As Range
+    Set customerNames = ActiveSheet.Range("pNames")
+
+    Dim allChangedCells As Range
+    Set allChangedCells = Intersect(Target, customerNames)
+    If Not allChangedCells Is Nothing Then
+        Dim changedCell As Range
+        For Each changedCell In allChangedCells
+            AddLoanToDictionary changedCell
+        Next changedCell
+    End If
+End Sub
+</code></pre>
+
+<p>(There's a bonus method below to <code>ShowLoans</code> that gave me a quick test of the dictionary. You can expand/modify it as needed.)</p>
+
+<p><strong>Code Module: LoanDataSupport</strong></p>
+
+<pre><code>Option Explicit
+
+Private allLoans As Dictionary
+
+Public Sub CreateLoanDictionary(Optional ByVal forceNewDictionary As Boolean = False)
+    '--- if the dictionary already exists, we don't have to recreate it
+    '    unless it's forced
+    If forceNewDictionary Or (allLoans Is Nothing) Then
+        Set allLoans = New Dictionary
+        Dim customerNames As Range
+        Set customerNames = ActiveSheet.Range("pNames")
+        Dim customer As Range
+        For Each customer In customerNames
+            UpdateLoanDictionary customer
+        Next customer
+    End If
+End Sub
+
+Public Sub UpdateLoanDictionary(ByRef thisCustomer As Range)
+    '--- just in case this Sub is called before the dictionary is created
+    If allLoans Is Nothing Then CreateLoanDictionary
+    If IsEmpty(thisCustomer.Value) Then Exit Sub
+
+    Dim thisLoan As LoanData
+    Set thisLoan = New LoanData
+    thisLoan.Populate thisCustomer
+
+    If Not allLoans.Exists(thisLoan.CustomerName) Then
+        '--- create a new loan entry
+        allLoans.Add thisLoan.CustomerName, thisLoan
+    Else
+        '--- update the existing loan entry
+        allLoans(thisLoan.CustomerName) = thisLoan
+    End If
+End Sub
+
+Sub ShowLoans()
+    If allLoans Is Nothing Then
+        Debug.Print "This is no loan dictionary!"
+    Else
+        If allLoans.Count = 0 Then
+            Debug.Print "There is a loan dictionary, but it's empty!"
+        Else
+            Debug.Print "There are " &amp; allLoans.Count &amp; " loans in the dictionary:"
+            Dim loan As Variant
+            For Each loan In allLoans.Items
+                Debug.Print "Loan Number: " &amp; loan.LoanNumber
+            Next loan
+        End If
+    End If
+End Sub
+</code></pre>
+    </div>

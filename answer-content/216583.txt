@@ -1,0 +1,181 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I like what you have done and much enjoyed getting to grips with it. Let's take a look. </p>
+
+<p>The Clojure reader provides a syntax tree of sequences, which your algorithm traverses</p>
+
+<ul>
+<li>vertically, by recursive descent and</li>
+<li>horizontally by double shunting an operator stack and a value stack.</li>
+</ul>
+
+<p>Let's look at the role of <code>next-op</code> - the last binding in the <code>loop</code>.</p>
+
+<ul>
+<li>It's a boolean flag - <code>true</code> or <code>false</code>.</li>
+<li>It alternates between these two values: the <code>true</code> handler recurs it
+to <code>false</code> and vice versa.</li>
+</ul>
+
+<p>We can</p>
+
+<ul>
+<li>transform this phase change into mutual tail recursion, then </li>
+<li>flatten it by using <a href="https://clojuredocs.org/clojure.core/trampoline" rel="nofollow noreferrer"><code>trampoline</code></a>.</li>
+</ul>
+
+<p>Donald Knuth discusses similar transformations in <a href="http://www.cs.sjsu.edu/~mak/CS185C/KnuthStructuredProgrammingGoTo.pdf" rel="nofollow noreferrer"><em>Structured Programming with Goto Statements</em></a>. Look at example 4 on page 11/271. </p>
+
+<p><em>Mutual tail-recursion</em></p>
+
+<p>We lose the <code>next-op</code> local, replacing it with two mutually recursive functions:</p>
+
+<ul>
+<li><code>next-op</code> - the <code>true</code> phase, expecting an operator;</li>
+<li><code>next-val</code> - the <code>false</code> phase, expecting a value.</li>
+</ul>
+
+<p>Minor changes:</p>
+
+<ul>
+<li>I've used <a href="https://clojuredocs.org/clojure.core/split-with" rel="nofollow noreferrer"><code>split-with</code></a> to pop the operator stack. This is just
+an    abbreviation of what you did.</li>
+<li>I test <code>expr</code> with <code>seq?</code> rather than <code>list?</code>, just in case we want
+to supply a lazy sequence or such. No need for this, as it happens.</li>
+</ul>
+
+<p>We get</p>
+
+<pre><code>(defn infix-parse [expr]
+  (if (seq? expr)
+    (letfn [(next-op [val-stack op-stack remaining]
+              (if next-op
+                (let [prec (if (empty? remaining)
+                             ##-Inf
+                             (operator-precedence (first remaining)))
+                      [popped left] (split-with #(&gt;= (operator-precedence %) prec) op-stack)
+                      result (reduce
+                               (fn [[a b &amp; vals] op]
+                                 (cons (list op b a) vals))
+                               val-stack
+                               popped)]
+                  (if (empty? remaining)
+                    (first result)
+                    (next-val result
+                      (cons (first remaining) left)
+                      (rest remaining))))))
+            (next-val [val-stack op-stack remaining]
+              (next-op (cons (infix-parse (first remaining)) val-stack)
+                op-stack
+                (rest remaining)))]
+      (next-val () () expr))
+    expr))
+</code></pre>
+
+<p><em>Flattening the Tail Recursions</em></p>
+
+<p>The above recurses on every token. Ouch! But these are tail recursions - hardly surprising since they derive from <code>recur</code>s. So we can flatten them using <code>trampoline</code>. </p>
+
+<p>The procedure is as follows:</p>
+
+<ul>
+<li>Wrap each recursive call as a parmeterless function - prefixing <code>#</code>
+does that.</li>
+<li>Insert <code>trampoline</code> into the initial call</li>
+</ul>
+
+<p>This produces ... </p>
+
+<pre><code>(defn infix-parse [expr]
+  (if (seq? expr)
+    (letfn [(next-op [val-stack op-stack remaining]
+              ...
+                    #(next-val result
+                       (cons (first remaining) left)
+                       (rest remaining))))))
+            (next-val [val-stack op-stack remaining]
+              #(next-op (cons (infix-parse (first remaining)) val-stack)
+                 op-stack
+                 (rest remaining)))]
+      (trampoline next-val () () expr))
+    expr))
+</code></pre>
+
+<p>Is it worth it? I don't know. It certainly helped me understand the algorithm. However, there is a simpler approach. </p>
+
+<p><em>Amalgamating the alternating phases</em></p>
+
+<p>The phase alternation represents the alternation of operators and operands in any (horizontal) expression. So we can unroll the two phases of the operator-operand pair into one pass of the loop. This is easy because we are dealing with only binary operators. </p>
+
+<p>Modifying your code along these lines, I came up with the following: </p>
+
+<pre><code>(defn infix-parse [expr]
+  (if-not (seq? expr)
+    expr
+    (loop [val-stack ()
+           op-stack ()
+           [opd op &amp; expr] expr]
+      (let [priority (if op (operator-precedence op) ##-Inf)
+            [popped-ops unpopped-ops] (split-with
+                                        #(&gt;= (operator-precedence %) priority)
+                                        op-stack)
+            val-stack (reduce
+                        (fn [[right left &amp; vals] op]
+                          (cons (list op left right) vals))
+                        (cons (infix-parse opd) val-stack)
+                        popped-ops)]
+        (if-not op
+          (first val-stack)
+          (recur val-stack (cons op unpopped-ops) expr))))))
+</code></pre>
+
+<p>I've changed some of the names and inverted some <code>if</code>s to make the code easier to follow. I've also assumed that the expression is not allowed to be empty, and used destructuring to detect this case. </p>
+
+<p>I've also rebound the same names in <code>loop</code> and <code>let</code> where the new expression takes over the role of the old - yes, it's like assignment. I like doing  so. Many don't.</p>
+
+<p>Finally, I rewrote your macro ...</p>
+
+<pre><code>(defmacro infix [&amp; form]
+  (infix-parse form))
+</code></pre>
+
+<p>... so that it accepts expressions inline:</p>
+
+<pre><code>user=&gt; (infix 1 + 3 * (4 - 5) * 10 / 2)
+ -14
+</code></pre>
+
+<p>Again, trivial stuff. </p>
+
+<p><strong>Appendix</strong></p>
+
+<p><em>Why your algorithm isn't quite the Dijkstra <a href="https://en.wikipedia.org/wiki/Shunting-yard_algorithm" rel="nofollow noreferrer">Shunting Yard Algorithm</a> (SYA) you refer to.</em></p>
+
+<ul>
+<li>You take in a Clojure form that is an <a href="https://en.wikipedia.org/wiki/Tree_(graph_theory)#Ordered_tree" rel="nofollow noreferrer">ordered tree</a> of tokens, where parentheses have disappeared into the structure of the tree. The SYA takes in a flat sequence of tokens that includes parentheses.</li>
+<li>You put out a tree of Clojure operator invocations, where operator scope/arity is resolved by the tree structure (which presents as parentheses). The SYA puts out a flat postfix (reverse Polish) token stream of operator invocations without parentheses, where the scope of each operator is resolved by its fixed arity. </li>
+<li>Your algorithm is explicitly recursive (in the last <code>recur</code>). The SYA
+is entirely iterative. </li>
+</ul>
+
+<p>To show that your algorithm is properly recursive, define</p>
+
+<pre><code>(defn nest [thing depth]
+  (if (pos? depth)
+    (recur (list thing) (dec depth))
+    thing))
+</code></pre>
+
+<p>... , a function that wraps its first argument in as many lists as its second argument prescribes. For example, </p>
+
+<pre><code>user=&gt; (nest :a 6)
+((((((:a))))))
+</code></pre>
+
+<p>Now ask <code>infix-parse</code> to handle a deeply parenthesised/nested expression:</p>
+
+<pre><code>user=&gt; (do (infix-parse (nest -36 1E6)) :b)
+Execution error (StackOverflowError) at infix/infix-parse (infix.clj:34).
+</code></pre>
+
+<p>It runs out of stack space. </p>
+    </div>

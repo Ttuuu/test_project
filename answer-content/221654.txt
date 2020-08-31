@@ -1,0 +1,98 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>A sycnhronisation context is still a powerful and meaningful API, since <a href="https://docs.microsoft.com/en-us/dotnet/api/system.threading.tasks.taskscheduler.fromcurrentsynchronizationcontext?view=netframework-4.8" rel="nofollow noreferrer">task schedulers rely on them</a>. However, I have some concerns with your implementation.</p>
+<h3>Exception Management</h3>
+<p>You have no exception management in place.</p>
+<ul>
+<li><code>Post</code> requires the <em>synchronization context</em> to handle the exception.</li>
+<li><code>Send</code> requires the exception to be propagated up to the caller.</li>
+</ul>
+<p>As a consequence, any exception short-circuits signaling threads that are awaiting completion of the callback.</p>
+<blockquote>
+<pre><code>public void Execute ()
+{
+    _callback (_state); // &lt;- on error
+    if (_reset != null) {
+        _reset.Set ();   // &lt;-- this will not be called
+    }
+}
+</code></pre>
+</blockquote>
+<hr>
+<h3>Proposed Solution</h3>
+<p>Simplify the work item. Extract threading flow from it.</p>
+<pre><code>        private sealed class WorkItem
+        {
+            private readonly SendOrPostCallback _callback;
+            private readonly object _state;
+
+            public WorkItem(SendOrPostCallback callback, object state)
+            {
+                if (callback == null)
+                    throw new ArgumentNullException("callback");
+
+                _callback = callback;
+                _state = state;
+            }
+
+            public void Execute()
+            {
+                _callback(_state);
+            }
+        }
+</code></pre>
+<p>Let <code>Post</code> and <code>Send</code> have distinct exception management.</p>
+<pre><code>        public override void Post(SendOrPostCallback d, object state)
+        {
+            _workItems.Enqueue(new WorkItem(arg =&gt; 
+            {
+                try
+                {
+                    d(arg);
+                }
+                catch (Exception error)
+                {
+                    // TODO handle internally, but don't propagate it up the stack
+                }
+
+            }, state));
+        }
+
+        public override void Send(SendOrPostCallback d, object state)
+        {
+            if (Thread.CurrentThread == _executingThread)
+            {
+                // Execute inline
+                new WorkItem(d, state).Execute();
+            }
+            else
+            {
+                Exception executionException = null;
+                using (var signal = new ManualResetEventSlim())
+                {
+                    _workItems.Enqueue(new WorkItem(arg =&gt;
+                    {
+                        try
+                        {
+                            d(arg);
+                        }
+                        catch (Exception error)
+                        {
+                            executionException = error;
+                        }
+                        finally
+                        {
+                            signal.Set();
+                        }
+
+                    }, state));
+
+                    signal.Wait();
+                }
+                if (executionException != null)
+                {
+                    throw new TargetInvocationException("failure executing the callback", executionException);
+                }
+            }
+        }
+</code></pre>
+    </div>

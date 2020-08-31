@@ -1,0 +1,195 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>Some random notes:</strong></p>
+
+<ul>
+<li>Your use of <code>notFoundHandler().ServeHTTP(w, r)</code> is weird. Why do you have a function returning this if it doesn't take any params? You'd probably be better off just having a function <code>writeNotFound(w, r)</code>. This mirrors the approach of <code>net.http</code>, which already provides <a href="https://golang.org/pkg/net/http/#NotFound" rel="nofollow noreferrer">functions like this</a>.</li>
+<li>From a RESTful approach, you shouldn't be returning the <code>StatusCode</code> in the JSON. That should be the HTTP status code.</li>
+<li>This is minor, but what is an <code>Enrol</code>? Enrollment?</li>
+<li><code>if r.Method != http.MethodGet</code>, you should be returning a <code>405 Method Not Allowed</code> instead of a <code>404 Not Found</code></li>
+<li>If <code>json.Marshal</code> fails, you should return a <code>500 Internal Server Error</code> instead of an unauthorized</li>
+<li>Be careful with variables shadowing a package (<code>store *store.Store</code>). That can have unexpected consequences. Ideally you package name and struct should form a complete thought like <code>http.Server</code> (instead of <code>server.Server</code>). Unfortunately, in some scenarios this is difficult.</li>
+<li>Your store functions don't follow Go conventions. If you are returning <code>(X, error)</code> then you should <strong>only</strong> check <code>err != nil</code>. Either <code>err != nil</code> (and you ignore the first thing) or <code>err = nil</code> and the first thing is valid. Don't do <code>assessments == nil || err != nil</code>. This should just be <code>err != nil</code>. You may need to change how the <code>store</code> functions behave to conform to this pattern.</li>
+</ul>
+
+<p><strong>The overarching point</strong></p>
+
+<p>Repetitive error handling is an unfortunate consequence of some of the design decisions of Go (namely, a lack of parametric polymorphism). In this case however, even if you had generics (to pull out the repetitive error handling logic), you'd still need some way to bubble the <code>return</code> up to the <code>http.HandlerFunc</code>. And that would require something like:</p>
+
+<pre><code>if !tryQuery(func() (User, error) { return store.GetUserByEmail(email) }) {
+    return
+}
+</code></pre>
+
+<p>Where <code>tryQuery</code> returns <code>false</code> if <code>store.GetUserByEmail(email)</code> returned an <code>error</code>. This is certainly shorter, but it's dubious that this is an improvement. You also couldn't write such a <code>tryQuery</code> currently in go because the first return type <code>User</code> would need to be generic. Sure, you could cast through <code>interface{}</code>, but that's a world of ugliness that you don't want to deal with. It would require you to do lots of casts, which incur a runtime cost and are (programmer) error prone.</p>
+
+<p>So what to do? Well, any refactoring you embark on will be a tradeoff. The go ethos often prefers more verbose, repetitive code because it's easier to follow. But this comes at a cost. Eventually code becomes hard to reason about and harder to test because units have many responsibilities.</p>
+
+<p>That said, I think there are some patterns you could use that would really help clear this code up. In the end, the code should be easier to read and easier to test.</p>
+
+<p>First, checks like "is the user authorized" is often better suited for middleware. This pattern will allow you write the authorization check once and then wrap every handler in this middleware that needs it:</p>
+
+<pre><code>func needsAuthorization(handler http.HandlerFunc) http.HandlerFunc {
+    return http.HandlerFunc(func (w http.ResponseWriter, r *http.Request) {
+        if !request.IsAuthorized(r) {
+            log.Println("Unauthorized")
+            writeUnauthorized(w, r)
+        } else {
+            handler(w, r)
+        }
+    })
+}
+</code></pre>
+
+<p>Then you can use it like so:</p>
+
+<pre><code>func stateHandler(store *store.Store) http.HandlerFunc {
+    return needsAuthorization(func(w http.ResponseWriter, r *http.Request) {
+        // This is only called if user is authorized
+        // Check email, get assessments, etc.
+    })
+}
+</code></pre>
+
+<p>This is appropriate for checks like authorization (and maybe checking the request method), but shouldn't be used for everything.</p>
+
+<p>Another option here (although sometimes frowned upon by the purists) is to use <a href="https://gobuffalo.io/en/docs/routing" rel="nofollow noreferrer">an existing HTTP framework</a> that handles routing (including method) and maybe already has utilities for injecting middleware. This is somewhat in conflict with Go's obvious philosophy as there is some magic introduced. As with refactoring , there are tradeoffs here. Frameworks abstract away some common patterns to enable more succinct business logic. For example, with a buffalo router you can do:</p>
+
+<pre><code>a.GET("/state", stateHandler(store))
+</code></pre>
+
+<p>The meat of your problem still exists. All of the interaction with your models and constructing the response still is a lot of repetitive error handling. The ideal approach here would be an <code>Applicative</code> pattern which is capable of constructing data up until the point of an error. In Haskell, this would look something like:</p>
+
+<pre><code>user &lt;- getUserByEmail =&lt;&lt; getParam "email"
+return $ StateResponse &lt;$&gt; user &lt;*&gt; getEnrollments user &lt;*&gt; getAssessments user
+                       &lt;*&gt; getSubmissions user
+</code></pre>
+
+<p>The beauty here is that all of these steps (<code>user</code>, <code>getEnrollments user</code>, etc.) can fail. And when they do, the error is returned instead. But until one occurs, we just continue to construct the data. Note that this looks almost like how you build the <code>StateResponse</code> struct in Go, except it also does error handling.</p>
+
+<p>In Go, you'd have to duplicate some (trivial) code to achieve something like this. And I'm not sure it would be worth it. You'd end up with something like:</p>
+
+<pre><code>state := StateResponseBuilder{}
+
+state.SetEmail(func() (string, bool) { return  r.Url.Query()["email"] })
+state.SetUser(func() (store.User, error) { return store.GetUserByEmail(state.Email) })
+state.SetEnrollments(func() ([]store.Enrollment, error) { return store.GetEnrollmentsByUser(state.User.UID) })
+state.SetAssessments(func() ([]store.Assessment, error) { return store.GetAssessmentForUser(state.User.UID) })
+state.SetSubmissions(func() ([]store.Submission, error) { return store.GetSubmissionsForUser(state.User.UID) })
+
+respBytes, err := state.Build()
+if err != nil {
+    // return error
+} else {
+    w.Write(respBytes)
+}
+</code></pre>
+
+<p>The idea here is that <code>StateResponseBuilder</code> somewhat follows the Pike technique. Each <code>SetX</code> looks like this:</p>
+
+<pre><code>type StateResponseBuilder struct {
+    Err error
+    X X
+}
+
+
+func (s *StateResponseBuilder) SetX(f func() (X, error)) {
+    if s.Err != nil {
+        return
+    }
+
+    if x, err := f(); err != nil {
+        self.Err = err
+    } else {
+        self.X = x
+    }
+}
+</code></pre>
+
+<p>Your error short circuiting is handled by checking if <code>s.Err != nil</code> before running <code>f()</code>. <code>s.Err</code> is the first error we encountered or <code>nil</code> if everything so far as succeeded.</p>
+
+<p>You'll note this requires <em>a lot</em> of code repetition in the <code>SetX</code> methods. Furthermore, the resulting code is probably less obvious even though it lacks all the error checking.</p>
+
+<p>That said, such a pattern can be useful in certain contexts.</p>
+
+<p><strong>A better approach</strong></p>
+
+<p>A more suitable pattern, in my opinion, would be to separate concerns and use some indirection to make errors responsible for reporting themselves (instead of making your handler responsible for knowing how to report them). The big idea here is that currently your handler has many jobs. This is what is making it slightly unwieldy. You can separate its main jobs into two categories:</p>
+
+<ol>
+<li>HTTP related (specifically, translating errors/data to the appropriate constructs in HTTP)</li>
+<li>Interacting with <code>store</code></li>
+</ol>
+
+<p>If you separated these two, you could de-duplicate some of your repetitive HTTP error handling code. Further, this would abstract your controller logic away from HTTP so if you wanted to provide another kind of API (maybe some sort of custom protocol over TCP), you could do this fairly easily. Doing something like this would make your handler look like:</p>
+
+<pre><code>func stateHandler(store *store.Store) http.HandlerFunc {
+    return needsAuthorization(onlyGet((http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        var email string
+
+        emails := r.URL.Query()["email"]
+        if len(emails) == 1 {
+            email = emails[0]
+        }
+
+        response, err := buildStateResponse(store, email)
+        if err != nil {
+            err.WriteHTTP(w)
+        } else {
+            w.Write(response)
+        }
+    })))
+}
+</code></pre>
+
+<p>We've done several things here. First, all the HTTP error handling has been reduced to one location. This should make logging much easier. All HTTP-related things are located <em>just</em> in the handler. Note that we did push some of this into the errors themselves. This kind of indirection allows us to not have to handle every case in the HTTP handler. The advantage here is if another error condition arises when you're working on <code>store</code>, you don't have to go through all of your HTTP handlers and handle outputting the error each place a <code>store</code> function is used. Doing this would require you to create a custom error <code>interface</code> that has <code>WriteHTTP</code>, but you could just as easily make this a function that takes an <code>error</code> as its first parameter. The simplicity of the pure controller logic speaks for itself:</p>
+
+<pre><code>// You may want to return the `StateResponse` here and handle serialization in the HTTP handler
+func buildStateRespones(store *store.Store, email string) ([]byte, error) {
+    user, err := store.GetUserByEmail(email)
+    if err != nil {
+        return nil, err
+    }
+
+    enrolled, err := store.GetUserEnrollments(user.UID)
+    if err != nil {
+        return nil, err
+    }
+
+    assessments, err := store.GetUserAssessments(user.UID)
+    if err != nil {
+        return nil, err
+    }
+
+    submissions, err := store.GetUserSubmissions(user.UID)
+    if err != nil {
+        return nil, err
+    }
+
+    return json.Marshal(StateResponse{
+        User: *user,
+        Enrolled: enrollments,
+        Assessment: assessments,
+        Submissions: submissions,
+    })
+}
+</code></pre>
+
+<p>You still need the error checks, but now you aren't trying to do so much inside them. This code should be much easier to follow. What's more, if the new error check proposal lands, this code will immediately be convertible to this <em>much more readable</em> form:</p>
+
+<pre><code>func buildStateRespones(store *store.Store, email string) (*StateResponse, error) {
+    user := check store.GetUserByEmail(email)
+    enrolled := check store.GetUserEnrollments(user.UID)
+    assessments := check store.GetUserAssessments(user.UID)
+    submissions := check store.GetUserSubmissions(user.UID)
+
+    return &amp;StateResponse{
+        User: *user,
+        Enrolled: enrollments,
+        Assessment: assessments,
+        Submissions: submissions,
+    }, nil
+}
+</code></pre>
+
+<p>Here we've separated business logic from protocol specific "presentation" logic. The result is that each separated part is now easier to reason about (and easier to unit test!).</p>
+    </div>

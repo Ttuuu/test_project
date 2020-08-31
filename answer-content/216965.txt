@@ -1,0 +1,368 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+<pre><code>public Dictionary&lt;string, List&lt;string&gt;&gt; ConsecutiveMatches { get; set; } = new Dictionary&lt;string, List&lt;string&gt;&gt;();
+</code></pre>
+</blockquote>
+
+<p>I wouldn't allow public access to the result in this way, because I wouldn't want clients to be able to manipulate the result of the search directly. Instead I would make this result data be private and then expose it via a public read only method or property either as an <code>IEnumerable&lt;&gt;</code> or as an <code>IReadOnlyDictionary&lt;&gt;</code>: </p>
+
+<pre><code>private Dictionary&lt;string, List&lt;string&gt;&gt; matches = new Dictionary&lt;string, List&lt;string&gt;&gt;();
+
+public IReadOnlyDictionary&lt;string, List&lt;string&gt;&gt; GetResult()
+{
+  return new ReadOnlyDictionary&lt;string, List&lt;string&gt;&gt;(matches.Where(m =&gt; m.Value.Count &gt; 1).ToDictionary(kvp =&gt; kvp.Key, kvp =&gt; kvp.Value));
+}
+</code></pre>
+
+<p>In this way you ensure that the result is valid and consistent if you need it to be used more than once.</p>
+
+<p>Another common way could be to implement <code>IEnumerable&lt;T&gt;</code>, but here that is IMO wrong because of the call to <code>Load(...)</code>. A pattern like (for the different naming see below):</p>
+
+<pre><code>  ConsecutiveMatcher matcher = new ConsecutiveMatcher();
+  matcher.Search(data);
+  foreach (var result in matcher.GetResult())
+  {
+     ...
+  }
+</code></pre>
+
+<p>is more intuitive than:</p>
+
+<pre><code>  ConsecutiveMatcher matcher = new ConsecutiveMatcher();
+  matcher.Search(data);
+  foreach (var result in matcher)
+  {
+     ...
+  }
+</code></pre>
+
+<hr>
+
+<blockquote>
+<pre><code>public void Load(List&lt;string&gt; dataset)
+{
+</code></pre>
+</blockquote>
+
+<p>If this method is called more than once, you'll have to have a flag to indicate if the new data is to be appended to existing data or the cache should be reset:</p>
+
+<pre><code>public void Search(List&lt;string&gt; dataset, bool append = false)
+{
+  if (dataset == null || dataset.Count == 0) return;  // Or throw?
+
+  if (!append) matches.Clear();
+</code></pre>
+
+<p>and as shown, you should validate the input.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>    var words = sentence.Split(new[] { " " }, StringSplitOptions.RemoveEmptyEntries);
+</code></pre>
+</blockquote>
+
+<p>You have to refine the way you split into words:</p>
+
+<p>In this sentence <code>"this world in this world."</code> the two <code>"this world"</code> occurrences are not matched by your way to split into words because of the punctuation.</p>
+
+<p>On the other hand are <code>"Hello World"</code> <code>"Hello. World"</code> to be regarded as consecutively equal? </p>
+
+<p>Depending on how you define a word and "consecutive", you could use a <code>regex</code> pattern like:</p>
+
+<pre><code>      string pattern = @"(?&lt;word&gt;\b\w+\b)(?&lt;space&gt;[\W]*)";
+</code></pre>
+
+<p>and then split the string by a <code>Regex</code> match:</p>
+
+<pre><code>        var words = Regex.Matches(sentence, pattern).Cast&lt;Match&gt;().Select(m =&gt; m.Groups["word"].Value).ToArray();
+</code></pre>
+
+<p>Whether the above pattern is suitable for your culture or needs you'll have to decide, but it could be a place to start.</p>
+
+<hr>
+
+<blockquote>
+  <p><code>permutation</code></p>
+</blockquote>
+
+<p>strictly speaking the strings you are building are not permutations but 
+ <code>sub strings</code> or <code>prefix strings</code>.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>    if (ConsecutiveMatches.TryGetValue(permutation, out var matches))
+    {
+      ConsecutiveMatches[permutation].Add(sentence);
+    }
+    else
+    {
+      ConsecutiveMatches.Add(permutation, new List&lt;string&gt; { sentence });
+    }
+</code></pre>
+</blockquote>
+
+<p>This is a little awkward construct. Why not use the maybe found <code>matches</code>:</p>
+
+<pre><code>    if (!ConsecutiveMatches.TryGetValue(permutation, out var matches))
+    {
+      matches= new List&lt;string&gt;();
+      ConsecutiveMatches[permutation] = matches;
+    }
+
+    matches.Add(sentence);
+</code></pre>
+
+<hr>
+
+<p>All in all it's not a bad implementation, but there is a major problem in that it builds up a large dictionary of strings with large data sets and the deconstruct - reconstruct of prefix strings is time expensive. As "Oh My Goodness" states, a <code>trie</code> as data structure is more efficient in respect to memory and probably also time wise - for large data sets at least.</p>
+
+<hr>
+
+<p>Below is an edition of your code with the above comments implemented. I've also renamed things a little bit in my flavor:</p>
+
+<pre><code>  class ConsecutiveWordMatcher
+  {
+    private Dictionary&lt;string, List&lt;string&gt;&gt; matches = new Dictionary&lt;string, List&lt;string&gt;&gt;();
+
+    public void Search(List&lt;string&gt; dataset, bool append = false)
+    {
+      if (dataset == null || dataset.Count == 0) return;
+
+      if (!append) matches.Clear();
+
+      string pattern = @"(?&lt;word&gt;\b\w+\b)(?&lt;space&gt;[\W]*)";
+
+      for (int i = 0; i &lt; dataset.Count; i++)
+      {
+        var sentence = dataset[i];
+        if (string.IsNullOrWhiteSpace(sentence)) continue;
+
+        var words = Regex.Matches(sentence, pattern).Cast&lt;Match&gt;().Select(m =&gt; m.Groups["word"].Value).ToArray();
+
+        BuildConsecutiveMatches(words, sentence);
+      }
+    }
+
+    private void BuildConsecutiveMatches(string[] words, string sentence)
+    {
+      BuildConsecutiveMatchesRecursive(words, 0, sentence);
+    }
+
+    private void BuildConsecutiveMatchesRecursive(string[] words, int index, string sentence)
+    {
+      if (index &gt;= words.Length - 1)
+      {
+        return;
+      }
+
+      StringBuilder builder = new StringBuilder(words[index]);
+      builder.Append(' ');
+
+      foreach (string word in words.Skip(index + 1))
+      {
+        builder.Append(word);
+        var subString = builder.ToString();
+
+        if (!matches.TryGetValue(subString, out var sources))
+        {
+          sources = new List&lt;string&gt;();
+          matches[subString] = sources;
+        }
+
+        sources.Add(sentence);
+
+        builder.Append(' ');
+      }
+
+      BuildConsecutiveMatchesRecursive(words, ++index, sentence);
+    }
+
+
+    public IReadOnlyDictionary&lt;string, List&lt;string&gt;&gt; GetResult(int minOccurrences)
+    {
+      return new ReadOnlyDictionary&lt;string, List&lt;string&gt;&gt;(matches.Where(m =&gt; m.Value.Count &gt;= minOccurrences).ToDictionary(kvp =&gt; kvp.Key, kvp =&gt; kvp.Value));
+    }
+  }
+</code></pre>
+
+<hr>
+
+<p>Just for fun and inspiration the below is an implementation using a trie like data structure:</p>
+
+<pre><code>  public class SentenceInfo
+  {
+    public int Count { get; set; }
+    public string Sentence { get; set; }
+    public List&lt;string&gt; Sources { get; set; }
+  }
+
+  // A trie implementation
+  public class ConsecutiveWordMatcher
+  {
+    class Node
+    {
+      private Dictionary&lt;string, Node&gt; m_children = new Dictionary&lt;string, Node&gt;();
+      private List&lt;string&gt; m_sources = new List&lt;string&gt;();
+
+      public Node(string word)
+      {
+        Word = word;
+      }
+
+      public string Word { get; }
+      public Dictionary&lt;string, Node&gt; Children =&gt; m_children;
+      public int Count { get; private set; }
+
+      public void AddChild(Node child)
+      {
+        m_children[child.Word] = child;
+      }
+
+      public IEnumerable&lt;string&gt; Sentences
+      {
+        get
+        {
+          if (m_children.Count == 0)
+          {
+            yield return Word;
+          }
+          else
+          {
+            foreach (Node child in m_children.Values)
+            {
+              foreach (string substring in child.Sentences)
+              {
+                yield return $"{Word} {substring}";
+              }
+            }
+          }
+        }
+      }
+
+      public IEnumerable&lt;SentenceInfo&gt; GetMatches(int wordCount, int minOccurrences)
+      {
+        return GetMatches(wordCount, minOccurrences, 1);
+      }
+
+      private IEnumerable&lt;SentenceInfo&gt; GetMatches(int wordCount, int minOccurrences, int level)
+      {
+        if (Count &gt;= minOccurrences)
+        {
+          if (level &gt;= wordCount)
+            yield return new SentenceInfo { Count = 1, Sentence = Word, Sources = m_sources };
+
+          foreach (Node child in m_children.Where(kvp =&gt; kvp.Value.Count &gt;= wordCount).Select(kvp =&gt; kvp.Value))
+          {
+            foreach (SentenceInfo info in child.GetMatches(wordCount, minOccurrences, level + 1))
+            {
+              info.Count++;
+              info.Sentence = $"{Word} {info.Sentence}";
+              yield return info;
+            }
+          }
+        }
+      }
+
+      internal bool TryGetNode(string word, out Node node)
+      {
+        return m_children.TryGetValue(word, out node);
+      }
+
+      internal void AddSequence(string[] sequence, int index, string source)
+      {
+        if (sequence.Length == 0 || index &gt;= sequence.Length) return;
+
+        Count++;
+        string word = sequence[index];
+
+        if (word != Word) throw new InvalidOperationException($"'{word}' doesn't match '{Word}'");
+
+        if (!m_sources.Contains(source))
+        {
+          m_sources.Add(source);
+        }
+
+        if (index &lt; sequence.Length - 1)
+        {
+          string nextWord = sequence[index + 1];
+          if (!m_children.TryGetValue(nextWord, out Node childNode))
+          {
+            childNode = new Node(nextWord);
+            m_children[nextWord] = childNode;
+          }
+
+          childNode.AddSequence(sequence, index + 1, source);
+        }
+      }
+
+      public override string ToString()
+      {
+        return Word;
+      }
+
+      internal void Clear()
+      {
+        m_children.Clear();
+        m_sources.Clear();
+      }
+    }
+
+    private readonly Node m_root = new Node("");
+
+    public ConsecutiveWordMatcher()
+    {
+    }
+
+    public void Search(List&lt;string&gt; dataset, bool append = false)
+    {
+      if (dataset == null || dataset.Count == 0) return;
+
+      if (!append)
+        m_root.Clear();
+
+      string pattern = @"(?&lt;word&gt;\b\w+\b)(?&lt;space&gt;[\W]*)";
+
+      foreach (string data in dataset)
+      {
+        if (string.IsNullOrWhiteSpace(data)) continue;
+
+        string line = data;
+        MatchCollection matches = Regex.Matches(line, pattern);
+        if (matches.Count &gt; 0)
+        {
+          string[] sequence = matches.Cast&lt;Match&gt;().Select(m =&gt; m.Groups["word"].Value).ToArray();
+
+          for (int i = 0; i &lt; matches.Count; i++)
+          {
+            HandleWord(sequence, i, data);
+          }
+        }
+      }
+    }
+
+    private void HandleWord(string[] sequence, int index, string source)
+    {
+      string word = sequence[index];
+
+      if (!m_root.TryGetNode(word, out Node node))
+      {
+        node = new Node(word);
+        m_root.AddChild(node);
+      }
+
+      node.AddSequence(sequence, index, source);
+    }
+
+    public IEnumerable&lt;SentenceInfo&gt; GetResult(int wordCount = 2, int minOccurrences = 2)
+    {
+      return m_root.Children.Values.SelectMany(n =&gt; n.GetMatches(wordCount, minOccurrences));
+    }
+  }
+</code></pre>
+
+<p>As a bonus I've added the possibility to change both how many consecutive words and how many occurrences to search for.</p>
+
+<p>It isn't that well tested, so don't hang me, if...</p>
+    </div>

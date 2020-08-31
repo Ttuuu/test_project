@@ -1,0 +1,63 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Raising events inside of a lock is a code smell.  Locks should be short lived as possible.   Plus since, maybe today, you know what the events will do that doesn't mean in the future they won't change.  Having a long processing event could make this a bottle neck or if an event also subscribed and wanted to update the collection has the potential for a deadlock.  </p>
+
+<p>You have this statement in the constructor </p>
+
+<pre><code>SuppressNotifications = suppressNotifications;
+</code></pre>
+
+<p>This field and parameter don't exist. I assume it's a copy / paste error.</p>
+
+<p>Instead of locking and creating a snapshot each time you could use the <a href="https://docs.microsoft.com/en-us/dotnet/api/system.threading.readerwriterlockslim?view=netframework-4.7.2" rel="nofollow noreferrer">ReaderWriterLockSlim</a> class to lock reading and writing.  The GetEnumerator would probably still want a snapshot but could be done by making the snapshot lazy.  Then the code would look something similar to this</p>
+
+<pre><code>private void UpdateSnapshot()
+{
+    if (_snapShot == null || _snapShot.IsValueCreated)
+    {
+        Interlocked.Exchange(ref _snapShot, new Lazy&lt;T[]&gt;(() =&gt;
+        {
+            T[] result;
+            var lockTaken = false;
+            try
+            {
+                _lock.EnterReadLock();
+                lockTaken = true;
+                result = _list.ToArray();
+            }
+            finally
+            {
+                if (lockTaken)
+                {
+                    _lock.ExitReadLock();
+                }
+            }
+            return result;
+        }));
+    }
+}
+</code></pre>
+
+<p>Basically this would defer the coping of all the items to the snapshot until an enumerator has accessed it and if no updates where done then the Lazy object is acting like a caching object.  Again this code is assuming switching to the ReaderWriterLockSlim Class.  But this way when collection has a process that is adding items to the collection the class doesn't make a new copy of the list every add.  </p>
+
+<p>** As a side note the coding for the ReaderWriterLockSlim class is a bit much but it's not hard to create an IDisposable class that wraps it so the locks turn into using statements that hide the try/finally/lock taken code. </p>
+
+<p>For saving the dispatcher I would suggest reading this <a href="http://geekswithblogs.net/NewThingsILearned/archive/2008/01/16/have-worker-thread-update-observablecollection-that-is-bound-to-a.aspx" rel="nofollow noreferrer">blog</a>.  It gets a list of event handler target to see if it's a dispatcher object</p>
+
+<pre><code>var delegates = eventHandler.GetInvocationList();
+// Walk thru invocation list
+foreach (NotifyCollectionChangedEventHandler handler in delegates)
+{
+    var dispatcherObject = handler.Target as DispatcherObject;
+    // If the subscriber is a DispatcherObject and different thread
+    if (dispatcherObject != null &amp;&amp; dispatcherObject.CheckAccess() == false)
+    {
+        // Invoke handler in the target dispatcher's thread
+        dispatcherObject.Dispatcher.Invoke(DispatcherPriority.DataBind, handler, this, e);
+    }
+    else // Execute handler as is
+    {
+        handler(this, e);
+    }
+}
+</code></pre>
+    </div>

@@ -1,0 +1,130 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Almost certainly the largest slow-down is that you are getting each individual value on its own. Instead get all information at once:</p>
+
+<pre><code>poke_query = """
+SELECT
+hpiv, atkiv, defiv, spatkiv, spdefiv, speediv, 
+hpev, atkev, defev, spatkev, spdefev, speedev,
+lvl, exp, nature
+FROM pokes
+WHERE id = {}"""
+
+poke_info = await con.execute(poke_query.format(fetch_id)).fetchone()
+</code></pre>
+
+<p>Note that the parameters you pass to <code>str.format</code> are put into the placeholders in the order you pass them, so e.g. <code>"{0} {1} {2}".format(1, 2, 3)</code> is equivalent to <code>"{} {} {}".format(1, 2, 3)</code>.</p>
+
+<p>You should be able to access the individual columns with their names (e.g. <code>poke_info.hpiv</code>) or like a tuple (e.g. <code>poke_info[0]</code>).</p>
+
+<p>In addition, most SQL packages allow using parameters. This prevents <a href="https://en.wikipedia.org/wiki/SQL_injection" rel="nofollow noreferrer">SQL injections</a>, which you should be vary of, because the user of the bot controls the value of <code>poke</code>. I think in your case it would be as easy as</p>
+
+<pre><code>poke_query = """
+SELECT
+hpiv, atkiv, defiv, spatkiv, spdefiv,
+speediv, hpev, atkev, defev, speedev,
+lvl, exp, nature
+FROM pokes
+WHERE id = ?"""
+
+poke_info = await con.execute(poke_query, fetch_id).fetchone()
+</code></pre>
+
+<p>For the poke ID it is similarly:</p>
+
+<pre><code>fetch_id = await con.fetchval("SELECT pokes[?] FROM users WHERE u_id = ?",
+                              poke, ctx.message.author.id)
+</code></pre>
+
+<p>These are assuming you are using <a href="https://github.com/mkleehammer/pyodbc/wiki/Getting-started" rel="nofollow noreferrer">pyodbc</a>, but there are equivalent ways to achieve the same thing in other packages.</p>
+
+<p>For example with <a href="https://magicstack.github.io/asyncpg/current/index.html" rel="nofollow noreferrer">asyncpg</a> it would be <code>$1</code> instead of <code>?</code>:</p>
+
+<pre><code>poke_query = """
+SELECT
+hpiv, atkiv, defiv, spatkiv, spdefiv,
+speediv, hpev, atkev, defev, speedev,
+lvl, exp, nature
+FROM pokes
+WHERE id = $1"""
+
+poke_info = await con.fetchrow(poke_query, fetch_id)
+</code></pre>
+
+<p>Where each value can be accessed as <code>poke_info['hpiv']</code> or <code>poke_inf[0]</code>.</p>
+
+<hr>
+
+<p>There is no need for <code>pokes</code> and <code>natures</code> to be <code>global</code> values. The way you currently define them they are class variables and you can access them both with <code>Info.pokes</code> and <code>self.pokes</code>. Beware that these are initialized at class definition time. So if you change the config files you need to restart the script/bot/interpreter. If you put that code into the constructor <code>__init__</code> it would be read everytime a new instance of <code>Info</code> is created and <code>pokes</code> becomes an attribute so can only be accessed via <code>self.pokes</code>.</p>
+
+<p>You can also use dictionary expressions to make this a bit easier.</p>
+
+<pre><code>class Info(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+        with open('./poke/resources/pokemon_list.json') as pokemon_list_file:
+            pokemon_list = json.load(pokemon_list_file)
+            self.pokes = {p['name']: {'image_url': p['image'],
+                                      'hp': p['hp'],
+                                      'attack': p['attack'],
+                                      'defense': p['defense'],
+                                      'special_attack': p['special_attack'],
+                                      'special_defense': p['special_defense'],
+                                      'speed': p['speed']}
+                          for p in json.load(pokemon_list_file)}
+
+        with open('./poke/resources/natures.json') as natures_file:
+            self.natures = {n['name']: {'boost': n['boost'],
+                                        'remove': n['remove']}
+                            for n in json.load(natures_file)}
+</code></pre>
+
+<p>Things get even easier if you don't care that the inner dictionaries also contain the name (and any additional keys) and that the name of the image url changes:</p>
+
+<pre><code>class Info(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+        with open('./poke/resources/pokemon_list.json') as pokemon_list_file:
+            pokemon_list = json.load(pokemon_list_file)
+            self.pokes = {p['name']: p for p in json.load(pokemon_list_file)}
+
+        with open('./poke/resources/natures.json') as natures_file:
+            self.natures = {n['name']: n for n in json.load(natures_file)}
+</code></pre>
+
+<hr>
+
+<p>I can't say I completely understand all the calculations of the actual stats from the IVs, EVs and base stats. But try to save each stat as its natural type. If a thing is an <code>int</code>, save it as an <code>int</code> from the beginning and don't continuously cast it to an <code>int</code>. This will not save a lot of runtime but make it a lot easier to read.</p>
+
+<p>Another thing you could to for this is put the calculations into their own functions, which you can give a name and docstring explaining what the function does. It also makes it immediately clear that the actual calculation is the same in all cases.</p>
+
+<pre><code>def calc(base, iv, ev, lvl):
+    """Calculate the actual stat from the base value, IV, EV and current level."""
+    return int((int((2 * base + iv + int(ev / 4)) * lvl) / 100) + 5)
+
+self.attack = calc(atk_base, atk_iv, atk_ev, lvl)
+self.defense = calc(def_base, def_iv, def_ev, lvl)
+...
+</code></pre>
+
+<p>For the boosts and removes, you can shorten it a bit using a mapping from the name to the internal name and in-place operations:</p>
+
+<pre><code>mapping = {"Attack": "attack", "Defense": "defense",
+           "Special Attack": "special_attack", "Special Defense": "special_defense"}
+
+nature = self.natures[nature]
+self.__dict__[mapping[nature['boost']]] *= 1.1
+self.__dict__[mapping[nature['remove']]] *= 0.9
+</code></pre>
+
+<p>Instead of this dict you can also use the fact that there is an easy way to convert from one to the other:</p>
+
+<pre><code>def nature_to_attr(name):
+    return name.lower().replace(" ", "_")
+
+nature = self.natures[nature]
+self.__dict__[nature_to_attr(nature['boost'])] *= 1.1
+self.__dict__[nature_to_attr(nature['remove'])] *= 0.9
+</code></pre>
+    </div>

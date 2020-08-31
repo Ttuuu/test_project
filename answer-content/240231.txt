@@ -1,0 +1,208 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Bugs</h2>
+
+<p>Lines 32 and 42:</p>
+
+<pre><code>        for titles, info in zip(self, titles, self.comicinfo):
+
+
+        for dol_amount in comic_prices:
+</code></pre>
+
+<p>both have unresolved variable references - <code>titles</code> and <code>comic_prices</code>.</p>
+
+<h2>Bare class declaration</h2>
+
+<pre><code>class ComicScraper():  # Class ComicScraper for scraping comic books
+</code></pre>
+
+<p>can be</p>
+
+<pre><code>class ComicScraper:
+    """
+    For scraping comic books
+    """
+</code></pre>
+
+<p>Note the more common format for docstrings used.</p>
+
+<h2>Doing too much in an <code>init</code></h2>
+
+<pre><code>requests.get(self.url)
+</code></pre>
+
+<p>should probably not be done in an <code>__init__</code>. Constructors are usually best to initialize everything that the class will need without "doing" too much.</p>
+
+<h2>Argument names</h2>
+
+<p><code>titles</code> doesn't actually accept multiple titles; it only accepts one. Providing the argument twice overwrites the first value. That means that this loop:</p>
+
+<pre><code>        for comic_title in self.comic_titles:
+</code></pre>
+
+<p>is actually going to loop through each of the characters in the provided string, which is probably not what you want.</p>
+
+<p>Reading the docs - <a href="https://docs.python.org/3/library/argparse.html" rel="nofollow noreferrer">https://docs.python.org/3/library/argparse.html</a> - you probably want <code>action='append'</code>.</p>
+
+<h2>Reaching past <code>argparse</code></h2>
+
+<p>This:</p>
+
+<pre><code>    if len(sys.argv) == 1:
+</code></pre>
+
+<p>should not be done. Instead, rely on the output of <code>argparse</code>.</p>
+
+<h2>Suggested</h2>
+
+<p>Here is a re-thought program:</p>
+
+<pre><code>from bs4 import BeautifulSoup, Tag
+from datetime import date, datetime
+from typing import Iterable
+import argparse
+import re
+from requests import Session
+
+
+class Comic:
+    # ·  Apr 8th, 2020  ·  $7.99
+    RELEASE_PAT = re.compile(
+        r'^\s*·\s*'
+        r'(?P&lt;month&gt;\S+)\s*'
+        r'(?P&lt;day&gt;\d+)\w*?,\s*'
+        r'(?P&lt;year&gt;\d+)\s*'
+        r'(·\s*\$(?P&lt;price&gt;[0-9.]+))?\s*$'
+    )
+
+    def __init__(self, item: Tag):
+        self.id = int(item['id'].split('-')[1])
+        sku = item.select_one('.comic-diamond-sku')
+        if sku:
+            self.sku: str = sku.text.strip()
+        else:
+            self.sku = None
+
+        consensus_head = item.find(name='span', text=re.compile('CONSENSUS:'))
+        if consensus_head:
+            self.consensus = float(consensus_head.find_next_sibling().strong.text)
+        else:
+            self.consensus = None
+
+        potw_head = item.find(name='span', text=re.compile('POTW'))
+        self.pick_of_the_week = float(potw_head.find_next_sibling().text.rstrip('%'))
+
+        title_anchor = item.select_one('.comic-title &gt; a')
+        self.title: str = title_anchor.text
+        self.link = title_anchor['href']
+
+        details = item.select_one('.comic-details')
+        self.publisher: str = details.strong.text
+
+        parts = self.RELEASE_PAT.match(list(details.strings)[2]).groupdict()
+        self.pub_date: date = (
+            datetime.strptime(
+                f'{parts["year"]}-{parts["month"]}-{parts["day"]}',
+                '%Y-%b-%d'
+            )
+            .date()
+        )
+        price = parts.get('price')
+        if price is None:
+            self.price = price
+        else:
+            self.price = float(price)
+
+        self.desc: str = list(item.select_one('.comic-description &gt; p').strings)[0]
+
+
+class ComicScraper:
+    URL = 'https://leagueofcomicgeeks.com/'
+
+    def __init__(self):
+        self.session = Session()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.session.close()
+
+    @staticmethod
+    def _parse(content: str) -&gt; Iterable[Comic]:
+        soup = BeautifulSoup(content, 'html.parser')
+        list_items = soup.select('#comic-list &gt; ul &gt; li')
+        return (Comic(li) for li in list_items)
+
+    def get_from_page(self) -&gt; Iterable[Comic]:
+        with self.session.get(self.URL + 'comics/new-comics') as response:
+            response.raise_for_status()
+            return self._parse(response.content)
+
+    def get_from_xhr(self, req_date: date) -&gt; Iterable[Comic]:
+        params = {
+            'addons': 1,
+            'list': 'releases',
+            'list_option': '',
+            'list_refinement': '',
+            'date_type': 'week',
+            'date': f'{req_date:%d/%m/%Y}',
+            'date_end': '',
+            'series_id': '',
+            'user_id': 0,
+            'title': '',
+            'view': 'list',
+            'format[]': (1, 6),
+            'character': '',
+            'order': 'pulls',
+        }
+        with self.session.get(self.URL + 'comic/get_comics', params=params) as response:
+            response.raise_for_status()
+            return self._parse(response.json()['list'])
+
+
+def print_comics(comics: Iterable[Comic]):
+    print(f'{"Title":40} {"Publisher":20} {"Date":10} {"Price":6}')
+
+    for c in comics:
+        print(
+            f'{c.title[:40]:40} {c.publisher[:20]:20} '
+            f'{c.pub_date}', end=' '
+        )
+        if c.price is not None:
+            print(f' ${c.price:5.2f}', end='')
+        print()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    # Titles of comicbooks i.e "Detective Comics #1"
+    parser.add_argument('-t', '--titles', help='Print these comic titles ONLY',
+                        action='append')
+    args = parser.parse_args()
+    titles = args.titles and set(args.titles)
+
+    with ComicScraper() as scraper:
+        comics = scraper.get_from_xhr(date(year=2020, month=3, day=25))
+        if titles:
+            comics = (c for c in comics if c.title in titles)
+        print_comics(comics)
+
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+
+<p>Points:</p>
+
+<ul>
+<li>Your original class is not useful as a class - it's effectively a function; the important stuff to capture in a class is distinct fields on the data you're trying to represent</li>
+<li>You can still class-ify the generator as a class method</li>
+<li>Use type hints</li>
+<li>Use set membership check for titles</li>
+<li>Use a regex to parse the info field</li>
+<li>Pull out price and date as a float and date, respectively; don't leave them stringly-typed</li>
+</ul>
+
+<p>Note the second method to use an XHR backend instead of the web front-end. The return format is awkward - they return rendered HTML as a part of the JSON payload - but the interface is more powerful and the method might be more efficient. I have not done a lot of investigation into what each of those parameters means; to learn more you will probably have to dig around the site using developer tools.</p>
+    </div>

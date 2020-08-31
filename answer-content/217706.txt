@@ -1,0 +1,101 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>A couple of thoughts.</p>
+
+<ul>
+<li><p>The presence of <code>init(viewModel:)</code> in the view controller (with its associated comment about using this during testing) seems to suggest that you plan on testing the view controller. But one of the central tenets of MVP, MVVM and the like is that the goal is to have a UIKit-independent representation. Part of the reasons we do that is because that is the object that we’ll test, not the view controller.</p>
+
+<p>Bottom line, I’d be inclined to retire <code>init(viewModel:)</code> from the view controller and restrict the testing to the view model.</p>
+
+<p>For example, a MVP might look like:</p>
+
+<p><a href="https://i.stack.imgur.com/VwJav.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/VwJav.png" alt="enter image description here"></a></p>
+
+<p>Or, in MVVM, you’ll see structures like:</p>
+
+<p><a href="https://i.stack.imgur.com/l8JM3.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/l8JM3.png" alt="enter image description here"></a></p>
+
+<p>(Both images from Medium's <a href="https://medium.com/ios-os-x-development/ios-architecture-patterns-ecba4c38de52" rel="nofollow noreferrer">iOS Architecture Patterns</a>.)</p>
+
+<p>But in both cases, the mediator (the view model or the presenter), should not be UIKit-specific, and it’s that mediator on which we’ll do our unit testing.</p></li>
+<li><p>The view controller has a method <code>updateUI</code>, which is adding the view to the hierarchy. I’d suggest you decouple the initial “configure the view” from the “view model has informed me of some model change”. </p></li>
+<li><p>MVVM generally suggests that you’re doing some “data binding”, where the initial configuration of the view controller sets up the connection between presenter events and UIKit control updates and vice versa. It’s hard to tell, but this feels like you’re got the beginning of something with a more MVP <em>je ne sais quoi</em> than MVVM. That’s not necessarily wrong, but they’re just different.</p></li>
+<li><p>In <code>BreachViewModel</code> is updating the <code>text</code> property of the <code>UILabel</code> called <code>nameLabel</code> within the view. To my two prior points, the view model, itself, should be UIKit dependent, and it definitely shouldn’t be reaching into a subview of the view and updating the <code>text</code> itself. If this was MVVM, you’d bind the label to the view model and have the update take place that way. If this was MVP, the presenter should just inform the view controller that the value has changed and the view controller would update the UIKit control.</p>
+
+<p>But avoid having anything UIKit specific in the view model.</p></li>
+<li><p>A few observations in <code>fetchData</code>:</p>
+
+<ul>
+<li><p>You have paths of execution where you don’t call the completion handler. You generally always want to call the completion handler, reporting success with data or failure with error information. Perhaps adopt the <code>Result&lt;T, U&gt;</code> pattern you did with <code>ClosureHTTPManager</code> (like we did in the answer to <a href="https://codereview.stackexchange.com/a/216836/54422">your earlier question</a>).</p></li>
+<li><p>You are decoding your JSON twice. Obviously, you only want to do that once.</p></li>
+</ul></li>
+<li><p>This is personally a matter of taste, but I’m not crazy about the view model doing JSON parsing. That seems like the job of some API layer, not the view model. I like to see the view model limited to taking parsed data, updating models, applying business rules, etc.</p></li>
+</ul>
+
+<p>I think the aforementioned <a href="https://medium.com/ios-os-x-development/ios-architecture-patterns-ecba4c38de52" rel="nofollow noreferrer">iOS Architecture Patterns</a> is an interesting discussion of many of these issues. I also think Dave DeLong’s <a href="https://davedelong.com/blog/2017/11/06/a-better-mvc-part-1-the-problems/" rel="nofollow noreferrer">A Better MVC</a> is an interesting read.</p>
+
+<hr>
+
+<p>Generally, if you were going to write MVVM, you’d use a framework like <a href="https://github.com/DeclarativeHub/Bond" rel="nofollow noreferrer">Bond</a> or <a href="https://github.com/ReactiveX/RxSwift" rel="nofollow noreferrer">SwiftRX</a> to facilitate the bindings. But let’s contemplate what a minimalist implementation might look like. (In the absence of these binding networks, this is arguably more MVP than MVVM, but it illustrates the basic idea that this view-model/presenter is where the logic goes and the view controller is just responsible for hooking it up to the view.)</p>
+
+<p>Bottom line, the view controller would basically set up the view model (possibly passing in initial model data), and tell the view model what it wanted to do when the view model wanted to inform us </p>
+
+<pre><code>class BreachViewController: UITableViewController {
+    var viewModel = BreachViewModel(model: nil)
+    var dimmingView: UIView?
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+
+        // tell view model what you want it to do when the model changes
+
+        viewModel.breachesDidChange = { [weak self] result in
+            self?.tableView.reloadData()
+        }
+
+        // tell view model that you want it to fetch from the server
+
+        viewModel.fetchBreaches() { [weak self] result in
+            if case .failure(let error) = result {
+                self?.showError(error)
+            }
+        }
+    }
+}
+</code></pre>
+
+<p>The view model could have a method to perform the request and inform the view (controller) of the changes:</p>
+
+<pre><code>class BreachViewModel {
+
+    var breaches: [Breach]? {
+        didSet { breachesDidChange?(breaches) }
+    }
+
+    var breachesDidChange: (([Breach]?) -&gt; Void)?
+
+    init(model: [Breach]?) {
+        breaches = model
+    }
+
+    func fetchBreaches(completion: @escaping (Result&lt;[Breach], Error&gt;) -&gt; Void) {
+        ApiManager.shared.fetchBreaches { [weak self] result in
+            guard let self = self else { return }
+
+            switch result {
+            case .failure:
+                self.breaches = nil
+
+            case .success(let breaches):
+                self.breaches = breaches.sortedByName()
+            }
+
+            completion(result)
+        }
+    }
+}
+</code></pre>
+
+<p>In this example, the view controller is responsible for the view, the presenter/view model is a small testable class, and network and API logic are encapsulated in separate services.</p>
+
+<p>See <a href="https://github.com/robertmryan/Breaches" rel="nofollow noreferrer">https://github.com/robertmryan/Breaches</a> for working demonstration.</p>
+    </div>

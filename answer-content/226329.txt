@@ -1,0 +1,174 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Putting this through the built-in profiler reveals some hot spots. Perhaps surprisingly: <code>ReverseBits</code>. It's not the biggest thing in the list, but it is significant while it shouldn't be.</p>
+
+<p>You could use one of the many alternate ways to implement <code>ReverseBits</code>, or the sequence of bit-reversed indexes (which does not require reversing all the indexes), or the overall bit-reversal permutation (which does not require bit reversals).</p>
+
+<p>For example here is a way to compute the sequence of bit-reversed indexes without explicitly reversing any index:</p>
+
+<pre><code>for (size_t n = 0, rev = 0; n &lt; N; ++n)
+{
+    X[n] = x[rev];
+    size_t change = n ^ (n + 1);
+#if _WIN64
+    rev ^= change &lt;&lt; (__lzcnt64(change) - (64 - stages));
+#else
+    rev ^= change &lt;&lt; (__lzcnt(change) - (32 - stages));
+#endif
+}
+</code></pre>
+
+<p>On my PC, that reduces the time from around 2.8 million microseconds to 2.3 million microseconds.</p>
+
+<p>This trick works by using that the XOR between adjacent indexes is a mask of ones up to and including the least significant zero (the +1 carries through the least significant set bits and into that least significant zero), which has a form that can be reversed by just shifting it. The reversed mask is then the XOR between adjacent reversed indexes, so applying it to the current reversed index with XOR increments it.</p>
+
+<p><code>__lzcnt64</code> and <code>_WIN64</code> are for MSVC, you could use more preprocessor tricks to find the right intrinsic and bitness-detection for the current compiler. Leading zero count can be avoided by using <code>std::bitset</code> and its <code>count</code> method:</p>
+
+<pre><code>size_t change = n ^ (n + 1);
+std::bitset&lt;64&gt; bits(~change);
+rev ^= change &lt;&lt; (bits.count() - (64 - stages));
+</code></pre>
+
+<p><code>count</code> is recognized by GCC and Clang as an intrinsic for <code>popcnt</code>, but it seems not by MSVC, so it is not reliable for high performance scenarios.</p>
+
+<p>Secondly, there is a repeated expression: <code>W[n * W_offset] * X[k + n + N_stage / 2]</code>. The compiler is often relied on to remove such duplication, but here it didn't happen. Factoring that out reduced the time to under 2 million microseconds.</p>
+
+<p>Computing the twiddle factors takes a bit more time than it needs to. They are powers of the first non-trivial twiddle factor, and could be computed iteratively that way. This suffers from some build-up of inaccuracy, which could be improved by periodically resetting to the proper value computed by <code>std::polar</code>. For example,</p>
+
+<pre><code>auto twiddle_step = std::polar(1.0, -2.0 * M_PI / N);
+auto twiddle_current = std::polar(1.0, 0.0);
+for (size_t k = 0; k &lt; N / 2; ++k)
+{
+    if ((k &amp; 0xFFF) == 0)
+        twiddle_current = std::polar(1.0, -2.0 * M_PI * k / N);
+    W[k] = twiddle_current;
+    twiddle_current *= twiddle_step;
+
+    // The N/2-point complex DFT uses only the even twiddle factors
+    if (k % 2 == 0)
+    {
+        W_p[k / 2] = W[k];
+    }
+}
+</code></pre>
+
+<p>On my PC that reduces the time from hovering around 1.95 million µs to around 1.85 million µs, not a huge difference but easily measurable.</p>
+
+<p>More advanced: use SSE3 for the main calculation, for example (not well tested, but seems to work so far)</p>
+
+<pre><code>__m128d w_real = _mm_set1_pd(W[n * W_offset].real());
+__m128d w_imag = _mm_set1_pd(W[n * W_offset].imag());
+__m128d z = _mm_loadu_pd(reinterpret_cast&lt;double*&gt;(&amp;X[k + n + N_stage / 2]));
+__m128d z_rev = _mm_shuffle_pd(z, z, 1);
+__m128d t = _mm_addsub_pd(_mm_mul_pd(w_real, z), _mm_mul_pd(w_imag, z_rev));
+
+__m128d x = _mm_loadu_pd(reinterpret_cast&lt;double*&gt;(&amp;X[k + n]));
+__m128d t1 = _mm_add_pd(x, t);
+__m128d t2 = _mm_sub_pd(x, t);
+_mm_storeu_pd(reinterpret_cast&lt;double*&gt;(&amp;X[k + n]), t1);
+_mm_storeu_pd(reinterpret_cast&lt;double*&gt;(&amp;X[k + n + N_stage / 2]), t2);
+</code></pre>
+
+<p>That takes it from 1.85 million µs down to around 1.6 million µs on my PC.</p>
+
+<hr>
+
+<p>Using a different algorithm, Stockham algorithm the version from <a href="http://wwwa.pikara.ne.jp/okojisan/otfft-en/optimization1.html" rel="nofollow noreferrer">List-8</a> and some miscellaneous things, the time goes down to 0.9 million µs. It's a huge win already and this is not the best version of the algorithm. The linked website has faster versions with fancier tricks and SIMD too, so it's there if you want it. As a bonus, no bit reversing is used at all, so no need for a compiler-specific intrinsic.</p>
+
+<p>The real work happens here: (taken from the linked website)</p>
+
+<pre><code>void fft0(int n, int s, bool eo, complex_t* x, complex_t* y)
+// n  : sequence length
+// s  : stride
+// eo : x is output if eo == 0, y is output if eo == 1
+// x  : input sequence(or output sequence if eo == 0)
+// y  : work area(or output sequence if eo == 1)
+{
+    const int m = n / 2;
+    const double theta0 = 2 * M_PI / n;
+
+    if (n == 2) {
+        complex_t* z = eo ? y : x;
+        for (int q = 0; q &lt; s; q++) {
+            const complex_t a = x[q + 0];
+            const complex_t b = x[q + s];
+            z[q + 0] = a + b;
+            z[q + s] = a - b;
+        }
+    }
+    else if (n &gt;= 4) {
+        for (int p = 0; p &lt; m; p++) {
+            const complex_t wp = complex_t(cos(p*theta0), -sin(p*theta0));
+            for (int q = 0; q &lt; s; q++) {
+                const complex_t a = x[q + s * (p + 0)];
+                const complex_t b = x[q + s * (p + m)];
+                y[q + s * (2 * p + 0)] = a + b;
+                y[q + s * (2 * p + 1)] = (a - b) * wp;
+            }
+        }
+        fft0(n / 2, 2 * s, !eo, y, x);
+    }
+}
+
+void fft(int n, complex_t* x) // Fourier transform
+// n : sequence length
+// x : input/output sequence
+{
+    complex_t* y = new complex_t[n];
+    fft0(n, 1, 0, x, y);
+    delete[] y;
+    // scaling removed because OP doesn't do it either
+    //for (int k = 0; k &lt; n; k++) x[k] /= n;
+}
+</code></pre>
+
+<p>And here is that wrapper to do a Real FFT with a Complex FFT with half the number of points,</p>
+
+<pre><code>std::vector&lt;std::complex&lt;double&gt;&gt; FFT2(const std::vector&lt;double&gt;&amp; x)
+{
+    size_t N = x.size();
+
+    // Radix2 FFT requires length of the input signal to be a power of 2
+    // TODO: Implement other algorithms for when N is not a power of 2
+    assert(IsPowerOf2(N));
+
+    // Taking advantage of symmetry the FFT of a real signal can be computed
+    // using a single N/2-point complex FFT. Split the input signal into its
+    // even and odd components and load the data into a single complex vector.
+    std::vector&lt;std::complex&lt;double&gt;&gt; x_p(N / 2);
+    std::copy(x.data(), x.data() + x.size(), reinterpret_cast&lt;double*&gt;(x_p.data()));
+
+    fft(N / 2, x_p.data());
+
+    // Extract the N-point FFT of the real signal from the results 
+    std::vector&lt;std::complex&lt;double&gt;&gt; X(N);
+    X[0] = x_p[0].real() + x_p[0].imag();
+    auto twiddle_step = std::polar(1.0, -2.0 * M_PI / N);
+    auto twiddle_current = twiddle_step;
+    for (size_t k = 1; k &lt; N / 2; ++k)
+    {
+        auto Wk = twiddle_current;
+        // Extract the FFT of the even components
+        auto A = std::complex&lt;double&gt;(
+            (x_p[k].real() + x_p[N / 2 - k].real()) / 2,
+            (x_p[k].imag() - x_p[N / 2 - k].imag()) / 2);
+
+        // Extract the FFT of the odd components
+        auto B = std::complex&lt;double&gt;(
+            (x_p[N / 2 - k].imag() + x_p[k].imag()) / 2,
+            (x_p[N / 2 - k].real() - x_p[k].real()) / 2);
+
+        // Sum the results and take advantage of symmetry
+        X[k] = A + Wk * B;
+        X[k + N / 2] = A - Wk * B;
+
+        twiddle_current *= twiddle_step;
+    }
+
+    return X;
+}
+</code></pre>
+
+<p>Using <code>std::copy</code> was faster than a manual loop, and not storing the twiddles was also faster. Of course I used the fast twiddle factor generation scheme (without resets this time as per the comments, of course that's easy to put back in). Avoiding the copy altogether would obviously be better, but then the input data will be turned into its FFT instead of leaving it read-only, it's not a drop-in replacement.</p>
+
+<p>Extracting the Real FFT takes a significant portion of the total time by the way.</p>
+    </div>

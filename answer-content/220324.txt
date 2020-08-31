@@ -1,0 +1,127 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Style</h2>
+
+<p>Your placement of the parameters in a function definition isn't consistent. The typical convention, across languages, is no space between the name and the <code>(</code>. There is no "standard" style for Lua, though, so if you want to put a space before, go ahead! Just do it on <em>all</em> of your functions, and not just most of them.</p>
+
+<p>A useful style is to use "trailing commas" whenever you have lists or tables split across multiple lines. This reduces the churn in line-based diffs (like what <code>git</code> and <code>hg</code> use) and overall can make the code look more regular. </p>
+
+<pre><code>tokens[#tokens + 1] = {
+    tag = tags.tokens.num,
+    lexeme = string.sub(s, j, i),
+    pos = j, -- you can add trailing comma here
+}
+</code></pre>
+
+<p>"left parenthese" isn't correct spelling. Although it may look awkward, the correct word is "left parenthesis". One way to get around this (and also produce a more precise and concise diagnostic) is to just the symbol itself:</p>
+
+<pre><code>report_syntax_error('Expected number, `(` or `-`')
+</code></pre>
+
+<h2>tags</h2>
+
+<p>Instead of using numbers for your tags, you can just use strings. <code>==</code> on strings in Lua is exactly as fast (and does essentially the same thing; comparing an integer rather than a float [if you're using Lua 5.1/5.2]) as <code>==</code> on numbers. This will mean your tables are much more interpretable when debugging and it simplifies the overall structure.</p>
+
+<p>The advantage of some kind of "enum" approach is that you can more easily avoid typos (e.g. <code>'sbu'</code> instead of <code>'sub'</code>) because you have a central place to validate all of the strings you're using, and IDEs will be more able to help you. However, because this is so simple, and bugs here would almost surely be caught in simple tests, I would err on the side of simplicity and deletings <code>tags.lua</code> altogether, just using the string constants as you need them.</p>
+
+<p>One benefit that falls out of this is being able to use punctuation as tags, for example, the self explanatory <code>'('</code> instead of <code>'lpu'</code>.</p>
+
+<p>If you want to get value of <code>tags.lua</code>, you might want to, for example, add a metatable to <code>tokens</code> that throws an error if an unknown token is mentioned.</p>
+
+<h2>tokenizer</h2>
+
+<p>Making an alias <code>local sub = string.sub</code> does help slightly with performance, but it's most likely not worth it. Following the same logic track, you should eliminate <code>current</code> and simply repeat <code>sub(s, i, i)</code> over and over. But actually, computing <code>.</code> and entering functions is not where your code is spending most if its time, so it's not really worth optimizing.</p>
+
+<p>This is especially true when there are other options that will save more time <em>and</em> clean up your code: For example, you don't need to call <code>current()</code> so many times. Instead of having that function, you could instead make a local variable:</p>
+
+<pre><code>local current = s:sub(i, i)
+if current == '+' then
+</code></pre>
+
+<p>By the way, since <code>current()</code> always returned a string, <code>current() or ' '</code> is redundant; the <code>' '</code> branch will never be used.</p>
+
+<p>Instead of using <code>while</code> loops for lexing numbers, you could use Lua's built in pattern matching. This will likely run faster, and is a lot less code.</p>
+
+<pre><code>local _, integer_stop = s:find("[0-9]+", i)
+local number_stop = integer_stop
+if s:sub(integer_stop + 1, integer_stop + 1) == "." then
+    local _, fraction_stop = s:find("[0-9]+", integer_stop + 2)
+    if not fraction_stop then
+        error({ message = 'Expected digit after dot', pos = integer_stop + 2 })
+    end
+    number_stop = fraction_stop
+end
+
+tokens[#tokens + 1] = {
+    pos = i,
+    lexeme = s:sub(i, number_stop),
+}
+i = number_stop - 1
+</code></pre>
+
+<h2>parser</h2>
+
+<p>The same comment for localizing <code>string.sub</code> goes for <code>table.remove</code>; you shouldn't write code in a different way just to save a few cycles until everything else is perfect.</p>
+
+<p>Your <code>pop</code> function is unnecessary; <code>table.remove</code> removes the last element from a list if you don't specify an argument. However, I find it inconsistent that you use <code>t[#t + 1] =</code> to insert, but use <code>table.remove</code> to remove. I would be consistent with my idioms, and use <code>t[#t] = nil</code> to pop values off of a stack. </p>
+
+<p>By the way, the typical name for what you call <code>add</code> is <code>push</code>. "<code>add</code>" is an extra unfortunate name, since it's also the name of one of your tokens.</p>
+
+<p>Using a global variable <code>context</code> is an unnecessary source of complexity and ugliness, especially because the things that operate on it are so simple.</p>
+
+<p>I would either</p>
+
+<ul>
+<li>eliminate <code>add</code>, <code>pop</code>, <code>is_at</code>, and <code>current</code>, inlining them into all of their uses</li>
+<li>or make <code>context</code> an argument to each of <code>add</code>, <code>pop</code>, <code>is_at</code>, and <code>current</code>.</li>
+</ul>
+
+<p>You're not actually using your <code>context.ast</code> stack though! Notice that you pop everything off at the end of every function. Instead of going through the stack, you should make your <code>parse_</code> functions <em>return</em> the AST that they have just parsed. For example, here's what <code>parse_expression_2</code> might look like (simplifying to only include <code>'*'</code> and not <code>'/'</code>):</p>
+
+<pre><code>local function parse_expression_2 ()
+    local ast = parse_expression_3()
+
+    while true do
+        if is_at('*') then
+            advance()
+        else
+            return ast
+        end
+        local right = parse_expression_3()
+        ast = {tag = '*', left = ast, right = right}
+    end
+end
+</code></pre>
+
+<p>You could do a similar thing for the tokens (notice that <code>is_at</code> is always paired with an <code>advance()</code> immediately after!) where they return <code>true</code> if it starts, and automatically advances, and otherwise returns <code>false</code>. I would rename them to something like <code>try_consume</code> in that case, to make it clearer what they do.</p>
+
+<p>Instead of an 'eof' token, you could just use size of the token list; unlike, say, C, we know where the ends of our arrays are.</p>
+
+<h2>interpreter</h2>
+
+<p>The most obvious change to me is to use <code>elseif</code> to compress the many cases. While you could always use that style when a branch <code>return</code>s, it especially makes sense here since you are handling different cases of the same variable. Also, apply the suggestion to use raw strings rather than tokens, and you get something much cleaner:</p>
+
+<pre><code>local function evaluate (ast)
+    if ast.tag == 'num' then
+        return tonumber(ast.lexeme)
+    elseif ast.tag == 'u-' then
+        return -evaluate(ast.expr)
+    elseif ast.tag == '+' then
+        return evaluate(ast.left) + evaluate(ast.right)
+    end
+</code></pre>
+
+<h2>repl</h2>
+
+<p>Your use of <code>error</code> <code>pcall</code> makes your code fairly simple, but it's also not a great design for large-scale projects. The best way to use <code>error</code> in Lua is to mark <em>programmer errors</em>; ie, if your code throws an <code>error</code>, you have a mistake in your code.</p>
+
+<p>To mark bad input (like you're currently using <code>error</code> for), it should <em>return</em> an error message. The Lua standard library typically does this by returning <code>nil</code> and then the message:</p>
+
+<pre><code>return nil, "Cannot divide by 0"
+</code></pre>
+
+<p>However, doing this does make your code more complicated, since you have to check error values at every call. On the other hand, if you make a mistake in your program, your <code>pcall</code> is going to try to read that and show it to the user like they put in bad input. (It will actually fail in a confusing way with <code>'Error: ' .. v.message</code> failing because <code>v.message</code> will be <code>nil</code>).</p>
+
+<p>Not throwing <code>error</code>s makes your code easier to embed in other code. If every caller of your library is supposed to surround every function call with a <code>pcall</code>, you've not designed a very good interface!</p>
+
+<p>On the other hand, if you can be certain that your code doesn't have any unexpected errors (or you catch and rethrow them, for example, by inspecting the <code>type(v)</code> when <code>pcall</code> returns unsuccessfully), you could keep the same internal structure, and just add a <code>pcall</code> to return the error out of each exported function (just <code>evaluate</code>, <code>parse</code>).</p>
+    </div>

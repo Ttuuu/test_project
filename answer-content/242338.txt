@@ -1,0 +1,97 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'm not familiar with <code>Promise</code> from <em>JavaScript</em> and this is quite a complex flow, so hopefully I didn't miss much.</p>
+
+<h3>Let's just review the flow a bit</h3>
+
+<pre><code>new Promise&lt;&gt;(new Promise.Executor&lt;Integer&gt;() {
+    @Override
+    public void execute(Promise.Action&lt;Integer&gt; action) {
+        // Perhaps do something asynchronous and then:
+        action.resolve(1);
+    }
+})
+</code></pre>
+
+<p>In this case, the entire execution is done within you constructor, under <code>execute()</code>. There is access to some properties in the class, however it is done in a single thread. So no problems so far.</p>
+
+<pre><code>.andThen(new Promise.Callback&lt;Integer, Boolean&gt;() {
+    @Override
+    public Promise.Result&lt;Boolean&gt; execute(Integer value) {
+        return new Promise.Result&lt;&gt;(false);
+    }
+})
+</code></pre>
+
+<p>Now things start to complicate a bit. <code>andThen</code> creates a new <code>Promise</code> which adds this callback to the <em>original</em> <code>Promise</code>. The callback it self, is transferred to an <code>Handler</code>, and executed using <code>postDelayed</code>.</p>
+
+<p>We know for certain that the first execution of the original <code>Promise</code> was done, since it is in the constructor. So there is no race with it. We also know that the callback doesn't access any of the properties in our <code>Promise</code>. So far it looks safe. Let's take a look at the execution of the callbacks:</p>
+
+<pre><code>    private &lt;R&gt; void handleCallbacks(final CallbackContainer&lt;T, R&gt; callbackContainer) {
+        synchronized(callbackContainers) {
+            if(state == State.PENDING) {
+                callbackContainers.add(callbackContainer);
+            }
+            else if(state == State.FULFILLED &amp;&amp; callbackContainer.onFulfilled != null) {
+                callbackContainer.onFulfilled.execute(value);
+            }
+            else if(state == State.REJECTED &amp;&amp; callbackContainer.onRejected != null) {
+                callbackContainer.onRejected.execute(error);
+            }
+        }
+    }
+</code></pre>
+
+<p>The first thing done in this method is entering a <code>synchronized</code> block, so any modifications to our states are going to be safe. This includes modifications to <code>state</code> and <code>callbackContainers</code>.</p>
+
+<p>Let's say we have 2 callbacks. One by one, the call is done to <code>Handler.postDelayed</code>, with execution of those callbacks. We know they are added to <code>postDelayed</code> in order, so they should be executed in order (I'm not sure 100% that <code>postDelayed</code> guarantees that`. </p>
+
+<p>Let's dive in a little. Say <code>callbackContainer.onFulfilled.execute(value);</code> is called, This will invoke this code section:</p>
+
+<pre><code>new Promise.Callback&lt;T, R&gt;() {
+        @Override
+        public Promise.Result&lt;R&gt; execute(final T value) {
+            if(onFulfilled != null) {
+                try {
+                    action.resolve(onFulfilled.execute(value));
+                }
+                catch(Throwable e) {
+                    action.reject(e);
+                }
+            }
+            else {
+                action.resolve((R) null);
+            }
+
+            return null;
+        }
+    }
+</code></pre>
+
+<p>Let's say a value is returned from <code>onFulfilled</code>, and <code>action.resolve(onFulfilled.execute(value));</code> is called. This calls <code>resolveInternal</code>, and called lead to a call to <code>fulfillInternal</code>.</p>
+
+<pre><code>    private void fulfillInternal(final T fulfillValue) {
+        synchronized(callbackContainers) {
+            if(state == State.PENDING) {
+                state = State.FULFILLED;
+                value = fulfillValue;
+                handleCallbacks();
+                callbackContainers.clear();
+            }
+        }
+    }
+</code></pre>
+
+<p>Luckily <code>state</code> is fulfilled already, so this won't be executed. What if it isn't? The modification of values is done in a <code>synchronized</code> block, so it is safe. How about <code>handleCallbacks</code>? Well it will run all callbacks inside <code>callbackContainer</code>, and because the callback use the same lock, and are only added to the container from <code>postDelayed</code> under that lock, it shouldn't be a problem.</p>
+
+<p>Although the code is complex, and I have talked here a lot, it is actually quite solid. The limitations on <code>state</code> are well placed, the use of the lock is done where needed, and the callbacks are executed well. I could try to dig further, but I have to go.</p>
+
+<p>So well done!</p>
+
+<p>A couple of other things: </p>
+
+<ul>
+<li>Wayyy to much code in one file. All the inner types and the javadoc make it difficult to navigate. You should extract the inner classes.</li>
+<li>I can't really find much way that it after <code>execute</code> in the constructor, the value won't be <code>PENDING</code>. To do this, I have to run an async operation from inside the <code>Executor</code>, and modify the action there.  Which is weird. Maybe I'm missing something?</li>
+<li>Exposing <code>Action</code> to users is quite dangerous, since it is a state of the class, and they can really abuse it.</li>
+</ul>
+    </div>

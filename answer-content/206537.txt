@@ -1,0 +1,199 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>1. Introduction</h3>
+
+<p>From a practical point of view, the most important points are that Python has batteries included:</p>
+
+<ol>
+<li><p>To run tasks in a pool of worker threads, use <a href="https://docs.python.org/3/library/concurrent.futures.html#concurrent.futures.ThreadPoolExecutor" rel="noreferrer"><code>concurrent.futures.ThreadPoolExecutor</code></a>.</p></li>
+<li><p>But if what you <em>really</em> want to do is run external programs via the shell, as suggested by the use of <a href="https://docs.python.org/3/library/os.html#os.system" rel="noreferrer"><code>os.system</code></a>, then you don't need threads at all! Use <a href="https://docs.python.org/3/library/subprocess.html#subprocess.Popen" rel="noreferrer"><code>subprocess.Popen</code></a> instead.</p>
+
+<p>(Note that on some operating systems, notably macOS, you can only have one call to <a href="https://docs.python.org/3/library/os.html#os.system" rel="noreferrer"><code>os.system</code></a> running at a time. Subsequent calls, even from other threads, have to wait for the first call to finish. On these systems you <em>have</em> to use <a href="https://docs.python.org/3/library/subprocess.html#subprocess.Popen" rel="noreferrer"><code>subprocess.Popen</code></a> if you want the subprocesses to run in parallel.)</p></li>
+</ol>
+
+<p>Nonetheless I think it's a good exercise to have a go at writing your own thread pool, and so I'm go to look at how you might improve the code in the post. There's quite a lot of ground to cover, so I'm going to take it in stages, starting by reviewing improving the code in the post, and then identifying and fixing various problems with the design.</p>
+
+<h3>2. Initial review</h3>
+
+<ol>
+<li><p>There are no docstrings. How do I use this module? Which classes are public and which are private? Do I create my own <code>Worker</code> objects or do I let the <code>Pool</code> create them for me? What kind of object do I pass for <code>queue</code>? How should I specify the <code>timeout</code>?</p></li>
+<li><p>The <code>Pool</code> constructor takes <code>timeout</code> and <code>output</code> arguments but these have no effect: they are passed to <code>Worker.__call__</code> but then they are ignored.</p></li>
+<li><p>The <code>Pool</code> class has only one method (other than <code>__init__</code>). When you have a class with just one method, then what you need is a <em>function</em>. Not everything needs to be a class! It would simplify the code if it were turned into a function with a specification like this:</p>
+
+<pre><code>def run_shell_commands_in_parallel(commands, max_threads):
+    """Run shell commands in parallel. max_threads is the maximum
+    number of threads that may run simultaneously.
+
+    """
+</code></pre></li>
+<li><p>Running a shell command is not very general. It would make sense to generalize the code to do arbitrary function calls in parallel:</p>
+
+<pre><code>def apply_in_parallel(fun, args, max_threads=4):
+    """Apply fun to each of the arguments in parallel. max_threads is the
+    maximum number of threads that may run simultaneously.
+
+    """
+</code></pre>
+
+<p>To try to run a bunch of shell commands in parallel, you'd call it like this:</p>
+
+<pre><code>apply_in_parallel(os.system, ['command1', 'command2', ...])
+</code></pre>
+
+<p>but now you can use it for other parallel tasks:</p>
+
+<pre><code>apply_in_parallel(print, range(10))
+</code></pre></li>
+<li><p>The main thread calls <code>workers.pop(0)</code> and the worker threads call <code>workers.append(self)</code>, but the <code>workers</code> data structure is just an ordinary Python list, which is not thread-safe. Whenever you have a data structure that's shared between threads, access to the data structure needs to be <a href="https://en.wikipedia.org/wiki/Synchronization_(computer_science)" rel="noreferrer">synchronized</a>, for example by using a <a href="https://docs.python.org/3/library/threading.html#semaphore-objects" rel="noreferrer">lock</a> to ensure that only one thread can be updating it at a time.</p></li>
+<li><p>All the <code>Worker</code> objects are identical — their only attribute is <code>self.pool</code>, and that's the same for every worker, so instead of a list of workers all we really need is a count of how many workers are idle.</p></li>
+</ol>
+
+<h3>3. Revised code</h3>
+
+<p>Fixing the issues in §1 above yields the following, which does essentially the same thing as the code in the post, but in a simpler way:</p>
+
+<pre><code>def apply_in_parallel(fun, args, max_threads=4):
+    """Apply fun to each of the arguments in parallel. max_threads is the
+    maximum number of threads to run simultaneously.
+
+    """
+    available_workers = max_threads
+    available_workers_lock = Lock()
+
+    def worker(arg):
+        nonlocal available_workers
+        fun(arg)
+        with available_workers_lock:
+            available_workers += 1
+
+    for arg in args:
+        while True:
+            with available_workers_lock:
+                if available_workers:
+                    available_workers -= 1
+                    break
+        Thread(target=worker, args=(arg,)).start()
+</code></pre>
+
+<h3>4. Problem: busy-waiting</h3>
+
+<p>The <code>while True:</code> loop is <a href="https://en.wikipedia.org/wiki/Busy_waiting" rel="noreferrer">busy-waiting</a>. If it takes a long time for a worker to become available, the main thread will be wasting effort by repeatedly taking the lock and testing the condition <code>if available_workers:</code> which remains false.</p>
+
+<p>What we'd like instead is to be able to suspend the main thread until a worker becomes available. For this use case what we need is a <a href="https://en.wikipedia.org/wiki/Semaphore_(programming)" rel="noreferrer">semaphore</a>, and Python provides us with <a href="https://docs.python.org/3/library/threading.html#semaphore-objects" rel="noreferrer"><code>threading.Semaphore</code></a>:</p>
+
+<pre><code>from threading import Semaphore, Thread
+
+def apply_in_parallel(fun, args, max_threads=4):
+    """Apply fun to each of the arguments in parallel. max_threads is the
+    maximum number of threads that may run simultaneously.
+
+    """
+    available = Semaphore(max_threads)
+
+    def worker(arg):
+        fun(arg)
+        available.release()
+
+    for arg in args:
+        available.acquire()
+        Thread(target=worker, args=(arg,)).start()
+</code></pre>
+
+<h3>5. Problem: can't tell when threads are done</h3>
+
+<p>The code in §4 starts the shell commands but does not wait for them all to complete. But in many use cases it is important to wait for workers to finish running before proceding.</p>
+
+<p>To ensure that all threads have finished, we must <a href="https://docs.python.org/3/library/threading.html#threading.Thread.join" rel="noreferrer"><em>join</em></a> them before returning:</p>
+
+<pre><code>from threading import Semaphore, Thread
+
+def apply_in_parallel(fun, args, max_threads=4):
+    """Apply fun to each of the arguments in parallel and wait until all
+    calls have completed. max_threads is the maximum number of threads
+    that may run simultaneously.
+
+    """
+    available = Semaphore(max_threads)
+
+    def worker(arg):
+        fun(arg)
+        available.release()
+
+    threads = []
+    for arg in args:
+        available.acquire()
+        thread = Thread(target=worker, args=(arg,))
+        threads.append(thread)
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+</code></pre>
+
+<h3>6. Problem: too many threads</h3>
+
+<p>The code in §5 creates a new thread for every task, and every thread exits after completing its task. This defeats one of the purposes of having a pool of threads, namely that it avoids some of the overhead of creating new threads by reusing the threads in the pool.</p>
+
+<p>The usual approach to implementing a pool of threads is for each thread to execute another task when it is finished (so long as there are more tasks to run). That means that the main thread is going to need a safe way of sending the tasks to the running threads, and Python provides <a href="https://docs.python.org/3/library/queue.html#queue.Queue" rel="noreferrer"><code>queue.Queue</code></a> which is exactly what we want:</p>
+
+<pre><code>from queue import Queue
+from threading import Thread
+
+def apply_in_parallel(fun, args, max_threads=4):
+    """Apply fun to each of the arguments in parallel and wait until all
+    calls have completed. max_threads is the maximum number of threads
+    that may run simultaneously.
+
+    """
+    queue = Queue()
+
+    def worker():
+        while True:
+            arg = queue.get()
+            fun(arg)
+            queue.task_done()
+
+    for _ in range(max_threads):
+        Thread(target=worker).start()
+    for arg in args:
+        queue.put(arg)
+    queue.join()
+</code></pre>
+
+<h3>7. Problem: threads are left dangling</h3>
+
+<p>The problem with the implementation in §6 is that the worker threads never finish! When all the tasks are done, each worker thread is blocked in <a href="https://docs.python.org/3/library/queue.html#queue.Queue.get" rel="noreferrer"><code>queue.get</code></a> waiting for the next task, but it will never arrive. This is a dangerous resource leak because the number of threads that we can create is limited by the operating system, and so to ensure that we can continue to create new threads later in the program, we must clean up all the threads that we started.</p>
+
+<p>So when all tasks are done, we must tell the threads to exit. A convenient way to do that is to pass in a special sentinel argument that is different from any argument that the caller could pass in:</p>
+
+<pre><code>from queue import Queue
+from threading import Thread
+
+def apply_in_parallel(fun, args, max_threads=4):
+    """Apply fun to each of the arguments in parallel and wait until all
+    calls have completed. max_threads is the maximum number of threads
+    that may run simultaneously.
+
+    """
+    queue = Queue()
+    sentinel = object()
+
+    def worker():
+        while True:
+            arg = queue.get()
+            if arg is sentinel:
+                break
+            fun(arg)
+
+    threads = []
+    for _ in range(max_threads):
+        thread = Thread(target=worker)
+        threads.append(thread)
+        thread.start()
+    for arg in args:
+        queue.put(arg)
+    for _ in range(max_threads):
+        queue.put(sentinel)
+    for thread in threads:
+        thread.join()
+</code></pre>
+    </div>

@@ -1,0 +1,142 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Looks reasonable to me. But I strongly recommend splitting up some of the more complicated source lines to conform to the rule "one side effect, one line of code." For example:</p>
+
+<pre><code>if (--pblock-&gt;cnt == 0) delete pblock;
+</code></pre>
+
+<p>This really means</p>
+
+<pre><code>uint64_t new_cnt = --pblock-&gt;cnt;
+if (new_cnt == 0) {
+    delete pblock;
+}
+</code></pre>
+
+<p>Or again:</p>
+
+<pre><code>void reset(T* p = nullptr) {
+    auto expire(std::move(*this));
+    pblock = !p ? nullptr : new block{unique_ptr(p), {1}};
+}
+</code></pre>
+
+<p>This really means</p>
+
+<pre><code>void reset(T *p) {
+    shared_ptr expire = std::move(*this);
+    if (p != nullptr) {
+        pblock = new block{unique_ptr(p), {1}};
+    }
+}
+void reset() {
+    shared_ptr expire = std::move(*this);
+}
+</code></pre>
+
+<p>or possibly just</p>
+
+<pre><code>void reset(T *p) {
+    swap(this, shared_ptr(p));
+}
+void reset() {
+    reset(nullptr);
+}
+</code></pre>
+
+<hr>
+
+<pre><code>private:
+  shared_ptr(block* p):
+    pblock(p) {
+    // pass
+  }
+</code></pre>
+
+<p>Always, always, always mark your constructors <code>explicit</code>! This goes quadruple for implementation-detail private constructors.</p>
+
+<p>In this case, because you failed to provide a <code>shared_ptr(std::nullptr_t)</code> constructor, you won't be able to call</p>
+
+<pre><code>void foo(shared_ptr&lt;Widget&gt;);
+void test() {
+    foo(nullptr);
+}
+</code></pre>
+
+<p>because there are two equally good ways of converting <code>nullptr</code> to <code>shared_ptr&lt;Widget&gt;</code> — via the public <code>T*</code> constructor and via the private <code>block*</code> constructor — and so you get an ambiguity. Marking the private constructor <code>explicit</code> would have solved that particular problem. However, you'll still need the constructor from <code>std::nullptr_t</code> (a.k.a. <code>decltype(nullptr)</code>) in order to solve</p>
+
+<pre><code>void foo(shared_ptr&lt;Widget&gt;);
+void test() {
+    foo(shared_ptr&lt;Widget&gt;(nullptr));
+}
+</code></pre>
+
+<hr>
+
+<p>Your indentation of destructors by <code>n-1</code> characters is idiosyncratic and weird.</p>
+
+<pre><code>    foo();
+   ~foo();  // Strange!
+</code></pre>
+
+<hr>
+
+<pre><code> ~atomic_shared_ptr() {
+    auto p = pblock.load();
+    if (p.pblock) {
+      p.pblock-&gt;cnt += p.stagecnt;
+      shared_ptr_t(p.pblock);
+    }
+  }
+</code></pre>
+
+<p>The line</p>
+
+<pre><code>      shared_ptr_t(p.pblock);
+</code></pre>
+
+<p>may be correct, but it certainly looks strange. I would also question the use of <code>auto</code> on your first line, given how important it is in this code that we know which of our variables are <code>atomic</code> and which aren't. So I would write this as</p>
+
+<pre><code>  ~atomic_shared_ptr() {
+      counted_ptr p = pblock.load();
+      if (p.pblock != nullptr) {
+          std::atomic_uint64_t&amp; cnt = p.pblock-&gt;cnt;
+          cnt += p.stagecnt;
+          std::uint64_t old_cnt = cnt--;
+          if (old_cnt == 1) {
+              delete p.pblock;
+          }
+      }
+  }
+</code></pre>
+
+<p>And then I would wonder whether it was possible to coalesce those two additions into</p>
+
+<pre><code>      std::uint64_t new_cnt = (cnt += p.stagecnt - 1);
+      if (new_cnt == 0) {
+</code></pre>
+
+<hr>
+
+<pre><code>operator shared_ptr_t() const {
+    auto p = copy_ptr();
+    return p.pblock;
+}
+</code></pre>
+
+<p>Again with the implicit conversion. <code>p.pblock</code> isn't a <code>shared_ptr&lt;T&gt;</code>, so it's strange to be returning it from a function that claims to return <code>shared_ptr&lt;T&gt;</code>. Eliminating that implicit conversion from <code>block*</code> to <code>shared_ptr</code> will force you to fix this too.</p>
+
+<hr>
+
+<pre><code>counted_ptr p = pblock, pp;
+</code></pre>
+
+<p>I strongly recommend writing one declaration per line.</p>
+
+<pre><code>counted_ptr p = pblock;
+counted_ptr pp;
+</code></pre>
+
+<hr>
+
+<p>It seems like the bulk of the "interesting" stuff (and thus the highest likelihood of bugs) is in the <code>compare_exchange_weak</code> functions; and they depend on the <code>copy_ptr</code> function, which is non-standard (so cppreference won't help the reader understand its purpose) and undocumented. I strongly recommend adding some commentary to <code>copy_ptr</code> that explains what its preconditions and postconditions are supposed to be.</p>
+    </div>

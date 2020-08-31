@@ -1,0 +1,206 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>In the tests (and anywhere else), you should use constants to ensure correct spelling of the properties :</p>
+
+<pre><code>const PERSON_NAME = 'name';
+const PERSON_SURNAME = 'surname';
+...
+$expectedProperties = array(self::PERSON_NAME,self::PERSON_SURNAME);
+</code></pre>
+
+<p>Then the Filtering and Serialization tests are very similar while they should be atomic (one test tests one thing) : you should not test Filtering whike testing Serialization.</p>
+
+<p>In the production code there is one error : you set the desired property (i.e. <code>$this-&gt;name</code>) while you get the internal array's key (<code>$this-&gt;properties['name']</code>). To keep the simplicity of defining an object as a class with public properties you should drop the internal array. This will also make the <code>__sleep</code> and <code>__wakeup</code> calls much clearer.</p>
+
+<p>Also a design flaw is to use the <a href="http://php.net/manual/en/book.reflection.php" rel="nofollow noreferrer">Reflection</a> : it seems unavoidable but depending on your usage there might be performance issues. Using a caching system such as a static array will help. In particular if you look at the <code>__wakeup</code> and <code>__sleep</code> function you will notice a repeted call to the <code>getPropertyNames</code> method.</p>
+
+<p>Finally what might be problematic is that you don't check if the property exists when setting or getting. If it does not you should throw an exception. There are <a href="http://php.net/manual/en/language.oop5.overloading.php" rel="nofollow noreferrer">magic methods in PHP5.3</a> (<code>__get</code>, <code>__set</code> and <code>__call</code>) ; you may do better using them. This way you will be able to use <code>$personName = $person-&gt;getName()</code> / <code>$person-&gt;setName('Simone')</code> as well as <code>$personName = $person-&gt;name</code> / <code>$person-&gt;name = 'Simone'</code></p>
+
+<p>Tests :</p>
+
+<pre><code>const PERSON_NAME = 'name';
+const PERSON_SURNAME = 'surname';
+
+public function testProvideDtoPropertyNames()
+{
+    $propertyNames = Person::getPropertyNames();
+
+    $expectedProperties = array(
+        self::PERSON_NAME,
+        self::PERSON_SURNAME,
+    );
+
+    $this-&gt;assertEquals(
+        $expectedProperties,
+        $propertyNames
+    );
+}
+public function testProvidePropertyViaGeneralGetter()
+{
+    $dto = Person::createFromArray(array(
+        self::PERSON_NAME =&gt; 'Simone',
+    ));
+
+    $this-&gt;assertEquals(
+        'Simone',
+        $dto-&gt;getName()
+    );
+}
+public function testDTOAcceptOnlyItsOwnProperties()
+{
+    $dto = Person::createFromArray(array(
+        self::PERSON_NAME =&gt; 'Simone',
+        'non existent property' =&gt; 'Simone',
+    ));
+
+    $expectedProperties = array(
+        self::PERSON_NAME =&gt; 'Simone',
+        self::PERSON_SURNAME =&gt; null,
+    );
+
+    $this-&gt;assertEquals(
+        $expectedProperties,
+        $dto-&gt;asArray()
+    );
+}
+public function testSerializationKeepSameProperties()
+{
+    $properties = array(
+        self::PERSON_NAME =&gt; 'Simone',
+        self::PERSON_SURNAME =&gt; null,
+    );
+
+    $dto = Person::createFromArray($properties);
+
+    $serialized = serialize($dto);
+    $unserialized = unserialize($serialized);
+
+    $this-&gt;assertEquals(
+        $dto-&gt;asArray(),
+        $unserialized-&gt;asArray()
+    );
+
+    $this-&gt;assertEquals(
+        $properties,
+        $unserialized-&gt;asArray()
+    );
+}
+</code></pre>
+
+<p>Production code :</p>
+
+<pre><code>class DtoException extends Exception
+{
+}
+abstract class Dto
+{
+    private static $propertyNamesByClass = array();
+
+    private function __construct(array $properties)
+    {
+        foreach($properties as $propertyName=&gt;$propertyValue)
+            if(Static::hasPropertyName($propertyName))
+                $this-&gt;set($propertyName,$propertyValue);
+    }
+    public function __call($method, array $arguments)
+    {
+        $getOrSet = substr($method, 0, 3);
+        if($getOrSet != 'get' &amp;&amp; $getOrSet != 'set')
+            throw new DtoException('"'.get_class($this).'" has no method "'.$method.'"');
+
+        $propertyName = strtolower(substr($method, 3));
+        if(!Static::hasPropertyName($propertyName))
+            throw new DtoException('"'.get_class($this).'" has no property "'.$propertyName.'"');
+
+        $getOrSetMethod = array($this,$getOrSet);
+        array_unshift($arguments,$propertyName);
+        return call_user_func_array($getOrSetMethod, $arguments);
+    }
+    public function __get($propertyName)
+    {
+        if(!Static::hasPropertyName($propertyName))
+            throw new DtoException('"'.get_class($this).'" has no property "'.$propertyName.'"');
+
+        return $this-&gt;get($propertyName);
+    }
+    public function __set($propertyName, $propertyValue)
+    {
+        if(!Static::hasPropertyName($propertyName))
+            throw new DtoException('"'.get_class($this).'" has no property "'.$propertyName.'"');
+
+        return $this-&gt;set($propertyName, $propertyValue);
+    }
+
+    public static function createFromArray($properties)
+    {
+        return new Static($properties);
+    }
+
+    public function set($propertyName, $propertyValue)
+    {
+        $this-&gt;$propertyName = $propertyValue;
+    }
+
+    public function get($propertyName)
+    {
+        return $this-&gt;$propertyName;
+    }
+
+    public static function getPropertyNames()
+    {
+        $className = get_called_class();
+        if(isset(self::$propertyNamesByClass[$className]))
+            return self::$propertyNamesByClass[$className];
+
+        $reflected = new ReflectionClass($className);
+        $reflectedProperties = $reflected-&gt;getProperties(
+            ReflectionProperty::IS_PUBLIC
+        );
+
+        $propertyNames = array();
+        foreach($reflectedProperties as $reflectedProperty) {
+            $propertyNames[] = $reflectedProperty-&gt;getName();
+        }
+
+        self::$propertyNamesByClass[$className] = $propertyNames;
+        return $propertyNames;
+    }
+    public static function hasPropertyName($propertyName)
+    {
+        $propertyNames = Static::getPropertyNames();
+        return in_array($propertyName,$propertyNames);
+    }
+
+    public function asArray()
+    {
+        $values = array();
+
+        foreach (Static::getPropertyNames() as $propertyName) {
+            $values[$propertyName] = $this-&gt;get($propertyName);
+        }
+
+        return $values;
+    }
+
+    public function __sleep()
+    {
+        $propertyNames = self::getPropertyNames();
+
+        foreach ($propertyNames as $propertyName) {
+            $propertyValue = $this-&gt;get($propertyName);
+            $this-&gt;set($propertyName, $propertyValue);
+        }
+
+        return $propertyNames;
+    }
+
+    public function __wakeup()
+    {
+        $propertyNames = self::getPropertyNames();
+
+        return $propertyNames;
+    }
+}
+</code></pre>
+
+<p>I tested it on PHP5.3 and <a href="https://3v4l.org/rL8Uf" rel="nofollow noreferrer">it works</a>, however I have to tell you that it does not work on PHP5.2- or PHP7+.</p>
+    </div>

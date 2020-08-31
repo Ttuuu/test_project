@@ -1,0 +1,119 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The indentation needs to be mentioned. Hopefully it's just an accidental tabs vs spaces issue that caused it to render this way, ...but I'm not seeing the <kbd>Tab</kbd> characters, so... the indentation needs to be mentioned, becauase this is not normal:</p>
+
+<blockquote>
+<pre><code>public IList&lt;Employee&gt; ReadEmployees(byte[] file, string companyId)
+        {
+</code></pre>
+</blockquote>
+
+<p>Expected:</p>
+
+<pre><code>public IList&lt;Employee&gt; ReadEmployees(byte[] file, string companyId)
+{
+</code></pre>
+
+<p>Just like you have here:</p>
+
+<blockquote>
+<pre><code>            using (var stream = new MemoryStream(file))
+            {
+</code></pre>
+</blockquote>
+
+<p>And here:</p>
+
+<blockquote>
+<pre><code>                    for (var rowNumber = 3; rowNumber &lt;= worksheet.Dimension.End.Row; rowNumber++)
+                    {
+</code></pre>
+</blockquote>
+
+<p>Now, with that cleared, the <code>GetEmployeeRowSummary</code> method looks much cleaner already:</p>
+
+<pre><code>private static Employee GetEmployeeRowSummary(ExcelWorksheet worksheet, int rowNumber, string companyId)
+
+{
+    var employeeId = Guid.NewGuid().ToString();
+    return new Employee
+    {
+        CompanyId = companyId,
+        EmployeeId = employeeId,
+        EmployeeNumber = worksheet.Cells[rowNumber, 1].GetValue&lt;string&gt;(),
+        FirstName = worksheet.Cells[rowNumber, 2].GetValue&lt;string&gt;(),
+        LastName = worksheet.Cells[rowNumber, 3].GetValue&lt;string&gt;(),
+        BirthDate = worksheet.Cells[rowNumber, 4].GetValue&lt;DateTime&gt;(),
+        AppointmentDate = worksheet.Cells[rowNumber, 5].GetValue&lt;DateTime&gt;(),
+        CompanyRunFrequencyId = 9,
+        JobTitle = worksheet.Cells[rowNumber, 8].GetValue&lt;string&gt;(),
+        DateCreated = DateTime.Now,
+        EmployeeAddress = new List&lt;EmployeeAddress&gt;
+        {
+            new EmployeeAddress
+            {
+                EmployeeId = employeeId,
+                StreetNumber = worksheet.Cells[rowNumber, 9].GetValue&lt;int&gt;(),
+                Suburb = worksheet.Cells[rowNumber, 11].GetValue&lt;string&gt;(),
+                City = worksheet.Cells[rowNumber, 12].GetValue&lt;string&gt;(),
+                PostalCode = worksheet.Cells[rowNumber, 13].GetValue&lt;int&gt;()
+            }
+       }
+   };
+}
+</code></pre>
+
+<p>Consistent indentation is fundamental for clean, readable code.</p>
+
+<p>But readability isn't the biggest problem here: the repeated calls to <code>worksheet.Cells</code> and <code>{Range?}.GetValue</code> are.</p>
+
+<p>I'm not sure what <code>ExcelPackage</code> is, but it's definitely not VSTO, so <em>maybe</em> this isn't as much of a problem, but invoking <code>worksheet.Cells[...].GetValue&lt;...&gt;()</code> is spawning a RCW (Runtime Callable Wrapper - a .NET wrapper object to access a COM object) whose reference isn't captured, and thus could be leaking the object reference. If you were using VSTO, there would very likely be a "ghost" EXCEL.EXE process lingering in <em>Task Manager</em> forever, well after your application happily terminated.</p>
+
+<p>In any case, working directly with worksheet cells is THE slowest thing you can do, whether in VBA or C# through COM interop, whether it be through VSTO or any other library.</p>
+
+<p>Again I don't know what <code>ExcelPackage</code> is nor what this API has to offer, but in the native Excel object model <code>Range.Value</code>, when the <code>Range</code> object represents multiple cells, gives you a 2D variant array (<code>object[,]</code> in .NET) - if all you're ever interested in is the values that are in the cells (as seems to be the case), then you don't need to deal with worksheets and cells and <code>.GetValue&lt;T&gt;()</code>.</p>
+
+<p>So instead of looping through rows:</p>
+
+<blockquote>
+<pre><code>for (var rowNumber = 3; rowNumber &lt;= worksheet.Dimension.End.Row; rowNumber++)
+</code></pre>
+</blockquote>
+
+<p>Grab the values array (not sure what the syntax would be with this API - if your library doesn't allow you to grab a 2D array of values, drop that library and use VSTO):</p>
+
+<pre><code>var values = worksheet.Range(worksheet.Cells[3, 1], worksheet.Cells[lastRow, 13]).Value;
+</code></pre>
+
+<p>The idea is to get a <code>Range</code> object that encompasses all the cells you're interested in. Maybe that's everything from row 3 to <code>worksheet.Dimension.End.Row</code>, but even without knowing the slightest thing about this particular API I would fear that <code>worksheet.Dimension.End.Row</code> yields something like 1,048,576 - which is very very very unlikely the <em>actual</em> number of rows you need to care about.</p>
+
+<p>With the Excel object model, you'd do something like <code>sheet.Range("A" &amp; sheet.Rows.Count).End(xlUp).Row</code> to get the last interesting row (aka <code>lastRow</code>), and use that row number to make the "interesting range" from which to read the values.</p>
+
+<p>Now that you have a 2D array that contains all the values, <code>GetEmployeeRowSummary</code> doesn't make much sense anymore: we don't care for a <code>rowNumber</code>, and we don't need a <code>ExcelWorksheet</code> reference anymore.</p>
+
+<p>In fact all we need is a "row slice" of the 2D array, by copying the row to a new array (<a href="https://stackoverflow.com/a/51241629/1188513">this code</a> looks like it):</p>
+
+<pre><code>public T[] GetRow(T[,] matrix, int rowNumber)
+{
+    return Enumerable.Range(0, matrix.GetLength(1))
+            .Select(x =&gt; matrix[rowNumber, x])
+            .ToArray();
+}
+
+private static Employee ReadEmployee(object[] row, string companyId)
+{
+    var id = Guid.NewGuid().ToString();
+    return new Employee
+    {
+        CompanyId = companyId,
+        EmployeeId = id,
+        EmployeeNumber = (string)row[1],
+        FirstName = (string)row[2],
+        LastName = (string)row[3],
+        BirthDate = (DateTime)row[4],
+        //...
+    };
+}
+</code></pre>
+
+<p>As for mapping the properties automatically, I'm not a fan. <em>Something, somewhere</em> needs to do the mapping, and I'd much rather it be explicit in the code. Automatic mapping would need more metadata than just column indices - you'd likely need column names and data types, so instead of copying the cells to an array you'd be copying the cells to some <code>DataTable</code>, or have the mapper understand what an Excel <code>Range</code> or <code>ListObject</code> is... all of which sound like quite a lot of effort for an error-prone way to just list the properties at the left of an <code>=</code> operator. If your explicit casts blow up, you'll know why. If the automagic mapping blows up, pray the library throws meaningful exceptions.</p>
+    </div>

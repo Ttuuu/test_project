@@ -1,0 +1,124 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Python has some neat features, some of which might seem familiar from C++ and some not. The Python standard library is also very powerful. These comments are meant to be complementary to the <a href="https://codereview.stackexchange.com/a/226509/98493">answer</a> by <a href="https://codereview.stackexchange.com/users/25834/reinderien">@Reinderlein</a>, I will not repeat the useful advice given there.</p>
+
+<ul>
+<li>You can <a href="https://www.geeksforgeeks.org/chaining-comparison-operators-python/" rel="nofollow noreferrer">compare multiple things</a>: <code>MINIMUM_SIZE &lt; x.size &lt; MAXIMUM_SIZE</code>.</li>
+<li><p>The <a href="https://docs.python.org/3/library/itertools.html" rel="nofollow noreferrer"><code>itertools</code></a> module: </p>
+
+<pre><code>from itertools import chain
+files = list(chain.from_iterable(
+    get_files(x, lambda x: MINIMUM_SIZE &lt; x.size &lt; MAXIMUM_SIZE)) for x in args.dirs))
+</code></pre></li>
+<li><p><a href="https://realpython.com/primer-on-python-decorators/" rel="nofollow noreferrer">Decorators</a>, which makes code involving getters easy with <code>property</code>, which you are already using, but not to it's full potential:</p>
+
+<pre><code>@property
+def part_hash(self):
+    if self._part_hash is None:
+        h = hashlib.sha1()
+        with open(self.name, 'rb') as f:
+            h.update(f.read(self.part_hash_size))
+        self._part_hash = h.hexdigest()
+    return self._part_hash
+</code></pre>
+
+<p>Note that <code>self.part_hash_size</code> is the same as <code>MyFile.part_hash_size</code>, unless you overwrite it in the instance (and be careful of mutating mutable objects). This gives you additional flexibility.</p></li>
+<li><p>(Python 3.6+) <a href="https://realpython.com/python-f-strings/" rel="nofollow noreferrer">Format strings</a>, which utilize the <code>format</code> syntax and make it even better:</p>
+
+<pre><code>def __str__(self):
+    return f"{self.name} is {self.size}"
+
+def __repr__(self):
+    return f"&lt;{self.__class__.__name__} {self.name}:{self.size}&gt;"
+</code></pre></li>
+<li><p>(Python 3.8+) <a href="https://www.python.org/dev/peps/pep-0572" rel="nofollow noreferrer">Assignment expressions</a>, which allow you to shorten some <code>while</code> loops:</p>
+
+<pre><code>@property
+def full_hash(self):
+    if self._full_hash is None:
+        h = hashlib.sha256()
+        with open(self.name, 'rb') as f:
+            while buf := f.read(self.part_hash_size):
+                h.update(buf)
+            self._full_hash = h.hexdigest()
+    return self._full_hash
+</code></pre></li>
+<li><p>Truthiness of non-empty containers: <code>if l</code> is the same as <code>if len(l) &gt; 0</code> for any container in the standard library (and should also be the same for any custom classes you create).</p></li>
+<li><p>Modules are automatically in their own namespace. No need to come up with names like <code>MyFile</code>, just call it <code>File</code>. You should avoid overwriting built-in names, but everything else is fair game, since you can always import them from another module and prefix them with the module name.</p></li>
+<li><p>List comprehensions are nice, but sometimes the functions in <a href="https://docs.python.org/3/library/operator.html" rel="nofollow noreferrer"><code>operator</code></a> give you more readability. Not really in this case, but as a demonstration: </p>
+
+<pre><code>from operator import attrgetter
+a = [x.name for x in dup]              # in your code
+b = [getattr(x, "name") for x in dup]  # if the attribute name is a variable
+c = map(attrgetter("name"), dup)       # using operator instead
+assert a == b == list(c)
+</code></pre></li>
+<li><p><a href="https://wiki.python.org/moin/Generators" rel="nofollow noreferrer">Generators</a> allow you to get rid of storing the full result in a list only to then operate on every item of the list. Instead, generate the next item whenever you are done processing the previous one:</p>
+
+<pre><code>def recursive_dir(dir, pattern, filter):
+    for root, dirs, files in os.walk(dir):
+        for file in files:
+            if fnmatch.fnmatch(file, pattern):
+                if filter(f := File(os.path.join(root, file))):
+                    yield f
+</code></pre>
+
+<p>Or, with a generator expression added and using the <a href="https://docs.python.org/3/whatsnew/3.3.html#pep-380" rel="nofollow noreferrer"><code>yield from</code></a> keyword:</p>
+
+<pre><code>def recursive_dir(dir, pattern, filter):
+    for root, dirs, files in os.walk(dir):
+        yield from (f for file in files
+                    if fnmatch.fnmatch(file, pattern)
+                    and filter(f := File(os.path.join(root, file))))
+</code></pre></li>
+</ul>
+
+<hr>
+
+<p>As to your actual algorithm, you want to group together "equal" items, for some measure of equality. Currently you are comparing each file against each other file, so your algorithm is <span class="math-container">\$\mathcal{O}(n^2)\$</span>. Instead, just define how two files compare and what the hash should be:</p>
+
+<pre><code>def __eq__(self, other):
+    if not isinstance(other, self.__class__):
+        return False
+    return self.part_hash == other.part_hash and self.full_hash == other.full_hash
+
+def __hash__(self):
+    return int(self.part_hash, base=16)
+</code></pre>
+
+<p>Then you can just put them into a dictionary, which is <span class="math-container">\$\mathcal{O}(n)\$</span>, because you only need to iterate over the files once:</p>
+
+<pre><code>from collections import defaultdict
+
+def groupby_hash(files):
+    duplicates = defaultdict(list)
+    for f in files:
+        duplicates[f].append(f)
+    return duplicates
+
+def files_with_duplicates(files):
+    groups = groupby_hash(files).values()
+    return list(filter(lambda x: len(x) &gt; 1, groups))
+</code></pre>
+
+<p>This uses the fact that when putting a hashable object into a dictionary, it is not just put into a slot according to its hash. If two objects have the same hash, they are also compared by equality. This way only the <code>part_hash</code> should be used if there are no duplicates of it and the <code>full_hash</code> is used to make sure they are actually full duplicates. Sometimes the <code>full_hash</code> will still be calculated anyway because of regular collisions. You can test that this is the case for example like this:</p>
+
+<pre><code>files = list(recursive_dir(".", "*", lambda f: os.path.isfile(f.name)))
+len(files)
+# 1448
+d = groupby_hash(files)
+
+# There are files which are unique and their `full_hash` has never been computed
+sum(map(lambda f: f._full_hash is None and len(d[f]) == 1, files)))
+# 759
+
+# The `full_hash` has been computed for all files with duplicates
+sum(map(lambda f: f._full_hash is not None and len(d[f]) &gt; 1, files))
+# 93
+sum(map(lambda f: f._full_hash is None and len(d[f]) &gt; 1, files))
+# 0
+
+# But there are some files without duplicates, whose `full_hash` has been computed
+sum(map(lambda f: f._full_hash is not None and len(d[f]) == 1, files))
+# 596
+</code></pre>
+    </div>

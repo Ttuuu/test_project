@@ -1,0 +1,100 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Some comments:</p>
+
+<ol>
+<li>Code is not formatted properly. There is a bunch of unnecessary whitespace, and there is some inconsistent use of var/let.</li>
+<li>Most of the comments just add noise, and can be removed.</li>
+<li>You're not taking advantage of promises or async/await (both for your expressjs route, the mongodb client, and for the outgoing http requests).</li>
+<li>There is no general error handling middleware, or any other error handling in the express route. </li>
+<li>The server accepts requests before the database is connected.
+A side-effect of this is that the db global needs to be null-checked in every function that uses it.</li>
+<li>It's hard to test</li>
+<li>The naming is a bit lacking. From DB_NAME and other clues I gather this is about some sort of config, but other than that it's hard to tell</li>
+</ol>
+
+<p>I did some quick refactoring (not tested):</p>
+
+<pre><code>const MongoClient = require('mongodb').MongoClient
+const express = require('express')
+const app = express()
+const bodyParser = require('body-parser')
+const rp = require('request-promise')
+const URL = 'mongodb://localhost:27017'
+const DB_NAME = 'config-insert'
+
+let db = null
+async function connectDb(){
+    let client = await MongoClient.connect(URL)
+    db = client.db(DB_NAME)
+}
+
+async function insertOne(db, data){
+    data = JSON.parse(JSON.stringify(data)) // use this otherwise mongo was modifying data variable
+
+    return db.collection('config-history').insertOne(data, {
+        w: 'majority',
+        wtimeout: 10000,
+        serializeFunctions: true
+    })
+}
+
+async function putCategory(data){
+    let response = await rp({
+        uri: `http://10.1.1.41/category/${data.id}`,
+        method: 'PUT',
+        port: 9202,
+        body: data,
+        json: true
+    })
+
+    if(response._shards.successful !== 1){
+        throw new Error(`Could not put ${data.id}`)
+    }
+}
+
+const promiseRoute = route =&gt; async (req, res, next) =&gt; {
+    try{
+        await route(req, res)
+    }catch(err){
+        next(err)
+    }
+}
+
+app.use(bodyParser.json())
+
+app.post('/', promiseRoute(async (req, res) =&gt; {
+    let data = req.body
+
+    await insertOne(db, data)
+    await putCategory(data)
+
+    res.status(200).json({status: 'ok'})
+}))
+
+app.use((err, req, res, next) =&gt; {
+    console.error(err)
+    res.status(500).json({status: 'not nok'})
+})
+
+connectDb()
+    .then(() =&gt; {
+        app.listen(4000, () =&gt; console.log('Example app listening on port 4000!'))
+    })
+    .catch(err =&gt; {
+        console.log(err)
+    })
+</code></pre>
+
+<p>What I have done is:</p>
+
+<ol>
+<li>Format the code</li>
+<li>Remove almost all the comments</li>
+<li>Used async await instead of callbacks. Notice I have wrapped the expressjs route in a helper middleware that just passes any uncaught errors on to the general error handler. For mongodb, the driver already supports promises, and for outgoing http requests we have the request-promise library.</li>
+<li>Added error handling middleware that ensures you get a proper response even if a request fails</li>
+<li>Not starting the http server before the db is connected. Notice how the db null check is gone.</li>
+<li>Injecting db into insertOne to allow for easier testing in the future.</li>
+<li>Turned the _shards.successful response into a more general error case since it was not handled anyway.</li>
+<li>Moved the json-parse trick closer to where it is needed (you could probably use an Object.assign here as well if you wanted)</li>
+</ol>
+    </div>

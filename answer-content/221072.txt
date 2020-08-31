@@ -1,0 +1,157 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>About <strong>performance</strong> (there's a good article to get your started: <a href="https://blogs.technet.microsoft.com/ashleymcglone/2017/07/12/slow-code-top-5-ways-to-make-your-powershell-scripts-run-faster/" rel="nofollow noreferrer"><em>Slow Code: Top 5 ways to make your Powershell scripts run faster</em></a>); I apply that advice as follows:</p>
+
+<ul>
+<li><em>Problem #1: Expensive operations repeated</em>, e.g. 
+
+<ul>
+<li><code>Invoke-Expression</code>: rather than this time consuming cmdlet, I evaluate math expressions using the <code>Compute</code> method of the <a href="https://docs.microsoft.com/en-us/dotnet/api/system.data.datatable" rel="nofollow noreferrer"><code>DataTable</code></a> class;</li>
+<li><code>Write-Progress</code>: <em>show progress bar. We don't call <code>Write-Progress</code> each time through the loop because that is slow</em>. <strong>Edit</strong>: due to <a href="https://codereview.stackexchange.com/a/221098/88771">this Dangph's answer</a>;</li>
+</ul></li>
+<li><em>Problem #0: Not using cmdlet parameter filters</em>, e.g. instead of collecting <em>all</em> the <code>[System.Math]::Pow($operators.Count,$range.count-1)</code> permutations and then narrowing the huge array using the <code>Where-Object</code> cmdlet, I collect only desired values;</li>
+<li><em>Problem #4: Searching text</em>: the original script computes a string in the (commonly usable) <code>ConvertTo-Base</code> function and then casts it as <code>[string[]][char[]]</code>;</li>
+</ul>
+
+<p>… and some further (maybe minor) enhancements are visible in the following (partially commented) <code>122635answer.ps1</code> script:</p>
+
+<pre><code># [CmdletBinding(PositionalBinding=$false)] # slows script execution cca 50%
+param (     # Variables
+    [parameter()]                  # [ValidateRange(3,20)] # ???
+    [int]$maxRange = 9,
+    [parameter()]
+    [int]$lowCountThreshold = 5,
+    [parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$opString = '+-*/'     # Mathematical Operators as string
+)
+Begin {
+    Set-StrictMode -Version Latest
+    # cast $operators variable as an array of characters
+    $operators = [char[]]$opString
+    $opsCount  = $operators.Count
+    # Define the number range for calculations. 13 would make for the largest values 13!. Cap the script as 13
+    $maxRangeMinus1 = $maxRange - 1
+    # Build an array for extending 
+    $maxOpsArray = 1..$maxRange
+    for ( $i=0; $i -lt $maxRange; $i++ ) {
+        $maxOpsArray[$maxRangeMinus1 -$i] = ,$operators[0] * $i
+    }
+    # Build the format string that will be used for invoking.
+    # Will look like 1{2}2{1}3{0}4. Acting as place holders for mathematic operators
+    [string]$formatString = -join (1..($maxRangeMinus1) | 
+        ForEach-Object{"$_{$([int]$maxRangeMinus1 - $_)}"}) + $maxRange # reverse order
+      # ForEach-Object{"$_{$([int]$_ - 1)}"}) + $maxRange  # $range[-1] # ascending order
+      # ascending order would require `[array]::Reverse($newOperatorArr)` below in the process loop
+    if ( $maxRange -gt 11 ) {
+        # force decimal computing in following `$DataTable.Compute( $mathString, '')`
+        $formatString = $formatString.Replace('{','.0{') + '.0'
+    }
+    # Determine the number of possible permutations of those operators inbetween the number set. 
+    [int64]$permutations = [System.Math]::Pow($opsCount, $maxRangeMinus1)
+    # Narrow down $alphanumerics array size to necessary count
+    $alphanumerics = $([char[]]'0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+                      )[0..($opsCount -1)]
+    Write-Verbose -Verbose -Message `
+      ("maxRange=$maxRange, lowCountThreshold=$lowCountThreshold, operators=""$(-join $operators)""" `
+     + "`r`npermutations=$permutations formatString=""$formatString""")
+    $DataTable=[System.Data.DataTable]::new()
+    $Error.Clear()                             # for debugging purposes
+}
+Process {
+# Cycle each permutation. Use `for` loop instead of `0..($permutations - 1) | ForEach-Object`
+$( for ( $i=0; $i -lt $permutations; $i++ ) {
+    # Build an array of operators:
+    #        ( based on the number converted to base `$opsCount` )
+        $Number = $i
+        $newOperatorArr = @( $( do {
+            $Remainder = $Number % $opsCount
+            # Get the associated character
+            $operators[$Remainder]
+            $Number = ($Number - $Remainder) / $opsCount
+        } while ($Number -gt 0) ))
+        # Extend array of operators to appropriate length if necessary
+        if ( $newOperatorArr.Count -lt $maxRangeMinus1 ) {
+            $newOperatorArr += $maxOpsArray[$newOperatorArr.Count]
+        }
+    ### [array]::Reverse($newOperatorArr) # only if `$formatString` is in ascending order
+    $mathString = $formatString -f @( $newOperatorArr )
+    # evaluate math expression using the Compute method of the DataTable class
+    #                          rather than time consuming Invoke-Expression
+    $value122635 = $DataTable.Compute( $mathString, '')
+    # Effectively reduce the output size in advance: refuse "non-integers"
+    if ( $value122635 -eq [System.Math]::Floor($value122635) ) {
+        # Build an object that contains the result and the mathematical expression 
+        [pscustomobject]@{
+            Expression = $mathString
+            Value      = [System.Math]::Floor($value122635) # [int64]$value122635
+        }
+    }
+    # Show progress bar. We don't call Write-Progress each time through the loop 
+    # because that is slow. 
+    # Due to Dangph's answer https://codereview.stackexchange.com/a/221098/88771
+    if ($i % 1000 -eq 0) {
+      Write-Progress -Activity "Performing mathematical calculations" `
+        -Status "Please wait." -PercentComplete (100 * $i / $permutations) `
+        -CurrentOperation "$([math]::Round(100 * $i / $permutations))% Completed."
+    }
+    # Only give group results
+} ) | Group-Object Value |
+      Where-Object{$_.Count -ge $lowCountThreshold} |
+       Sort-Object -property Count &lt;# -Descending &lt;##&gt;, @{Expression = {[int]$_.Name} }
+</code></pre>
+
+<p>About <strong>correctness</strong>: the <code>$_.Value -is [int32]</code> condition seems to be too strong. For instance, <code>1/2*3*4</code> gives <code>6</code>, however <code>(1/2*3*4).GetTypeCode()</code> gives <code>Double</code>; hence, <code>(1/2*3*4) -is [int32]</code> condition (incorrectly) rejects the value from result.</p>
+
+<p>For the sake of comparison, I added appropriate <code>Write-Verbose</code> cmdlet (immediately before the main loop) and used <code>$maxRange = 7; $lowCountThreshold = 1</code> in the original script. The comparison of the latter with the adapted one I performed using the following wrapper:</p>
+
+<pre><code>param (
+    [parameter()]                  
+    [ValidateRange(8,13)]
+    [int]$maxLoop = 12
+)
+
+$y = (Measure-Command {$x = D:\PShell\CR\122635.ps1}).TotalSeconds
+$z = ($x | Measure-Object -Property  Count -Sum).Sum
+'orig.  {0,4} {1,9} {2,9} {3,16}' -f 7, $x.count, $z, $y
+
+for ( $icnt=7; $icnt -lt $maxLoop; $icnt++ ) { 
+    $y = (Measure-Command {
+        $x = D:\PShell\CR\122635answer.ps1 -maxRange $icnt -lowCountThreshold 1
+                          }).TotalSeconds
+    $z = ($x | Measure-Object -Property  Count -Sum).Sum
+    'answer {0,4} {1,9} {2,9} {3,16}' -f $icnt, $x.count, $z, $y
+    if ($icnt -eq 7) {''}
+}
+</code></pre>
+
+<p><strong>Comparison result</strong> shows that the <code>122635answer.ps1</code> script runs <strong>approximately <code>26×</code> faster</strong> (<code>21.33 / 0.80</code>) than original for given <code>$maxRange=7</code>and <code>$lowCountThreshold=1</code>
+(in fact, I see no practical use if <code>maxRange</code> is greater than <code>9</code>; that's in merely to show exponential time growth…):</p>
+
+<pre><code>pwsh -noprofile -file D:\PShell\CR\122635wrapper.ps1
+</code></pre>
+
+<blockquote>
+<pre><code>VERBOSE: maxRange=7, lowCountThreshold=1, operators="+-*/"
+permutations=4096 formatString="1{0}2{1}3{2}4{3}5{4}6{5}7"
+orig.     7       269       756       21,3338469
+VERBOSE: maxRange=7, lowCountThreshold=1, operators="+-*/"
+permutations=4096 formatString="1{5}2{4}3{3}4{2}5{1}6{0}7"
+answer    7       284       839        0,7970644
+
+VERBOSE: maxRange=8, lowCountThreshold=1, operators="+-*/"
+permutations=16384 formatString="1{6}2{5}3{4}4{3}5{2}6{1}7{0}8"
+answer    8       663      2605        1,8726185
+VERBOSE: maxRange=9, lowCountThreshold=1, operators="+-*/"
+permutations=65536 formatString="1{7}2{6}3{5}4{4}5{3}6{2}7{1}8{0}9"
+answer    9      1514      7897        7,5665315
+VERBOSE: maxRange=10, lowCountThreshold=1, operators="+-*/"
+permutations=262144 formatString="1{8}2{7}3{6}4{5}5{4}6{3}7{2}8{1}9{0}10"
+answer   10      3286     24349       32,0042106
+VERBOSE: maxRange=11, lowCountThreshold=1, operators="+-*/"
+permutations=1048576 formatString="1{9}2{8}3{7}4{6}5{5}6{4}7{3}8{2}9{1}10{0}11"
+answer   11      7089     73434      158,3116746
+</code></pre>
+</blockquote>
+
+<p><strong>Edit</strong>: due to <a href="https://codereview.stackexchange.com/a/221098/88771">this Dangph's answer</a>, above performance improvements become even better…</p>
+    </div>

@@ -1,0 +1,73 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Assuming that <code>#PurchaseOrderProducts</code> is a realistic depiction of your real table but with less data (and that your real table is also a heap), then I get this plan.</p>
+
+<p><a href="https://i.stack.imgur.com/JnHXz.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/JnHXz.png" alt="Query plan with code as written"></a></p>
+
+<p>This is a pretty reasonable plan, where I wouldn't necessarily expect it to be that bad.</p>
+
+<p>There are a few things we could do to make this better, including:</p>
+
+<ol>
+<li>Batch-mode for rowstore is enabled (via hacks) in SQL Server 2016 if you include a CCI in your query, even if it isn't used. This can likely make the window function better. This gets me a batch-mode operator for everything but the table scan, and cleans up a lot of the aggregation. <a href="https://i.stack.imgur.com/KKywP.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/KKywP.png" alt="rowstore batch mode"></a></li>
+<li>Creating an appropriate index that your window function can use will help as well by removing the sort (the index maintains a sorted order). A clustered index on the <code>Id</code> column moves all of the cost onto the index scan. A non-clustered index on <code>Id</code> that <code>INCLUDE</code>s <code>Quantity</code> and <code>Product</code> (order didn't matter in my testing) does the same. You'll have to <code>INCLUDE</code> any columns you want in the output, however - otherwise it will just table scan, or if you force it to use the index it'll key lookup. That won't be great for performance. <a href="https://i.stack.imgur.com/wIeFd.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/wIeFd.png" alt="clustered index scan"></a> <a href="https://i.stack.imgur.com/lUaN9.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/lUaN9.png" alt="nonclustered index scan"></a><a href="https://i.stack.imgur.com/1C5K7.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/1C5K7.png" alt="key lookup :("></a></li>
+</ol>
+
+<p>If we look at all of these side-by-side, we notice that the non-clustered without an <code>INCLUDE</code> is the worst by far, and the rest all look about the same.</p>
+
+<p><a href="https://i.stack.imgur.com/IrtVk.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/IrtVk.png" alt="side-by-side"></a></p>
+
+<p>You may notice that the batch-mode query is also using the non-clustered index; getting all of the plans side-by-side without indices is a pain. If you use the batch-mode hack without any indices then it will still have to sort the data, but it can do that in batch mode which will provide a nice performance bump. This is also good if you rely on the table being a heap elsewhere (e.g. parallel inserts, minimal logging, etc).</p>
+
+<p>You may also notice that the plans using the clustered index vs non-clustered index have no apparent difference (besides the index they use). This is because all of the columns in the table are selected in both queries, and all indices include all columns. You can get substantial performance and memory savings if you only need a subset of columns and have a good non-clustered index; this might be helpful for your real data if the temp table isn't representative.</p>
+
+<hr>
+
+<p>Query samples:</p>
+
+<p>Batch mode w/ rowstore table</p>
+
+<pre><code>DROP TABLE IF EXISTS #FakeCciForRowstoreBatchMode;
+CREATE TABLE #FakeCciForRowstoreBatchMode
+(
+  __zzDontUseMe bit NULL,
+  INDEX CCI CLUSTERED COLUMNSTORE
+);
+
+DROP TABLE IF EXISTS #PurchaseOrderProducts;
+CREATE TABLE #PurchaseOrderProducts
+(
+  Id       int,
+  Product  varchar(10),
+  Quantity int
+);
+
+INSERT INTO #PurchaseOrderProducts
+VALUES
+( 1, 'Item A', 5 ),
+( 2, 'Item B', 1 ),
+( 3, 'Item C', 8 ),
+( 4, 'Item D', 2 ),
+( 5, 'Item E', 1 );
+
+SELECT P.Id,
+       P.Product,
+       P.RunningQty,
+       P.Quantity
+  FROM ( SELECT Id,
+                Product,
+                Quantity,
+                SUM( Quantity ) OVER ( ORDER BY Id ) RunningQty
+           FROM #PurchaseOrderProducts
+             LEFT OUTER JOIN #FakeCciForRowstoreBatchMode
+               ON 1 = 0 ) P
+  WHERE P.RunningQty - P.Quantity &lt; 12;
+</code></pre>
+
+<p>Indices I created for #2 (plans generated using <code>INDEX</code> hints)</p>
+
+<pre><code>CREATE CLUSTERED INDEX whatever ON #PurchaseOrderProducts( Id ASC )
+CREATE NONCLUSTERED INDEX whatever2 ON #PurchaseOrderProducts( Id ASC ) INCLUDE( Quantity, Product )
+CREATE NONCLUSTERED INDEX whatever3 ON #PurchaseOrderProducts( Id ASC ) INCLUDE( Product, Quantity )
+CREATE NONCLUSTERED INDEX whatever4 ON #PurchaseOrderProducts( Id ASC )
+</code></pre>
+    </div>

@@ -1,0 +1,183 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>In general, your OOP approach looks good to me.<br>
+Please check the comments to know more about the changes/details I found:</p>
+
+<pre><code>require 'nokogiri'
+require 'rest-client'
+require 'csv'
+
+# Just as a general reference, I changed all the code's indentation from 4 to 2
+# spaces as it's the most used way, also suggested by the ruby style guide
+# https://rubystyle.guide/#spaces-indentation , but it's up to you to use 4 if
+# you feel more comfortable with it.
+class InfoJobs
+  # If you're not really reading/writing object attributes when you create an
+  # instance, like:
+  #
+  #   test = InfoJobs.new(city, state)
+  #   test.total = 12345
+  #   puts test.parsed_html
+  #
+  # there's no need to expose them for the object's instance. That's why I
+  # remove all `attr_accessor`s. I have the feeling `city` and `state` are the
+  # only attributes should be accessible, but only read access. Another option
+  # would be to declare attributes as private `attr_reader`s, but I leave that
+  # to you.
+  attr_reader :city, :state
+
+  # city/state attributes should be initialized in the constructor. Also is more
+  # like an OOP approach.
+  def initialize(city, state)
+    @city = city.chomp.downcase.tr(' ', '-')
+    @state = state.chomp.downcase
+  end
+
+  def run
+    # Removed:
+    # - `build_url`, as `base_url` will be called from every method when be
+    #   required.
+    # - `parsing(@url)` as it's later called in `initial_page_values`, where it
+    #   really do something with the received html.
+    # - All `self.` definitions, in general `self.` is required only when you're
+    #   modifying a value of the instance, but it's not needed to read values or
+    #   call methods.
+    initial_page_values
+    scraping
+  ensure
+    # With `ensure`, in case you ctrl+c the process or fail for some reason, you
+    # "ensure" the gathered info so far is saved.
+    writing
+  end
+
+  # The only accessible method for the class instance is `.run`, so the rest of
+  # them should be kept as private.
+  private
+
+  # Changed method `build_url` to memoized method `base_url`. More info in
+  # https://www.rubydoc.info/gems/rubocop/RuboCop/Cop/Naming/MemoizedInstanceVariableName
+  def base_url
+    # Changes:
+    # - Using ||= to set a value only when this is empty,
+    # - Using already defined city/state attr_readers instead of accessing
+    #   directly to the global variables @city and @state
+    # - Instead of using + to concatenate, I'm interpolating, which is the most
+    #   prefered way. https://rubystyle.guide/#string-interpolation
+    @base_url ||= "https://www.infojobs.com.br/empregos-em-#{city},-#{state}.aspx"
+  end
+
+  def parsing(url)
+    # No need of `begin` when `rescue` contemplates the whole method
+    html = RestClient.get(url)
+    # No sense to have html parsing out of begin/rescue block. For `rescue`
+    # case, the parsing would fail, so moving html parsing before rescue.
+    # Also the result of this operation should be returned, not kept in a global
+    # variable `@parsed_html`.
+    Nokogiri::HTML(html)
+  rescue StandardError =&gt; e
+    puts "ERROR on #{url}"
+    puts "Exception Class:#{e.class.name}"
+    puts "Exception Message:#{e.message}"
+  end
+
+  # Minor change, but `get_` and `set_` method names are discouraged in ruby.
+  # More info in https://rubystyle.guide/#accessor_mutator_method_names
+  def initial_page_values
+    # Following what was described in the previous method, you're going to need
+    # the result of the parsing method only for the scope of this method, so
+    # there's no need to save it as a global variable.
+    parsed_html = parsing(base_url)
+    # You're only using @last page out of this method, so there shouldn't be
+    # necessary to have @total and @per_page as global variables.
+    total = parsed_html.css('.js_xiticounter').text.delete('.')
+    per_page = parsed_html.css('.element-vaga').count
+    @last_page = (total.to_f / per_page).round
+    puts "#{@last_page} pages found"
+  end
+
+  def scraping
+    @list = []
+    page = 1
+    # Removed
+    #   @url += '?Page='
+    # as it should be better to handle it directly when the parsing is invoked.
+    until page &gt;= @last_page
+      # This is wrong:
+      #   @url + page.to_s
+      # as you're adding the page to @url in a void context, after this line,
+      # @url will keep having the same value as before this line.
+      # This should be the url to parse:
+      jobs = parsing("#{base_url}?Page=#{page}").css('.element-vaga')
+      # Moving all the job parsing to its own method. Also to decrease ABC
+      # metric https://en.wikipedia.org/wiki/ABC_Software_Metric and Cyclomatic
+      # complexity https://en.wikipedia.org/wiki/Cyclomatic_complexity for this
+      # `scraping` method.
+      jobs.each { |job| @list.push(job_data(job)) }
+      # Page increasing should be out of the jobs loop.
+      puts "The page #{page} was successfully saved"
+      page += 1
+    end
+  end
+
+  def job_data(job)
+    company = job.css('div.vaga-company &gt; a').text.strip
+    company = company.empty? ? 'Confidential Company' : company
+    {
+      title: job.css('div.vaga &gt; a &gt; h2').text.strip,
+      company: company,
+      city: job.css('p.location2 &gt; span &gt; span &gt; span').text,
+      area: job.css('p.area &gt; span').text
+    }#.tap { |jd| puts jd } # Uncomment if you need to debug values.
+  end
+
+  def writing
+    # If you don't have values to save, simply return
+    return unless @list &amp;&amp; @list.any?
+
+    puts "saving #{@list.count} jobs."
+    # Just a minor change to write to a different file every time you run this,
+    # but feel free to remove it.
+    filename = "list_jobs_#{Time.now.to_i}.csv"
+    CSV.open(filename, 'wb', headers: @list.first.keys) do |csv|
+      csv &lt;&lt; %w[Title Company City Area]
+      @list.each do |hash|
+        csv &lt;&lt; hash
+      end
+    end
+  end
+end
+
+puts '[ Type a city ] '
+city = gets
+puts '[ Type the state ]'
+state = gets
+puts 'Processing...'
+test = InfoJobs.new(city, state)
+test.run
+</code></pre>
+
+<hr>
+
+<p>When I talk about void context, check the following example:</p>
+
+<pre><code># First definition of variable with a value
+@url = 'www.stackoverflow.com' # =&gt; "www.stackoverflow.com"
+# Then I'm adding a text, which is returning a value in a void context, in other
+# words, there's no context, like a variable or a method, which is receiving the
+# resulting value.
+@url + '/tags' # =&gt; "www.stackoverflow.com/tags"
+# If I access to the variable again, it has the same initial value
+@url # =&gt; "www.stackoverflow.com"
+# A different situation is when there's a context, in this case the same @url
+# variable, which it will receive the resulting value of the addition.
+@url = @url +  '/tags' # =&gt; "www.stackoverflow.com/tags"
+@url # =&gt; "www.stackoverflow.com/tags"
+# Or also using the shorter += version
+@url += '?tab=name' # =&gt; "www.stackoverflow.com/tags?tab=name"
+@url # =&gt; "www.stackoverflow.com/tags?tab=name"
+</code></pre>
+
+<p>I'm far to be an OOP expert (I've forgotten most of theory learned in Uni.😅), but the idea is try to keep only the essential information of your object as attributes.<br>
+For your case, I think city and state are essential to make all the object's functioning works as expected.<br>
+Also, could be good to keep as attributes information to be accessed multiple times and that takes a while to get it. For your case, the jobs list was saved to be written later to a file (actually, rethinking the problem, maybe it wasn't necessary at all to have <code>@list</code> if after writing to a file isn't going to be used anymore).<br>
+Finally, you must to think that any created instance variable isn't garbage collected and will keep living in memory as long as your object's instance is alive. For your particular case, maybe this isn't a problem, but in the eventual case where you have thousands of those objects created, they should be as lightweight as possible or you could run out of memory.</p>
+    </div>

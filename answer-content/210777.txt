@@ -1,0 +1,165 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>// This keeps a variable in the final output:
+#define KEEP(x) volatile auto x __attribute__((unused))
+</code></pre>
+
+<p>Getting off to a controversial start here, aren't we? :)  This macro is used <em>only</em> in your test harness <code>main()</code>, so it should be defined way down at the bottom of the file, right above <code>main()</code>. That way the reader doesn't get scared that your actual library functionality requires such a wacky macro.</p>
+
+<p>In general, you should make it clearer which part of your code is the library and which part is the test harness. Consider adding <code>#ifdef TESTING</code> around the harness code, which, IIUC, basically begins at the line</p>
+
+<pre><code>// Generate unique types
+</code></pre>
+
+<hr>
+
+<p>If <em>all</em> you're using <code>KEEP</code> for is to "keep a variable in the final output," why don't you just make the variable global? That is, replace</p>
+
+<pre><code>int main() {
+    KEEP(k1) = map::id&lt;uint16_t&gt;; // size_t =&gt; 1
+    KEEP(k2) = std::is_same_v&lt;map::type&lt;1&gt;, uint16_t&gt;; // bool =&gt; true
+
+    fn(0, 0);
+    fn(1, 1);
+    fn(2, 2);
+
+    KEEP(k4) = counter;
+}
+</code></pre>
+
+<p>with simply</p>
+
+<pre><code>size_t k1 = map::id&lt;uint16_t&gt;;  // should be 1
+bool k2 = std::is_same_v&lt;map::type&lt;1&gt;, uint16_t&gt;;  // should be true
+size_t k4 = 0;
+
+int main() {
+    fn(0, 0);
+    fn(1, 1);
+    fn(2, 2);
+
+    k4 = counter;  // should be ???
+}
+</code></pre>
+
+<p>Since other translation units might access <code>k1</code>, <code>k2</code>, and <code>k4</code> by name, the compiler <em>has</em> to keep them around. No <code>volatile</code> or <code>__attribute__</code> needed!</p>
+
+<hr>
+
+<pre><code>void fn(const std::size_t n, const std::size_t i) {
+</code></pre>
+
+<p>Lose the meaningless <code>const</code>s. They just make your function prototype harder to read. (Personally, I would also lose the <code>std::</code>s; they aren't needed. But some people like them, and if you're such a person, I won't argue.)</p>
+
+<pre><code>void fn(size_t n, size_t i) {
+</code></pre>
+
+<p>So much cleaner! Now we even have room to give <code>n</code> and <code>i</code> real names, if we want to.</p>
+
+<hr>
+
+<p>FWIW, I don't understand the purpose of the <code>__asm volatile</code> comments.</p>
+
+<hr>
+
+<pre><code>map::parse(n, &amp;bytes[i], [&amp;](auto&amp; val) {
+    __asm volatile("# LLVM-MCA-END");
+    // Needed because the handler needs to apply to any type in the map:
+    if constexpr (std::is_integral_v&lt;decltype(val)&gt;) {
+        counter += val;
+    }
+});
+</code></pre>
+
+<p>It is highly unusual to write a generic lambda that takes a parameter of type <code>auto&amp;</code>.  Pass-by-value <code>auto</code>, sure. Pass-by-forwarding-reference <code>auto&amp;&amp;</code>, sure. Pass-by-const-ref <code>const auto&amp;</code>, quite plausibly. But pass-by-nonconst-ref <code>auto&amp;</code>? That's a weird one. Are you sure that's what you want? In generic code you usually want <code>auto&amp;&amp;</code> for perfect forwarding.</p>
+
+<p>Since <code>decltype(val)</code> is <em>always</em> a reference type, it's <em>never</em> an integral type. Do you observe this <code>if constexpr</code> branch ever being taken? I don't think it is being taken. What was its purpose supposed to be?</p>
+
+<hr>
+
+<pre><code>static constexpr void noop(const std::size_t = 0) {}
+</code></pre>
+
+<p>What is the purpose of the default function argument here? I would prefer to see this as</p>
+
+<pre><code>static void noop(size_t) {}
+</code></pre>
+
+<p>or, even better if you care about inlining,</p>
+
+<pre><code>struct Noop { void operator()(size_t) const {} };
+</code></pre>
+
+<p>And then down where you use <code>noop</code>:</p>
+
+<pre><code>template &lt;typename F, typename E = decltype(noop)&gt;
+static constexpr decltype(auto) parse(const std::size_t id, const void *const ptr, F func, E on_error = noop) {
+    return map_visit_impl&lt;sizeof...(Ts), Ts...&gt;::visit(id, ptr, func, on_error);
+}
+</code></pre>
+
+<p>this would be better optimizable if you wrote it as</p>
+
+<pre><code>template&lt;class F, class E = Noop&gt;
+static constexpr decltype(auto) parse(size_t id, const void *ptr, F func, E on_error = E()) {
+    return map_visit_impl&lt;sizeof...(Ts), Ts...&gt;::visit(id, ptr, func, on_error);
+}
+</code></pre>
+
+<p>And if you <em>really</em> care about efficiency, and don't want to burden your end-user with wrapping their error handler in <code>std::ref()</code> all the time, then you'll break with STL tradition and either pass the error handler by reference, or move-out-of it (instead of copying it) when you pass it by value:</p>
+
+<pre><code>template&lt;class F, class E = Noop&gt;
+static constexpr decltype(auto) parse(size_t id, const void *ptr, const F&amp; func, const E&amp; on_error = E()) {
+    return map_visit_impl&lt;sizeof...(Ts), Ts...&gt;::visit(id, ptr, func, on_error);
+}
+</code></pre>
+
+<p>or</p>
+
+<pre><code>template&lt;class F, class E = Noop&gt;
+static constexpr decltype(auto) parse(size_t id, const void *ptr, F func, E on_error = E()) {
+    return map_visit_impl&lt;sizeof...(Ts), Ts...&gt;::visit(id, ptr, std::move(func), std::move(on_error));
+}
+</code></pre>
+
+<hr>
+
+<pre><code>template &lt;typename IN, typename... Ts&gt;
+static constexpr const auto index_of_type_v { index_of_type&lt;IN, Ts...&gt;::value };
+</code></pre>
+
+<p>This is the weirdest way of writing</p>
+
+<pre><code>template&lt;class T, class... Ts&gt;
+inline constexpr size_t index_of_type_v = index_of_type&lt;T, Ts...&gt;::value;
+</code></pre>
+
+<p>that I've ever seen. :)</p>
+
+<hr>
+
+<pre><code>    /*
+     * @tparam F    Function type
+     * @param id    id / index of type
+     * @param ptr   Storage location
+     * @param func  Handler function
+     * @return      Result of handler function
+</code></pre>
+
+<p>You know, if you renamed <code>ptr</code> to <code>storage</code> and renamed <code>func</code> to <code>handler</code>, then you could get rid of this comment. (Self-documenting code!)</p>
+
+<hr>
+
+<pre><code>return func(*reinterpret_cast&lt;const nth_type_t&lt;I-1, Ts...&gt; *const&gt;(ptr));
+</code></pre>
+
+<p>As I mentioned in a comment on <a href="https://codereview.stackexchange.com/a/210687/16369">user673679's answer</a>, you should avoid <code>reinterpret_cast</code> whenever possible. It's a big red flag that makes the reader wonder what trickery you're doing. So, if you're not doing any trickery, you should avoid waving that red flag unnecessarily.</p>
+
+<p>Also, as usual, you've got useless <code>const</code>s that merely clutter the code.</p>
+
+<pre><code>return func(*static_cast&lt;const nth_type_t&lt;I-1, Ts...&gt; *&gt;(ptr));
+</code></pre>
+
+<hr>
+
+<p>Both <code>index_of_type</code> and <code>map_visit_impl</code> are done with recursive template instantiations. You should consider how to rewrite them as non-recursive templates using pack expansion and/or fold-expressions. Especially <code>map_visit_impl</code>, since function instantiation is basically the slowest thing you can ask a compiler to do. See <a href="https://quuxplusone.github.io/blog/2018/07/23/metafilter/" rel="nofollow noreferrer">this blog post</a> for inspiration if you need it.</p>
+    </div>

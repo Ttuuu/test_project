@@ -1,0 +1,148 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I thought that what you have is actually quite solid; my only suggestion is that you should take advantage of C#'s features in order to slightly clean things up. First, let's create an options object to hold the various items that you're injecting into the class:</p>
+
+<pre><code>public class HttpServiceOptions&lt;TLogger&gt;
+{
+    public string AuthenticationToken { get; set; }
+    public ILogger&lt;TLogger&gt; Logger { get; set; }
+}
+</code></pre>
+
+<p>This should make it much simpler to add/remove dependencies to the "system" since everything is injected via a single "container". Now, let's make your base class abstract and refactor it to accept our options object:</p>
+
+<pre><code>public abstract class AbstractHttpService&lt;TLogger&gt;
+{
+    private readonly string _authToken;
+    private readonly HttpClient _client;
+
+    public ILogger&lt;TLogger&gt; Logger { get; }
+
+    public AbstractHttpService(HttpClient httpClient, IOptions&lt;HttpServiceOptions&lt;TLogger&gt;&gt; options) {
+        var optionsValue = options.Value;
+        var client = httpClient;
+
+        client.BaseAddress = new Uri("url/");
+        client.DefaultRequestHeaders.Add("Accept", "application/json");
+
+        _authToken = optionsValue.AuthenticationToken;
+        _client = client;
+
+        Logger = optionsValue.Logger;
+    }
+
+    public async Task&lt;FailureResponseModel&gt; GetFailureResponseModel(HttpResponseMessage response) {
+        var failureModel = await response.Content.ReadAsAsync&lt;FailureResponseModel&gt;();
+
+        failureModel.ResponseStatusCode = Convert.ToInt32(response.StatusCode);
+
+        Logger.LogError("Request Failed: {Error}", failureModel.ResultDetails);
+
+        return failureModel;
+    }
+    public async Task&lt;object&gt; ProcessAsync&lt;T&gt;(HttpRequestMessage request, NamingStrategy namingStrategy) {
+        var authToken = _authToken;
+
+        if (!string.IsNullOrEmpty(authToken)) {
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
+        }
+
+        var response = await _client.SendAsync(request);
+
+        if (response.IsSuccessStatusCode) {
+            Logger.LogInformation("Request Succeeded");
+
+            var dezerializerSettings = new JsonSerializerSettings {
+                ContractResolver = new DefaultContractResolver {
+                    NamingStrategy = namingStrategy
+                }
+            };
+            var responseModel = JsonConvert.DeserializeObject&lt;T&gt;(await response.Content.ReadAsStringAsync(), dezerializerSettings);
+
+            return responseModel;
+        }
+        else {
+            return await GetFailureResponseModel(response);
+        }
+    }
+    public async Task&lt;object&gt; GetAsync&lt;T&gt;(string uri) {
+        return await GetAsync&lt;T&gt;(uri, new DefaultNamingStrategy());
+    }
+    public async Task&lt;object&gt; GetAsync&lt;T&gt;(string uri, NamingStrategy namingStrategy) {
+        using (var requestMessage = new HttpRequestMessage(HttpMethod.Get, uri)) {
+            return await ProcessAsync&lt;T&gt;(requestMessage, namingStrategy);
+        }
+    }
+    public async Task&lt;object&gt; PostAsync&lt;T1, T2&gt;(string uri, T2 content) {
+        return await PostAsync&lt;T1, T2&gt;(uri, content, new DefaultNamingStrategy());
+    }
+    public async Task&lt;object&gt; PostAsync&lt;T1, T2&gt;(string uri, T2 content, NamingStrategy namingStrategy) {
+        using (var requestMessage = new HttpRequestMessage(HttpMethod.Post, uri)) {
+            var json = JsonConvert.SerializeObject(content);
+
+            using (var stringContent = new StringContent(json, Encoding.UTF8, "application/json")) {
+                requestMessage.Content = stringContent;
+                return await ProcessAsync&lt;T1&gt;(requestMessage, namingStrategy);
+            }
+        }
+    }
+    public async Task&lt;object&gt; PutAsyc&lt;T1, T2&gt;(string uri, T2 content) {
+        return await PutAsyc&lt;T1, T2&gt;(uri, content, new DefaultNamingStrategy());
+    }
+    public async Task&lt;object&gt; PutAsyc&lt;T1, T2&gt;(string uri, T2 content, NamingStrategy namingStrategy) {
+        using (var requestMessage = new HttpRequestMessage(HttpMethod.Put, uri)) {
+            var json = JsonConvert.SerializeObject(
+                value: content,
+                formatting: Formatting.None,
+                settings: new JsonSerializerSettings {
+                    NullValueHandling = NullValueHandling.Ignore
+                }
+            );
+
+            using (var stringContent = new StringContent(json, Encoding.UTF8, "application/json")) {
+                requestMessage.Content = stringContent;
+
+                return await ProcessAsync&lt;T1&gt;(requestMessage, namingStrategy);
+            }
+        }
+    }
+}
+</code></pre>
+
+<p><br>
+We also need to implement the <code>ClubMatasHttpService</code> by deriving from the abstract class: </p>
+
+<pre><code>public sealed class ClubMatasHttpService : AbstractHttpService&lt;ClubMatasHttpService&gt;
+{
+    public ClubMatasHttpService(HttpClient httpClient, IOptions&lt;HttpServiceOptions&lt;ClubMatasHttpService&gt;&gt; options) : base(httpClient, options) { }
+
+    public async Task&lt;object&gt; GetShops(string category) {
+        Logger.LogInformation("ClubMatas outgoing request: {RequestName}", nameof(GetShops));
+
+        return await GetAsync&lt;ShopsResponseModel&gt;($"v2/shops?category={WebUtility.UrlEncode(category)}");
+    }
+    public async Task&lt;object&gt; PostLogin(LoginRequestModel form) {
+        Logger.LogInformation("ClubMatas outgoing request: {RequestName}", nameof(PostLogin));
+
+        return await PostAsync&lt;LoginResponseModel, LoginRequestModel&gt;("v2/login", form, new SnakeCaseNamingStrategy());
+    }
+}
+</code></pre>
+
+<p>Finally, we write a couple of extension methods to help configure everything:</p>
+
+<pre><code>public static class IServiceCollectionExtensions
+{
+    public static IHttpClientBuilder AddClubMatasHttpService(this IServiceCollection services, Action&lt;HttpServiceOptions&lt;ClubMatasHttpService&gt;&gt; configureOptions) {
+        if (null == services) { throw new ArgumentNullException(nameof(services)); }
+        if (null == configureOptions) { throw new ArgumentNullException(nameof(configureOptions)); }
+
+        services.Configure(configureOptions);
+
+        return services.AddHttpClient&lt;ClubMatasHttpService&gt;();
+    }
+    public static IHttpClientBuilder AddClubMatasHttpService(this IServiceCollection services, IConfiguration configuration) {
+        return services.AddClubMatasHttpService(configuration.Bind);
+    }
+}
+</code></pre>
+    </div>

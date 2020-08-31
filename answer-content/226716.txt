@@ -1,0 +1,175 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><em>(self-answer)</em></p>
+
+<hr>
+
+<p>The idea for not-using the constructor is indeed insane but... since it's possible I kept it in the new version too. I changed the name of this tool to <code>DtoUpdater</code>. It now can collect updates for multiple properties that at the end have to be <code>Commit</code>ed. Parameters are now matched with members not only by name but also by type and it picks the constructor with the most parameters ana matching properties. I created this helper for updating <em>simple</em> DTOs and they usually have only one constructor initializing all properties so I think its current <em>complexity</em> is sufficient for most use-cases. </p>
+
+<p>This version also no longer forces the user to specify all values that a constructor requires. I think that this new functionality now makes this utility in certain situations  more useful than using the construtor... if it allows <code>default</code> values of course.</p>
+
+<pre><code>public static class DtoUpdater
+{
+    public static DtoUpdater&lt;T&gt; For&lt;T&gt;() =&gt; new DtoUpdater&lt;T&gt;(default);
+
+    public static DtoUpdater&lt;T&gt; Update&lt;T&gt;(this T obj) =&gt; new DtoUpdater&lt;T&gt;(obj);
+}
+
+public class DtoUpdater&lt;T&gt;
+{
+    private readonly T _obj;
+
+    private readonly ICollection&lt;(MemberInfo Member, object Value)&gt; _updates = new List&lt;(MemberInfo Member, object Value)&gt;();
+
+    public DtoUpdater(T obj) =&gt; _obj = obj;
+
+    public DtoUpdater&lt;T&gt; With&lt;TProperty&gt;(Expression&lt;Func&lt;T, TProperty&gt;&gt; update, TProperty value)
+    {
+        _updates.Add((((MemberExpression)update.Body).Member, value));
+        return this;
+    }
+
+    public T Commit()
+    {
+        var members =
+            from member in typeof(T).GetMembers(BindingFlags.Public | BindingFlags.Instance).Where(m =&gt; m is PropertyInfo || m is FieldInfo)
+            select (member.Name, Type: (member as PropertyInfo)?.PropertyType ?? (member as FieldInfo)?.FieldType);
+
+        members = members.ToList();
+
+        // Find the ctor that matches most properties.
+        var ctors =
+            from ctor in typeof(T).GetConstructors()
+            let parameters = ctor.GetParameters()
+            from parameter in parameters
+            join member in members
+                on
+                new
+                {
+                    Name = parameter.Name.AsIgnoreCase(),
+                    Type = parameter.ParameterType
+                }
+                equals
+                new
+                {
+                    Name = member.Name.AsIgnoreCase(),
+                    Type = member.Type
+                }
+            orderby parameters.Length descending
+            select ctor;
+
+        var theOne = ctors.First();
+
+        // Join parameters and values by parameter order.
+        // The ctor requires them sorted but they might be initialized in any order.
+        var parameterValues =
+            from parameter in theOne.GetParameters()
+            join update in _updates on parameter.Name.AsIgnoreCase() equals update.Member.Name.AsIgnoreCase() into x
+            from update in x.DefaultIfEmpty()
+            select update.Value ?? GetMemberValueOrDefault(parameter.Name);
+
+        return (T)theOne.Invoke(parameterValues.ToArray());
+    }
+
+    private object GetMemberValueOrDefault(string memberName)
+    {
+        if (_obj == null) return default;
+
+        // There is for sure only one member with that name.
+        switch (typeof(T).GetMembers(BindingFlags.Public | BindingFlags.Instance).Single(m =&gt; m.Name.AsIgnoreCase().Equals(memberName)))
+        {
+            case PropertyInfo p: return p.GetValue(_obj);
+            case FieldInfo f: return f.GetValue(_obj);
+            default: return default; // Makes the compiler very happy.
+        }
+    }
+}
+
+public static class StringExtensions
+{
+    public static IEquatable&lt;string&gt; AsIgnoreCase(this string str) =&gt; (IgnoreCase)str;
+
+    private class IgnoreCase : IEquatable&lt;string&gt;
+    {
+        private IgnoreCase(string value) =&gt; Value = value;
+        private string Value { get; }
+        public bool Equals(string other) =&gt; StringComparer.OrdinalIgnoreCase.Equals(Value, other);
+        public override bool Equals(object obj) =&gt; obj is IgnoreCase ic &amp;&amp; Equals(ic.Value);
+        public override int GetHashCode() =&gt; StringComparer.OrdinalIgnoreCase.GetHashCode(Value);
+        public static explicit operator IgnoreCase(string value) =&gt; new IgnoreCase(value);
+    }
+}
+</code></pre>
+
+<p>I hid the <code>IgnoreCase</code> helper behind a new extension:</p>
+
+<pre><code>public static class StringExtensions
+{
+    public static IEquatable&lt;string&gt; AsIgnoreCase(this string str) =&gt; (IgnoreCase)str;
+
+    private class IgnoreCase : IEquatable&lt;string&gt;
+    {
+        private IgnoreCase(string value) =&gt; Value = value;
+        private string Value { get; }
+        public bool Equals(string other) =&gt; StringComparer.OrdinalIgnoreCase.Equals(Value, other);
+        public override bool Equals(object obj) =&gt; obj is IgnoreCase ic &amp;&amp; Equals(ic.Value);
+        public override int GetHashCode() =&gt; StringComparer.OrdinalIgnoreCase.GetHashCode(Value);
+        public static explicit operator IgnoreCase(string value) =&gt; new IgnoreCase(value);
+    }
+}
+</code></pre>
+
+<p>The new API can now be used like this:</p>
+
+<pre><code>public class DtoBuilderTest
+{
+    [Fact]
+    public void Can_create_and_update_object()
+    {
+        var person =
+            DtoUpdater
+                .For&lt;Person&gt;()
+                .With(x =&gt; x.FirstName, "Jane")
+                .With(x =&gt; x.LastName, null)
+                //.With(x =&gt; x.NickName, "JD") // Optional
+                .Commit();
+
+        Assert.Equal("Jane", person.FirstName);
+        Assert.Null(person.LastName);
+        Assert.Null(person.NickName);
+
+        person =
+            person
+                .Update()
+                .With(x =&gt; x.LastName, "Doe")
+                .With(x =&gt; x.NickName, "JD")
+                .Commit();
+
+        Assert.Equal("Jane", person.FirstName);
+        Assert.Equal("Doe", person.LastName);
+        Assert.Equal("JD", person.NickName);
+    }
+
+    private class Person
+    {
+        public Person(string firstName, string lastName, string nickName = null)
+        {
+            FirstName = firstName;
+            LastName = lastName;
+            NickName = nickName;
+        }
+
+        // This ctor should confuse the API.
+        public Person(string other) { }
+
+        public string FirstName { get; }
+
+        public string LastName { get; }
+
+        public string NickName { get; set; }
+
+        // This property should confuse the API too.
+        public string FullName =&gt; $"{LastName}, {FirstName}";
+    }
+}
+</code></pre>
+    </div>

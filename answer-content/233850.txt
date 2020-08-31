@@ -1,0 +1,123 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<ul>
+<li><p>I tried using <code>__</code> once and found it to produce more problems than it's worth. Take:</p>
+
+<pre><code>def __foo():
+    return 'foo'
+
+
+class Bar:
+    def __init__(self):
+        self.__baz = __foo()
+
+
+Bar()
+</code></pre>
+
+<pre><code>NameError: name '_Bar__foo' is not defined
+</code></pre>
+
+<p>I'd suggest you follow PEP 8 and only use it for classes that <em>will be subclassed</em> and where you <em>need</em> to prevent name collisions. <code>__robot</code> in global scope isn't following the advice in <a href="https://www.python.org/dev/peps/pep-0008/#method-names-and-instance-variables" rel="nofollow noreferrer">PEP 8's Naming Conventions - Method Names and Instance Variables</a></p>
+
+<blockquote>
+  <p>Python mangles these names with the class name: if class Foo has an attribute named <code>__a</code>, it cannot be accessed by <code>Foo.__a</code>. (An insistent user could still gain access by calling <code>Foo._Foo__a</code>.) Generally, double leading underscores should be used only to avoid name conflicts with attributes in classes designed to be subclassed.</p>
+  
+  <p>Note: there is some controversy about the use of __names (see below).</p>
+</blockquote></li>
+<li><p>Your docstrings aren't consistent, nor are they PEP 257 compliant.<br>
+You should lint your code and use Sphinx.</p></li>
+<li>Your class seems to have a lot of noise in it because you've chosen to make it mutable. This is a poor design choice.</li>
+<li>You can <code>url.rstrip('/')</code> to remove the need for another <code>if</code> in <code>_set_url</code>.</li>
+<li>If <code>url</code> is passed to <code>DeliciousSoda</code> than you run <code>__download_robots</code> twice. This is a waste.</li>
+<li>Don't add <code>\n</code> to exceptions. If you really want to add this mutate the <code>InvalidUrlException</code>'s <code>__init__</code>. But seriously, please don't.</li>
+<li>Don't add the name of the exception to the exception message. Python does this automagically.</li>
+<li>If I were a consumer, I would prefer to be able to distinguish between the errors your program raises. You should raise different errors when there's an invalid URL or the site doesn't have a robots.</li>
+<li><code>__download_robots</code> shouldn't be validating the URL. You should do that when you set the URL. Furthermore if your class was immutable then you could ignore all of this. Including the <code>self.__url is not None</code> part.</li>
+<li><code>__download_robots</code> seems overly engineered. You're downloading a file to your filesystem to then reading the <em>entire</em> file into memory. Clearly there's an unneeded step.</li>
+<li>You should make <code>set_url</code>, <code>__validate_url</code> and <code>__download_robots</code> become one single, <code>download_robots</code> function, not method. This function can also take an *args and **kwargs that delegates to <code>requests.get</code>.</li>
+<li>The rest of your code is how you parse the robots. At which point you may as well just make that a function and return a dictionary.</li>
+</ul>
+
+<pre><code>"""
+:copyright: (c) 2019 by Ben Antonellis, Peilonrayz.
+:license: CC BY-SA 4.0.
+"""
+
+from typing import List, Dict
+import collections
+import os
+
+from requests.exceptions import SSLError
+import requests
+
+
+def _normalize_robots_url(url: str) -&gt; str:
+    url = url.rstrip('/')
+    if not url.endswith('robots.txt'):
+        url += "/robots.txt"
+    return url
+
+
+def _download_robots(url: str, *args, **kwargs) -&gt; str:
+    url = _normalize_robots_url(url)
+    try:
+        r = requests.get(url, *args, **kwargs)
+    except SSLError:
+        raise InvalidUrlException("Invalid Url")
+    r.raise_for_status()
+    return r.text
+
+
+def _parse_robots(robots: str) -&gt; Dict[str, List[str]]:
+    info: Dict[str, List[str]] = collections.defaultdict(list)
+    for line in robots.split('\n'):
+        name, value, *_ = *line.split(': ', 1), None
+        if name and not name.startswith('#'):
+            info[name].append(value)
+    return info
+
+
+def delicious_soda(url: str, *args, **kwargs) -&gt; Dict[str, List[str]]:
+    robots = _download_robots(url, *args, **kwargs)
+    return _parse_robots(robots)
+
+
+class InvalidUrlException(Exception):
+    """ Url passed to DeliciousSoda object is `Invalid`. """
+    pass
+
+
+# Example Usage
+if __name__ == "__main__":
+    robots = delicious_soda("https://www.google.com")
+    print(robots.keys())
+    print(robots['Sitemap'])
+    print(robots['User-agent'])
+    print(robots['Allow'])
+    print(robots['Disallow'])
+</code></pre>
+
+<hr>
+
+<p>Given the above functions I still have some concerns.</p>
+
+<ol>
+<li><p>I personally consider calling <code>_normalize_robots_url</code> inside <code>_download_robots</code> an anti-pattern. The <em>normalizing in fetch</em> anti-pattern if you will.</p>
+
+<p>You should normalize your data before you perform the fetch. If I'm asking for <code>example.com/robots-new.txt</code> then I should have a pretty good reason to. Your 'help' of then appending <code>/robots.txt</code> to the end of <em>my valid url</em> has caused me needless problems.</p>
+
+<p>I recommend exposing <code>_normalize_robots_url</code> as a function that people can call <em>if</em> they want that behavior.</p></li>
+<li><p>I also find <code>delicious_soda</code> to be an anti-pattern. The <em>fetch and parse</em> anti-pattern if you will.</p>
+
+<p>This is bad as it needlessly locks users into one usage. What if I want to cache the fetch, what if I need to stream it, what if I need to handle user authentication. What if I need to do something with the fetch <em>you can't think of</em>? At that point I can't use your library.</p>
+
+<p>IMO a library provider always needs to provide fetching and parsing as two separate entities. The cost to most users is having to do <code>parse(fetch())</code>. If you want to expose a helper function too, that's cool, but not exposing both as separate things is just bad.</p></li>
+<li><p>The function <code>_parse_robots</code> seems like the best part of the library. Whilst the way you implemented it in <code>DeliciousSoda</code> isn't great. It's the best part of the library.</p>
+
+<p>But I don't think it's great as a stand alone library, as I've implemented most of the features in a 7 line function, which I'd hope most Python programmers could mimic with ease.</p></li>
+</ol>
+
+<p>In all currently the library is just a 7 line function - <code>_parse_robots</code>. I don't think <code>_download_robots</code> is great as part of the library. I'd elect to just use <code>requests</code> which is more powerful and I know it won't break when I enter valid urls.</p>
+
+<p>I would suggest expanding on <code>_parse_robots</code> in a way that makes the library somewhat more usable. Say converting it into a class and adding a <code>DS.allowed_url</code> method.</p>
+    </div>

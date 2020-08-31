@@ -1,0 +1,135 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>because OP code is using poor abstractions, the code review that should be produced involves writing a whole new solution from scratch to demonsrate what should have been done going down the path chosen by OP.</p>
+
+<p>it is a lot of work, with chances that the end code does not even demonstrate specific solution to some specific flaws of OP code, because the new implementation would probably be inherently not affected by this or that flaw.</p>
+
+<p>here are some comments about OP code, then an alternative approach proposal</p>
+
+<ul>
+<li>sm variable usage seems racy, you should <code>go run</code> your code with the <code>-race</code> argument.</li>
+<li>relay codes management appears weak to flooding. they lack a maximum count limit and lifetime system involving timeout durations.</li>
+<li>send/receive operations might be weak to code stealing</li>
+<li>the headers are a map[string], i would use a well defined struct </li>
+<li>this is weird <code>hdr := *new([]byte)</code>, just write <code>hdr := []byte{}</code></li>
+<li>tests are not testing much of the use cases, the current api does not allow it.</li>
+</ul>
+
+<p>dirty code, but functional, userA shares files with userB. the third party rdv point is provided by the tor network, users has to exchange both EP and credentials.</p>
+
+<pre><code>package main
+
+import (
+    "context"
+    "crypto"
+    "crypto/ed25519"
+    "crypto/rand"
+    "crypto/x509"
+    "encoding/pem"
+    "flag"
+    "fmt"
+    "io/ioutil"
+    "log"
+    "net/http"
+    "os"
+    "os/signal"
+    "time"
+
+    "github.com/99designs/basicauth-go"
+    "github.com/clementauger/tor-prebuilt/embedded"
+    "github.com/cretz/bine/tor"
+)
+
+func main() {
+
+    var privateKey crypto.PrivateKey
+    if _, err := os.Stat("onion.pk"); os.IsNotExist(err) {
+        _, privateKey, err = ed25519.GenerateKey(rand.Reader)
+        if err != nil {
+            log.Fatal(err)
+        }
+        x509Encoded, err := x509.MarshalPKCS8PrivateKey(privateKey)
+        if err != nil {
+            log.Fatal(err)
+        }
+        pemEncoded := pem.EncodeToMemory(&amp;pem.Block{Type: "PRIVATE KEY", Bytes: x509Encoded})
+        ioutil.WriteFile("onion.pk", pemEncoded, os.ModePerm)
+    } else {
+        d, _ := ioutil.ReadFile("onion.pk")
+        block, _ := pem.Decode(d)
+        x509Encoded := block.Bytes
+        privateKey, err = x509.ParsePKCS8PrivateKey(x509Encoded)
+        if err != nil {
+            log.Fatal(err)
+        }
+    }
+
+    d, err := ioutil.TempDir("", "")
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Start tor with default config (can set start conf's DebugWriter to os.Stdout for debug logs)
+    fmt.Println("Starting and registering onion service, please wait a couple of minutes...")
+    t, err := tor.Start(nil, &amp;tor.StartConf{TempDataDirBase: d, ProcessCreator: embedded.NewCreator(), NoHush: true})
+    if err != nil {
+        log.Panicf("Unable to start Tor: %v", err)
+    }
+    defer t.Close()
+    // Wait at most a few minutes to publish the service
+    listenCtx, listenCancel := context.WithTimeout(context.Background(), 3*time.Minute)
+    defer listenCancel()
+    // Create a v3 onion service to listen on any port but show as 80
+    onion, err := t.Listen(listenCtx, &amp;tor.ListenConf{Key: privateKey, Version3: true, RemotePorts: []int{80}})
+    if err != nil {
+        log.Panicf("Unable to create onion service: %v", err)
+    }
+    defer onion.Close()
+    fmt.Printf("Open Tor browser and navigate to http://%v.onion\n", onion.ID)
+    // fmt.Println("Press enter to exit")
+    // Serve the current folder from HTTP
+    errCh := make(chan error, 1)
+    go func() {
+        errCh &lt;- mainn(onion)
+    }()
+    // End when enter is pressed
+    // go func() {
+    //  if _, err := fmt.Scanln(); err == nil {
+    //      errCh &lt;- nil
+    //  }
+    // }()
+
+    c := make(chan os.Signal, 1)
+    signal.Notify(c)
+    select {
+    case err = &lt;-errCh:
+        log.Panicf("Failed serving: %v", err)
+    case s := &lt;-c:
+        fmt.Println("Got signal:", s)
+    }
+}
+
+func mainn(onion *tor.OnionService) error {
+    var dir string
+    var user string
+    var pwd string
+    flag.StringVar(&amp;dir, "d", ".", "directory path to serve")
+    flag.StringVar(&amp;user, "u", "user", "username")
+    flag.StringVar(&amp;pwd, "p", "pass", "password")
+    flag.Parse()
+
+    users := map[string][]string{}
+    users[user] = []string{pwd}
+    middleware := basicauth.New(onion.ID, users)
+
+    h := middleware(http.FileServer(http.Dir(dir)))
+
+    return http.Serve(onion, h)
+}
+</code></pre>
+
+<p>because the underlying implementation is using the http std go library, one can use all sorts of middleware to improve security or other aspects.</p>
+
+<p>using tor you have a zero configuration JIT bi directionnal connectivity to work with out of the box, although some enterprise level network environment might give problems.</p>
+
+<p>I don't know if that would pass the test (...)</p>
+    </div>

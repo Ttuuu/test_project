@@ -1,0 +1,239 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>First impressions</h1>
+
+<p>The code seems very clean and tidy.  As far as I can tell, you're including exactly the required headers - no more, and no less.  There's generally good use of <code>const</code> and <code>static</code>, but <code>left_rotate()</code> could benefit from <code>constexpr</code>, and <code>digest()</code> and <code>hex_digest</code> should both be <code>const</code>.</p>
+
+<h1>Separability</h1>
+
+<p>Consider moving the member function definitions out from within the class.  This will make it easier to see what's in the class in a single screenful, and will help you extract a reusable header file from the implementation.</p>
+
+<h1>Initial values</h1>
+
+<p>We don't need this constructor:</p>
+
+<pre><code>    md5()
+      : a0_(0x67452301),
+        b0_(0xefcdab89),
+        c0_(0x98badcfe),
+        d0_(0x10325476)
+    {}
+</code></pre>
+
+<p>We can instead give the members their initial values inline:</p>
+
+<pre><code>    std::uint32_t a0_ = 0x67452301;
+    std::uint32_t b0_ = 0xefcdab89;
+    std::uint32_t c0_ = 0x98badcfe;
+    std::uint32_t d0_ = 0x10325476;
+</code></pre>
+
+<h1>Perhaps roll up a loop of repeated instructions</h1>
+
+<p>I'm not sure whether it works out cleaner that what you have, but an alternative implementation of <code>uint32_to_hex()</code> puts the eight writes into a loop:</p>
+
+<pre><code>template&lt;class OutputIterator&gt;
+static void uint32_to_hex(const std::uint32_t n, OutputIterator&amp; out)
+{
+    static auto const hex_chars = "0123456789abcdef";
+
+    // print nibbles, low byte first (but high nibble before low nibble)
+    // so shift is 4, 0, 12, 8, 20, 16, ...
+    for (auto i = 0u;  i &lt; 32;  i += 4) {
+        *out++ = hex_chars[(n &gt;&gt; (i ^ 4)) &amp; 0xf];
+    }
+}
+</code></pre>
+
+<p>It's likely that the two produce similar code when subject to a good optimizer.</p>
+
+<h1>Remove unnecessary bit-masking</h1>
+
+<p>This function has useless <code>&amp;</code> operations:</p>
+
+<pre><code>void original_length_bits_to_m_array(std::uint64_t original_length_bits)
+{
+    original_length_bits &amp;= 0xffffffffffffffff;
+    *m_array_first_++ = (original_length_bits) &amp; 0x00000000ffffffff;
+    *m_array_first_++ = (original_length_bits &amp; 0xffffffff00000000) &gt;&gt; 32;
+}
+</code></pre>
+
+<p>The first is meaningless because <code>0xffffffffffffffff</code> is the same as <code>~0</code> in 64 bits, so makes no change.  The other two are redundant because assigning an unsigned 64-bit value to a 32-bit variable simply discards the upper bits.  So it's exactly equivalent to:</p>
+
+<pre><code>void original_length_bits_to_m_array(std::uint64_t original_length_bits)
+{
+    *m_array_first_++ = original_length_bits;
+    *m_array_first_++ = original_length_bits &gt;&gt; 32;
+}
+</code></pre>
+
+<h1>Simplify the interface</h1>
+
+<p>We should be able to initialize a <code>md5</code> object <em>and</em> feed it its first (perhaps only) data.  And it would be nice if we didn't have to create an output collection and pass it to be written to.  That's easily achieved by adding a constructor and overloads of <code>digest()</code> and <code>hex_digest()</code>:</p>
+
+<pre><code>md5()
+{}
+
+template&lt;class InputIterator&gt;
+md5(InputIterator first, InputIterator last)
+{
+    update(first, last);
+}
+
+template&lt;class Container&gt;
+Container digest() const
+{
+    Container c;
+    digest(c);
+    return c;
+}
+
+template&lt;class Container&gt;
+Container hex_digest() const
+{
+    Container c;
+    hex_digest(c);
+    return c;
+}
+</code></pre>
+
+<p>Then our <code>main()</code> becomes shorter, simpler and more robust:</p>
+
+<pre><code>int main()
+{
+    std::string data = "Hello World";
+
+    const md5 hash(data.begin(), data.end());
+    const auto data_hex_digest = hash.hex_digest&lt;std::string&gt;();
+
+    std::cout &lt;&lt; data_hex_digest &lt;&lt; std::endl;
+}
+</code></pre>
+
+<h1>Constrain the input type</h1>
+
+<p>At present, <code>update</code> will accept a pair of iterators if they dereference to integer types.  However, the algorithm assumes that they will be no wider than 8 bits, so I could pass it a <code>std::wstring</code> and be surprised by the result.  It's better to prevent such code from compiling:</p>
+
+<pre><code>#include &lt;limits&gt;
+#include &lt;type_traits&gt;
+</code></pre>
+
+
+
+<pre><code>template&lt;class InputIterator&gt;
+typename std::enable_if&lt;
+    std::numeric_limits&lt;typename InputIterator::value_type&gt;::digits &lt;= 8
+&gt;::type
+update(InputIterator first, InputIterator last)
+</code></pre>
+
+<p>We also need to ensure that <code>bytes_to_m_array()</code> doesn't sign-extend the values it reads:</p>
+
+<pre><code>template&lt;class InputIterator&gt;
+void bytes_to_m_array(InputIterator&amp; first,
+                      std::array&lt;std::uint32_t, 16&gt;::iterator m_array_last)
+{
+    for (; m_array_first_ != m_array_last; ++m_array_first_) {
+        *m_array_first_ = std::uint8_t(*first++);
+        *m_array_first_ |= std::uint8_t(*first++) &lt;&lt; 8;
+        *m_array_first_ |= std::uint8_t(*first++) &lt;&lt; 16;
+        *m_array_first_ |= std::uint8_t(*first++) &lt;&lt; 24;
+    }
+}
+</code></pre>
+
+<p>There's a similar change needed in <code>true_bit_to_m_array()</code> - it's probably worth writing a small helper function:</p>
+
+<pre><code>template&lt;class InputIterator&gt;
+static std::uint8_t input_u8(const InputIterator&amp; it)
+{
+    return *it;
+}
+
+template&lt;class InputIterator&gt;
+void bytes_to_m_array(InputIterator&amp; first,
+                      std::array&lt;std::uint32_t, 16&gt;::iterator m_array_last)
+{
+    for (; m_array_first_ != m_array_last; ++m_array_first_) {
+        *m_array_first_ = input_u8(first++);
+        *m_array_first_ |= input_u8(first++) &lt;&lt; 8;
+        *m_array_first_ |= input_u8(first++) &lt;&lt; 16;
+        *m_array_first_ |= input_u8(first++) &lt;&lt; 24;
+    }
+}
+
+template&lt;class InputIterator&gt;
+void true_bit_to_m_array(InputIterator&amp; first, std::ptrdiff_t chunk_length)
+{
+    switch (chunk_length % 4) {
+    case 0:
+        *m_array_first_++ = 0x00000080;
+        break;
+    case 1:
+        *m_array_first_++ = input_u8(first++);
+        *m_array_first_ |= 0x00008000;
+        break;
+    case 2:
+        *m_array_first_++ = input_u8(first++);
+        *m_array_first_ |= input_u8(first++) &lt;&lt; 8;
+        *m_array_first_ |= 0x00800000;
+        break;
+    case 3:
+        *m_array_first_++ = input_u8(first++);
+        *m_array_first_ |= input_u8(first++) &lt;&lt; 8;
+        *m_array_first_ |= input_u8(first++) &lt;&lt; 16;
+        *m_array_first_ |= 0x80000000;
+        break;
+    }
+}
+</code></pre>
+
+<h1>BUG: increment last</h1>
+
+<p>Whilst editing that last function, I spotted a bug:</p>
+
+<pre><code>        *m_array_first_++ = input_u8(first++);
+        *m_array_first_ |= input_u8(first++) &lt;&lt; 8;
+        *m_array_first_ |= input_u8(first++) &lt;&lt; 16;
+        *m_array_first_ |= 0x80000000;
+</code></pre>
+
+<p>I think that <code>_array_first_</code> is meant to be incremented in the last of those statements, rather than the first:</p>
+
+<pre><code>        *m_array_first_ = input_u8(first++);
+        *m_array_first_ |= input_u8(first++) &lt;&lt; 8;
+        *m_array_first_ |= input_u8(first++) &lt;&lt; 16;
+        *m_array_first_++ |= 0x80000000;
+</code></pre>
+
+<p>I suspect that this was caused by a last-minute change that wasn't detected by your test suite.  That's a sign that your tests are missing some vital cases, but as they are not included in the review, I'm not able to make any recommendations beyond very general advice to add tests for the bugs you find before you fix them (writing the test and showing it to fail is the easiest way to demonstrate that it's a useful and effective test).</p>
+
+<p>It may be clearer and safer to write a separate increment statement outside the <code>switch</code>:</p>
+
+<pre><code>template&lt;class InputIterator&gt;
+void true_bit_to_m_array(InputIterator&amp; first, std::ptrdiff_t chunk_length)
+{
+    switch (chunk_length % 4) {
+    case 0:
+        *m_array_first_  = 0x00000080;
+        break;
+    case 1:
+        *m_array_first_  = input_u8(first++);
+        *m_array_first_ |= 0x00008000;
+        break;
+    case 2:
+        *m_array_first_  = input_u8(first++);
+        *m_array_first_ |= input_u8(first++) &lt;&lt; 8;
+        *m_array_first_ |= 0x00800000;
+        break;
+    case 3:
+        *m_array_first_  = input_u8(first++);
+        *m_array_first_ |= input_u8(first++) &lt;&lt; 8;
+        *m_array_first_ |= input_u8(first++) &lt;&lt; 16;
+        *m_array_first_ |= 0x80000000;
+        break;
+    }
+    ++m_array_first_;
+}
+</code></pre>
+    </div>

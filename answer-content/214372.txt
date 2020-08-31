@@ -1,0 +1,134 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Let's get from the simplest thing to change to the hardest one:</p>
+
+<h1>BuilderObject</h1>
+
+<p>This is actually a recursive dictionary, which is more easily achieved using either <a href="https://docs.python.org/3/library/collections.html#collections.defaultdict" rel="nofollow noreferrer"><code>collections.defaultdict</code></a> or by implementing <a href="https://docs.python.org/3/reference/datamodel.html#object.__missing__" rel="nofollow noreferrer"><code>dict.__missing__</code></a>. Since you also want <code>__getattr__</code> to act like <code>__getitem__</code> and so on, I’d go the <code>dict</code> subclass route:</p>
+
+<pre><code>class BuilderObject(dict):
+    def __missing__(self, item):
+        self[item] = missing = BuilderObject()
+        return missing
+
+    def __getattr__(self, item):
+        return self[item]
+
+    def __setattr__(self, item, value):
+        self[item] = value
+
+    def __delattr__(self, item):
+        del self[item]
+</code></pre>
+
+<p>Simpler to read and understand. I’m not fond of the name however, but couldn't come up with something better.</p>
+
+<h1>Converters</h1>
+
+<p>These are in fact <a href="https://docs.python.org/3/howto/descriptor.html" rel="nofollow noreferrer">descriptors</a> in disguise. Instead of writing the getter, setter and deleter functions to feed to <code>property</code>, you could as well write them as <code>__get__</code>, <code>__set__</code> and <code>__delete__</code> method on a custom class. Also <a href="https://docs.python.org/3/library/operator.html#operator.attrgetter" rel="nofollow noreferrer"><code>operator.attrgetter</code></a> is your friend, no need to rewrite it yourself:</p>
+
+<pre><code>class AttributeProxy:
+    def __init__(self, path: str, *, get_fn=None, set_fn=None):
+        self.__path = '_obj.' + path
+        self.__parent, self.__attribute_name = self.__path.rsplit('.', 1)
+        self.__getter = get_fn
+        self.__setter = set_fn
+
+    def __get__(self, instance, owner):
+        if not issubclass(owner, Converter):
+            raise RuntimeError('cannot use Property descriptors on non Converter types')
+        if instance is None:
+            return self
+        value = operator.attrgetter(self.__path)(instance)
+        if isinstance(value, BuilderObject):
+            raise AttributeError
+        if self.__getter is not None:
+            value = self.__getter(value)
+        return value
+
+    def __set__(self, instance, value):
+        if self.__setter is not None:
+            value = self.__setter(value)
+        setattr(operator.attrgetter(self.__parent)(instance), self.__attribute_name, value)
+
+    def __delete__(self, instance):
+        delattr(operator.attrgetter(self.__parent)(instance), self.__attribute_name)
+
+
+class DateProxy(AttributeProxy):
+    def __init__(self, path, format):
+        super().__init__(
+            path,
+            get_fn=lambda value: value.strftime(format),
+            set_fn=lambda value: datetime.strptime(value, format)
+        )
+</code></pre>
+
+<h1>_get_args</h1>
+
+<p>The main purpose of this function is to check that, when one derives from <code>Converter</code>, they provide a specialization of <code>T</code>; and optionally retrieve that specialization. I find the implementation somewhat cryptic and potentially missing some edge cases. I fiddled with a metaclass so the check is performed very early in the program. This is the main advantage of the approach as you would get an error message right away, not latter on in an unrelated section of the code:</p>
+
+<pre><code>class CheckBaseExist(type):
+    def __new__(mcls, name, bases, attrs):
+        cls = super().__new__(mcls, name, bases, attrs)
+        if not issubclass(cls, Generic):
+            raise TypeError('CheckBaseExist metaclass should be used on typing.Generic subclasses')
+
+        if Generic not in bases:
+            # We already know that klass is a subclass of Generic so it must define __orig_bases__
+            try:
+                base, = cls.__orig_bases__
+            except ValueError:
+                raise TypeError('cannot use more than one specialization of a base CheckBaseExist class in the inheritance tree') from None
+            if base.__origin__ is Generic:
+                raise TypeError('no specialization provided when inheriting from a base CheckBaseExist class')
+        else:
+            generic_subclasses = ' or '.join(
+                klass.__name__
+                for klass in bases
+                if klass is not Generic and issubclass(klass, Generic)
+            )
+            if generic_subclasses:
+                raise TypeError(f'cannot use typing.Generic as a common base class with {generic_subclasses}')
+        return cls
+</code></pre>
+
+<p>Not too fond of the name either… Usage being:</p>
+
+<pre><code>class Converter(Generic[T], metaclass=CheckBaseExist):
+    _obj: T
+
+    def __init__(self, **kwargs) -&gt; None:
+        self._obj = BuilderObject()
+        for name, value in kwargs.items():
+            setattr(self, name, value)
+
+    def to_base(self, exists_ok: bool=False) -&gt; T:
+        """Build base object"""
+        base_cls = self.__class__.__orig_bases__[0].__args__[0]
+        if isinstance(self._obj, BuilderObject):
+            self._obj = _build(base_cls, self._obj)
+        elif not exists_ok:
+            raise RuntimeError('Base type has been built already.')
+        return self._obj
+
+    @classmethod
+    def from_base(cls, base: T):
+        """Build function from base object"""
+        instance = cls()
+        instance._obj = base
+        return instance
+</code></pre>
+
+<p>This works as:</p>
+
+<ol>
+<li>we checked in the metaclass that <code>self.__class__.__orig_bases__</code> contains a single item;</li>
+<li><code>Generic[T]</code> ensures that <code>__args__</code> contains a single item.</li>
+</ol>
+
+<h1>_build</h1>
+
+<p>I really dislike the fact that this function relies on <code>typing.get_type_hints</code> but couldn't come up with something clean that doesn't use it, or at least does it optionally. Maybe an extra argument in the <code>AttributeProxy</code> constructor, defaulting to None. I’m not a huge fan of it, but you’ll have to provide type hints somehow anyway.</p>
+
+<p>This is important in case you want to convert to/from objects in external libraries that don't use those type hints, so you must implement a fallback mechanism.</p>
+    </div>

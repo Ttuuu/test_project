@@ -1,0 +1,195 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Code Review</h2>
+
+<ul>
+<li>Use standard library data structures! In this case <code>std::list</code>.</li>
+<li>Iterators are the usual way of traversing a C++ container, so use those too (they also allow us to not care which data structure is being used).</li>
+<li>Use <code>std::size_t</code> or even <code>std::container&lt;T&gt;::size_type</code> for indexing. An int is signed, and won't necessarily cover the correct range to be indexed.</li>
+<li><code>lenK</code> and <code>lenKheap</code> return doubles, but should presumably return the index type.</li>
+</ul>
+
+
+
+<pre><code>template&lt;class IteratorT&gt;
+std::size_t length(IteratorT begin, IteratorT end, std::size_t totalLength = 0) {
+    return (begin == end) ? totalLength : length(std::next(begin), end, totalLength + 1);
+}
+
+using F = std::function&lt;std::size_t(std::size_t)&gt;;
+
+template&lt;class IteratorT&gt;
+std::size_t lengthK(IteratorT begin, IteratorT end, F k = [] (std::size_t a) { return a; }) {
+    return (begin == end) ? k(0) : lengthK(std::next(begin), end, [k] (std::size_t a) { return k(a + 1); });
+}
+
+...
+
+    auto list = std::vector&lt;int&gt;{ 0, 1, 2, 3 };
+
+    std::cout &lt;&lt; length(list.begin(), list.end()) &lt;&lt; std::endl;
+    std::cout &lt;&lt; lengthK(list.begin(), list.end()) &lt;&lt; std::endl;
+</code></pre>
+
+<hr>
+
+<p>Note that the stack overflow that happens with long lists is due to the depth of recursion. <code>std::function</code> may already be using the heap to allocate memory. As such, there's not much point in using <code>unique_ptr</code>.</p>
+
+<p>In theory we could use the type hiding already present in <code>std::function</code>, rather than defining a separate inheritance hierarchy, and do something like this:</p>
+
+<pre><code>template&lt;class IteratorT&gt;
+std::size_t lengthKHeap(IteratorT begin, IteratorT end, std::unique_ptr&lt;F&gt;&amp;&amp; k = std::make_unique&lt;F&gt;([] (std::size_t a) { return a; })) {
+    return (begin == end) ? (*k)(0) : lengthKHeap(std::next(begin), end, std::make_unique&lt;F&gt;([k = std::move(k)](std::size_t a) { return (*k)(a + 1); }));
+}
+</code></pre>
+
+<p>However, this doesn't compile. Although lambda capture by move was added in C++14, <code>std::function</code> is still required to be copyable. We can use a dodgy work-around storing the parameters in a shared pointer like this:</p>
+
+<pre><code>// hideous hack from here: https://stackoverflow.com/a/20846873/673679
+template&lt;class F&gt;
+auto make_copyable_function(F&amp;&amp; f) {
+    auto spf = std::make_shared&lt;std::decay_t&lt;F&gt;&gt;(std::forward&lt;F&gt;(f));
+    return [spf] (auto&amp;&amp;... args) -&gt; decltype(auto) { return (*spf)(decltype(args)(args)...); };
+}
+
+template&lt;class IteratorT&gt;
+std::size_t lengthKHeap(IteratorT begin, IteratorT end, std::unique_ptr&lt;F&gt;&amp;&amp; k = std::make_unique&lt;F&gt;([] (std::size_t a) { return a; })) {
+    return (begin == end) ? (*k)(0) : lengthKHeap(std::next(begin), end, std::make_unique&lt;F&gt;(make_copyable_function([k = std::move(k)](std::size_t a) { return (*k)(a + 1); })));
+}
+</code></pre>
+
+<p>But as mentioned, this doesn't help avoid the stack overflow.</p>
+
+<hr>
+
+<h2>Deviations</h2>
+
+<p>Things become much more interesting if we stop using recursion and store a vector of functions instead. This allows us to make the control flow explicit (which appears to be one of the main points of using continuations). e.g.:</p>
+
+<pre><code>using NodeT = std::function&lt;void()&gt;;
+
+struct Then {
+
+    void add(NodeT node) {
+        m_nodes.push_back(std::move(node));
+    }
+
+    void operator()() const {
+        for (auto&amp; n : m_nodes)
+            n();
+    }
+
+private:
+
+    std::vector&lt;NodeT&gt; m_nodes;
+};
+
+...
+
+    auto i = 0;
+    auto increment = [&amp;] () { ++i; };
+
+    auto then = Then();
+
+    for (auto _ : list)
+        then.add(increment);
+
+    then();
+
+    std::cout &lt;&lt; i &lt;&lt; std::endl;
+</code></pre>
+
+<p>Counting the elements in a list isn't a good example, but I've actually found this pattern of composing functions very helpful for writing lexers / parsers. By defining some more classes to go with <code>Then</code> (<code>Or</code>, <code>ZeroOrOne</code>, <code>ZeroOrMore</code>, etc.) and some operator overloading, it's possible to build up an entire tree of parsing / lexing functions with code that's <a href="https://bitbucket.org/mba105/calculator/src/default/lex.cpp" rel="nofollow noreferrer">very close to a simple statement of the language grammar</a>. Which is pretty cool (if not technically continuations).</p>
+
+<hr>
+
+<p>Of course, there's also asychronously oriented composition stuff using <a href="https://en.cppreference.com/w/cpp/thread/future" rel="nofollow noreferrer"><code>std::future</code></a>, but I've not been keeping up with what's going on in the C++ standard with that lately.</p>
+
+<ul>
+<li><a href="https://code.fb.com/developer-tools/futures-for-c-11-at-facebook/" rel="nofollow noreferrer">facebook version</a>.</li>
+<li><a href="https://vittorioromeo.info/index/blog/zeroalloc_continuations_p0.html" rel="nofollow noreferrer">blog series on avoiding allocations</a>.</li>
+</ul>
+
+<hr>
+
+<h2>Full Code</h2>
+
+<pre><code>#include &lt;functional&gt;
+#include &lt;memory&gt;
+
+template&lt;class IteratorT&gt;
+std::size_t length(IteratorT begin, IteratorT end, std::size_t totalLength = 0) {
+    return (begin == end) ? totalLength : length(std::next(begin), end, totalLength + 1);
+}
+
+using F = std::function&lt;std::size_t(std::size_t)&gt;;
+
+template&lt;class IteratorT&gt;
+std::size_t lengthK(IteratorT begin, IteratorT end, F k = [] (std::size_t a) { return a; }) {
+    return (begin == end) ? k(0) : lengthK(std::next(begin), end, [k] (std::size_t a) { return k(a + 1); });
+}
+
+// hideous hack from here: https://stackoverflow.com/a/20846873/673679
+template&lt;class F&gt;
+auto make_copyable_function(F&amp;&amp; f) {
+    auto spf = std::make_shared&lt;std::decay_t&lt;F&gt;&gt;(std::forward&lt;F&gt;(f));
+    return [spf] (auto&amp;&amp;... args) -&gt; decltype(auto) { return (*spf)(decltype(args)(args)...); };
+}
+
+template&lt;class IteratorT&gt;
+std::size_t lengthKHeap(IteratorT begin, IteratorT end, std::unique_ptr&lt;F&gt;&amp;&amp; k = std::make_unique&lt;F&gt;([] (std::size_t a) { return a; })) {
+    return (begin == end) ? (*k)(0) : lengthKHeap(std::next(begin), end, std::make_unique&lt;F&gt;(make_copyable_function([k = std::move(k)](std::size_t a) { return (*k)(a + 1); })));
+}
+
+#include &lt;functional&gt;
+#include &lt;vector&gt;
+
+using NodeT = std::function&lt;void()&gt;;
+
+struct Then {
+
+    void add(NodeT node) {
+        m_nodes.push_back(std::move(node));
+    }
+
+    void operator()() const {
+        for (auto&amp; n : m_nodes)
+            n();
+    }
+
+private:
+
+    std::vector&lt;NodeT&gt; m_nodes;
+};
+
+#include &lt;list&gt;
+#include &lt;vector&gt;
+#include &lt;iostream&gt;
+
+int main() {
+
+    {
+        auto const list = std::vector&lt;int&gt;{ 0, 1, 2, 3 };
+
+        {
+            std::cout &lt;&lt; length(list.begin(), list.end()) &lt;&lt; std::endl;
+            std::cout &lt;&lt; lengthK(list.begin(), list.end()) &lt;&lt; std::endl;
+            std::cout &lt;&lt; lengthKHeap(list.begin(), list.end()) &lt;&lt; std::endl;
+        }
+
+        {
+            auto i = 0;
+            auto increment = [&amp;] () { ++i; };
+
+            auto then = Then();
+
+            for (auto _ : list)
+                then.add(increment);
+
+            then();
+
+            std::cout &lt;&lt; i &lt;&lt; std::endl;
+        }
+    }
+}
+</code></pre>
+    </div>

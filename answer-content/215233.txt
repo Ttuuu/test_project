@@ -1,0 +1,143 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>It might be difficult to get great feedback on this <code>shared_ptr</code> just because it omits <em>so many</em> of the features of <code>std::shared_ptr</code>. I mean I'd be tempted to just list all the features it doesn't have and then fail to review the code at all:</p>
+
+<ul>
+<li>Atomic/thread-safe accesses to the reference count.</li>
+<li>Implicit conversion from <code>shared_ptr&lt;T&gt;</code> to <code>shared_ptr&lt;U&gt;</code> whenever <code>T*</code> is convertible to <code>U*</code>.</li>
+<li><code>shared_ptr&lt;void&gt;</code>.</li>
+<li>Custom and type-erased deleters.</li>
+<li>The "aliasing constructor."</li>
+<li><code>weak_ptr</code>.</li>
+<li>Implicit conversion from <code>unique_ptr</code>.</li>
+<li><code>make_shared</code>.</li>
+</ul>
+
+<hr>
+
+<pre><code>~shared_ptr() noexcept {             // destructor
+</code></pre>
+
+<p>The comment is redundant. And so is the <code>noexcept</code>: in C++11-and-later, destructors are implicitly <code>noexcept</code>, and it's idiomatic not to write it explicitly.</p>
+
+<p>Contrariwise, it is <em>extremely important</em> to provide a noexcept <code>swap</code> function! You're missing the <code>noexcept</code> keyword here:</p>
+
+<pre><code>void swap (shared_ptr&amp; other) {
+</code></pre>
+
+<p>By the way, it's weird to put a space between the name of the function and its opening parenthesis. Prefer <code>swap(shared_ptr&amp; other)</code>.</p>
+
+<hr>
+
+<p>You've got a typo in a comment: <code>assignent</code>. Look for typos elsewhere. Where there's one mistake, there's often more than one. (Also, eliminate that redundant comment.)</p>
+
+<hr>
+
+<pre><code>      --(*ref_count_);
+        if (*ref_count_ == 0) {
+</code></pre>
+
+<p>Your accesses to <code>*ref_count</code> already aren't thread-safe; but FYI, here's where the race condition would sneak in if you just went and made <code>ref_count</code> a pointer to a <code>std::atomic&lt;int&gt;</code>. In a multithreaded environment, it might well be that <code>*ref_count_ == 0</code>, but that doesn't mean that <em>you're</em> the one whose decrement took it to <code>0</code>.</p>
+
+<hr>
+
+<pre><code>constexpr shared_ptr() noexcept : ptr_{nullptr}, ref_count_{nullptr} {}
+</code></pre>
+
+<p>If you used C++11 non-static data member initializers (NSDMIs) for <code>ptr_</code> and <code>ref_count_</code>, you could <code>=default</code> this constructor.</p>
+
+<pre><code>T *ptr_ = nullptr;
+int *ref_count_ = nullptr;
+
+constexpr shared_ptr() noexcept = default;
+</code></pre>
+
+<hr>
+
+<pre><code>shared_ptr&amp; operator = (shared_ptr&amp;&amp; other) noexcept {   // move assignment operator
+    *this = other;
+}
+</code></pre>
+
+<p>Why did you bother implementing this overload at all, if you're not going to make it more efficient? Either omit it entirely (so that there's only one assignment operator), or implement it as e.g.</p>
+
+<pre><code>shared_ptr&amp; operator=(shared_ptr&amp;&amp; other) noexcept {
+    if (this != &amp;other) {
+        decrement_ref_count_and_delete_if_needed();
+        ptr_ = std::exchange(other.ptr_, nullptr);
+        ref_count_ = std::exchange(other.ref_count_, nullptr);
+    }
+    return *this;
+}
+</code></pre>
+
+<p>By the way, once you make your <code>swap</code> function noexcept, you might consider saving some brain cells by using the <a href="https://stackoverflow.com/questions/3279543/what-is-the-copy-and-swap-idiom">copy-and-swap idiom</a>:</p>
+
+<pre><code>shared_ptr&amp; operator=(shared_ptr&amp;&amp; other) noexcept {
+    shared_ptr(std::move(other)).swap(*this);
+    return *this;
+}
+</code></pre>
+
+<hr>
+
+<pre><code>  void reset() noexcept {
+    decrement_ref_count_and_delete_if_needed();
+  }
+</code></pre>
+
+<p>This is wrong. Consider:</p>
+
+<pre><code>shared_ptr&lt;int&gt; p(new int);
+shared_ptr&lt;int&gt; q = p;
+p.reset();
+assert(p.get() != nullptr);  // oops
+</code></pre>
+
+<hr>
+
+<pre><code>  void reset(T* ptr) {
+    decrement_ref_count_and_delete_if_needed();
+    ptr_ = ptr;
+    if (!ref_count_) {
+      ref_count_ = new int{1};
+    }
+    *ref_count_ = 1;
+  }
+</code></pre>
+
+<p>This is also wrong. Consider:</p>
+
+<pre><code>shared_ptr&lt;int&gt; p(new int);  // A
+shared_ptr&lt;int&gt; q = p;       // B
+p.reset(new int);            // C
+p = shared_ptr&lt;int&gt;();       // D
+assert(q.use_count() == 0);  // oops!
+</code></pre>
+
+<p>Line A sets the refcount to 1. Line B increments the refcount to 2. Line C repoints <code>p.ptr_</code> (but does not change <code>p.ref_count_</code> — oops!), and then resets the refcount to 1. Line D decrements the refcount to 0 and frees the int that was allocated on line C. Now <code>q.ptr_</code> still points to the int that was allocated on line A, but <code>*q.ref_count_ == 0</code>.</p>
+
+<p>The correct implementation of <code>reset(T*)</code> is simply</p>
+
+<pre><code>  void reset(T *ptr) {
+      *this = shared_ptr(ptr);
+  }
+</code></pre>
+
+<p>(I strongly advise <em>against</em> ever making calls to <code>reset</code> from user code, by the way, because every call to <code>reset</code> can be more readably expressed as a simple and type-safe assignment.)</p>
+
+<hr>
+
+<pre><code>int use_count() const noexcept {
+    return *ref_count_;
+}
+</code></pre>
+
+<p>There's an unspoken precondition here: that <code>use_count()</code> shall never be called on a <code>shared_ptr</code> in the default-constructed ("disengaged", "moved-from", "partially formed") state. If you keep this precondition, then the <a href="https://quuxplusone.github.io/blog/2018/04/25/the-lakos-rule/" rel="nofollow noreferrer">Lakos Rule</a> would suggest that this function shouldn't be <code>noexcept</code>. However, I think it would be more natural to write</p>
+
+<pre><code>int use_count() const noexcept {
+    return ref_count_ ? *ref_count_ : 0;
+}
+</code></pre>
+
+<p>so that the function always has well-defined behavior.</p>
+    </div>

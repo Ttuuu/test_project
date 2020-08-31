@@ -1,0 +1,190 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>There are few things that can be improved, will start with the major ones:</p>
+
+<p><strong>General</strong></p>
+
+<ul>
+<li>Instead of having function for each API call you can generalise it a bit like so:</li>
+</ul>
+
+<pre><code>/* Updated the name, since it's not only for transactions anymore
+Since we no longer know the exact endpoint we will have to pass it to the function
+
+I would also add `requestMeta` parameter that will contain any other information that would be needed to perform the api call
+`parameters`, `encoding`, `authenticationType`, `additionalHeaders`, `shouldReauthenticate`
+but this is in case you need them
+*/
+
+func apiReques&lt;T: Codable&gt;(_ dataType: T.Type,
+                                    endpoint: Endpoint,
+                                  completion: @escaping (Result&lt;[T], ResultError&gt;) -&gt; Void) {
+
+        self.httpLayer.request(at: endpoint) { (data, error) in
+
+// In general an "early return" strategy is preferred, use guard when applicable and avoid nesting `if` statements
+            if let error = error as NSError? {
+                completion(.failure(error))
+                return
+            }
+
+// Do not force unwrap, it's better to show empty screen (or error) instead of crashing the app
+            guard let data = data else {
+                completion(.failure(NSError(domain: "", code: 1, userInfo: [:])))
+                return
+            }
+
+            do {
+                let transactions = try JSONDecoder().decode([T].self, from: data)
+                completion(.success(transactions))
+            } catch {
+                completion(.failure(self.defaultError))
+            }
+        }
+    }
+</code></pre>
+
+<p>So, since your structures are <code>Decodable</code> (consider using <code>Codable</code>) you can easily use generics.</p>
+
+<p>The <code>_ dataType: T.Type</code> is a bit tricky. Since we are not returning <code>T</code> we have to add it as a parameter so the compiler can infer the actual type (more on the topic can be found <a href="https://stackoverflow.com/questions/27965439/cannot-explicitly-specialize-a-generic-function">here</a></p>
+
+<ul>
+<li>I would prefer keeping all the urls in one place, so I would move <code>baseURL</code> to endpoints enum. Again do not force unwrap</li>
+</ul>
+
+<pre><code>enum Endpoint {
+
+    static let baseURLString = "https://example.com"
+
+    case listTransactions
+    case transactionDetails(String)
+}
+
+extension Endpoint {
+
+    var method: HTTPMethod {
+        return .get
+    }
+
+    var path: String {
+        switch self {
+        case .listTransactions:
+            return Endpoint.baseURLString + "/api/transactions/"
+        case .transactionDetails(let id):
+            return Endpoint.baseURLString + "/api/transactions/\(id)"
+        }
+    }
+}
+</code></pre>
+
+<p>This will affect your <code>request</code> func:</p>
+
+<pre><code>func request(at endpoint: Endpoint, completion: @escaping (Data?, Error?) -&gt; Void) {
+
+        guard let url = URL(string: endpoint.path) else { return }
+// endpoint.method is available as well if needed
+
+        let task = URLSession.shared.dataTask(with: url) { (data, response, error) in
+            completion(data, error)
+        }
+        task.resume()
+    }
+</code></pre>
+
+<ul>
+<li>It seems that you are instantiating new <code>HTTPLayer</code> for every <code>APIClient</code>. In that case I would just go with <code>private let httpLayer: HTTPLayer = HTTPLayer()</code> and deleting the <code>init</code>. In that case you can mark <code>class HTTPLayer</code> as <code>fileprivate</code> so noone beside <code>APIClient</code> can access it and if any params needs to be passed to it will go through <code>APIClient</code> -&gt; <code>apiReques()</code></li>
+</ul>
+
+<p><strong>Error handling</strong></p>
+
+<ul>
+<li>If you want to go a bit further you can update the <code>enum Result</code></li>
+</ul>
+
+<pre><code>enum Result&lt;Value, Error: Swift.Error&gt; {
+    case success(Value)
+    case failure(Error)
+}
+</code></pre>
+
+<p>and also adding your custom errors:</p>
+
+<pre><code>enum ResultError: Error {
+    case general(String?)
+    case specific(Int?)
+    case `default` // default is a keyword so if you want to use it, you should wrap it in ``, imo don't and choose another name
+    case whateverYouWant
+}
+
+extension ResultError {
+    var errorString: String {
+        switch self {
+...
+        }
+    }
+
+    private func specificErrorString(_ errorCode: Int) -&gt; String {
+        switch errorCode {
+...
+        }
+    }
+}
+</code></pre>
+
+<p>This will affect the generic <code>apiRequest</code> a bit in the signature <code>@escaping (Result&lt;[T], ResultError&gt;) -&gt; Void)</code> and ofc the <code>completions</code></p>
+
+<pre><code>completion(.failure(.general("something went wrong")))
+completion(.failure(.specific(123))
+completion(.failure(.default)
+</code></pre>
+
+<p>Now you can delete <code>var defaultError: NSError = NSError(domain: "", code: 1, userInfo: nil)</code></p>
+
+<p><strong>How to use it</strong></p>
+
+<pre><code>APIClient(). apiReques(Transaction.self,endpoint: Endpoint.listTransactions) { data in
+
+    switch data {
+    case .success(let response):
+        print("Success")
+    case .failure(let error):
+        print("error")
+    }
+}
+</code></pre>
+
+<p><strong>Bonus</strong></p>
+
+<p>You can also split the completion into two completion <code>success</code> and <code>failure</code></p>
+
+<ul>
+<li>Signature</li>
+</ul>
+
+<pre><code>func apiReques &lt;T: Decodable&gt;(_ dataType: T.Type,
+                                    endpoint: Endpoint,
+                                    success: @escaping (([T]) -&gt; Void),
+                                    failure: @escaping ((ResultError) -&gt; Void))
+</code></pre>
+
+<ul>
+<li>block calls</li>
+</ul>
+
+<pre><code>failure(.general(""))
+failure(.default)
+success(data)
+</code></pre>
+
+<ul>
+<li>Usage</li>
+</ul>
+
+<pre><code>APIClient().transactions(Transaction.self,
+                         endpoint: Endpoint.listTransactions,
+                         success: { data in
+                            print(data)
+}, failure: { error in
+    print(error)
+})
+</code></pre>
+    </div>

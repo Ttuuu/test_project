@@ -1,0 +1,199 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Overview</h1>
+
+<p>Normally a ThreadPool has a fixed number of threads. With a variable amount of work that is to be completed by the threads. You have gone the other way. You have as many threads as there is work. So your pool is not really a pool of workers it is more of a thread maintainer than a thread pool.</p>
+
+<p>Threads are relatively expensive to create. The amount of a parallelism supported by the hardware is limited and fixed so there is no point in having more threads than the hardware physically supports.</p>
+
+<p>So usually a thread pool is created is created with a fixed number of threads that matches the hardware limits. Then you add work (not threads) to the pool. Each thread then simply checks the work queue for work and executes that work. On completion of the work it checks a work queue to get more work.</p>
+
+<hr>
+
+<h1>Code Review</h1>
+
+<p>Nice comment. I usually complain about bad comments. But I actually don't mind this one so I though I should make a special effort to comment about it :-)</p>
+
+<pre><code>/**
+ * RAII-style timer. 
+ * Used only in main to measure performance
+ */
+</code></pre>
+
+<hr>
+
+<p>Prefer to initialize one variable per line:</p>
+
+<pre><code>    Buffer(int producer_parallelism) : buff_sem(0), producer_sem(producer_parallelism), mu(), print_mu(), cond_var(), buffer_(){};
+</code></pre>
+
+<p>In all the rest of your code you only declare and initialize one variable per line. So why did you do all variables on one line here. The whole point os using a high level language is try and make it readable for humans. This si the opposite.</p>
+
+<p>why not like this?</p>
+
+<pre><code>    Buffer(int producer_parallelism)
+        : buff_sem(0)
+        , producer_sem(producer_parallelism)
+        , mu()
+        , print_mu()
+        , cond_var()
+        , buffer_()
+    {};
+</code></pre>
+
+<p>Now that it is easier to read. I would not bother being explicit with the ones that use a default constructor. So I would simplify to:</p>
+
+<pre><code>    Buffer(int producer_parallelism)
+        : buff_sem(0)
+        , producer_sem(producer_parallelism)
+    {};
+</code></pre>
+
+<hr>
+
+<p>There is no need to delete the default constructor.</p>
+
+<pre><code>    Buffer() = delete;
+</code></pre>
+
+<p>If any other constructor is defined then the compiler will not generate a default constructor.</p>
+
+<hr>
+
+<p>OK. This comment is a bit usless.</p>
+
+<pre><code>    /**
+     * Add an element to the buffer
+     */
+    void add(char c)
+</code></pre>
+
+<p>The self documeting nature of the function already tells me this. Don't need a comment to tell me the exact same thing.</p>
+
+<hr>
+
+<p>Think I may have just learned something new.</p>
+
+<pre><code>        const std::lock_guard&lt;std::mutex&gt; lg(print_mu);
+        (std::cout &lt;&lt; ... &lt;&lt; args);
+</code></pre>
+
+<p>Don't recognize this format. Will need to look up what it means.</p>
+
+<hr>
+
+<hr>
+
+<h2>ThreadPool</h2>
+
+<p>You don't need to dynamically allocate the vector!</p>
+
+<pre><code>    std::vector&lt;std::thread *&gt; *threads_;  // Also the * should move left.
+                                           // The * is part of the type info
+                                           // so should be with the type
+                                           // not the member name.
+</code></pre>
+
+<p>This can simply be:</p>
+
+<pre><code>    std::vector&lt;std::thread*&gt;   threads_;
+</code></pre>
+
+<p>Don't dynamically allocate something if it is not required.</p>
+
+<hr>
+
+<p>Why are you keeping pointers to the threads?<br>
+Why does the thread pool not own the threads? You can create the thread then move the thread into the pool. Or simply pass the function to the thread pool and allow it to assign the function to a thread.</p>
+
+<pre><code>    // This is what I would do.
+    std::vector&lt;std::thread&gt;   threads_;
+
+    template&lt;typename F&gt;
+    void add_action(F&amp;&amp; action)
+    {
+        threads.emplace_back(std::move(action));
+</code></pre>
+
+<h2>        }</h2>
+
+<p>The member <code>is_finished_</code> is never used.</p>
+
+<p>You should turn on your compiler warnings and fix all warnings. A warning is a an error in your logical thinking. The compiler lets it go because it is technically valid but the warning is there for a reason (you have messed up in some way).</p>
+
+<hr>
+
+<p>You have a method <code>join_all()</code> which is fine. But would you not want to force this call from the destructor (if they had all already not been joined?</p>
+
+<p>That way you can never accidentally go out of scope and leave threads running.</p>
+
+<p>If I look at your main.</p>
+
+<pre><code>{
+    // STUFF
+    ThreadPool tp;
+
+    // STUFF
+
+    tp.join_all();
+}
+</code></pre>
+
+<p>Yes it looks like that should simply be called from the destructor of the <code>ThreadPool</code>. That way if there is a problem you don't leave threads accidentally hanging.</p>
+
+<hr>
+
+<p>Looking at main.<br>
+Does not look like <code>buff</code> needs to be dynamically allocated.</p>
+
+<pre><code>    {
+        std::shared_ptr&lt;Buffer&gt; buff = std::make_shared&lt;Buffer&gt;(producer_parallelism);
+        ThreadPool tp;
+
+        for (/*LOOP*/)
+        {
+            Consumer *c = new Consumer{buff, producer_parallelism, i};
+            // STUFF but `c` is added to the `tp` as a thread
+        }
+
+        for (/*LOOP*/)
+        {
+            Producer *p = new Producer{buff, produced_preaces_per_producer, i};
+            // STUFF but `p` is added to the `tp`  as a thread
+        }
+
+        // Make sure all threads finish.
+        tp.join_all();
+    }
+</code></pre>
+
+<p>Here it created. Used only in the threads. You make sure all the threads terminate before you exit the scope. So all threads have access to the object for their lifetimes any only after all threads have finished do you exit scope and destroy the buffer. So easier to make this a local variable.</p>
+
+<pre><code>    {
+        Buffer buff(producer_parallelism);
+        ThreadPool tp;
+
+        for (/*LOOP*/)
+        {
+            // Note this does not need to change.
+            // Simply pass the buffer by reference and keep the
+            // reference in the consumer.
+            Consumer *c = new Consumer{buff, producer_parallelism, i};
+            // STUFF but `c` is added to the `tp` as a thread
+        }
+
+        for (/*LOOP*/)
+        {
+            // Note this does not need to change.
+            // Simply pass the buffer by reference and keep the
+            // reference in the producer.
+            Producer *p = new Producer{buff, produced_preaces_per_producer, i};
+            // STUFF but `p` is added to the `tp`  as a thread
+        }
+
+        // Make sure all threads finish.
+        tp.join_all();
+    }
+</code></pre>
+
+<hr>
+    </div>

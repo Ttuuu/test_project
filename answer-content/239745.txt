@@ -1,0 +1,209 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+<pre><code>typedef R(*Invoker)(std::byte*, Args...);
+typedef void(*Replacer)(std::byte*, const std::byte*);
+</code></pre>
+</blockquote>
+
+<p>Alias-declarations are easier to understand IMO:</p>
+
+<pre><code>using Invoker  =    R (*)(std::byte*, Args...);
+using Replacer = void (*)(std::byte*, const std::byte*);
+</code></pre>
+
+<blockquote>
+<pre><code>template &lt;typename Functor&gt;
+static R genericInvoker(std::byte* f, Args... args)
+{
+    static_assert(std::is_invocable_r_v&lt;R, Functor, Args...&gt;,
+        "Functor must be callable with the appropriate signature!");
+    return std::invoke(*std::launder(reinterpret_cast&lt;Functor*&gt;(f)),
+        std::forward&lt;Args&gt;(args)...);
+}
+</code></pre>
+</blockquote>
+
+<p>The <code>*std::launder(reinterpret_cast&lt;Functor*&gt;(f))</code> part comes up quite a lot.  Have you considered a helper function?</p>
+
+<pre><code>// somewhere
+template &lt;typename F&gt;
+F* as(void* storage)
+{
+    return *std::launder(std::reinterpret_cast&lt;F*&gt;(storage));
+}
+</code></pre>
+
+<p>then</p>
+
+<pre><code>using Invoker = R (*)(void*, Args...);
+
+Invoker invoker;
+
+template &lt;typename F&gt;
+static R invoke(void* storage, Args... args)
+{
+    std::invoke(*as&lt;F&gt;(storage), std::forward&lt;Args&gt;(args)...);
+}
+</code></pre>
+
+<blockquote>
+<pre><code>template &lt;typename Functor&gt;
+static void genericReplacer(std::byte* newObj, const std::byte* oldObj)
+{
+    if (oldObj) new (newObj) Functor(*std::launder(reinterpret_cast&lt;const Functor*&gt;(oldObj)));
+    else std::launder(reinterpret_cast&lt;Functor*&gt;(newObj))-&gt;~Functor();
+}
+</code></pre>
+</blockquote>
+
+<p>Don't put everything on one line — it requires horizontal scrolling and is hard to read.  <code>newObj</code> and <code>oldObj</code> are a bit confusing.  The logic may also be clearer if you separate the destruction part:</p>
+
+<pre><code>using Replacer = void (*)(void*, void*);
+using Destroyer = void (*)(void*);
+
+Replacer replacer;
+Destroyer destroyer;
+
+template &lt;typename F&gt;
+static void replace(void* storage, void* f)
+{
+    ::new (storage) F(*as&lt;F&gt;(f));
+}
+
+template &lt;typename F&gt;
+static void destroy(void* storage)
+{
+    std::destroy_at(as&lt;F&gt;(storage));
+}
+</code></pre>
+
+<blockquote>
+<pre><code>static R fptrInvoker(std::byte* f, Args... args)
+{
+    auto fptr = reinterpret_cast&lt;R(**)(Args...)&gt;(f);
+    return (*fptr)(args...);
+}
+
+static void fptrReplacer(std::byte* newObj, const std::byte* oldObj)
+{
+    *reinterpret_cast&lt;R(**)(Args...)&gt;(newObj) =
+        *reinterpret_cast&lt;R(* const*)(Args...)&gt;(oldObj);
+}
+</code></pre>
+</blockquote>
+
+<p>I don't think these are necessary — the generic version is fine.</p>
+
+<blockquote>
+<pre><code>std::byte storage[Size];
+</code></pre>
+</blockquote>
+
+<p>Using <code>std::byte</code>s to store the function object disregards alignment, which may cause performance degradation or even undefined behavior.  Use <code>std::aligned_storage</code> instead:</p>
+
+<pre><code>std::aligned_storage_t&lt;Size&gt; storage;
+</code></pre>
+
+<blockquote>
+<pre><code>// A trivial default constructor
+StaticFunction() = default;
+</code></pre>
+</blockquote>
+
+<p>This is questionable.  Throwing an exception when an empty <code>StaticFunction</code> is called may be better:</p>
+
+<pre><code>// special-case nullptr
+Invoker invoker{};
+Replacer replacer{};
+Destroyer destroyer{};
+</code></pre>
+
+<blockquote>
+<pre><code>template &lt;typename Functor&gt;
+StaticFunction(const Functor&amp; f) : invoker(genericInvoker&lt;Functor&gt;), replacer(genericReplacer&lt;Functor&gt;)
+{
+    static_assert(std::is_invocable_r_v&lt;R, Functor, Args...&gt;,
+        "Functor must be callable with the appropriate signature!");
+    static_assert(sizeof(Functor) &lt;= Size,
+        "The required function object is too big to be stored!");
+
+    // Copy the functor
+    replacer(storage, reinterpret_cast&lt;const std::byte*&gt;(&amp;f));
+}
+</code></pre>
+</blockquote>
+
+<p>Instead of making <code>static_assert</code>s, why not SFINAE?  Taking the function object by value allows move semantics:</p>
+
+<pre><code>template &lt;typename F,
+          typename = std::enable_if_t&lt;std::is_invocable_r_v&lt;R, F, Args...&gt; &amp;&amp;
+                                      sizeof(F) &lt;= Size&gt;&gt;
+StaticFunction(F f)
+    : invoker{invoke&lt;F&gt;}
+    , replacer{replace&lt;F&gt;}
+    , destroyer{destroy&lt;F&gt;}
+{
+    ::new (&amp;storage) F(std::move(f));
+}
+</code></pre>
+
+<blockquote>
+<pre><code>// Copy constructor
+StaticFunction(const StaticFunction&amp; other) : invoker(other.invoker), replacer(other.replacer)
+{
+    // Replace this one storage with the other
+    if (replacer) replacer(storage, other.storage);
+}
+
+// Copy assignment operator
+StaticFunction&amp; operator=(const StaticFunction&amp; other)
+{
+    // Destroy the object here first
+    if (replacer) replacer(storage, nullptr);
+    invoker = other.invoker;
+    replacer = other.replacer;
+    replacer(storage, other.storage);
+    return *this;
+}
+</code></pre>
+</blockquote>
+
+<p>Consider supporting move semantics (maybe <code>move_replacer</code>).</p>
+
+<blockquote>
+<pre><code>R operator()(Args... args)
+{
+    // Calling an empty StaticFunction would trigger UB
+    return invoker(storage, std::forward&lt;Args&gt;(args)...);
+}
+</code></pre>
+</blockquote>
+
+<p>Maybe this:</p>
+
+<pre><code>R operator()(Args... args) const
+{
+    if (invoker) {
+        return invoker(&amp;storage, std::forward&lt;Args&gt;(args)...);
+    } else {
+        throw std::bad_function_call{};
+    }
+}
+</code></pre>
+
+<blockquote>
+<pre><code>~StaticFunction()
+{
+    replacer(storage, nullptr);
+}
+</code></pre>
+</blockquote>
+
+<p>Yeah, with <code>destroyer</code> it becomes</p>
+
+<pre><code>~StaticFunction()
+{
+    destroyer(&amp;storage);
+}
+</code></pre>
+    </div>

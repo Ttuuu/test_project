@@ -1,0 +1,988 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Inspired by @Alex's answer, I did some profiling and simple timing of your code, and some changes that seemed "obvious" to me.</p>
+
+<p>My environment for this is a 32-bit laptop that is old enough to have a driver's license, running python 3.7 on Windows. <strong>Note:</strong> Because of this, it's quite likely that your performance will differ from mine. Verify these results, it's important! </p>
+
+<p>I downloaded <code>scipy</code> for this, but I don't have any real knowledge of what you're doing. Also, at this point it's pretty late, so I'm not as smart as I was a few hours ago. Forgive me if I'm incoherent.</p>
+
+<p>I created modified versions of your main function, <code>step</code>. I'll describe the changes, and the result, then past in the code at the bottom for you to try to reproduce my results.</p>
+
+<pre><code>]$ python test.py -t
+Start: (N/A) 1555646668200
+Done orig: (1466) 1555646669666
+Done const True: (1404) 1555646671070
+Done const_lookup True: (1373) 1555646672443
+Done const_lookup_cse True: (1310) 1555646673753
+Done const_lookup_cse2 True: (1264) 1555646675017
+Done const_lookup_cse2_ary2 False: (1217) 1555646676234
+</code></pre>
+
+<p>The numbers in parens are elapsed milliseconds to run the <code>step_</code> function, so <strong>lower is better.</strong> The trailing numbers are current-time-in-ms, which you should ignore. The boolean value indicates whether the returned result matches the original <code>step</code> result -- note that <code>_ary2</code> is <code>False</code>.</p>
+
+<p>The names get longer because I was adding more changes, except for the <code>_ary</code> version, which I suppressed because it didn't work right. (I left it in, so you can see a failed example. But see the comments on <code>_ary2</code> first.)</p>
+
+<p>The functions are named <code>step_XXX</code> where XXX is whatever appears in the table above (e.g., <code>step_const_lookup_cse</code>). The parts of the name indicate what I tried to do in that iteration.</p>
+
+<h3><code>orig</code> (aka, <code>step</code>)</h3>
+
+<p>This is the original. Nothing to see here, move along.</p>
+
+<h3><code>step_const</code></h3>
+
+<p>In this version, I moved all the event and dynamics functions inside the <code>step</code> function as nested functions. I unpacked the <code>p[]</code> dictionary into variables (with uppercased names, so I called them constants) that don't change during the execution. </p>
+
+<p>For example:  <code>GRAVITY = p["gravity"]</code></p>
+
+<p>I then rewrote the various helpers to use these names instead of dictionary lookups. </p>
+
+<h3><code>const_lookup</code></h3>
+
+<p>In this version, I tried to remove lookups where possible. I did this by storing names into named-arguments with default values. Thus, for example, I would have a function with a parameter list like <code>(..., array=np.array)</code> so that the <code>array</code> named parameter could be used instead of a lookup of <code>np.array</code> each time.</p>
+
+<h3><code>const_lookup_cse</code></h3>
+
+<p>This was my first attempt at Common-Subexpression-Elimination. In general, I tried to eliminate repeated computations of the same result by storing results in local variables.</p>
+
+<h3><code>const_lookup_cse2</code></h3>
+
+<p>This is an extended version of <code>_cse</code> above. There aren't many changes, but not for lack of trying. </p>
+
+<p>One thing I tried was to "unpack" the <code>x[]</code> array into variables <code>x0, x1, ..., x5</code> in functions that used them. This <em>totally didn't work for me,</em> but it might be worth trying for you. That is, instead of expressions like <code>x[1] - x[5]</code> I used <code>x1 - x5</code>. I was surprised at how bad the performance was, so I quickly undid that change and want for some simpler ones.</p>
+
+<h3><code>const_lookup_cse2_ary2</code></h3>
+
+<p>I used the <code>cProfile</code> profiler to investigate the performance of various functions. There is a lot of time spent in library code, which is "good" in the sense that there's work being done and it's not your code.</p>
+
+<p>The dominant functions are related to the <code>stance_dynamics</code> call. One of the non-obvious culprits is <code>np.array</code> so I figured I would try to come up with some alternatives to calling that function.</p>
+
+<p>In my <code>_ary</code> version, which I suppressed, I created a ring of 4 <code>np.arrays</code> that I would alternate through in sequence. Sadly, this performed worse than just constructing the array from scratch each time. Yikes! Also, the results returned were not the same as the original function.</p>
+
+<p>So I tried a different approach, <code>_ary2</code> in which I held a single <code>np.array</code> for each function that returns one, and reset the values inside the array. This gets improved performance, but again, <strong>the results are not the same.</strong></p>
+
+<p>Now, here's the important part: I have no understanding of what you are doing. So it may be that the different results don't matter. If, for example, the only time the returned <code>np.array</code> is important is immediately after it is returned, then the overall results might be valid even though the details are different. So I left this in. On the other than, if the integration solver is referring back to previous values, and by overwriting the contents of the array I'm screwing those up, then this is an invalid change.</p>
+
+<p>But it's a decent speed-up, so I'm leaving that to you.</p>
+
+<p>One thing I noticed reading the docs for the solver, there's an option to vectorize the function. In that case, instead of an <code>array(n)</code> it takes and returns an <code>array(n, k)</code>. In my ignorance, I don't know if that means it would be a "growing" array, with new values being appended, or some other thing. That's up to you to figure out. But if it would let you append the results to the end of an existing array, it might give a similar performance boost.</p>
+
+<h2>Files</h2>
+
+<p>Here's the test driver, <code>test.py</code>, and then the module <code>slip.py</code>:</p>
+
+<h3><code>test.py</code></h3>
+
+<pre><code>import sys
+import time
+
+#import matplotlib.pyplot as plt
+import numpy as np
+from slip import *
+
+_last_time_ms = 0
+def timestamp(msg):
+    global _last_time_ms
+    time_ms = int(round(time.time() * 1000))
+    delta = 'N/A' if _last_time_ms == 0 else time_ms - _last_time_ms
+    print(f"{msg}: ({delta}) {time_ms}")
+    _last_time_ms = time_ms
+
+
+p = {'mass':80.0, 'stiffness':8200.0, 'resting_length':1.0, 'gravity':9.81,
+'aoa':1/5*np.pi}
+# x0 = [-np.sin(p['aoa'])*p['resting_length'],1.1*p['resting_length'], # body position
+#     5*p['resting_length'],0.0, # velocities
+#     0.0,0.0] # foot position
+
+def get_x0():
+    x0 = [0, 0.85, 5.5, 0, 0, 0]
+    x0 = resetLeg(x0, p)
+    p['total_energy'] = computeTotalEnergy(x0, p)
+    return x0
+
+def sol_close(a, b):
+    return np.allclose(a.t, b.t) and np.allclose(a.y, b.y)
+
+TIMING = ('-t' in sys.argv)
+
+if TIMING:
+    run_all = True
+
+    timestamp("Start")
+    sol = step(get_x0(), p)
+    timestamp("Done orig")
+
+    if run_all:
+
+        x = step_const(get_x0(), p)
+        same = sol_close(sol, x)
+        timestamp(f"Done const {same}")
+
+        x = step_const_lookup(get_x0(), p)
+        same = sol_close(sol, x)
+        timestamp(f"Done const_lookup {same}")
+
+        x = step_const_lookup_cse(get_x0(), p)
+        same = sol_close(sol, x)
+        timestamp(f"Done const_lookup_cse {same}")
+
+        x = step_const_lookup_cse2(get_x0(), p)
+        same = sol_close(sol, x)
+        timestamp(f"Done const_lookup_cse2 {same}")
+
+        # Doesn't work. Also, runs slower.
+        #x = step_const_lookup_cse2_ary(get_x0(), p)
+        #same = sol_close(sol, x)
+        #timestamp(f"Done const_lookup_cse2_ary {same}")
+
+        x = step_const_lookup_cse2_ary2(get_x0(), p)
+        same = sol_close(sol, x)
+        timestamp(f"Done const_lookup_cse2_ary2 {same}")
+
+else:
+    import cProfile
+    import pstats
+
+    statsfile = 'step_profile'
+
+    cProfile.run('step_const_lookup_cse2(get_x0(), p)', statsfile)
+
+    p = pstats.Stats(statsfile)
+    p.strip_dirs().sort_stats('cumtime').print_stats()
+
+# plt.plot(sol.t,sol.y[0])
+# plt.plot(sol.t,sol.y[1], color='green')
+# plt.plot(sol.t,sol.y[0])
+# plt.plot(sol.y[0],sol.y[1], color='orange')
+# plt.show()
+</code></pre>
+
+<h3><code>slip.py</code></h3>
+
+<pre><code>import math
+import numpy as np
+import scipy.integrate as integrate
+
+def pMap(x,p):
+    '''
+    Wrapper function for step, returning only x_next, and -1 if failed
+    '''
+    sol = step(x,p)
+    return sol.y[:,-1], sol.failed
+
+def step_const(x, p):
+    AOA = p['aoa']
+    GRAVITY = p['gravity']
+    MASS = p['mass']
+    RESTING_LENGTH = p['resting_length']
+    STIFFNESS = p['stiffness']
+    TOTAL_ENERGY = p['total_energy']
+
+    SPECIFIC_STIFFNESS = STIFFNESS / MASS  # FIXME: Is this name right?
+
+    # Note: not taken from p[]
+    HALF_PI = np.pi / 2.0
+    MAX_TIME = 5
+
+    # Function definitions: specific to the constants provided in `p`
+
+    def apex_event(t, x):
+        ''' Event function to reach apex '''
+        return x[3]
+    apex_event.terminal = True
+
+    def fall_event(t, x):
+        ''' Event function to detect the body hitting the floor (failure)
+        '''
+        return x[1]
+    fall_event.terminal = True
+
+    def flight_dynamics(t, x):
+        ''' code in flight dynamics, xdot_ = f() '''
+        return np.array([x[2], x[3], 0, -GRAVITY, x[2], x[3]])
+
+    def liftoff_event(t, x, RESTING_LENGTH_SQ=RESTING_LENGTH**2):
+        ''' Event function for maximum spring extension (transition to flight)
+        '''
+        return ((x[0]-x[4])**2 + (x[1]-x[5])**2) - RESTING_LENGTH_SQ
+    liftoff_event.terminal = True
+    liftoff_event.direction = 1
+
+    def stance_dynamics(t, x):
+        # energy = computeTotalEnergy(x,p)
+        # print(energy)
+        alpha = np.arctan2(x[1]-x[5], x[0]-x[4]) - HALF_PI
+        leg_length = np.sqrt((x[0] - x[4]) ** 2 + (x[1] - x[5]) ** 2)
+        xdotdot = -SPECIFIC_STIFFNESS * (RESTING_LENGTH - leg_length) \
+                * np.sin(alpha)
+        ydotdot = SPECIFIC_STIFFNESS * (RESTING_LENGTH - leg_length) \
+                * np.cos(alpha) - GRAVITY
+        return np.array([x[2], x[3], xdotdot, ydotdot, 0, 0])
+
+    def touchdown_event(t, x):
+        ''' Event function for foot touchdown (transition to stance)
+        '''
+        # x[1]- np.cos(p["aoa"])*p["resting_length"] (which is = x[5])
+        return x[5]
+    touchdown_event.terminal = True
+
+    APEX_EVENTS = (fall_event, apex_event)
+    FLIGHT_EVENTS = (fall_event, touchdown_event)
+    STANCE_EVENTS = (fall_event, liftoff_event)
+
+
+    t0 = 0
+    ''' Starting time '''
+    x0 = x
+    ''' Starting state '''
+
+    # FLIGHT: simulate till touchdown
+    sol = integrate.solve_ivp(
+            events=FLIGHT_EVENTS,
+            fun=flight_dynamics,
+            max_step=0.01,
+            t_span=[t0, t0 + MAX_TIME],
+            y0=x0,
+    )
+
+    # STANCE: simulate till liftoff
+    x0 = sol.y[:, -1]
+    sol2 = integrate.solve_ivp(
+            events=STANCE_EVENTS,
+            fun=stance_dynamics,
+            max_step=0.0001,
+            t_span=[sol.t[-1], sol.t[-1] + MAX_TIME],
+            y0=x0,
+    )
+
+    # FLIGHT: simulate till apex
+    x0 = resetLeg(sol2.y[:, -1], p)
+    sol3 = integrate.solve_ivp(
+            events=APEX_EVENTS,
+            fun=flight_dynamics,
+            max_step=0.01,
+            t_span=[sol2.t[-1], sol2.t[-1] + MAX_TIME],
+            y0=x0,
+    )
+
+    # concatenate all solutions
+    sol.t = np.concatenate((sol.t, sol2.t, sol3.t))
+    sol.y = np.concatenate((sol.y, sol2.y, sol3.y), axis=1)
+    sol.t_events += sol2.t_events + sol3.t_events
+    sol.failed = any(sol.t_events[i].size != 0 for i in (0, 2, 4))
+    return sol
+
+def step_const_lookup(x, p):
+    AOA = p['aoa']
+    GRAVITY = p['gravity']
+    MASS = p['mass']
+    RESTING_LENGTH = p['resting_length']
+    STIFFNESS = p['stiffness']
+    TOTAL_ENERGY = p['total_energy']
+
+    SPECIFIC_STIFFNESS = STIFFNESS / MASS  # FIXME: Is this name right?
+
+    # Note: not taken from p[]
+    HALF_PI = np.pi / 2.0
+    MAX_TIME = 5
+
+    # Function definitions: specific to the constants provided in `p`
+
+    def apex_event(t, x):
+        ''' Event function to reach apex '''
+        return x[3]
+    apex_event.terminal = True
+
+    def fall_event(t, x):
+        ''' Event function to detect the body hitting the floor (failure)
+        '''
+        return x[1]
+    fall_event.terminal = True
+
+    def flight_dynamics(t, x, array=np.array):
+        ''' code in flight dynamics, xdot_ = f() '''
+        return array([x[2], x[3], 0, -GRAVITY, x[2], x[3]])
+
+    def liftoff_event(t, x, RESTING_LENGTH_SQ=RESTING_LENGTH**2):
+        ''' Event function for maximum spring extension (transition to flight)
+        '''
+        return ((x[0]-x[4])**2 + (x[1]-x[5])**2) - RESTING_LENGTH_SQ
+    liftoff_event.terminal = True
+    liftoff_event.direction = 1
+
+    def stance_dynamics(t, x, atan2=np.arctan2, sqrt=np.sqrt, sin=np.sin,
+            cos=np.cos, array=np.array):
+        # energy = computeTotalEnergy(x,p)
+        # print(energy)
+        alpha = atan2(x[1]-x[5], x[0]-x[4]) - HALF_PI
+        leg_length = sqrt((x[0] - x[4]) ** 2 + (x[1] - x[5]) ** 2)
+        xdotdot = -SPECIFIC_STIFFNESS * (RESTING_LENGTH - leg_length) \
+                * sin(alpha)
+        ydotdot = SPECIFIC_STIFFNESS * (RESTING_LENGTH - leg_length) \
+                * cos(alpha) - GRAVITY
+        return array([x[2], x[3], xdotdot, ydotdot, 0, 0])
+
+    def touchdown_event(t, x):
+        ''' Event function for foot touchdown (transition to stance)
+        '''
+        # x[1]- np.cos(p["aoa"])*p["resting_length"] (which is = x[5])
+        return x[5]
+    touchdown_event.terminal = True
+
+    APEX_EVENTS = (fall_event, apex_event)
+    FLIGHT_EVENTS = (fall_event, touchdown_event)
+    STANCE_EVENTS = (fall_event, liftoff_event)
+
+
+    t0 = 0
+    ''' Starting time '''
+    x0 = x
+    ''' Starting state '''
+
+    solve_ivp = integrate.solve_ivp
+    ''' Cache lookup '''
+
+    # FLIGHT: simulate till touchdown
+    sol = solve_ivp(
+            events=FLIGHT_EVENTS,
+            fun=flight_dynamics,
+            max_step=0.01,
+            t_span=[t0, t0 + MAX_TIME],
+            y0=x0,
+    )
+
+    # STANCE: simulate till liftoff
+    x0 = sol.y[:, -1]
+    sol2 = solve_ivp(
+            events=STANCE_EVENTS,
+            fun=stance_dynamics,
+            max_step=0.0001,
+            t_span=[sol.t[-1], sol.t[-1] + MAX_TIME],
+            y0=x0,
+    )
+
+    # FLIGHT: simulate till apex
+    x0 = resetLeg(sol2.y[:, -1], p)
+    sol3 = solve_ivp(
+            events=APEX_EVENTS,
+            fun=flight_dynamics,
+            max_step=0.01,
+            t_span=[sol2.t[-1], sol2.t[-1] + MAX_TIME],
+            y0=x0,
+    )
+
+    # concatenate all solutions
+    concat = np.concatenate
+    sol.t = concat((sol.t, sol2.t, sol3.t))
+    sol.y = concat((sol.y, sol2.y, sol3.y), axis=1)
+    sol.t_events += sol2.t_events + sol3.t_events
+    ste = sol.t_events
+    sol.failed = any(ste[i].size != 0 for i in (0, 2, 4))
+    return sol
+
+def step_const_lookup_cse(x, p):
+    AOA = p['aoa']
+    GRAVITY = p['gravity']
+    MASS = p['mass']
+    RESTING_LENGTH = p['resting_length']
+    STIFFNESS = p['stiffness']
+    TOTAL_ENERGY = p['total_energy']
+
+    SPECIFIC_STIFFNESS = STIFFNESS / MASS  # FIXME: Is this name right?
+
+    # Note: not taken from p[]
+    HALF_PI = np.pi / 2.0
+    MAX_TIME = 5
+
+    # Function definitions: specific to the constants provided in `p`
+
+    def apex_event(t, x):
+        ''' Event function to reach apex '''
+        return x[3]
+    apex_event.terminal = True
+
+    def fall_event(t, x):
+        ''' Event function to detect the body hitting the floor (failure)
+        '''
+        return x[1]
+    fall_event.terminal = True
+
+    def flight_dynamics(t, x, array=np.array):
+        ''' code in flight dynamics, xdot_ = f() '''
+        return array([x[2], x[3], 0, -GRAVITY, x[2], x[3]])
+
+    def liftoff_event(t, x, RESTING_LENGTH_SQ=RESTING_LENGTH**2):
+        ''' Event function for maximum spring extension (transition to flight)
+        '''
+        return ((x[0]-x[4])**2 + (x[1]-x[5])**2) - RESTING_LENGTH_SQ
+    liftoff_event.terminal = True
+    liftoff_event.direction = 1
+
+    def stance_dynamics(t, x, atan2=np.arctan2, hypot=math.hypot, sqrt=np.sqrt,
+            cos=np.cos, sin=np.sin, array=np.array):
+        # energy = computeTotalEnergy(x,p)
+        # print(energy)
+        alpha = atan2(x[1] - x[5], x[0] - x[4]) - HALF_PI
+        #leg_length = sqrt((x[0] - x[4]) ** 2 + (x[1] - x[5]) ** 2)
+        stiff_x_leg = SPECIFIC_STIFFNESS * (RESTING_LENGTH -
+                                            hypot(x[0] - x[4], x[1] - x[5]))
+        xdotdot = -stiff_x_leg * sin(alpha)
+        ydotdot = stiff_x_leg * cos(alpha) - GRAVITY
+        return array([x[2], x[3], xdotdot, ydotdot, 0, 0])
+
+    def touchdown_event(t, x):
+        ''' Event function for foot touchdown (transition to stance)
+        '''
+        # x[1]- np.cos(p["aoa"])*p["resting_length"] (which is = x[5])
+        return x[5]
+    touchdown_event.terminal = True
+
+    t0 = 0
+    ''' Starting time '''
+    x0 = x
+    ''' Starting state '''
+
+    solve_ivp = integrate.solve_ivp
+    ''' Cache lookup '''
+
+    # FLIGHT: simulate till touchdown
+    sol = solve_ivp(
+            events=(fall_event, touchdown_event),
+            fun=flight_dynamics,
+            max_step=0.01,
+            t_span=[t0, t0 + MAX_TIME],
+            y0=x0,
+    )
+
+    # STANCE: simulate till liftoff
+    x0 = sol.y[:, -1]
+    last_t = sol.t[-1]
+    sol2 = solve_ivp(
+            events=(fall_event, liftoff_event),
+            fun=stance_dynamics,
+            max_step=0.0001,
+            t_span=[last_t, last_t + MAX_TIME],
+            y0=x0,
+    )
+
+    # FLIGHT: simulate till apex
+    x0 = resetLeg(sol2.y[:, -1], p)
+    last_t = sol2.t[-1]
+    sol3 = solve_ivp(
+            events=(fall_event, apex_event),
+            fun=flight_dynamics,
+            max_step=0.01,
+            t_span=[last_t, last_t + MAX_TIME],
+            y0=x0,
+    )
+
+    # concatenate all solutions
+    concat = np.concatenate
+    sol.t = concat((sol.t, sol2.t, sol3.t))
+    sol.y = concat((sol.y, sol2.y, sol3.y), axis=1)
+    sol.t_events += sol2.t_events + sol3.t_events
+    ste = sol.t_events
+    sol.failed = any(ste[i].size != 0 for i in (0, 2, 4))
+    return sol
+
+def step_const_lookup_cse2(x, p):
+    AOA = p['aoa']
+    GRAVITY = p['gravity']
+    MASS = p['mass']
+    RESTING_LENGTH = p['resting_length']
+    STIFFNESS = p['stiffness']
+    TOTAL_ENERGY = p['total_energy']
+
+    SPECIFIC_STIFFNESS = STIFFNESS / MASS  # FIXME: Is this name right?
+
+    # Note: not taken from p[]
+    HALF_PI = np.pi / 2.0
+    MAX_TIME = 5
+
+    # Function definitions: specific to the constants provided in `p`
+
+    def apex_event(t, x):
+        ''' Event function to reach apex '''
+        return x[3]
+    apex_event.terminal = True
+
+    def fall_event(t, x):
+        ''' Event function to detect the body hitting the floor (failure)
+        '''
+        return x[1]
+    fall_event.terminal = True
+
+    def flight_dynamics(t, x, array=np.array):
+        ''' code in flight dynamics, xdot_ = f() '''
+        return array([x[2], x[3], 0, -GRAVITY, x[2], x[3]])
+
+    def liftoff_event(t, x, hypot=math.hypot):
+        ''' Event function for maximum spring extension (transition to flight)
+        '''
+        return hypot(x[0] - x[4], x[1] - x[5]) - RESTING_LENGTH
+    liftoff_event.terminal = True
+    liftoff_event.direction = 1
+
+    def stance_dynamics(t, x, atan2=np.arctan2, hypot=math.hypot, sqrt=np.sqrt,
+            cos=np.cos, sin=np.sin, array=np.array):
+        # energy = computeTotalEnergy(x,p)
+        # print(energy)
+        x15 = x[1] - x[5]
+        x04 = x[0] - x[4]
+        alpha = atan2(x15, x04) - HALF_PI
+        stiff_x_leg = SPECIFIC_STIFFNESS * (RESTING_LENGTH - hypot(x15, x04))
+        xdotdot = -stiff_x_leg * sin(alpha)
+        ydotdot = stiff_x_leg * cos(alpha) - GRAVITY
+        return array([x[2], x[3], xdotdot, ydotdot, 0, 0])
+
+    def touchdown_event(t, x):
+        ''' Event function for foot touchdown (transition to stance)
+        '''
+        # x[1]- np.cos(p["aoa"])*p["resting_length"] (which is = x[5])
+        return x[5]
+    touchdown_event.terminal = True
+
+    t0 = 0
+    ''' Starting time '''
+    x0 = x
+    ''' Starting state '''
+
+    solve_ivp = integrate.solve_ivp
+    ''' Cache lookup '''
+
+    # FLIGHT: simulate till touchdown
+    sol = solve_ivp(
+            events=(fall_event, touchdown_event),
+            fun=flight_dynamics,
+            max_step=0.01,
+            t_span=[t0, t0 + MAX_TIME],
+            y0=x0,
+    )
+
+    # STANCE: simulate till liftoff
+    x0 = sol.y[:, -1]
+    last_t = sol.t[-1]
+    sol2 = solve_ivp(
+            events=(fall_event, liftoff_event),
+            fun=stance_dynamics,
+            max_step=0.0001,
+            t_span=[last_t, last_t + MAX_TIME],
+            y0=x0,
+    )
+
+    # FLIGHT: simulate till apex
+    x0 = resetLeg(sol2.y[:, -1], p)
+    last_t = sol2.t[-1]
+    sol3 = solve_ivp(
+            events=(fall_event, apex_event),
+            fun=flight_dynamics,
+            max_step=0.01,
+            t_span=[last_t, last_t + MAX_TIME],
+            y0=x0,
+    )
+
+    # concatenate all solutions
+    concat = np.concatenate
+    sol.t = concat((sol.t, sol2.t, sol3.t))
+    sol.y = concat((sol.y, sol2.y, sol3.y), axis=1)
+    sol.t_events += sol2.t_events + sol3.t_events
+    ste = sol.t_events
+    sol.failed = any(ste[i].size != 0 for i in (0, 2, 4))
+    return sol
+
+# NB: I pasted the code in two parts, and this is the seam.
+
+def step_const_lookup_cse2_ary(x, p):
+    AOA = p['aoa']
+    GRAVITY = p['gravity']
+    MASS = p['mass']
+    RESTING_LENGTH = p['resting_length']
+    STIFFNESS = p['stiffness']
+    TOTAL_ENERGY = p['total_energy']
+
+    SPECIFIC_STIFFNESS = STIFFNESS / MASS  # FIXME: Is this name right?
+
+    # Note: not taken from p[]
+    HALF_PI = np.pi / 2.0
+    MAX_TIME = 5
+
+    _arrays = [np.array([0]*6) for _ in range(4)]
+    _arrays.append(0)
+
+    # Function definitions: specific to the constants provided in `p`
+
+    def apex_event(t, x):
+        ''' Event function to reach apex '''
+        return x[3]
+    apex_event.terminal = True
+
+    def fall_event(t, x):
+        ''' Event function to detect the body hitting the floor (failure)
+        '''
+        return x[1]
+    fall_event.terminal = True
+
+    def flight_dynamics(t, x, arrays=_arrays):
+        ''' code in flight dynamics, xdot_ = f() '''
+        i = arrays[-1]
+        arrays[-1] += 1
+        a = arrays[i &amp; 3]
+        a[4] = a[0] = x[2]
+        a[5] = a[1] = x[3]
+        a[2] = 0
+        a[3] = -GRAVITY
+        return a
+
+    def liftoff_event(t, x, hypot=math.hypot):
+        ''' Event function for maximum spring extension (transition to flight)
+        '''
+        return hypot(x[0] - x[4], x[1] - x[5]) - RESTING_LENGTH
+    liftoff_event.terminal = True
+    liftoff_event.direction = 1
+
+    def stance_dynamics(t, x, atan2=np.arctan2, hypot=math.hypot, sqrt=np.sqrt,
+            cos=np.cos, sin=np.sin, arrays=_arrays):
+        # energy = computeTotalEnergy(x,p)
+        # print(energy)
+        x15 = x[1] - x[5]
+        x04 = x[0] - x[4]
+        alpha = atan2(x15, x04) - HALF_PI
+        stiff_x_leg = SPECIFIC_STIFFNESS * (RESTING_LENGTH - hypot(x15, x04))
+        xdotdot = -stiff_x_leg * sin(alpha)
+        ydotdot = stiff_x_leg * cos(alpha) - GRAVITY
+        i = arrays[-1]
+        arrays[-1] += 1
+        a = arrays[i &amp; 3]
+        a[0] = x[2]
+        a[1] = x[3]
+        a[2] = xdotdot
+        a[3] = ydotdot
+        a[4] = a[5] = 0
+        return a
+
+    def touchdown_event(t, x):
+        ''' Event function for foot touchdown (transition to stance)
+        '''
+        # x[1]- np.cos(p["aoa"])*p["resting_length"] (which is = x[5])
+        return x[5]
+    touchdown_event.terminal = True
+
+    t0 = 0
+    ''' Starting time '''
+    x0 = x
+    ''' Starting state '''
+
+    solve_ivp = integrate.solve_ivp
+    ''' Cache lookup '''
+
+    # FLIGHT: simulate till touchdown
+    sol = solve_ivp(
+            events=(fall_event, touchdown_event),
+            fun=flight_dynamics,
+            max_step=0.01,
+            t_span=[t0, t0 + MAX_TIME],
+            y0=x0,
+    )
+
+    # STANCE: simulate till liftoff
+    x0 = sol.y[:, -1]
+    last_t = sol.t[-1]
+    sol2 = solve_ivp(
+            events=(fall_event, liftoff_event),
+            fun=stance_dynamics,
+            max_step=0.0001,
+            t_span=[last_t, last_t + MAX_TIME],
+            y0=x0,
+    )
+
+    # FLIGHT: simulate till apex
+    x0 = resetLeg(sol2.y[:, -1], p)
+    last_t = sol2.t[-1]
+    sol3 = solve_ivp(
+            events=(fall_event, apex_event),
+            fun=flight_dynamics,
+            max_step=0.01,
+            t_span=[last_t, last_t + MAX_TIME],
+            y0=x0,
+    )
+
+    # concatenate all solutions
+    concat = np.concatenate
+    sol.t = concat((sol.t, sol2.t, sol3.t))
+    sol.y = concat((sol.y, sol2.y, sol3.y), axis=1)
+    sol.t_events += sol2.t_events + sol3.t_events
+    ste = sol.t_events
+    sol.failed = any(ste[i].size != 0 for i in (0, 2, 4))
+    return sol
+
+def step_const_lookup_cse2_ary2(x, p):
+    AOA = p['aoa']
+    GRAVITY = p['gravity']
+    MASS = p['mass']
+    RESTING_LENGTH = p['resting_length']
+    STIFFNESS = p['stiffness']
+    TOTAL_ENERGY = p['total_energy']
+
+    SPECIFIC_STIFFNESS = STIFFNESS / MASS  # FIXME: Is this name right?
+
+    # Note: not taken from p[]
+    HALF_PI = np.pi / 2.0
+    MAX_TIME = 5
+
+    # Function definitions: specific to the constants provided in `p`
+
+    def apex_event(t, x):
+        ''' Event function to reach apex '''
+        return x[3]
+    apex_event.terminal = True
+
+    def fall_event(t, x):
+        ''' Event function to detect the body hitting the floor (failure)
+        '''
+        return x[1]
+    fall_event.terminal = True
+
+    def flight_dynamics(t, x, a=np.zeros(6)):
+        ''' code in flight dynamics, xdot_ = f() '''
+        a[4] = a[0] = x[2]
+        a[5] = a[1] = x[3]
+        a[2] = 0
+        a[3] = -GRAVITY
+        return a
+
+    def liftoff_event(t, x, hypot=math.hypot):
+        ''' Event function for maximum spring extension (transition to flight)
+        '''
+        return hypot(x[0] - x[4], x[1] - x[5]) - RESTING_LENGTH
+    liftoff_event.terminal = True
+    liftoff_event.direction = 1
+
+    def stance_dynamics(t, x, atan2=np.arctan2, hypot=math.hypot, sqrt=np.sqrt,
+            cos=np.cos, sin=np.sin, a=np.zeros(6)):
+        # energy = computeTotalEnergy(x,p)
+        # print(energy)
+        x15 = x[1] - x[5]
+        x04 = x[0] - x[4]
+        alpha = atan2(x15, x04) - HALF_PI
+        stiff_x_leg = SPECIFIC_STIFFNESS * (RESTING_LENGTH - hypot(x15, x04))
+        xdotdot = -stiff_x_leg * sin(alpha)
+        ydotdot = stiff_x_leg * cos(alpha) - GRAVITY
+        a[0] = x[2]
+        a[1] = x[3]
+        a[2] = xdotdot
+        a[3] = ydotdot
+        a[4] = a[5] = 0
+        return a
+
+    def touchdown_event(t, x):
+        ''' Event function for foot touchdown (transition to stance)
+        '''
+        # x[1]- np.cos(p["aoa"])*p["resting_length"] (which is = x[5])
+        return x[5]
+    touchdown_event.terminal = True
+
+    t0 = 0
+    ''' Starting time '''
+    x0 = x
+    ''' Starting state '''
+
+    solve_ivp = integrate.solve_ivp
+    ''' Cache lookup '''
+
+    # FLIGHT: simulate till touchdown
+    sol = solve_ivp(
+            events=(fall_event, touchdown_event),
+            fun=flight_dynamics,
+            max_step=0.01,
+            t_span=[t0, t0 + MAX_TIME],
+            y0=x0,
+    )
+
+    # STANCE: simulate till liftoff
+    x0 = sol.y[:, -1]
+    last_t = sol.t[-1]
+    sol2 = solve_ivp(
+            events=(fall_event, liftoff_event),
+            fun=stance_dynamics,
+            max_step=0.0001,
+            t_span=[last_t, last_t + MAX_TIME],
+            y0=x0,
+    )
+
+    # FLIGHT: simulate till apex
+    x0 = resetLeg(sol2.y[:, -1], p)
+    last_t = sol2.t[-1]
+    sol3 = solve_ivp(
+            events=(fall_event, apex_event),
+            fun=flight_dynamics,
+            max_step=0.01,
+            t_span=[last_t, last_t + MAX_TIME],
+            y0=x0,
+    )
+
+    # concatenate all solutions
+    concat = np.concatenate
+    sol.t = concat((sol.t, sol2.t, sol3.t))
+    sol.y = concat((sol.y, sol2.y, sol3.y), axis=1)
+    sol.t_events += sol2.t_events + sol3.t_events
+    ste = sol.t_events
+    sol.failed = any(ste[i].size != 0 for i in (0, 2, 4))
+    return sol
+
+def step(x,p):
+    '''
+    Take one step from apex to apex/failure.
+    returns a sol object from integrate.solve_ivp, with all phases
+    '''
+
+    # TODO: properly update sol object with all info, not just the trajectories
+
+    # take one step (apex to apex)
+    # the "step" function in MATLAB
+    # x is the state vector, a list or np.array
+    # p is a dict with all the parameters
+
+    # set integration options
+
+    x0 = x
+    max_time = 5
+    t0 = 0 # starting time
+
+    # FLIGHT: simulate till touchdown
+    events = [lambda t,x: fallEvent(t,x,p), lambda t,x: touchdownEvent(t,x,p)]
+    for ev in events:
+        ev.terminal = True
+    sol = integrate.solve_ivp(fun=lambda t, x: flightDynamics(t, x, p),
+    t_span = [t0, t0+max_time], y0 = x0, events=events, max_step=0.01)
+
+    # STANCE: simulate till liftoff
+    events = [lambda t,x: fallEvent(t,x,p), lambda t,x: liftoffEvent(t,x,p)]
+    for ev in events:
+        ev.terminal = True
+    events[1].direction = 1 # only trigger when spring expands
+    x0 = sol.y[:,-1]
+    sol2 = integrate.solve_ivp(fun=lambda t, x: stanceDynamics(t, x, p),
+    t_span = [sol.t[-1], sol.t[-1]+max_time], y0 = x0,
+    events=events, max_step=0.0001)
+
+    # FLIGHT: simulate till apex
+    events = [lambda t,x: fallEvent(t,x,p), lambda t,x: apexEvent(t,x,p)]
+    for ev in events:
+        ev.terminal = True
+
+    x0 = resetLeg(sol2.y[:,-1], p)
+    sol3 = integrate.solve_ivp(fun=lambda t, x: flightDynamics(t, x, p),
+    t_span = [sol2.t[-1], sol2.t[-1]+max_time], y0 = x0,
+    events=events, max_step=0.01)
+
+    # concatenate all solutions
+    sol.t = np.concatenate((sol.t,sol2.t,sol3.t))
+    sol.y = np.concatenate((sol.y,sol2.y,sol3.y),axis=1)
+    sol.t_events += sol2.t_events + sol3.t_events
+
+    # TODO: mark different phases
+    for fail_idx in (0,2,4):
+        if sol.t_events[fail_idx].size != 0: # if empty
+            sol.failed = True
+            break
+    else:
+        sol.failed = False
+        # TODO: clean up the list
+
+    return sol
+
+def resetLeg(x,p):
+    x[4] = x[0]+np.sin(p['aoa'])*p['resting_length']
+    x[5] = x[1]-np.cos(p['aoa'])*p['resting_length']
+    return x
+
+def stanceDynamics(t, x,p):
+    # stance dynamics
+    # energy = computeTotalEnergy(x,p)
+    # print(energy)
+    alpha = np.arctan2(x[1]-x[5] , x[0]-x[4]) - np.pi/2.0
+    leg_length = np.sqrt( (x[0]-x[4])**2 + (x[1]-x[5])**2 )
+    xdotdot = -p["stiffness"]/p["mass"]*(p["resting_length"] -
+                leg_length)*np.sin(alpha)
+    ydotdot =  p["stiffness"]/p["mass"]*(p["resting_length"] -
+                leg_length)*np.cos(alpha) - p["gravity"]
+    return np.array([x[2], x[3], xdotdot, ydotdot, 0, 0])
+
+def fallEvent(t,x,p):
+    '''
+    Event function to detect the body hitting the floor (failure)
+    '''
+    return x[1]
+fallEvent.terminal = True
+# TODO: direction
+
+def touchdownEvent(t,x,p):
+    '''
+    Event function for foot touchdown (transition to stance)
+    '''
+        # x[1]- np.cos(p["aoa"])*p["resting_length"] (which is = x[5])
+    return x[5]
+touchdownEvent.terminal = True # no longer actually necessary...
+# direction
+
+def liftoffEvent(t,x,p):
+    '''
+    Event function to reach maximum spring extension (transition to flight)
+    '''
+    return ((x[0]-x[4])**2 + (x[1]-x[5])**2) - p["resting_length"]**2
+liftoffEvent.terminal = True
+liftoffEvent.direction = 1
+
+def apexEvent(t,x,p):
+    '''
+    Event function to reach apex
+    '''
+    return x[3]
+apexEvent.terminal = True
+
+def computeTotalEnergy(x,p):
+    # TODO: make this accept a trajectory, and output parts as well
+    return (p["mass"]/2*(x[2]**2+x[3]**2) +
+    p["gravity"]*p["mass"]*(x[1]) +
+    p["stiffness"]/2*
+    (p["resting_length"]-np.sqrt((x[0]-x[4])**2 + (x[1]-x[5])**2))**2)
+
+def flightDynamics(t, x, p):
+    ''' code in flight dynamics, xdot_ = f() '''
+    return np.array([x[2], x[3], 0, -p["gravity"], x[2], x[3]])
+
+### Functions for Viability
+def map2e(x, p):
+    '''
+    map an apex state to its dimensionless normalized height
+    TODO: make this accept trajectories
+    '''
+    assert(np.isclose(x[3],0))
+    potential_energy = p['mass']*p['gravity']*x[1]
+    kinetic_energy = p['mass']/2*x[3]**2
+    return potential_energy/(potential_energy+kinetic_energy)
+
+def map2x(x,p,e):
+    '''
+    map a desired dimensionless height `e` to it's state-vector
+    '''
+    if 'total_energy' not in p:
+        print('WARNING: you did not initialize your parameters with '
+        'total energy. You really should do this...')
+
+    assert(np.isclose(x[3],0)) # check that we are at apex
+
+    x_new = x
+    x_new[1] = p['total_energy']*e/p['mass']/p['gravity']
+    x_new[2] = np.sqrt(p['total_energy']*(1-e)/p['mass']*2)
+    x_new[3] = 0.0 # shouldn't be necessary, but avoids errors accumulating
+    return x_new
+
+def mapSA2xp_height_angle(state_action,x,p):
+    '''
+    Specifically map state_actions to x and p
+    '''
+    p['aoa'] = state_action[1]
+    x = map2x(x,p,state_action[0])
+    return x,p
+</code></pre>
+    </div>

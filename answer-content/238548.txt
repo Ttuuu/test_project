@@ -1,0 +1,102 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>MallocAllocator(const MallocAllocator&amp;) noexcept = default;
+//...
+~MallocAllocator() noexcept = default;
+</code></pre>
+
+<p>These two will be defined implicitly anyway. I suggest following the rule-of-zero and not declaring them at all. It will not make a difference here, but as general rule this is relevant, because e.g. the declared destructor inhibits declaration of the implicit move operations.</p>
+
+<hr>
+
+<p>The <em>Allocator</em> requirements require that <code>MallocAllocator&lt;T&gt;</code> and <code>MallocAllocator&lt;U&gt;</code> be comparable with <code>==</code> and <code>!=</code> and that the comparison indicates whether the two instances can be used to deallocate the other's allocations. So you should add:</p>
+
+<pre><code>template&lt;class T, class U&gt;
+bool operator==(MallocAllocator&lt;T&gt; const&amp;, MallocAllocator&lt;U&gt; const&amp;) noexcept
+{
+    return true;
+}
+
+template&lt;class T, class U&gt;
+bool operator!=(MallocAllocator&lt;T&gt; const&amp;, MallocAllocator&lt;U&gt; const&amp;) noexcept
+{
+    return false;
+}
+</code></pre>
+
+<p>(or similar)</p>
+
+<hr>
+
+<p>You probably should add</p>
+
+<pre><code>using propagate_on_container_move_assignment = std::true_type;
+</code></pre>
+
+<p>to <code>MallocAllocator</code>. Otherwise containers cannot generally statically assert that moving a container with this allocator does not require reallocation.</p>
+
+<hr>
+
+<pre><code>static constexpr AllocationType
+otherAllocType(AllocationType const at) noexcept
+{
+  switch (at) {
+    case AllocationType::Object:
+      return AllocationType::Array;
+    case AllocationType::Array:
+      return AllocationType::Object;
+  }
+}
+</code></pre>
+
+<p>This function is ill-formed in C++11, because control flow statements like <code>switch</code> were not allowed in <code>constexpr</code> functions. You would need to rewrite it as single return statement using the conditional operator.</p>
+
+<hr>
+
+<pre><code>std::decay_t&lt;decltype(get_mem_map&lt;at&gt;())&gt; map;
+</code></pre>
+
+<p>This is also ill-formed in C++11, because the <code>_t</code> helpers for type traits were only introduced in C++14. So use</p>
+
+<pre><code>typename std::decay&lt;decltype(get_mem_map&lt;at&gt;())&gt;::type map;
+</code></pre>
+
+<p>instead. In either case this looks very awkward to me and I would probably rather alias the type and type it twice, or if you decide to drop the C++11 support in favor of C++14, you might want to consider making the return type <code>auto&amp;</code> and spelling out the type for <code>map</code> instead.</p>
+
+<hr>
+
+<pre><code>      if (!map.empty()) { // If map isn't empty, we've leaked memory.
+</code></pre>
+
+<p>The test is redundant. I don't think it really improves readability either.</p>
+
+<hr>
+
+<pre><code>MallocStackTrace{ 3, 100 }
+</code></pre>
+
+<p>These are magic constants that should be defined as named variables instead. Probably it would also be a good idea to wrap this construction into a function that doesn't take any parameters or has defaulted parameters, given that it is used twice.</p>
+
+<hr>
+
+<p>Your approach using a local <code>static</code> to construct and destruct the allocation map is not always safe when other static storage duration objects are used. Consider for example the test program:</p>
+
+<pre><code>std::vector x;
+
+int main() {
+    x.push_back(1);
+}
+</code></pre>
+
+<p>The initialization of <code>x</code> will (dependent on the implementation) probably not call <code>operator new</code>, because no allocation is needed yet.
+Then <code>push_back</code> requires allocation and calls <code>operator new</code> for the first time, constructing the corresponding <code>static Mem mem;</code>.</p>
+
+<p>Now <code>x</code>'s construction has completed before <code>mem</code>'s and so <code>mem</code> will be destroyed before <code>x</code> will. This causes the allocation done by <code>x</code> to be reported as memory leak and it also causes undefined behavior when the destructor of <code>x</code> is called, because it will access <code>mem</code> when its lifetime has already ended.</p>
+
+<p>I am not sure whether there is any way to completely avoid this though.</p>
+
+<p>The best I can think of is to mimic <code>#include&lt;iostream&gt;</code>'s behavior and require that all translation units include a header file at the beginning which contains dummy global static objects that call <code>get_mem_map</code> for both allocation types in their initializer, but even then there may be static storage duration objects with unordered dynamic initialization, e.g. in class template specializations, which may execute before those.</p>
+
+<hr>
+
+<p>For thread-safety, assuming performance isn't really important, I would suggest simply to use a single global mutex and to scope-lock it in both <code>delete_base</code> and <code>new_base</code>.</p>
+    </div>

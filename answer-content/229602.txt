@@ -1,0 +1,113 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>FYI, in IEEE754 <code>sqrt</code> is a "basic" operation that's <strong>required to be correctly-rounded</strong> (rounding error &lt;= 0.5ulp), same as + - * /.  Hardware FPUs (I think) always provide sqrt if they provide the other operations, especially division which is <a href="https://stackoverflow.com/questions/54642663/how-sqrt-of-gcc-works-after-compiled-which-method-of-root-is-used-newton-rap">typically implemented similarly (and with similar performance)</a>.</p>
+
+<p>NR iterations each involving a division are <em>not</em> going to be faster than HW sqrt.  I think that's part of why x86's approximation instructions are for reciprocal and rsqrt, not sqrt: the Newton iteration formula for <code>1/sqrt(x)</code> doesn't involve division, so on old CPUs with very slow sqrtps  compared to mulps, it was worth using <code>sqrt(x) ~= x * approx_rsqrt(x)</code>, <a href="https://stackoverflow.com/questions/31555260/fast-vectorized-rsqrt-and-reciprocal-with-sse-avx-depending-on-precision">optionally with a Newton iteration on the approx_rsqrt result</a>.  Maybe sometimes still worth doing that in a loop that does nothing else, but normally you should aim for more computational intensity (do more with your data while it's hot in registers; don't write loops that just load/sqrt/store).</p>
+
+<p>IDK if it's possible for your code to converge on a value that's not the correctly-rounded result, but something you should test for by checking against the implementation's <code>sqrt</code> function.</p>
+
+<p>(Call your function something else.  With GCC for example, <code>sqrt</code> is a special name unless you use <code>-fno-builtin-sqrt</code>.  Callers will inline the sqrt instruction on targets that have one, like x86 <code>sqrtsd</code>, only calling the libc function for inputs that need to set errno.  Or never if you compile with <code>-fno-math-errno</code>, always a good idea.  Math-errno is an optional feature that not all libcs support, although GNU C does.  It's a pretty bad obsolete design that <a href="https://stackoverflow.com/questions/57673825/how-to-force-gcc-to-assume-that-a-floating-point-expression-is-non-negative/57674631#57674631">nobody should use</a>; that's why we have <code>fenv.h</code> to check per-thread sticky FP exception flags.)</p>
+
+<hr>
+
+<h3>Wrong initial guess for inputs &lt; 1.0</h3>
+
+<blockquote>
+<pre><code> /* Divide the exponent by 2 */
+ r.o.e -= EXPONENT_BIAS;
+ r.o.e = (r.o.e &amp; 1) | (r.o.e &gt;&gt; 1);
+ r.o.e += EXPONENT_BIAS;
+</code></pre>
+</blockquote>
+
+<p>Your exponent bitfield type is <code>unsigned short</code><sup>1</sup> so this is a logical right shift.</p>
+
+<p>But anyway, <strong>logical right shift is a bug in your initial approximation.</strong></p>
+
+<p>The exponent field is a 2's complement integer (encoded with a bias, but that's just an encoding/decoding detail you already take care of).  A logical right shift of a small exponent (like for <code>0.0001</code>) will result in a large <em>positive</em> exponent from shifting in a zero.  Your initial guess for <code>0.0001</code> will be something close-ish to <code>DBL_MAX</code>, way above <code>1.0</code>.</p>
+
+<p><strong>You need an arithmetic right shift of the exponent</strong> to bring it closer to the middle exponent value (unbiased) <code>0</code> or (biased) <code>127</code>.  Thus bringing the magnitude of the represented value closer to <code>1.0</code>.</p>
+
+<p><em>Most</em> C implementations make the sane choice that <code>&gt;&gt;</code> of a signed integer type is an arithmetic right shift.  ISO C requires that implementations define which it is, but unfortunately leaves them the choice of logical or arithmetic.  (Unlike signed left shift, it can't be UB).</p>
+
+<p>But fortunately your code is written in GNU C (not ISO C), e.g. using <code>__attribute__((packed))</code> on a struct.  <strong><a href="https://gcc.gnu.org/onlinedocs/gcc//Integers-implementation.html" rel="nofollow noreferrer">GNU C guarantees that <code>&gt;&gt;</code> on signed integers is arithmetic</a></strong>.  (And that signed integer types are 2's complement!)  So the only implementations that can compile your code are ones where <code>&gt;&gt;</code> on an <code>int</code> does what you want.</p>
+
+<blockquote>
+  <p><a href="https://gcc.gnu.org/onlinedocs/gcc//Integers-implementation.html" rel="nofollow noreferrer">(GCC manual, integer implementation-defined behaviour)</a>:<br>
+  Signed ‘&gt;&gt;’ acts on negative numbers by sign extension.</p>
+</blockquote>
+
+<p>You might want to use unsigned bitfield members and unsigned arithmetic for bias/unbias.  But you can safely use <code>int32_t</code> (which is guaranteed to be a 2's complement integer type), or just <code>int</code> for the temporary holding the field value for the bias/unbias calculations.  Bias/unbias may cross zero (unsigned wrapping), not signed overflow.</p>
+
+<hr>
+
+<h2>Or better, use @Rainer P's method:</h2>
+
+<p>Don't unbias first, just unsigned shift and then add half the bias constant.  (See his answer for how it simplifies down to that).  Doing the shift before unbiasing means the exponent is unsigned so shifting in a zero is good.  (I think this works right even for tiny values with biased-exponents near zero, i.e. near the smallest possible exponent encoding).</p>
+
+<p>I tried a few values on <a href="https://www.h-schmidt.net/FloatConverter/IEEE754.html" rel="nofollow noreferrer">https://www.h-schmidt.net/FloatConverter/IEEE754.html</a>, manually shifting the exponent and then adding 1 (with carry) to the 2nd-highest exponent bit.  e.g. <code>2.3509887E-38</code> (biased exponent = <code>0b0000'0010</code>) becomes 2.1684043E-19 (biased exponent = <code>0b0100'0001</code>).</p>
+
+<p>But beware when shifting the entire bit-pattern that you don't shift in a <code>1</code> from the sign bit of <code>-0.0</code>.  You are handling <code>a == 0.0</code> as a special case so you're fine there because <code>-0.0 == 0.0</code> is true.  I guess you can't let <code>0.0</code> go through the main NR loop because you'd have a division by zero.</p>
+
+<hr>
+
+<p>Footnote 1:</p>
+
+<p>IDK why you'd choose <code>unsigned short</code> instead of just <code>unsigned</code> for your exponent bitfield type.  The underlying type of a bitfield can be wider  than the field without hurting anything, and some compilers will do math at the width of that type.  So using <code>unsigned int</code> if it's wide enough is a good idea.  <code>int</code> is at least 16 bits.</p>
+
+<p>Using <code>uint64_t</code> as the bitfield type can result in slow 32-bit code with some compilers (notably MSVC), but I think <code>unsigned int</code> is always fine for the exponent.  Unsigned does make sense for the biased exponent.</p>
+
+<p>Fun fact: just <code>int</code> as the bitfield type leaves the signedness up to the implementation.  You can use <code>signed int</code> to force signed.  <a href="https://stackoverflow.com/questions/42527387/signed-bit-field-represetation">https://stackoverflow.com/questions/42527387/signed-bit-field-represetation</a></p>
+
+<hr>
+
+<h3>unroll instead of checking <code>c % 2 == 0</code></h3>
+
+<p>A compiler might do this anyway, but it probably makes more sense to just unroll your loop by 2 instead of using a counter to do something special every other iteration.</p>
+
+<p>The actual Newton iteration expression is compact enough that repeating it once is probably <em>more</em> simple for humans to read than working through the <code>c++</code> and <code>if (c%2 == 0)</code> logic.</p>
+
+<p>You can handle the <code>while(foo)</code> condition as <code>if(!foo) break;</code> when unrolling, or simply leave it out and only check for leaving the loop every 2 Newton iterations, unless you need to check both possibilities to catch alternation between two values.</p>
+
+<p>(With a bad initial estimate that will take many iterations anyway, this might be worth it.  Otherwise probably not, especially on a superscalar / out-of-order CPU that can be checking the branch condition in parallel with the main dependency chain which doesn't have a lot of ILP (instruction-level parallelism); mostly one long dependency chain.)</p>
+
+<hr>
+
+<h2>Pull some checks off the fast-path</h2>
+
+<p>Your version has 4 separate checks on <code>a</code> before we reach the actual work.</p>
+
+<pre><code>    if(a &lt; -(TYPE)0)
+    {
+        errno = EDOM;
+        return NAME_SFX(nan)("");
+    }
+    if(a == (TYPE)0 || is_nan(a) || a &gt; TYPE_MAX)
+    {
+        return a;
+    }
+</code></pre>
+
+<p>Instead, <strong>catch the special cases with one or two compares, and sort them out in that block, off the fast path</strong>.  The performance of <code>sqrt(NaN)</code> is much much less important than the performance of <code>sqrt(1.234)</code></p>
+
+<pre><code>    if(! a &gt; (TYPE)0)
+    {
+        if(a == (TYPE)0 || is_nan(a))
+            return a;
+        // else a &lt; 0
+        errno = EDOM;
+        return NAME_SFX(nan)("");
+    }
+    if( a &gt; TYPE_MAX)
+    {
+        return a;
+    }
+</code></pre>
+
+<p>If you need to handle subnormals specially (at least for generating the initial approximation?), you might use <code>if (! a&gt;=DBL_MIN)</code>.  Or you could decide that your soft-float implementation simply doesn't handle subnormals.</p>
+
+<p>IDK what your goal is with this code; if it was part of a soft-float library, simply using FP add, mul, and divide seems inefficient.  You'd want to optimize multiple operations together and so on.</p>
+
+<p>But if it's for HW FPUs, then I think real all FPUs will have sqrt built-in as well.</p>
+
+<p>So I assume this is just a learning exercise.  So we won't get into too detail of optimizing it for any particular hardware or compiler.</p>
+    </div>

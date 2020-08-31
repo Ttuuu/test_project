@@ -1,0 +1,78 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>As a heads up - we have very different formatting styles for our code. Feel free to ignore that difference and don't consider it a comment on your style (unless you prefer mine, in which case please do).</p>
+<hr>
+<h3>Aliases</h3>
+<p>I really dislike the practice of using short aliases for tables. I've never seen a point, and it always makes it harder for me to understand. You can get easy aliases (e.g. <code>q</code> -&gt; <code>questions</code> or <code>a</code> -&gt; <code>answers</code>) for very few characters.</p>
+<p>I also really like when each column of my output has an actual name, so its easier to understand. In this case, I would alias <code>COUNT(*)</code> as <code>[Zombie Kill Count]</code> or something.</p>
+<p>Also, you can use the alias in your <code>ORDER BY</code>, which I find conceptually easier to understand.</p>
+<hr>
+<h3>Performance</h3>
+<p>One thing that jumps out at me is that you're using a function in your <code>WHERE</code> clause. This can cause the cardinality estimator to get <em>really</em> confused (I don't know if SEDE still uses the legacy cardinality estimator; if they do, then this problem is magnified) and you can end up with some less-than-ideal query plans. One way to avoid this is to not include your column in the function. For example, instead of this:</p>
+<pre><code>SELECT *
+  FROM Posts
+  WHERE DATEDIFF( MONTH, CreationDate, @startDate ) &gt; 1;
+</code></pre>
+<p>You could do this</p>
+<pre><code>SELECT *
+  FROM Posts
+  WHERE CreationDate &lt; DATEADD( MONTH, -1, @startDate );
+</code></pre>
+<p>This lets the cardinality estimator use the available statistics on the <code>CreationDate</code> column without confusing it with the function.</p>
+<p>If you're grouping by a value that doesn't actually add a new level of granularity (<code>Users.DisplayName</code> doesn't actually change the grouping) it can be more efficient to use an aggregate there; you get the same result, but a cheaper sort.</p>
+<pre><code>SELECT MAX( u.DisplayName ) -- I'm cheaper than grouping on me
+</code></pre>
+<p>Playing around with the <code>APPLY</code> operator can be fun as well; I've often seen it perform better than a <code>NOT EXISTS</code>, like so (with a <code>GoodAnswers.Id IS NULL</code> in the <code>WHERE</code> clause to get an exclusive outer apply). Note - this one wasn't tested, so YMMV. <code>APPLY</code> can be pretty situational, but I always have fun writing them.</p>
+<pre><code>OUTER APPLY ( SELECT TOP( 1 ) Id
+                FROM Posts OldAnswers
+                WHERE OldAnswers.ParentId = Questions.Id
+                  AND OldAnswers.CreationDate &lt; @startDate
+                  AND OldAnswers.Score &gt; 0 
+                ORDER BY ( SELECT NULL ) ) GoodAnswers
+</code></pre>
+<hr>
+<p>Overall, I came up with something like this.</p>
+<pre><code>DECLARE @startDate date;
+SET @startDate = CONVERT( datetime, '2019-07-21' );
+
+SELECT TOP ( 25 )
+       MAX( Answerers.DisplayName ) [Answerer Name],
+       COUNT( * ) [Zombie Kill Count]
+  FROM Posts Questions
+    INNER JOIN Posts Answers
+      ON Questions.Id = Answers.ParentId
+    INNER JOIN Users Answerers
+      ON Answers.OwnerUserId = Answerers.Id
+    OUTER APPLY ( SELECT TOP ( 1 )
+                         Id
+                    FROM Posts OldAnswers
+                    WHERE OldAnswers.ParentId = Questions.Id
+                      AND OldAnswers.CreationDate &lt; @startDate
+                      AND OldAnswers.Score &gt; 0
+                    ORDER BY ( SELECT NULL )) GoodAnswers
+  WHERE Questions.PostTypeId = 1
+    -- Target old questions with new answers
+    AND Questions.CreationDate &lt; DATEADD( MONTH, -1, @startDate )
+    AND Answers.Score &gt; 0
+    AND Answers.CreationDate &gt; @startDate
+    -- That didn't already have a good answer
+    AND GoodAnswers.Id IS NULL
+    -- Remove low quality/closed/deleted/community owned questions
+    AND Questions.Score &gt;= 0
+    AND Questions.ClosedDate IS NULL
+    AND Questions.CommunityOwnedDate IS NULL
+    AND Questions.DeletionDate IS NULL
+  GROUP BY Answerers.Id
+  ORDER BY [Zombie Kill Count] DESC;
+</code></pre>
+<hr>
+<p>Some extra notes:</p>
+<ul>
+<li>Unfortunately, I had a hard time finding information on the available
+indices on SEDE. The best resource I found was <a href="https://meta.stackexchange.com/a/268343/247602">this</a> post. It
+doesn't list any indices on the <code>Posts</code> table, although we do have
+one on <code>Users.Id</code>. As such there aren't any great suggestions I have
+for joins here; you're probably doing about as well as you can.</li>
+<li>You have a pretty lengthy <code>WHERE</code> clause going on; that'll likely dilute the cardinality even further, but I don't see a reasonable
+alternative.</li>
+</ul>
+    </div>

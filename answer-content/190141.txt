@@ -1,0 +1,110 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Here is another answer, using Reflection, <code>Expression</code> and <code>Attribute</code> to create a more automated solution.</p>
+
+<p>First you create a couple of custom <code>Attribute</code>s to mark fields or properties with the CSV Header Name when it doesn't match the class member name, or to indicate a class member isn't initialized from the CSV:</p>
+
+<pre><code>[AttributeUsage(AttributeTargets.Field | AttributeTargets.Property, AllowMultiple = false)]
+public class CSVColumnName : Attribute {
+    public string ColumnName { get; }
+    public CSVColumnName(string name) =&gt; ColumnName = name;
+}
+
+[AttributeUsage(AttributeTargets.Field | AttributeTargets.Property, AllowMultiple = false)]
+public class CSVNoColumnName : Attribute {
+}
+</code></pre>
+
+<p>Then you can create a static method to build the PropertySetters <code>Dictionary</code> for you by Reflection. You need a couple of extension methods to make <code>MemberInfo</code> easier to work with:</p>
+
+<pre><code>public static Type GetMemberType(this MemberInfo member) {
+    switch (member.MemberType) {
+        case MemberTypes.Field:
+            return ((FieldInfo)member).FieldType;
+        case MemberTypes.Property:
+            return ((PropertyInfo)member).PropertyType;
+        case MemberTypes.Event:
+            return ((EventInfo)member).EventHandlerType;
+        default:
+            throw new ArgumentException("MemberInfo must be if type FieldInfo, PropertyInfo or EventInfo", "member");
+    }
+}
+
+public static bool GetCanWrite(this MemberInfo member) {
+    switch (member.MemberType) {
+        case MemberTypes.Field:
+            return true;
+        case MemberTypes.Property:
+            return ((PropertyInfo)member).CanWrite;
+        default:
+            throw new ArgumentException("MemberInfo must be if type FieldInfo or PropertyInfo", "member");
+    }
+}
+</code></pre>
+
+<p>Then you can create the setter lambdas for each field and put them in a <code>Dictionary</code>:</p>
+
+<pre><code>public static class CSVMapping&lt;T&gt; {
+    public static Dictionary&lt;string, Action&lt;T, object&gt;&gt; PropertySetters() {
+        var t = typeof(T);
+        var propsOrFields = t.GetMembers(BindingFlags.Instance | BindingFlags.Public).Where(m =&gt; m.MemberType == MemberTypes.Property || m.MemberType == MemberTypes.Field);
+
+        var ans = new Dictionary&lt;string, Action&lt;T, object&gt;&gt;(StringComparer.OrginalIgnoreCase);
+        foreach (var m in propsOrFields) {
+            if (!Attribute.IsDefined(m, typeof(CSVNoColumnName)) &amp;&amp; m.GetCanWrite()) {
+                var ca = (CSVColumnName)Attribute.GetCustomAttribute(m, typeof(CSVColumnName));
+                var csvname = (ca != null) ? ca.ColumnName : m.Name;
+                // (T p1, object p2) =&gt; p1.{m.Name} = ({m.Type})p2;
+                var paramobj = Expression.Parameter(t);
+                var paramval = Expression.Parameter(typeof(object));
+                var body = Expression.Assign(Expression.PropertyOrField(paramobj, m.Name), Expression.Convert(paramval, m.GetMemberType()));
+                var setter = Expression.Lambda&lt;Action&lt;T, object&gt;&gt;(body, new[] { paramobj, paramval });
+                ans.Add(csvname, setter.Compile());
+            }
+        }
+        return ans;
+    }
+}
+</code></pre>
+
+<p>Note: You could use reflection to assign values as well, but I figure it is worth the effort to build the lambdas since you presumably will be assigning to the fields often (once per CSV file row).</p>
+
+<p>Now you can annotate the class with CSV information:</p>
+
+<pre><code>private class MassUploadUser {
+    public string email { get; set; }
+
+    [CSVColumnName("First Name")]
+    public string firstName { get; set; }
+
+    [CSVColumnName("Last Name")]
+    public string lastName { get; set; }
+
+    public string role { get; set; }
+
+    [CSVNoColumnName]
+    public bool active { get { return true; } }
+}
+</code></pre>
+
+<p>Note: Since <code>active</code> is a read-only property, the <code>PropertySetters</code> method would skip it even if it didn't have the attribute.</p>
+
+<p>Finally, you can convert the CSV file to class members just like my previous answer, using the setters <code>Dictionary</code> to assign read-in values:</p>
+
+<pre><code>var fieldMap = CSVMapping&lt;MassUploadUser&gt;.PropertySetters();
+
+using (var parser = new TextFieldParser(csvFilename)) {
+    parser.SetDelimiters(",");
+
+    string[] header = parser.ReadFields();
+    var headerMap = header.Select((h, i) =&gt; new { h, i }).ToDictionary(hi =&gt; hi.h, hi =&gt; hi.i);
+
+    while (!parser.EndOfData) {
+        string[] fields = parser.ReadFields();
+
+        var massUploadUser = new MassUploadUser();
+        foreach (var field in fieldMap.Keys)
+            fieldMap[field](massUploadUser, fields[headerMap[field]]);
+    }
+}
+</code></pre>
+    </div>

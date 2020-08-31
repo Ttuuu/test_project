@@ -1,0 +1,200 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Architecture</h2>
+
+<p>I'll let other reviewers do more of the heavy lifting here, but there were a couple things that immediately stood out.</p>
+
+<hr>
+
+<p>I'm not sure I understand the purpose of wrapping the <code>Collection</code>'s in their own classes. You aren't adding any functionality at all other than making them pre-declared. This seems to me like a lot of superfluous code with 2 main goals:</p>
+
+<ul>
+<li>Make them act as globals. I'm not sure I like this any more than using the predeclared instances of a UserForm. It's like you want to <em>use them</em> like a global, but don't want to <em>declare them</em> as a global. If you're going to use globals, at least make it obvious that's what you're doing - the pre-declared attribute in VBA isn't visible, so at very least it would be deserving of a comment.</li>
+<li>Give you a singleton. Which would be nice if it were true, but there's absolutely nothing that would prevent a caller from newing up an instance and skipping the entire implicit instance. If you need a singleton, you need some mechanism to make sure that if I new up the object, I'll get the single instance. I consider this somewhat dangerous in design.</li>
+</ul>
+
+<p>Basically all you end up with here is a bunch of code that simply forwards methods to an embedded <code>Collection</code> and an identifier. That's a ton of work for what is secretly just this:</p>
+
+<pre><code>Option Explicit
+
+Public SpaceObjectsCntrls As Collection
+Public SpaceObjectsData As Collection
+Public MissleObjectsData As Collection
+'etc.
+</code></pre>
+
+<p>What it looks like is that what you <strong><em>really</em></strong> want is a <code>GameState</code> object. So much of the state is carried by the process itself that I think you'd be better off just newing up a state in your <code>Sub RunGame()</code> and giving everything an explicit place to live.</p>
+
+<hr>
+
+<p>Your <code>GameBoard</code> is tightly coupled with your presentation logic. Using an MVP framework would be much more useful here if the presenters were interchangeable. For example, let's say that I wanted to render your model <a href="https://codereview.stackexchange.com/questions/141404/excel-display-driver-class-for-tetris">directly onto an Excel Worksheet</a>. It strikes me that this <em>should</em> be  easy to do, but you have your controller so tightly bound up with the <code>GameBoard</code> that it would be difficult to pull off. If you had an interface (say <code>IGamePresenter</code>) that your <code>UserForm</code> implemented and worked with <em>that</em> in the controller, I could fairly easily wire it up (with an <code>IDrawable</code> to <code>ISpaceObject</code> adapter and a simple wrapper). The controller should be flexible enough that you can hand it an arbitrary model and and arbitrary presenter and it will work as long as the appropriate interfaces are implemented. In general, your modules are begging to belong to an <code>ISpaceController</code> interface, implemented by a controller <em>class</em>.</p>
+
+<hr>
+
+<p><code>Control</code>'s want to be associated with <code>ISpaceObject</code>'s. You do things like this all over the place:</p>
+
+<pre><code>    For indexSpaceObject = SpaceObjectDataCol.Count To 1 Step -1
+        Set spaceObject = SpaceObjectDataCol.Item(indexSpaceObject)
+        Set spaceObjectCntrl = SpaceObjectCntrlsCol.Item(indexSpaceObject)
+</code></pre>
+
+<p>Why not do something like a simple <code>IBoundControl</code> interface:</p>
+
+<pre><code>'IBoundControl
+
+Public Property Get Control() As Control
+End Property
+
+Public Property Set Control(bound As Control)
+End Property
+
+Public Property Get SpaceObject() As ISpaceObject
+End Property
+
+Public Property Set SpaceObject(bound As ISpaceObject)
+End Property
+</code></pre>
+
+<p>That allows you to just store the related items in a single <code>SpaceObjectCollection</code> or <code>ISpaceObjectHandler</code> or whatever. It also gets rid of a <em>ton</em> of duplicated code like this:</p>
+
+<blockquote>
+<pre><code>Private Sub InitalizeMissleObjectImgControl(ByRef cntrl As Control, ByRef missleObject As Missle)
+    With cntrl
+        .left = missleObject.left
+        .top = missleObject.top
+        .height = missleObject.height
+        .width = missleObject.width
+        .Picture = LoadPicture(missleObject.ImgPathWay)
+        .PictureSizeMode = 1
+    End With
+End Sub
+</code></pre>
+</blockquote>
+
+<p>...because now you can simply send everything through this:</p>
+
+<pre><code>Private Sub InitalizeGameObject(ByVal gameItem As IBoundControl)
+    With gameItem.Control
+        .left = gameItem.SpaceObject.left
+        .top = gameItem.SpaceObject.top
+        .height = gameItem.SpaceObject.height
+        .width = gameItem.SpaceObject.width
+        .Picture = gameItem.SpaceObject.BitMap  '&lt;-- decouple from the presenter.
+        .PictureSizeMode = 1
+    End With
+End Sub
+</code></pre>
+
+<p>Note that I'm just mapping values to each other there, which is a sign that <code>IBoundControl</code> can also serve as an adapter - that could easily be done in the concrete implementation as well.</p>
+
+<hr>
+
+<p><code>Missle</code> and <code>Ship</code> should implement <code>ISpaceObject</code>. There's no reason that they shouldn't, and it would allow you to generalize <code>CheckIfCollided</code> to test for the collision of any two <code>ISpaceObject</code>'s. Note that you can also short-circuit the tests:</p>
+
+<pre><code>Private Function CheckIfCollided(ByVal first As ISpaceObject, ByVal second As ISpaceObject) As Boolean
+    Select Case False
+        Case first.left - second.width &lt; second.left
+        Case second.left &lt; first.left + first.width
+        Case first.top - second.height &lt; second.top
+        Case second.top &lt; first.top + first.height
+        Case Else
+            CheckIfCollided = True
+    End Select
+End Function
+</code></pre>
+
+<hr>
+
+<h2>Everything Else</h2>
+
+<hr>
+
+<p>Almost everywhere that you pass objects or interfaces is done <code>ByRef</code>. Almost all of these should be passed <code>ByVal</code>. This is a common misconception about reference objects - what is <code>ByVal</code> isn't the <em>object</em>, it's the <em>pointer</em> to the object. It prevents you from doing things like this:</p>
+
+<pre><code>Private Sub Foo(ByRef someObject As Object)
+    Set someObject = Nothing 'or New, or whatever.
+End Sub
+</code></pre>
+
+<p>That's pretty much all it does. There isn't any difference in overhead, it doesn't create a "copy" of anything other than the object pointer, and it signals to the caller that you aren't going to mess with their object's assignment.</p>
+
+<hr>
+
+<p>I don't really understand the point of how you condition your main game loop here:</p>
+
+<blockquote>
+<pre><code>Do While x &lt; 100
+   '...
+Loop
+</code></pre>
+</blockquote>
+
+<p><code>x</code> is never initialized and never incremented, so your loop is functionally equivelent to this:</p>
+
+<pre><code>Do
+    '...
+Loop
+</code></pre>
+
+<p>There's absolutely nothing wrong with that, and it makes it immediately obvious that you intend for the contained code to run until your <code>Exit Do</code> statement.  Just do that instead.</p>
+
+<hr>
+
+<p>The only thing that you use the timing functions for are for calculating when new objects are spawned. The problem with this is that you are calling <code>DoEvents</code> inside the loop in order to allow the keystrokes to process. In fact, the <code>Sleep</code> call has a hard-coded value at the bottom of the loop. The amount of time that it takes <code>DoEvents</code> to return is going to be dependent on the processing power of the host machine, the Windows scheduler, system load, etc. That means the amount of time between "impulses" or "ticks" in your game loop could potentially vary wildly. I'd suggest using a fixed "tick" or "pulse" time to attempt to keep the game speed more constant:</p>
+
+<pre><code>'These aren't tested, and would probably need tweaking (or a difficulty setting)
+Const pulseLength As Long = 100   
+Const spawnInterval As Long = 20
+
+Dim spawnCounter As Long
+Do
+    startTime = timeGetTime
+    spawnCounter = spawnCounter + 1
+
+    If spawnCounter = spawnInterval Then
+        SOLoadSpaceObjectOntoGameBoard.LoadSpaceObjectOntoBoard newBoard
+        spawnCounter = 0
+    End If
+
+    '...
+
+    DoEvents
+
+    Dim loopTime As Long
+    loopTime = timeGetTime - startTime
+    Debug.Assert loopTime &gt; 0 'Oh noes! Time is running backwards!
+
+    'Normalize the time between pulses.
+    If loopTime &lt; pulseLength Then
+        Sleep pulseLength - loopTime
+    End If
+Loop
+</code></pre>
+
+<hr>
+
+<p>Your <code>Case</code>'s in <code>GameLogic.HandleSendKeys</code> and <code>GameBoard.UserForm_KeyDown</code> are implicitly being cast from <code>Long</code> to <code>String</code>:</p>
+
+<blockquote>
+<pre><code>Public Sub HandleSendKeys(ByRef board As GameBoard, ByRef caseNum As Long)
+    Select Case caseNum       '&lt;-- Long here
+        Case "37" '&lt;-- String here, implicit cast
+            SHMoveShip.moveShipLeft board
+</code></pre>
+</blockquote>
+
+<p>Also, in <code>GameBoard.UserForm_KeyDown</code> you are implicitly calling the default member of <code>KeyCode</code>:</p>
+
+<blockquote>
+<pre><code>Select Case KeyCode
+</code></pre>
+</blockquote>
+
+<p>...should probably be...</p>
+
+<pre><code>Select Case KeyCode.Value
+</code></pre>
+
+<hr>
+
+<p>Small nitpick that was driving me crazy every time I saw it... <code>Missle</code> is spelled <code>Missile</code>, with 2 <code>i</code>s.</p>
+    </div>

@@ -1,0 +1,253 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>/* ThreadPool class
+It is a singleton. To prevent spawning
+tons of threads, I made it a singleton */
+</code></pre>
+
+<p><code>ThreadPool</code>s can be useful as both singletons and not singletons.</p>
+
+<p>There is zero need to mix the <code>ThreadPool</code> implementation with the "this is a singleton" implementation.  There is a lot of need to not; there are some nasty things you have to look out for with singletons in non-trivial applications.</p>
+
+<pre><code>class ThreadPool{
+    //add any arg # function to queue
+    template &lt;typename Func, typename... Args &gt;
+    inline auto push(Func&amp;&amp; f, Args&amp;&amp;... args){
+</code></pre>
+
+<p>While <code>std::thread</code> and <code>std::async</code> supports passing arguments to a task, that is in my experience a needless complication.</p>
+
+<p>Just take a nullary function.  The caller can bundle up their arguemnts into a lambda really easily if they need to.</p>
+
+<pre><code>        //get return type of the function
+        typedef decltype(f(args...)) retType;
+
+        //package the task
+        std::packaged_task&lt;retType()&gt; task(std::move(std::bind(f, args...)));
+</code></pre>
+
+<p>An example of why what you did is a bad idea.  You used <code>std::bind</code>.  If <code>f</code> was already the result of a <code>std::bind</code>, this doesn't do the same thing as calling <code>f</code> with the arguments <code>args...</code>.</p>
+
+<p>Instead it does the insane thing <code>std::bind</code> does.</p>
+
+<pre><code>        // lock jobqueue mutex, add job to the job queue 
+        std::unique_lock&lt;std::mutex&gt; lock(JobMutex);
+</code></pre>
+
+<p>I'd advise, using the single responsibility principle, to split your job queue off from your thread pool.</p>
+
+<pre><code>template&lt;class T&gt;
+struct threadsafe_queue;
+</code></pre>
+
+<p>About half of the complexity of your <code>ThreadPool</code> is the queue, the other half is managing threads.  By splitting the two, you have two piece of code each half as complex.</p>
+
+<p>And a <code>threadsafe_queue</code> can be reused elsewhere.</p>
+
+<pre><code>    /* utility functions will go here*/
+    inline void resize(int newTCount){
+</code></pre>
+
+<p>Nix <code>inline</code>.</p>
+
+<p><code>resize</code> is a horrible name.  You aren't a container.</p>
+
+<pre><code>        int tmp = MAX_THREADS;
+</code></pre>
+
+<p>Having more threads that hardware concurrency size -1 is a perfectly sane thing to do if you know you have lots of blocking operations.</p>
+
+<p>This kind of logic <strong>does not belong in a class named <code>ThreadPool</code></strong>.</p>
+
+<p>Having easy access to "spawn max concurrency threads" or "max concurrency -1 threads" is good.  Setting a hard limit is bad.</p>
+
+<pre><code>                Pool.back().detach();
+</code></pre>
+
+<p>Detaching threads is the wrong thing to do 99.999% of the time.  Don't do it.  Threads running after main ends is extremely dangerous and toxic.</p>
+
+<pre><code>        else {
+            numThreads = (uint8_t)newTCount;
+            Pool.resize(newTCount);
+        }
+</code></pre>
+
+<p>You need to be really clear about what shrinking the number of threads means.</p>
+
+<pre><code>    //used polymorphism to store any type of function in the job queue
+    class Job {
+</code></pre>
+
+<p>While <code>std::function&lt;void()&gt;</code> isn't sufficient, as <code>packaged_task&lt;R()&gt;</code> is move only, a type like it is pretty sane and useful.</p>
+
+<p>The simplest to find type that can store a <code>packaged_task&lt;R()&gt;</code> is a <code>packaged_task&lt;void()&gt;</code>.  Try it.</p>
+
+<p>Replace <code>Job</code> with <code>std::packaged_task&lt;void()&gt;</code>.  Stop messing with pointers.</p>
+
+<p>But really, find a move-only <code>std::function</code> and use that.  When in doubt, use value semantics.</p>
+
+<pre><code>    //member variables
+    uint8_t numThreads; // number of threads in the pool
+    std::vector&lt;std::thread&gt; Pool; //the actual thread pool
+</code></pre>
+
+<p>Belongs in <code>ThreadPool</code>.  But really, <code>numThreads</code> is redundant; <code>Pool.size()</code> has that information.</p>
+
+<p>Maybe have a second vector of "parked threads".</p>
+
+<p>Also, always <code>=0</code> or whatever data.</p>
+
+<pre><code>    std::queue&lt;std::packaged_task&lt;void()&gt;&gt; JobQueue;
+    std::condition_variable thread;// used to notify threads about available jobs
+    std::mutex JobMutex; // used to push/pop jobs to/from the queue
+    //end member variables
+</code></pre>
+
+<p>Belongs in <code>threadsafe_queue</code>.</p>
+
+<pre><code>    /* infinite loop function */
+    inline void threadManager() {
+        while (true) {
+
+            std::unique_lock&lt;std::mutex&gt; lock(JobMutex);
+            thread.wait(lock, [this] {return !JobQueue.empty(); });
+
+            //strange bug where it will continue even if the job queue is empty
+            if (JobQueue.size() &lt; 1)
+                continue;
+
+            (*JobQueue.front()).execute();
+
+            JobQueue.pop();
+        }
+</code></pre>
+
+<p>don't do the work while the mutex is engaged.</p>
+
+<p>This is an example of where mixing the thread safe queue with the thread pool has messed you up.</p>
+
+<pre><code>threadsafe_queue&lt; std::packaged_task&lt;void()&gt; &gt; jobs;
+
+template&lt;class F&gt;
+auto push_task( F&amp;&amp; f ) {
+  using dF = std::decay_t&lt;F&gt;;
+  using R = std::result_of_t&lt; dF&amp;() &gt;;
+  std::packaged_task&lt; R() &gt; task = std::forward&lt;F&gt;(f);
+  auto retval = task.get_future();
+  jobs.push_back( std::move(task) ); // may require an explicit cast
+  return retval;
+}
+</code></pre>
+
+<p>wow, that is a simpler <code>push</code>.</p>
+
+<pre><code>struct killable_thread {
+  std::thread t;
+  std::shared_ptr&lt;std::atomic&lt;bool&gt;&gt; kill;
+  killable_thread( std::thread tin, std::shared_ptr&lt;std::atomic&lt;bool&gt;&gt; kin ):
+    t(std::move(tin)),
+    kill(std::move(kin))
+  {}
+};
+std::vector&lt;killable_thread&gt; threads;
+
+void add_thread(std::size_t n = 1) {
+  while (n &gt; 0 ) {
+    auto kill = std::make_shared&lt;std::atomic&lt;bool&gt;&gt;(false);
+    std::thread t( [this, kill]{
+      while (!*kill) {
+        auto job = jobs.pop_back();
+        if (!job)
+          return; // done
+        (*job)();
+      }
+    });
+    threads.emplace_back( std::move(t), std::move(kill) );
+    --n;
+  }
+}
+</code></pre>
+
+<p><code>remove_thread</code>s sets <code>*kill</code> and moves the threads somewhere else to clean up later.</p>
+
+<p>Possibly we augment the thread code to have them move <em>themselves</em> to a "to be cleaned up" queue, and other threads can even clean up that queue, leaving at most one "waiting to be joined" task in that queue.</p>
+
+<p>Note that we want <code>threadsafe_queue</code> to support <code>.abort()</code> -- that means <code>pop_back</code> returns an <code>optional&lt;T&gt;</code> (boost or not) instead of a <code>T</code>, so it can return "pop failed".  An alternative is that it could throw.</p>
+
+<p>If the queue is killed, all pops abort.</p>
+
+<pre><code>    /*  Constructors */
+    ThreadPool(); //prevent default constructor from being called
+</code></pre>
+
+<p><code>=delete</code>.</p>
+
+<pre><code>//real constructor that is used
+inline ThreadPool(uint8_t numThreads)  {
+        int tmp = MAX_THREADS;
+        if(numThreads &gt; tmp){
+            numThreads = tmp;
+        }
+</code></pre>
+
+<p>again, anti-pattern.</p>
+
+<p>Entire body should read:</p>
+
+<pre><code>ThreadPool(uint8_t numThreads)  {
+  add_thread(numThreads);
+}
+</code></pre>
+
+<p>DRY -- don't repeat yourself.  There should be one function for adding threads, uesd both here and elsewhere    </p>
+
+<pre><code>NULL_COPY_AND_ASSIGN(ThreadPool);
+</code></pre>
+
+<p>really?</p>
+
+<pre><code>ThreadPool(ThreadPool const&amp;)=delete;
+ThreadPool&amp; operator=(ThreadPool const&amp;)=delete;
+</code></pre>
+
+<p>that is so taxing you'll write a macro to avoid typing it?</p>
+
+<p>Here is a threadsafe queue:</p>
+
+<pre><code>template&lt;class T&gt;
+struct threaded_queue {
+  using lock = std::unique_lock&lt;std::mutex&gt;;
+  void push_back( T t ) {
+    lock l(m);
+    data.push_back(std::move(t));
+    cv.notify_one();
+  }
+  boost::optional&lt;T&gt; pop_front() {
+    lock l(m);
+    cv.wait(l, [this]{ return abort || !data.empty(); } );
+    if (abort) return {};
+    auto r = std::move(data.front());
+    data.pop_front();
+    return std::move(r);
+  }
+  void terminate() {
+    lock l(m);
+    abort = true;
+    data.clear();
+    cv.notify_all();
+  }
+  ~threaded_queue()
+  {
+    terminate();
+  }
+private:
+  std::mutex m;
+  std::deque&lt;T&gt; data;
+  std::condition_variable cv;
+  bool abort = false;
+};
+</code></pre>
+
+<p>another operation I find useful is the ability to "abandon all queued tasks", without aborting the queue.</p>
+
+<p>You'll notice how much smaller and more clean this is when it isn't mixed in with the thread pool code.  The thread pool code also gets cleaner.</p>
+    </div>

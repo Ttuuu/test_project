@@ -1,0 +1,215 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Here are some comments on <a href="https://codereview.stackexchange.com/a/234905/16369">your revised code</a>, many of which apply to your original code as well.</p>
+
+<pre><code>for (auto&amp; T: U) transform(T).find(max_perim, proc);
+</code></pre>
+
+<p>You're using the names <code>T</code> and <code>U</code> to refer to things that are <em>not</em> template type parameters. In fact, <code>U</code> is a reference to a static data member of the enclosing class, whose only declaration appears many lines below this use. This is extremely surprising code. I might instead write</p>
+
+<pre><code>for (auto&amp;&amp; formula : this-&gt;child_formulas) {
+    this-&gt;transform(formula).find(max_perim, proc);
+}
+</code></pre>
+
+<p>Notice the use of braces around the loop body; the use of <a href="https://quuxplusone.github.io/blog/2018/12/27/autorefref-still-always-works/" rel="nofollow noreferrer"><code>auto&amp;&amp;</code>, Which Always Works</a>; the use of <code>this-&gt;</code> to clarify for the human reader what scope we're expecting to find these names in; and especially the descriptive name <code>child_formulas</code> for <code>U</code>. (<code>child_formulas</code> says <em>what</em> <code>U</code> is; <code>this-&gt;</code> says <em>whose</em> it is. Both of those things were in question, in the old code.)</p>
+
+<hr>
+
+<pre><code>class triple : public std::array&lt;long, 3&gt; {
+</code></pre>
+
+<p><a href="https://quuxplusone.github.io/blog/2018/12/11/dont-inherit-from-std-types/" rel="nofollow noreferrer">Don't inherit from standard types.</a> It's legal C++, but it's bad practice.</p>
+
+<blockquote>
+  <p>If you (or your project, or your company) didn’t write class <code>Foo</code>, then class <code>Foo</code> should not be granted control over the API of your own class. And that’s what you’re doing when you inherit from a base class: you’re granting that class control over your API.</p>
+</blockquote>
+
+<p>I like your original <code>x, y, z</code> data members much better.</p>
+
+<hr>
+
+<pre><code>template &lt;typename F&gt;
+void find(long max_perim, F&amp;&amp; proc) {
+</code></pre>
+
+<p>You're passing <code>proc</code> by perfect-forwarding, but then when you use it, you're using it as a plain old lvalue. This is fine (in the wild-west anything-goes world of templates), but it doesn't express the meaning of <code>proc</code> quite as well as I'd like. <code>proc</code> is supposed to be a callback that gets called for each triple, right? Calling a callback doesn't modify the callback. So, we can and should require that <code>proc</code> be const-callable, and then we just write</p>
+
+<pre><code>template&lt;class F&gt;
+void find(int max_perim, const F&amp; proc) {
+</code></pre>
+
+<p>(Drive-by irrelevant style adjustments to save typing. <code>long</code> varies in size and is the same size as <code>int</code> on many platforms, so let's just use <code>int</code> until we're ready to step all the way up to a well-defined <code>int64_t</code> or <code>__int128_t</code>.)</p>
+
+<p>If you really want to support non-const and/or rvalue-callable <code>F</code>s, you <em>can</em> perfect-forward <code>proc</code> all over the place, but trust me, it's not worth it. (The <code>std::forward&lt;F&gt;(proc)</code>s will clutter your code, and all you're doing is enabling your users to write confusing and unintuitive client code.)</p>
+
+<p>Vice versa, re your question about concepts: You <em>can</em> constrain this template to SFINAE away in C++17 (or C++11) like this:</p>
+
+<pre><code>template&lt;class F, class = std::enable_if_t&lt;std::is_invocable_v&lt;const F&amp;, triple&amp;&gt;&gt;&gt;
+void find(int max_perim, const F&amp; proc) {
+</code></pre>
+
+<p>This is not <em>much</em> more boilerplate than the C++2a concepts version:</p>
+
+<pre><code>template&lt;class F&gt; requires std::is_invocable&lt;const F&amp;, triple&amp;&gt;
+void find(int max_perim, const F&amp; proc) {
+</code></pre>
+
+<p>Notice that in C++2a you will also be able to write "simply"</p>
+
+<pre><code>void find(int max_perim, const std::invocable&lt;triple&amp;&gt; auto&amp; proc) {
+</code></pre>
+
+<p>but (A) this doesn't express exactly the same SFINAE-constraint as the other two, and (B) IMHO it looks more confusing and scary.</p>
+
+<p>But <strong><em>should</em></strong> you constrain this function to SFINAE away when it's given a "bad" lambda type? IMHO, no, you shouldn't. There's no reason to SFINAE here. SFINAE is for when you need this version of <code>find</code> to drop out of the overload set so that some other more general version can pick up the call. That's not the situation that you have, here.</p>
+
+<p>Compare the error messages you get from <a href="https://godbolt.org/z/6PcAXX" rel="nofollow noreferrer">(A)</a> (or the C++2a Concepts version <a href="https://godbolt.org/z/2iAuyM" rel="nofollow noreferrer">(A2)</a>)</p>
+
+<pre><code>template&lt;class F, class = std::enable_if_t&lt;std::is_invocable_v&lt;const F&amp;, triple&amp;&gt;&gt;&gt;
+void find(int max_perim, const F&amp; proc) {
+    proc(*this);
+}
+
+this-&gt;find(42, 7);
+</code></pre>
+
+<p>versus <a href="https://godbolt.org/z/ApubPE" rel="nofollow noreferrer">(B)</a></p>
+
+<pre><code>template&lt;class F&gt;
+void find(int max_perim, const F&amp; proc) {
+    static_assert(std::is_invocable_v&lt;const F&amp;, triple&amp;&gt;);
+    proc(*this);
+}
+
+this-&gt;find(42, 7);
+</code></pre>
+
+<p>versus <a href="https://godbolt.org/z/uCAAT3" rel="nofollow noreferrer">(C)</a></p>
+
+<pre><code>template&lt;class F&gt;
+void find(int max_perim, const F&amp; proc) {
+    proc(*this);
+}
+
+this-&gt;find(42, 7);
+</code></pre>
+
+<p>and see which version feels most "user-friendly" for the client programmer. (Remember that someone using <code>find</code> <em>correctly</em> will never see any of these error messages, so you should optimize to help the guy who doesn't know how to use it.)</p>
+
+<hr>
+
+<pre><code>  cnt_next_depth += U.size(); // always 3
+  if (--cnt_this_depth == 0) {
+    if (++depth &gt; max_depth) return;
+    cnt_this_depth = cnt_next_depth;
+    cnt_next_depth = 0;
+  }
+  for (auto&amp; T: U) q.push(t.transform(T));
+</code></pre>
+
+<p>Code comments are usually a red flag, at least on CodeReview. ;) It seems that this <code>+=</code> corresponds to the three calls to <code>q.push</code> below; i.e., your algorithm requires that <code>cnt_next_depth</code> exactly track <code>q.size()</code>. But you can't use <code>q.size()</code> because you are reusing <code>q</code> to store <em>both</em> the elements at the current level <em>and</em> the elements at the next level.</p>
+
+<p>It would make more sense to use two different queues:</p>
+
+<pre><code>std::vector&lt;triple&gt; this_level = ...;
+std::vector&lt;triple&gt; next_level;
+for (int i=0; i &lt; max_depth; ++i) {
+    for (auto&amp;&amp; t : this_level) {
+        proc(t);
+        for (auto&amp;&amp; formula : child_formulas) {
+            next_level.push_back(t.transform(formula));
+        }
+    }
+    this_level = std::move(next_level);
+    next_level.clear();
+}
+</code></pre>
+
+<p>As a bonus, it turns out that we don't even need them to be queues anymore; they can be plain old vectors, and we save a bunch of heap traffic.</p>
+
+<hr>
+
+<pre><code>friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; stream, const triple&amp; t) noexcept {
+  // Frustrating boiler plate. Any terse alternatives, that do it quickly and correctly?
+  char comma[] = {'\0', ' ', '\0'}; // NOLINT
+  for (auto d: t) {
+    stream &lt;&lt; comma &lt;&lt; d;
+    comma[0] = ',';
+  }
+  return stream;
+}
+</code></pre>
+
+<p>No good answer. The idiomatic way would be</p>
+
+<pre><code>friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; stream, const triple&amp; t) {
+    bool first = true;
+    for (auto&amp;&amp; d : t) {
+        if (!first) stream &lt;&lt; ", ";
+        stream &lt;&lt; d;
+        first = false;
+    }
+    return stream;
+}
+</code></pre>
+
+<p>Notice that this function is <em>not</em> <code>noexcept</code>, because any of these stream operations might throw. (For example, if you're writing to a <code>stringstream</code> and it throws <code>bad_alloc</code>.)</p>
+
+<p>Also, in real life I'd write <code>for (int d : t)</code> to indicate exactly what type of "elements" I expect to be getting out of a <code>triple</code>. I'm using <code>auto&amp;&amp;</code> here only because I saw your comment that you want to stick with "Almost Always Auto" style.</p>
+
+<hr>
+
+<pre><code>  triple transform(const trans&amp; T) const noexcept {
+    auto res = triple{};
+    std::transform(T.begin(), T.end(), res.begin(), [this](vec3 V) {
+      return std::inner_product(V.begin(), V.end(), this-&gt;begin(), 0L);
+    });
+    return res;
+  }
+</code></pre>
+
+<p>This is interesting use of STL algorithms, but algorithms are really meant for operating on big anonymous ranges of <em>data elements</em>, not for constant-size situations like we have here. In order to use STL algorithms, you've been forced to anonymize your formulas into faceless data ranges:</p>
+
+<pre><code>  static constexpr auto U = std::array&lt;trans, 3&gt;{{
+      // https://en.wikipedia.org/wiki/Pythagorean_triple#Parent.2Fchild_relationships
+      {{{{{1, -2, 2}},    // vec3 U[0][0]
+         {{2, -1, 2}},    // vec3 U[0][1]
+         {{2, -2, 3}}}}}, // vec3 U[0][1]
+
+      {{{{{1, 2, 2}},    // vec3 U[1][0]
+         {{2, 1, 2}},    // vec3 U[1][1]
+         {{2, 2, 3}}}}}, // vec3 U[1][2]
+
+      {{{{{-1, 2, 2}},    // vec3 U[2][0]
+         {{-2, 1, 2}},    // vec3 U[2][1]
+         {{-2, 2, 3}}}}}, // vec3 U[2][2]
+  }};
+</code></pre>
+
+<p>Compare that code to a more "code-driven" version:</p>
+
+<pre><code>triple transform(const Formula&amp; f) const noexcept {
+    return f(x, y, z);
+}
+
+auto formulas[] = {
+    +[](int x, int y, int z){ return triple{ x - 2*y + 2*z, 2*x - y + 2*z, 2*x - 2*y + 3*z}; },
+    +[](int x, int y, int z){ return triple{ x + 2*y + 2*z, 2*x + y + 2*z, 2*x + 2*y + 3*z}; },
+    +[](int x, int y, int z){ return triple{ -x + 2*y + 2*z, -2*x + y + 2*z, -2*x + 2*y + 3*z}; },
+};
+</code></pre>
+
+<p>In this version, <code>trans</code> is gone already, and <code>t.transform(f)</code> is hardly pulling its weight.</p>
+
+<hr>
+
+<pre><code>if (perimeter() &gt; max_perim) return;
+</code></pre>
+
+<p>Consider what you'd do if you wanted to find all triples up to some maximum side length, or up to some maximum hypotenuse length. Does this approach generalize to</p>
+
+<pre><code>triple.find(callback_on_each_triple, stopping_condition);
+</code></pre>
+
+<p>?</p>
+    </div>

@@ -1,0 +1,105 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'm going to start off by saying I didn't test this code.  There might be some issues but I didn't setup EF and an In Memory Provider.  </p>
+
+<p>First I would load all the types right away and cache them and do some filtering to make sure they have the two properties we care about. </p>
+
+<p>You didn't save what your class name is so I'm going with DropDownLookUp</p>
+
+<pre><code>public class DropDownLookUp
+{
+
+    private DbContext _context;
+
+    private readonly static IDictionary&lt;string, Type&gt; Mappings;
+    private readonly static MethodInfo WhereMethod;
+    private readonly static MethodInfo SelectMethod;
+
+    static DropDownLookUp()
+    {
+        // Load up all the types and cache them making sure they have the properties we need
+        Mappings = typeof(State).Assembly.GetLoadableTypes()
+            .Where(x =&gt; x.GetProperty("IsApproved")?.PropertyType == typeof(bool) &amp;&amp;
+                   x.GetProperty(x.Name + "Name")?.PropertyType == typeof(string))
+                   .ToDictionary(x =&gt; x.Name, x =&gt; x);
+
+        Func&lt;IQueryable&lt;object&gt;, Expression&lt;Func&lt;object, bool&gt;&gt;, IQueryable&lt;object&gt;&gt; whereMethod = Queryable.Where;
+        WhereMethod = whereMethod.Method.GetGenericMethodDefinition();
+
+        Func&lt;IQueryable&lt;object&gt;, Expression&lt;Func&lt;object, object&gt;&gt;, IQueryable&lt;object&gt;&gt; selectMethod = Queryable.Select;
+        SelectMethod = selectMethod.Method.GetGenericMethodDefinition();
+    }
+</code></pre>
+
+<p>We do a one time load of the LoadableTypes and have a type safe way to grab the method infos for the Queryable Select and Where clauses.  </p>
+
+<p>Type load I got from StackOverFlow it's like this</p>
+
+<pre><code>public static class AssemblyExtensions
+{
+    public static IEnumerable&lt;Type&gt; GetLoadableTypes(this Assembly assembly)
+    {
+        if (assembly == null)
+        {
+            throw new ArgumentNullException("assembly");
+        }
+        try
+        {
+            return assembly.GetTypes().Where(x =&gt; x.IsPublic);
+        }
+        catch (ReflectionTypeLoadException e)
+        {
+
+            return e.Types.Where(t =&gt; t != null &amp;&amp; t.IsPublic);
+        }
+    }
+}
+</code></pre>
+
+<p>Now we don't want to drop down into IEnumerable until we have to.  We want to stay in ExpressionTrees and build up an IQueryable.  </p>
+
+<pre><code>private Expression CreateSelectExpression(Expression source)
+{
+    var param = Expression.Parameter(source.Type);
+    var project = Expression.Property(param, $"{source.Type.Name}Name");
+    var selector = Expression.Lambda(typeof(Func&lt;,&gt;).MakeGenericType(source.Type, typeof(string)), project, param);
+    return Expression.Call(SelectMethod.MakeGenericMethod(source.Type, typeof(string)), source, selector);
+}
+
+private Expression CreateWhereExpression(Expression source)
+{
+    var param = Expression.Parameter(source.Type);
+    var filter = Expression.Equal(
+        Expression.Property(param, "IsApproved"),
+        Expression.Constant(true));
+
+    var whereClause = Expression.Lambda(typeof(Func&lt;,&gt;).MakeGenericType(source.Type, typeof(bool)), filter, param);
+    return Expression.Call(WhereMethod.MakeGenericMethod(source.Type), source, whereClause);
+}
+</code></pre>
+
+<p>These methods now call the Queryable.Select and Queryable.Where.    If you want you could cache these methods per Type but I find building Expressions isn't that taxing, where compiling them is, but it's worth testing to see if you want to add some cache to these methods. </p>
+
+<p>For the main method we can just check the Mappings and if not found either return empty enumerable or throw.  We can still use the reflection on Set. If you really wanted you could build an expression tree to give you back the IQueryable when passing in a type.  I would base that on if you have performance issues or not. </p>
+
+<pre><code>public async Task&lt;IEnumerable&lt;string&gt;&gt; GetLookupOptions(string table)
+{
+    Type type;
+    if (!Mappings.TryGetValue(table, out type))
+    {
+        // Or you can throw your choice
+        return Enumerable.Empty&lt;string&gt;();
+    }
+
+    // Get the DbSet&lt;T&gt; for the &lt;table&gt;.
+    IQueryable set = (IQueryable)_context.GetType()
+        .GetMethod("Set")
+        .MakeGenericMethod(type)
+        .Invoke(_context, new object[0]);
+
+    var query = set.Provider.CreateQuery&lt;string&gt;(CreateSelectExpression(CreateWhereExpression(set.Expression)));
+    return await query.ToListAsync().ConfigureAwait(false);
+}
+</code></pre>
+
+<p>We can use the IQueryable Provider to create a new Query based on the expressions we build - which should execute the where and select up on the server and we can now use the ToListAsync to make the method async again. </p>
+    </div>

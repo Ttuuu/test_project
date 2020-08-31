@@ -1,0 +1,96 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>On the whole nice work! This is actually a problem I've looked at in the past, and as a result I'd like to review the approach you've taken and the API/ way users can interact with your code.</p>
+
+<hr>
+
+<p>As I understand it you have 3 main classes</p>
+
+<ol>
+<li><code>Tables</code> - responsible for instantiating a collection of <code>Table</code> objects (with some automagic methods to allow client code to attempt to keep this collection in sync so it reflects what's on the sheet)</li>
+<li><code>ITableAction</code> implementations which are essentially callback functions with a strict interface that are triggered by updates to the tables</li>
+<li>The <code>Table</code> class - what actually wraps <code>ListObjects</code> and converts Application level events into triggers to run those <code>TableActions</code></li>
+</ol>
+
+<p>The rest is mostly just utility stuff and example code. Now I'd argue that classes 1. (mostly) and 2. are actually redundant and making your life a lot harder, let's take a step back and see how the approach could perhaps be simplified and made more VBA-idiomatic.</p>
+
+<hr>
+
+<p>Starting with the constructor for the <code>Table</code> class:</p>
+
+<blockquote>
+<pre><code>Public Function Create(ByVal Actions As Collection, ByVal Table As ListObject) As Table
+    With New Table
+        Set .TableManagerActions = Actions
+        Set .RefTable = Table
+        .ColumnsCount = .RefTable.ListColumns.Count
+        .RowsCount = .RefTable.DataBodyRange.Rows.Count
+        Set Create = .Self
+    End With
+End Function
+
+Private Sub Class_Initialize()
+    Set appExcel = Excel.Application
+    Set TableManagerActions = New Collection
+End Sub
+</code></pre>
+</blockquote>
+
+<p>The <code>Create</code> method takes a <code>Collection</code> of actions, so why does the <code>Class_Initialize</code> method need to <code>New</code> one up? </p>
+
+<p>And what about that <code>appExcel</code> - in this case you're lucky that <code>Excel.Application</code> will probably always refer to the same object, but better to supply that in the <code>Create</code> method too (dependency injection) - that will also make it easier to Unit Test as you can use a mock <code>Excel.Application</code> to raise events when you are testing.</p>
+
+<hr>
+
+<p>While we're here, do we even need a reference to the Application? The only events you hook into are <code>appExcel_SheetChange</code> and <code>appExcel_SheetSelectionChange</code> - since a ListObject can never span multiple worksheets, why not declare</p>
+
+<pre><code>Private WithEvents listObjectParentSheet As Excel.Worksheet
+</code></pre>
+
+<p>and use the sheet level <code>Change</code> and <code>SelectionChange</code> events instead?</p>
+
+<p>Better still, you can then use</p>
+
+<pre><code>Set listObjectParentSheet = Table.Parent
+</code></pre>
+
+<p>in the constructor to get the worksheet reference without passing it explicitly</p>
+
+<hr>
+
+<p>I don't really like these names:</p>
+
+<blockquote>
+<pre><code>.ColumnsCount = .RefTable.ListColumns.Count
+.RowsCount = .RefTable.DataBodyRange.Rows.Count
+</code></pre>
+</blockquote>
+
+<p>It looks like they might be the current value when really they are a cached value that's used in <code>GetAction</code> to see whether the dimensions of the table have changed. So name them as such: <code>cachedColumnCount</code> / <code>previousColumnCount</code> (drop the s too)</p>
+
+<hr>
+
+<p>Now what about those <em>actions</em>. As I say, currently they are being used as callbacks; that is <code>GetAction</code> enumerates various changes to the table, <code>ProcessRange</code>uses these enumerated action strings to call various routines which ultimately lead to invoking the action somewhere down the line:</p>
+
+<blockquote>
+<pre><code>Set strategy = TableManagerActions.Item(Action)
+strategy.Run EvalCell, CurrentValue, previousValue
+</code></pre>
+</blockquote>
+
+<p>VBA already has a syntax for dealing with callbacks - Events. Instead of calling <code>ITableAction_Run</code>, your <code>Table</code> class could raise a custom <code>Add</code> or <code>Delete</code> or <code>Update</code> event. This way client code can <em>listen</em> for changes to the table, and hook any event handlers it fancies. You can then have different methods for handling events of different tables and don't need to construct a load of action objects.</p>
+
+<p>In summary, the <code>Table</code> class then does the following things:</p>
+
+<ol>
+<li>Listen to the encapsulated <code>ListObject</code>'s parent sheet for any changes</li>
+<li>Check whether these changes affect the encapsulated table, if so determine what kind of change occured (column added, row added, cell changed, table moved, row/column deleted etc.) by comparing to a cached version of the table.</li>
+<li>Generate any useful data you want the event listener to know about (If a row was added, which <code>ListRow</code> was it? If a cell was updated, then which cell and what was its previous value? If the table was moved, where from and to etc.)</li>
+<li><code>RaiseEvent ChangeKind(usefulData)</code> to notify any listeners of the change and run their event handlers (instead of calling an <code>ITableAction</code> directly)</li>
+</ol>
+
+<hr>
+
+<p>With those changes there will no longer be a need for <code>TableActions</code>. There will also be no <code>TableManagerActions</code> to save in the <code>Tables</code> collection, and therefore nothing in common between <code>Table</code> objects in the <code>Tables</code> collection except that they all live on the same worksheet. </p>
+
+<p>At this point I'd do away with the <code>Tables</code> class entirely - the <code>AddAllTablesInSheet</code> method can become a module function that takes a sheet as a parameter and spits out a simple collection of <code>Table</code> objects, or maybe passes them to a class that does the event listening and handling.</p>
+    </div>

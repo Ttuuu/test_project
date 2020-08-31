@@ -1,0 +1,165 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You didn't post a complete header file (no include-guard/<code>#pragma once</code>), so it's unclear whether you also omitted a <code>namespace Taylor {</code> somewhere in there. But you should definitely use a namespace around a name as common as <code>ref</code>.</p>
+
+<hr>
+
+<pre><code>  virtual ~refcount() { }
+</code></pre>
+
+<p>Nit: You could use <code>= default;</code> instead of <code>{ }</code> here, and you might get slightly better codegen on some compilers. (Virtual destructors are never actually "trivial," unfortunately, but getting the compiler to write this quasi-trivial code for you can't hurt.)</p>
+
+<hr>
+
+<p>I notice that <code>refcount-&gt;rc</code> is <code>public</code>, not <code>private</code>. Was that a design decision?</p>
+
+<p>It occurs to me that the proper name for what you're calling <code>refcount</code> is actually <code>refcounted</code>. The <strong>refcount</strong>, physically, is the data member <code>rc</code>. A type which derives from your base class is a <strong>refcounted</strong> type.</p>
+
+<hr>
+
+<pre><code>ref(T* obj) : obj(obj) {
+  if(obj) {
+    obj-&gt;rc++;
+  }
+}
+</code></pre>
+
+<p>I would write this as</p>
+
+<pre><code>explicit ref(T *obj) : obj_(obj) {
+    if (obj_ != nullptr) {
+        obj_-&gt;rc += 1;
+    }
+}
+</code></pre>
+
+<p>Notice the whitespace edits, the use of some kind of sigil for data members (to avoid having two different variables named <code>obj</code> in scope), my preference for <code>+= 1</code> when the increment is a stand-alone statement, the explicit comparison against <code>nullptr</code> in place of contextual-conversion-to-<code>bool</code>, and the addition of <code>explicit</code>. Non-explicit constructors permit implicit conversions, e.g.</p>
+
+<pre><code>struct Widget : public refcount { int data = 42; };
+
+void print_data_of(ref&lt;Widget&gt; x) { std::cout &lt;&lt; x-&gt;data &lt;&lt; "\n"; }
+
+int main() {
+    Widget *p = new Widget;
+    print_data_of(p);
+    delete p;  // OOPS! Double delete!
+}
+</code></pre>
+
+<p>It would be better (IMO of course) if this code did not compile.</p>
+
+<hr>
+
+<pre><code>template&lt;class T2&gt;
+ref(const ref&lt;T2&gt;&amp; r) {
+  if(r.get()) {
+    obj = r.get();
+    obj-&gt;rc++;
+  }
+}
+</code></pre>
+
+<p>This is extremely sketchy. Consider:</p>
+
+<pre><code>struct Widget : public refcount { int data = 42; };
+struct Gadget : public refcount { int x = -1; int data = 42; };
+int main() {
+    ref&lt;Widget&gt; w = new Widget;  // OK...
+    ref&lt;Gadget&gt; v = w;           // ...sketchy...
+    std::cout &lt;&lt; v-&gt;data &lt;&lt; "\n";  // OOPS! Prints "-1", not "42"
+}
+</code></pre>
+
+<p>This constructor should be either completely removed, or else constrained (using <code>enable_if</code>, C++2a <code>requires</code>, or some other trickery) so that it participates in overload resolution only when <code>T2*</code> would be convertible to <code>T*</code>.</p>
+
+<p>One easy way to mostly-fix this would be to simply add an assertion:</p>
+
+<pre><code>template&lt;class T2&gt;
+ref(const ref&lt;T2&gt;&amp; r) {
+    static_assert(std::is_convertible_v&lt;T2*, T*&gt;);
+    if (r != nullptr) {
+        obj_ = r.get();
+        obj_-&gt;rc += 1;
+    }
+}
+</code></pre>
+
+<p>Here we're lying to the library (e.g. <code>std::is_constructible_v&lt;ref&lt;Widget&gt;, ref&lt;Gadget&gt;&gt;</code> will still be <code>true</code>), but at least we prevent the client programmer from accidentally writing a program like the test case above.</p>
+
+<hr>
+
+<p>Another way to fix the issue would be to rely on pointer-assignment to do the check for us. Instead of <code>refcount *obj_;</code>, let's make our data member look like <code>T *obj_;</code>. Then we can write</p>
+
+<pre><code>template&lt;class T2&gt;
+ref(const ref&lt;T2&gt;&amp; r) {
+    if (r != nullptr) {
+        obj_ = r.obj_;  //HERE
+        obj_-&gt;rc += 1;
+    }
+}
+</code></pre>
+
+<p>And then if <code>T2*</code> <strong><em>isn't</em></strong> convertible to <code>T*</code>, we'll get an error on the line marked <code>//HERE</code>.</p>
+
+<p>Incidentally, this also solves your problem with <code>ref&lt;T&gt;::get()</code> and incomplete types.</p>
+
+<hr>
+
+<pre><code>T&amp; operator*() { return *get(); }
+T&amp; operator*() const { return *get(); }
+</code></pre>
+
+<p>You don't need both versions of the function, since they do exactly the same thing. Just write the <code>const</code> version. (Dereferencing a pointer doesn't need to modify the pointer, remember. <a href="https://quuxplusone.github.io/blog/2019/01/03/const-is-a-contract/" rel="nofollow noreferrer">Const is a contract.</a>)</p>
+
+<pre><code>T* operator-&gt;() { return static_cast&lt;T*&gt;(obj); }
+const T* operator-&gt;() const { return static_cast&lt;const T*&gt;(obj); }
+</code></pre>
+
+<p>And in this case you've got the two versions doing different things, but that's still wrong, because they <em>shouldn't</em> be doing different things! Dereferencing a pointer doesn't need to modify the pointer. What you meant in both cases was simply</p>
+
+<pre><code>T* get() const { return static_cast&lt;T*&gt;(obj); }
+T* operator-&gt;() const { return get(); }
+T&amp; operator*() const { return *get(); }
+</code></pre>
+
+<hr>
+
+<p>Your <code>void swap(ref&amp; p)</code> should be <code>noexcept</code> — just like your move-constructor, which I guess you didn't write. (You should do some move semantics here!)</p>
+
+<p>I recommend implementing your <code>swap</code> as a one-liner: <code>std::swap(obj_, rhs.obj_);</code>.</p>
+
+<p>A <strong><em>member</em></strong> <code>swap</code> function will not be picked up by any standard library algorithms. If you want your <code>swap</code> to be actually used, you'll need to provide an ADL <code>swap</code>, like this:</p>
+
+<pre><code>friend void swap(ref&amp; a, ref&amp; b) noexcept { a.swap(b); }
+</code></pre>
+
+<hr>
+
+<p>Your <code>queued_delete</code> is interesting. It's misnamed, in that its deletions are <strong>stacked</strong> (LIFO), not <strong>queued</strong> (FIFO). I don't know if that makes a difference to performance or anything like that, in practice.</p>
+
+<p>It's also thread-unsafe, which is not clear from your description/documentation. In standard C++, we can write</p>
+
+<pre><code>int main() {
+    std::shared_ptr&lt;Widget&gt; p(new Widget);
+    std::thread([q = p]() {
+        q = nullptr;
+    }).detach();
+    p = nullptr;
+}
+</code></pre>
+
+<p>and be guaranteed that the writes to the refcount shared by <code>p</code> and <code>q</code> won't race with each other. Your documentation clearly states that we can't do that with your <code>ref&lt;Widget&gt;</code>. But what is <strong><em>surprising</em></strong> to me is that we also can't do the following!</p>
+
+<pre><code>int main() {
+    ref&lt;Widget&gt; p(new Widget);
+    std::thread([]() {
+        ref&lt;Gadget&gt; q(new Gadget);
+        q = nullptr;
+    }).detach();
+    p = nullptr;
+}
+</code></pre>
+
+<p>Here, <code>p.obj-&gt;rc</code> and <code>q.obj-&gt;rc</code> are completely different objects, so there's no race there; but then they each call into <code>queued_delete</code> and try to write to <code>stack</code>, and <strong><em>those</em></strong> writes race with each other. So your <code>ref</code> is completely unsafe for use within a multi-threaded environment, even if you never share any objects between threads.</p>
+
+<p>In theory I guess you could "fix" this by replacing the storage class <code>static</code> with <code>thread_local</code> everywhere it appears; but, <a href="https://quuxplusone.github.io/blog/2018/11/14/fiber-local-storage/" rel="nofollow noreferrer">please don't do that.</a></p>
+    </div>

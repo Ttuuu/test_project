@@ -1,0 +1,361 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>OK, it is going to be a long answer :)</p>
+<p><strong>UPDATE</strong></p>
+<p>Actually, marking for deletion is not necessary, see <a href="https://web.archive.org/web/20160603221138/http://blogs.msdn.com/b/pfxteam/archive/2011/04/02/10149222.aspx" rel="nofollow noreferrer">Little-known gems: Atomic conditional removals from ConcurrentDictionary</a>.</p>
+<p>I would still consider the rest of the answer as an approach to structure the task.</p>
+<p><strong>END OF UPDATE</strong></p>
+<p><code>ConcurrentDictionary</code> - when you about to remove from it - first <code>mark for deletion</code> to get rid of racing conditions. I defined this helper class to assist with this task:</p>
+<pre><code>class AsyncDictionary&lt;TKey, TValue&gt;
+    where TValue : class
+{
+    ConcurrentDictionary&lt;TKey, TValue&gt; Values { get; } =
+        new ConcurrentDictionary&lt;TKey, TValue&gt;();
+
+    public delegate bool TryUpdate(ref TValue value);
+    
+    /// &lt;summary&gt;
+    /// It makes multiple attempts to execute if item under the question is marked for deletion.
+    /// &lt;/summary&gt;
+    /// &lt;param name="key"&gt;Well, the key.&lt;/param&gt;
+    /// &lt;param name="add"&gt;Value factory for add opeartion.&lt;/param&gt;
+    /// &lt;param name="tryUpdate"&gt;It will try to update, but might reject to do so.&lt;/param&gt;
+    /// &lt;returns&gt;Reports actual operation executed and the value assigned.&lt;/returns&gt;
+    public async Task&lt;Result&gt; AddOrUpdateAsync(TKey key, Func&lt;TValue&gt; add, TryUpdate tryUpdate)
+    {
+        while (true)
+        {
+            var result = Result.Cancelled;
+            Values.AddOrUpdate(key,
+                (k) =&gt;
+                {
+                    result = new Result(ValueAction.Added, add());
+                    return result.Value;
+                },
+                (k, v) =&gt;
+                {
+                    if (v == null)
+                        result = Result.Delayed;
+                    else                        
+                        result = tryUpdate(ref v) ?
+                            new Result(ValueAction.Updated, v) :
+                            Result.Cancelled;                        
+
+                    return v;
+                });
+
+            if (result.Action == ValueAction.Delayed)
+                await Task.Delay(10);
+            else
+                return result;
+        }
+    }
+
+    /// &lt;summary&gt;
+    /// Concurrent remove first marks the entry for deletion by assigning null 
+    /// to the value. 
+    /// &lt;/summary&gt;
+    /// &lt;param name="key"&gt;Well, the key.&lt;/param&gt;
+    /// &lt;param name="guard"&gt;Checks if we really want to kill it.&lt;/param&gt;
+    /// &lt;returns&gt;&lt;/returns&gt;
+    public Result Remove(TKey key, Predicate&lt;TValue&gt; guard)
+    {
+        TValue value;
+        if (!Values.TryGetValue(key, out value))
+            return Result.Cancelled;
+
+        if (value == null)
+            return Result.Cancelled;
+
+        if (!guard(value))
+            return Result.Cancelled;
+
+        if (!Values.TryUpdate(key, null, value))
+            return Result.Cancelled;
+
+        TValue nullValue;
+        Values.TryRemove(key, out nullValue);
+        if (nullValue != null)
+            throw new NotImplementedException();
+
+        return new Result(ValueAction.Removed, value);
+    }
+
+    /// &lt;summary&gt;
+    /// Removes everything matching the predicate.
+    /// &lt;/summary&gt;
+    /// &lt;param name="predicate"&gt;To be or not to be.&lt;/param&gt;
+    /// &lt;returns&gt;The corpses.&lt;/returns&gt;
+    public IEnumerable&lt;Result&gt; Remove(Predicate&lt;TValue&gt; predicate) =&gt;
+        from kvp in Values
+        where predicate(kvp.Value)
+        select Remove(kvp.Key, predicate) into r
+        where r.Action == ValueAction.Removed
+        select r;        
+
+    public struct Result
+    {
+        public static readonly Result Cancelled = new Result(ValueAction.Cancelled);
+        public static readonly Result Removed = new Result(ValueAction.Removed);
+        public static readonly Result Delayed = new Result(ValueAction.Delayed);
+
+        public Result(ValueAction action)
+            : this(action, null)
+        {
+        }
+
+        public Result(ValueAction action, TValue value)
+        {
+            Action = action;
+            Value = value;
+        }
+
+        public ValueAction Action { get; }
+        public TValue Value { get; }
+    }
+}
+
+enum ValueAction
+{
+    Added,
+    Updated,
+    Removed,
+    Cancelled,
+    Delayed
+}
+</code></pre>
+<p>Now let’s define abstractions for proper dependency management:</p>
+<pre><code>interface IClock
+{
+    DateTimeOffset GetTime();
+}
+
+interface ISessionMonitor : IDisposable
+{
+    Task StartAsync(Session session);
+    Task EndAsync(Session session);
+}
+
+interface IPingMonitor : IDisposable
+{
+    Task PingAsync(AgentId agentId);
+}
+</code></pre>
+<p>A little bit of "explicit language" - not necessary at all :)</p>
+<pre><code>struct AgentId
+{
+    public static implicit operator AgentId(int value) =&gt; new AgentId { Value = value };
+    public static implicit operator int(AgentId agentId) =&gt; agentId.Value;
+    int Value { get; set; }
+    public override string ToString() =&gt; $"Agent #{Value}";
+}
+</code></pre>
+<p>We are defining one business object, it knows how to calculate expiration:</p>
+<pre><code>class Session : ValueObject&lt;Session&gt;
+{
+    private static readonly TimeSpan Ttl = TimeSpan.FromMinutes(10);
+
+    public static Session Start(AgentId agentId, DateTimeOffset at) =&gt;
+        new Session(agentId, at, at);
+
+    public Session(AgentId agentId, DateTimeOffset started, DateTimeOffset lastActivity)
+    {
+        AgentId = agentId;
+        Started = started;
+        LastActivity = lastActivity;
+    }
+
+    public AgentId AgentId { get; }
+    public DateTimeOffset Started { get; }
+    public DateTimeOffset LastActivity { get; }
+    public bool IsExpired(DateTimeOffset at) =&gt; LastActivity + Ttl &lt; at;
+
+    public bool TryExtend(DateTimeOffset till, out Session extended)
+    {
+        extended = this;
+        if (IsExpired(till))
+            return false;
+
+        extended = new Session(AgentId, Started, till);
+        return true;
+    }
+
+    protected override IEnumerable&lt;object&gt; EqualityCheckAttributes =&gt;
+        new object[] { AgentId, Started };
+}
+</code></pre>
+<p>The most interesting thing:</p>
+<pre><code>class PingMonitor : IPingMonitor
+{
+    private static readonly TimeSpan Interval = TimeSpan.FromMinutes(1);
+    AsyncDictionary&lt;AgentId, Session&gt; Sessions { get; } =
+        new AsyncDictionary&lt;AgentId, Session&gt;();
+
+    public PingMonitor(IClock clock, ISessionMonitor monitor)
+    {
+        Clock = clock;
+        Monitor = monitor;
+        CancellationTokenSource = new CancellationTokenSource();
+        Task.Run(RunAsync);
+    }
+
+    public void Dispose()
+    {
+        CancellationTokenSource.Cancel();
+        Monitor.Dispose();
+    }
+
+    IClock Clock { get; }
+    ISessionMonitor Monitor { get; }
+    CancellationTokenSource CancellationTokenSource { get; }
+
+    public Task PingAsync(AgentId agentId) =&gt;
+        StartOrExtendAsync(agentId);
+
+    async Task StartOrExtendAsync(AgentId agentId)
+    {
+        var result = await Sessions.AddOrUpdateAsync(
+            agentId,
+            () =&gt; Session.Start(agentId, Clock.GetTime()),
+            (ref Session s) =&gt; s.TryExtend(Clock.GetTime(), out s));
+
+        switch (result.Action)
+        {
+            case ValueAction.Added:
+                await Monitor.StartAsync(result.Value);
+                return;
+
+            case ValueAction.Updated:
+                return;
+
+            case ValueAction.Cancelled:
+                await EndAsync(agentId);
+                await StartOrExtendAsync(agentId);
+                return;
+
+            default:
+                throw new NotImplementedException();
+        }
+    }
+
+    async Task EndAsync(AgentId agentId)
+    {
+        var result = Sessions.Remove(agentId, s =&gt; s.IsExpired(Clock.GetTime()));
+        switch (result.Action)
+        {
+            case ValueAction.Removed:
+                await Monitor.EndAsync(result.Value);
+                return;
+
+            case ValueAction.Cancelled:
+                return;
+
+            default:
+                throw new NotImplementedException();
+        }
+    }
+
+    async Task RunAsync()
+    {
+        while (!CancellationTokenSource.Token.IsCancellationRequested)
+        {
+            await Task.Delay(Interval, CancellationTokenSource.Token);
+            await Task.WhenAll(from r in Sessions.Remove(s =&gt; s.IsExpired(Clock.GetTime()))
+                               select Monitor.EndAsync(r.Value));
+        }
+    }
+}
+</code></pre>
+<p>I used this helper classes:</p>
+<pre><code>class Clock : IClock
+{
+    public DateTimeOffset GetTime() =&gt; DateTimeOffset.Now;
+}
+
+abstract class ValueObject&lt;T&gt; : IEquatable&lt;ValueObject&lt;T&gt;&gt;
+    where T : ValueObject&lt;T&gt;
+{
+    protected abstract IEnumerable&lt;object&gt; EqualityCheckAttributes { get; }
+
+    public override int GetHashCode() =&gt;
+        EqualityCheckAttributes
+            .Aggregate(0, (hash, a) =&gt; hash = hash * 31 + (a?.GetHashCode() ?? 0));
+
+    public override bool Equals(object obj) =&gt;
+        Equals(obj as ValueObject&lt;T&gt;);
+
+    public bool Equals(ValueObject&lt;T&gt; other) =&gt;
+        other != null &amp;&amp;
+            EqualityCheckAttributes.SequenceEqual(other.EqualityCheckAttributes);
+
+    public static bool operator ==(ValueObject&lt;T&gt; left, ValueObject&lt;T&gt; right) =&gt;
+        Equals(left, right);
+
+    public static bool operator !=(ValueObject&lt;T&gt; left, ValueObject&lt;T&gt; right) =&gt;
+        !Equals(left, right);
+}
+</code></pre>
+<p>Let’s test:</p>
+<pre><code>class Program
+{
+    static void Main(string[] args)
+    {
+        using (IPingMonitor m = new PingMonitor(new Clock(), new SessionLogWriter()))
+        {
+            Task.Run(async () =&gt;
+            {
+                while (true)
+                {
+                    await m.PingAsync(1);
+                    await Task.Delay(1000);
+                }
+            });
+
+            Task.Run(async () =&gt;
+            {
+                while (true)
+                {
+                    await m.PingAsync(10);
+                    await Task.Delay(4000);
+                }
+            });
+
+            Console.ReadLine();
+        }
+    }
+}
+</code></pre>
+<p>Where:</p>
+<pre><code>class SessionLogWriter : ISessionMonitor
+{
+    public SessionLogWriter()
+        : this(Console.Out)
+    {
+    }
+
+    public SessionLogWriter(TextWriter writer)
+    {
+        _writer = writer;
+    }
+
+    readonly TextWriter _writer;
+
+    public void Dispose()
+    {
+        _writer.Dispose();
+    }
+
+    public Task StartAsync(Session session) =&gt;
+        _writer.WriteLineAsync(
+            $"{session.AgentId}\t" +
+            $"{session.Started:hh:mm:ss}\t" +
+            $"{session.LastActivity:hh:mm:ss}\tTrue");
+
+    public Task EndAsync(Session session) =&gt;
+        _writer.WriteLineAsync(
+            $"{session.AgentId}\t" +
+            $"{session.Started:hh:mm:ss}\t" +
+            $"{session.LastActivity:hh:mm:ss}\tFalse");
+}
+</code></pre>
+<p>I would recommend to create <a href="https://en.wikipedia.org/wiki/Composite_pattern" rel="nofollow noreferrer">composite</a> <code>ISessionMonitor</code> to broadcast your changes between multiple <code>ISessionMonitor</code> implementations if needed.</p>
+    </div>

@@ -1,0 +1,224 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>As said in a comment this may be done better and faster with an SQL script depending on how the involved data sets are created, but below are some optimization suggestions.</p>
+
+<hr>
+
+<p>You should maybe consider some input check:</p>
+
+<pre><code>private void CustomersBuyingRange(string supplier, int topN)
+{
+  if (string.IsNullOrWhiteSpace(supplier)) return;
+  if (topN &lt;= 0) throw new ArgumentOutOfRangeException(nameof(topN));
+</code></pre>
+
+<hr>
+
+<p><strong>Optimizations:</strong></p>
+
+<p>1)</p>
+
+<blockquote>
+<pre><code>  // Get a list of products from a supplier.
+  string[] products = productDetails
+                      .Where(x =&gt; x.SupplierID == supplier.ToUpper())
+                      .Select(x =&gt; x.ProductCode).ToArray();
+</code></pre>
+</blockquote>
+
+<p><code>supplier.ToUpper()</code> is called repeatedly for every element in the vector. Consider to do it once:</p>
+
+<pre><code>  supplier = supplier.ToUpper();
+
+  // Get a list of products from a supplier.
+  var products = productDetails
+                      .Where(x =&gt; x.SupplierID == supplier)
+                      .Select(x =&gt; x.ProductCode);
+</code></pre>
+
+<p>As shown, there is also no need to populate an array with the result here.</p>
+
+<hr>
+
+<p>2)</p>
+
+<blockquote>
+<pre><code>  var customers = customerDetails
+      .Where(x =&gt; x.LastInvoiceDate &gt; DateTime.Now.AddMonths(-3).Date)
+      .OrderBy(x =&gt; x.CustomerName)
+      .ToList();
+</code></pre>
+</blockquote>
+
+<p>Again you create a new <code>DateTime</code> object for each customer you evaluate in the <code>Where()</code> call. Consider to create that date once:</p>
+
+<pre><code>    DateTime minDate = DateTime.Now.AddMonths(-3).Date;
+    // We only want customers that have had an order in the last 3 months.
+    var customers = customerDetails
+        .Where(x =&gt; x.LastInvoiceDate &gt; minDate)
+        .OrderBy(x =&gt; x.CustomerName);
+</code></pre>
+
+<p>You can then reuse it in the last loop too.</p>
+
+<hr>
+
+<p>3)</p>
+
+<blockquote>
+<pre><code>    for (int i = 0; i &lt; topN; i++)
+    {
+      row[topSellers[i]] = detailedOrderLines
+          .Any(x =&gt; x.CustomerID == customer.CustomerID &amp;&amp;
+               x.ProductCode == topSellers[i] &amp;&amp;
+               x.InvoiceDate &gt; DateTime.Now.AddMonths(-3).Date
+               ) ? "Yes" : "No";
+    }
+</code></pre>
+</blockquote>
+
+<p>Here you should be able to run a <code>foreach</code> loop instead:</p>
+
+<pre><code>      foreach (var topSeller in topSellers)
+      {
+        row[topSeller] = detailedOrderLines
+            .Any(x =&gt; x.CustomerID == customer.CustomerID &amp;&amp;
+                 x.ProductCode == topSeller &amp;&amp;
+                 x.InvoiceDate &gt; minDate) ? "Yes" : "No";
+      }
+</code></pre>
+
+<hr>
+
+<p>4)</p>
+
+<blockquote>
+<pre><code>foreach (var customer in customers)
+  {
+    DataRow row = table.NewRow();
+    row["CustomerID"] = customer.CustomerID;
+    row["Customer"] = customer.CustomerName;
+    row["AccountManager"] = customer.AccountManager;
+    for (int i = 0; i &lt; topN; i++)
+    {
+      row[topSellers[i]] = detailedOrderLines
+          .Any(x =&gt; x.CustomerID == customer.CustomerID &amp;&amp;
+               x.ProductCode == topSellers[i] &amp;&amp;
+               x.InvoiceDate &gt; DateTime.Now.AddMonths(-3).Date
+               ) ? "Yes" : "No";
+    }
+    table.Rows.Add(row);
+  }
+</code></pre>
+</blockquote>
+
+<p>Here you keep require the entire <code>detailedOrderLines</code> although you previously when creating the <code>topSellers</code> actually grouped those by <code>ProductCode</code>. So if you instead of selecting <code>topSellers</code> as <code>strings</code> select them as anonymous objects like:</p>
+
+<pre><code>  // Rank the products by distribution and then by sales,
+  // then add the required amount to an array.
+  var topProducts = detailedOrderLines
+                          .Where(x =&gt; products.Contains(x.ProductCode))
+                          .GroupBy(x =&gt; x.ProductCode)
+                          .Select(x =&gt; new
+                          {
+                            ProductCode = x.FirstOrDefault().ProductCode,
+                            DeliveredQty = x.Sum(p =&gt; p.DeliveredQty),
+                            Distribution = x.Select(c =&gt; c.CustomerID).Distinct().Count(),
+                            OrderLines = x.ToList()
+                          })
+                          .OrderByDescending(x =&gt; x.Distribution)
+                          .ThenByDescending(x =&gt; x.DeliveredQty)
+                          .Take(topN).ToList();
+</code></pre>
+
+<p>you only have to query the subset of <code>orderLines</code> that belongs to the current <code>ProductCode</code>:</p>
+
+<pre><code>    foreach (var customer in customers)
+    {
+      DataRow row = table.NewRow();
+      row["CustomerID"] = customer.CustomerID;
+      row["Customer"] = customer.CustomerName;
+      row["AccountManager"] = customer.AccountManager;
+
+      foreach (var topProduct in topProducts)
+      {
+        row[topProduct.ProductCode] = topProduct.OrderLines.Any(x =&gt; x.CustomerID == customer.CustomerID &amp;&amp; x.InvoiceDate &lt; minDate) ? "Yes" : "No";
+      }
+
+      table.Rows.Add(row);
+    }
+</code></pre>
+
+<hr>
+
+<p>All in all the method could then be something like:</p>
+
+<pre><code>private void CustomersBuyingRange(string supplier, int topN)
+{
+  if (string.IsNullOrWhiteSpace(supplier)) return;
+  if (topN &lt;= 0) throw new ArgumentOutOfRangeException(nameof(topN));
+
+  supplier = supplier.ToUpper();
+
+  // Get a list of products from a supplier.
+  var products = productDetails
+                      .Where(x =&gt; x.SupplierID == supplier)
+                      .Select(x =&gt; x.ProductCode);
+
+  // Rank the products by distribution and then by sales,
+  // then add the required amount to an array.
+  var topProducts = detailedOrderLines
+                          .Where(x =&gt; products.Contains(x.ProductCode))
+                          .GroupBy(x =&gt; x.ProductCode)
+                          .Select(x =&gt; new
+                          {
+                            ProductCode = x.FirstOrDefault().ProductCode,
+                            DeliveredQty = x.Sum(p =&gt; p.DeliveredQty),
+                            Distribution = x.Select(c =&gt; c.CustomerID).Distinct().Count(),
+                            OrderLines = x.ToList()
+                          })
+                          .OrderByDescending(x =&gt; x.Distribution)
+                          .ThenByDescending(x =&gt; x.DeliveredQty)
+                          .Take(topN).ToList();
+
+  using (DataTable table = new DataTable("Customers"))
+  {
+    table.Columns.Add("CustomerID", typeof(string));
+    table.Columns.Add("Customer", typeof(string));
+    table.Columns.Add("AccountManager", typeof(string));
+    // Add the columns with the products.
+    foreach (var topProduct in topProducts)
+    {
+      table.Columns.Add(topProduct.ProductCode, typeof(string));
+    }
+
+    DateTime minDate = DateTime.Now.AddMonths(-3).Date;
+    // We only want customers that have had an order in the last 3 months.
+    var customers = customerDetails
+        .Where(x =&gt; x.LastInvoiceDate &gt; minDate)
+        .OrderBy(x =&gt; x.CustomerName);
+
+
+    foreach (var customer in customers)
+    {
+      DataRow row = table.NewRow();
+      row["CustomerID"] = customer.CustomerID;
+      row["Customer"] = customer.CustomerName;
+      row["AccountManager"] = customer.AccountManager;
+
+      foreach (var topProduct in topProducts)
+      {
+        row[topProduct.ProductCode] = topProduct.OrderLines.Any(x =&gt; x.CustomerID == customer.CustomerID &amp;&amp; x.InvoiceDate &lt; minDate) ? "Yes" : "No";
+      }
+
+      table.Rows.Add(row);
+    }
+
+    Export.ExportToExcel(table, true);
+  }
+}
+</code></pre>
+
+<hr>
+
+<p>Disclaimer: I haven't had the opportunity to test the above, so don't hang me if it doesn't improve anything or if I have misunderstood something. </p>
+    </div>

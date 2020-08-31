@@ -1,0 +1,243 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The main operation is substitution via a small table, which is also what <a href="https://software.intel.com/en-us/node/524215" rel="nofollow noreferrer"><code>_mm_shuffle_epi8</code></a> does. The low 4 bits of the indexes clash though, and I could not find an easy way to remap them. The clash can also be worked around by remapping the <code>A..O</code> (<code>4x</code> range) and <code>P..Z</code> (<code>5x</code> range) ranges separately with a shuffle for each, then conditional-select based on which range the input character was in. The lower case letters can be handled easily by upper casing them first, which without special characters or validation can be done with just a bitwise AND.</p>
+
+<p>I could not find a way to gracefully handle newlines with SSE, but they can be detected and then handled with scalar code. That slows the code down significantly around a newline though, since a single newline can cause a dozen scalar iterations, which are now also slower than usual since every iteration checks whether it might be the start of a newline-free 16 byte block yet.</p>
+
+<p>My compiler couldn't handle that fancy array initialization so I changed it, of course you can change that back, but this is the code as I tested it:</p>
+
+<pre><code>void staticTransformationSSSE3(char* front, char *back) {
+    char c[128];
+    c['A'] = 'T'; c['a'] = 'T';
+    c['C'] = 'G'; c['c'] = 'G';
+    c['G'] = 'C'; c['g'] = 'C';
+    c['T'] = 'A'; c['t'] = 'A';
+    c['U'] = 'A'; c['u'] = 'A';
+    c['M'] = 'K'; c['m'] = 'K';
+    c['R'] = 'Y'; c['r'] = 'Y';
+    c['W'] = 'W'; c['w'] = 'W';
+    c['S'] = 'S'; c['s'] = 'S';
+    c['Y'] = 'R'; c['y'] = 'R';
+    c['K'] = 'M'; c['k'] = 'M';
+    c['V'] = 'B'; c['v'] = 'B';
+    c['H'] = 'D'; c['h'] = 'D';
+    c['D'] = 'H'; c['d'] = 'H';
+    c['B'] = 'V'; c['b'] = 'V';
+    c['N'] = 'N'; c['n'] = 'N';
+
+    char help;
+    __m128i newline = _mm_set1_epi8('\n');
+    __m128i lowercase = _mm_set1_epi8(~0x20);
+    //                               N    M       K          H    G          D    C    B    A
+    __m128i sub4x = _mm_set_epi8(0, 'N', 'K', 0, 'M', 0, 0, 'D', 'C', 0, 0, 'H', 'G', 'V', 'T', 0);
+    //                                              Y       W    V    U    T    S    R
+    __m128i sub5x = _mm_set_epi8(0, 0, 0, 0, 0, 0, 'R', 0, 'W', 'B', 'A', 'A', 'S', 'Y', 0, 0);
+    __m128i reverse = _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    while (front + 15 &lt; back - 15) {
+        __m128i fdata = _mm_loadu_si128((__m128i*)front);
+        __m128i bdata = _mm_loadu_si128((__m128i*)(back - 15));
+        // if there are no newlines, process 2x16 chars
+        // otherwise do a scalar iteration
+        if (_mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(fdata, newline), 
+                                           _mm_cmpeq_epi8(bdata, newline))) == 0) {
+            // toUpper
+            fdata = _mm_and_si128(fdata, lowercase);
+            bdata = _mm_and_si128(bdata, lowercase);
+            // substitute 4x and 5x with separate tables
+            __m128i subf4x = _mm_shuffle_epi8(sub4x, fdata);
+            __m128i subf5x = _mm_shuffle_epi8(sub5x, fdata);
+            __m128i maskf = _mm_cmpgt_epi8(fdata, _mm_set1_epi8(0x4F));
+            // note: could use _mm_blendv_epi8 with SSE4.1
+            __m128i subf = _mm_or_si128(_mm_and_si128(subf5x, maskf), _mm_andnot_si128(maskf, subf4x));
+            __m128i fpart = _mm_shuffle_epi8(subf, reverse);
+
+            // substitute 4x and 5x with separate tables
+            __m128i subb4x = _mm_shuffle_epi8(sub4x, bdata);
+            __m128i subb5x = _mm_shuffle_epi8(sub5x, bdata);
+            __m128i maskb = _mm_cmpgt_epi8(bdata, _mm_set1_epi8(0x4F));
+            // note: could use _mm_blendv_epi8 with SSE4.1
+            __m128i subb = _mm_or_si128(_mm_and_si128(subb5x, maskb), _mm_andnot_si128(maskb, subb4x));
+            __m128i bpart = _mm_shuffle_epi8(subb, reverse);
+
+            // write results swapped
+            _mm_storeu_si128((__m128i*)front, bpart);
+            _mm_storeu_si128((__m128i*)(back - 15), fpart);
+
+            front += 16;
+            back -= 16;
+        }
+        else {
+            if (*front == '\n')
+                front++;
+            if (*back == '\n')
+                back--;
+            help = c[(*front)];
+            *front = c[(*back)];
+            *back = help;
+            front++;
+            back--;
+        }
+    }
+    while (front &lt; back) {
+        if (*front == '\n')
+            front++;
+        if (*back == '\n')
+            back--;
+        help = c[(*front)];
+        *front = c[(*back)];
+        *back = help;
+        front++;
+        back--;
+    }
+}
+</code></pre>
+
+<p>By the way you need something like <code>#include &lt;tmmintrin.h&gt;</code> in order to access the SSSE3 intrinsics, and a compiler-dependent compile flag may need to be used when compiler, such as an appropriate <code>-march=</code> or <code>-mssse3</code> (not needed on MSVC).</p>
+
+<p>The performance is strongly dependent on the number and distribution of newlines, and will also depend on the microarchitecture. For example for 16KB of data without newlines, on my 4770K Haswell the SSSE3 version is about 10 times as fast, but if there is 1 newline per 256 bytes it already goes down to only 6 times as fast.</p>
+
+<hr>
+
+<p>Newline handling was a bit more important than I estimated, it can be improved by always doing the SIMD character substitution and reverse but then only writing back up to the newline. Then the next newline test will step over that newline immediately, instead of some scalar iterations having to happen first.</p>
+
+<p>Finding the first newline from both sides can be done by bit-scanning the comparison mask from both sides, for which you could use these functions:</p>
+
+<pre><code>// same semantics as __builtin_ctz,
+// but also works on MSVC
+int countTrailingZeros(uint32_t x) {
+#ifdef _MSC_VER
+    unsigned long res;
+    _BitScanForward(&amp;res, x);
+    return res;
+#else
+    return __builtin_ctz(x);
+#endif
+}
+
+// same semantics as __builtin_clz,
+// but also works on MSVC
+int countLeadingZeros(uint32_t x) {
+#ifdef _MSC_VER
+    unsigned long res;
+    _BitScanReverse(&amp;res, x);
+    return res ^ 31;
+#else
+    return __builtin_clz(x);
+#endif
+}
+</code></pre>
+
+<p>The conditional writeback can be done with the same type of conditional-select also used to merge the results of the <code>4x</code> and <code>5x</code> range character substitutions, with the mask depending on the number of characters up to the newline. There are various ways to calculate that mask, the easiest is looking it up in a small table. The reverse mask, for conditional writeback at the <code>back</code>, can be found in the same table by using <code>16 - index</code> and then using the mask with inverted interpretation (conditional-select with reversed operands).</p>
+
+<pre><code>void staticTransformationSSSE3(char* front, char *back) {
+    char c[128];
+    c['A'] = 'T'; c['a'] = 'T';
+    c['C'] = 'G'; c['c'] = 'G';
+    c['G'] = 'C'; c['g'] = 'C';
+    c['T'] = 'A'; c['t'] = 'A';
+    c['U'] = 'A'; c['u'] = 'A';
+    c['M'] = 'K'; c['m'] = 'K';
+    c['R'] = 'Y'; c['r'] = 'Y';
+    c['W'] = 'W'; c['w'] = 'W';
+    c['S'] = 'S'; c['s'] = 'S';
+    c['Y'] = 'R'; c['y'] = 'R';
+    c['K'] = 'M'; c['k'] = 'M';
+    c['V'] = 'B'; c['v'] = 'B';
+    c['H'] = 'D'; c['h'] = 'D';
+    c['D'] = 'H'; c['d'] = 'H';
+    c['B'] = 'V'; c['b'] = 'V';
+    c['N'] = 'N'; c['n'] = 'N';
+
+    __m128i lengthMaskLUT[16];
+    {
+        __m128i m = _mm_setzero_si128();
+        __m128i ones = _mm_set1_epi8(0xFF);
+        for (size_t i = 0; i &lt; 16; i++) {
+            lengthMaskLUT[i] = m;
+            m = _mm_alignr_epi8(m, ones, 15);
+        }
+    }
+
+    char help;
+    __m128i newline = _mm_set1_epi8('\n');
+    __m128i lowercase = _mm_set1_epi8(~0x20);
+    //                               N    M       K             H    G          D    C    B    A
+    __m128i sub4x = _mm_set_epi8(0, 'N', 'K', 0, 'M', '\n', 0, 'D', 'C', 0, 0, 'H', 'G', 'V', 'T', 0);
+    //                                              Y       W    V    U    T    S    R
+    __m128i sub5x = _mm_set_epi8(0, 0, 0, 0, 0, 0, 'R', 0, 'W', 'B', 'A', 'A', 'S', 'Y', 0, 0);
+    __m128i reverse = _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    while (front + 15 &lt; back - 15) {
+        // ignore newline
+        if (*front == '\n') {
+            front++;
+            continue;
+        }
+        if (*back == '\n') {
+            back--;
+            continue;
+        }
+        __m128i fdata = _mm_loadu_si128((__m128i*)front);
+        __m128i bdata = _mm_loadu_si128((__m128i*)(back - 15));
+        uint32_t newlineMaskF = _mm_movemask_epi8(_mm_cmpeq_epi8(fdata, newline));
+        uint32_t newlineMaskB = _mm_movemask_epi8(_mm_cmpeq_epi8(bdata, newline));
+        // toUpper
+        fdata = _mm_and_si128(fdata, lowercase);
+        bdata = _mm_and_si128(bdata, lowercase);
+        // substitute 4x and 5x with separate tables
+        __m128i subf4x = _mm_shuffle_epi8(sub4x, fdata);
+        __m128i subf5x = _mm_shuffle_epi8(sub5x, fdata);
+        __m128i maskf = _mm_cmpgt_epi8(fdata, _mm_set1_epi8(0x4F));
+        // note: could use _mm_blendv_epi8 with SSE4.1
+        __m128i subf = _mm_or_si128(_mm_and_si128(subf5x, maskf), _mm_andnot_si128(maskf, subf4x));
+        __m128i fpart = _mm_shuffle_epi8(subf, reverse);
+
+        // substitute 4x and 5x with separate tables
+        __m128i subb4x = _mm_shuffle_epi8(sub4x, bdata);
+        __m128i subb5x = _mm_shuffle_epi8(sub5x, bdata);
+        __m128i maskb = _mm_cmpgt_epi8(bdata, _mm_set1_epi8(0x4F));
+        // note: could use _mm_blendv_epi8 with SSE4.1
+        __m128i subb = _mm_or_si128(_mm_and_si128(subb5x, maskb), _mm_andnot_si128(maskb, subb4x));
+        __m128i bpart = _mm_shuffle_epi8(subb, reverse);
+
+        // if there is no newline in the block, write the whole thing
+        // otherwise write up to the newline
+        if ((newlineMaskF | newlineMaskB) == 0) {
+            _mm_storeu_si128((__m128i*)front, bpart);
+            _mm_storeu_si128((__m128i*)(back - 15), fpart);
+            front += 16;
+            back -= 16;
+        }
+        else {
+            // find newline-free prefix
+            // must have non-zero length otherwise the "ignore newline"
+            // step would have triggered
+            int prefixLength = std::min(
+                countTrailingZeros(newlineMaskF | 0x10000),
+                countLeadingZeros((newlineMaskB &lt;&lt; 16) | 0x8000));
+            // merge with mask, don't use _mm_maskmoveu_si128 since it's an NT store
+            __m128i mergedAtF = _mm_or_si128(
+                _mm_and_si128(bpart, lengthMaskLUT[prefixLength]),
+                _mm_andnot_si128(lengthMaskLUT[prefixLength], fdata));
+            _mm_storeu_si128((__m128i*)front, mergedAtF);
+            // reverse mask is the complement of the mask at the negated index
+            __m128i mergedAtB = _mm_or_si128(
+                _mm_and_si128(bdata, lengthMaskLUT[16 - prefixLength]),
+                _mm_andnot_si128(lengthMaskLUT[16 - prefixLength], fpart));
+            _mm_storeu_si128((__m128i*)(back - 15), mergedAtB);
+            front += prefixLength;
+            back -= prefixLength;
+        }
+    }
+    while (front &lt; back) {
+        if (*front == '\n')
+            front++;
+        if (*back == '\n')
+            back--;
+        help = c[(*front)];
+        *front = c[(*back)];
+        *back = help;
+        front++;
+        back--;
+    }
+}
+</code></pre>
+    </div>

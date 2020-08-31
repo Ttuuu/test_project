@@ -1,0 +1,123 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Dobra robota, tak trzymaj.</p>
+
+<p>Your code is rather good code:</p>
+
+<ul>
+<li>Docstrings, yay;</li>
+<li>PEP 8 compliant (except a missing second blank line before <code>if __name__ == '__main__'</code>);</li>
+<li>Custom exception for the module;</li>
+<li>Not executing top-level code on imports;</li>
+<li>Sensible defaults;</li>
+<li>Readable.</li>
+</ul>
+
+<p>However, it's rather WET and you've got a silly rookie mistake.</p>
+
+<h1>Bug</h1>
+
+<p>Reading the docstring above, I'm pretty sure <code>if source and target in self.supported_languages:</code> is not checking what you intended to check.</p>
+
+<p>This is parsed as <code>if source and (target in self.supported_languages):</code> which checks for the truth value of <code>source</code> rather than its existence in the <code>self.supported_language</code> dictionary.</p>
+
+<p>Instead you could write:</p>
+
+<pre><code>def _get_translate_direction(self, source, target):
+    """Raise an exception if source and target language are not currently
+    supported by the Yandex Translate API.
+    """
+    if target not in self.supported_languages:
+        raise YandexException('language target \'{}\' not supported'.format(target))
+    if source is None:
+        return target
+
+    if source not in self.supported_languages:
+        raise YandexException('language source \'{}\' not supported'.format(source))
+    return '{}-{}'.format(source, target)
+</code></pre>
+
+<h1>DRY it up</h1>
+
+<p>Each of the 3 method communicating with the API reuse the same exact structure and mostly share 7 lines in common. You could extract that to simplify things:</p>
+
+<pre><code>def _get_api_response(self, endpoint, payload):
+    try:
+        response = self._session.get(self.URL + endpoint, params=payload)
+        if response.status_code != 200:
+            raise YandexException(response.json())
+        return response.json()
+    except ConnectionError:
+        raise YandexException('API unavailable')
+
+@property
+def supported_languages(self):
+    payload = {
+        'ui': 'en',
+        'key': self.api_key
+    }
+    return self._get_api_response('getLangs', payload).get('langs')
+
+def translate(self, text, target='en', source=None):
+    translate_direction = self._get_translate_direction(source, target)
+    payload = {
+        'text': text,
+        'format': 'plain',
+        'lang': translate_direction,
+        'key': self.api_key
+    }
+    return self._get_api_response('translate', payload).get('text')[0]
+
+def detect_language(self, text):
+    payload = {
+        'text': text,
+        'format': 'plain',
+        'key': self.api_key
+    }
+    return self._get_api_response('detect', payload).get('lang')
+</code></pre>
+
+<h1>Improvements</h1>
+
+<p>I’m not sure why you chose to <code>.get</code> elements out of the JSON response rather than accessing them directly with <code>['lang']</code> or <code>['text']</code>: in case the API doesn't respond with the expected JSON, you won't figure it out. Worse, it will crash on other parts of the code with no obvious reasons.</p>
+
+<p>For instance, if the <code>getLangs</code> call does not return a dictionary with a <code>'langs'</code> key, <code>response.json().get('langs')</code> will return <code>None</code>. This will make the checks <code>target in self.supported_languages</code> raise <code>TypeError</code> because <code>None</code> is not iterable. This is not ideal. You should either:</p>
+
+<ul>
+<li>access the key directly and catch the <code>KeyError</code> to throw your own exception;</li>
+<li>or use a default value in your <code>.get</code> calls that is compatible with what is expected later.</li>
+</ul>
+
+<p>For the second option, I'd use:</p>
+
+<pre><code>return self._get_api_response('getLangs', payload).get('langs', {})
+return self._get_api_response('translate', payload).get('text', [None])[0]
+return self._get_api_response('detect', payload).get('lang')
+</code></pre>
+
+<p>For the last two, None seems valid as it convey the "I couldn't detect/translate" meaning.</p>
+
+<hr>
+
+<p>An other improvement I would make is to cache the returned value of <code>supported_languages</code> as there is very few chances that it changes during the lifespan of the application. I’d use <code>functools.lru_cache</code> for that:</p>
+
+<pre><code>from functools import lru_cache
+
+
+class Yandex:
+    ...
+    @property
+    @lru_cache(maxsize=1)
+    def supported_languages(self):
+        payload = {
+            'ui': 'en',
+            'key': self.api_key
+        }
+        return self._get_api_response('getLangs', payload).get('langs', {})
+</code></pre>
+
+<p>I chose a <code>maxsize</code> of 1 because there is little to no chance that more than 1 <code>Yandex</code> object get instanciated in a given application.</p>
+
+<hr>
+
+<p>Lastly, I’m not aware if Yandex provide a sandboxed environment with some kind of public key that anyone can use with restrictions on the amount of requests, for instance. But if they do, it could be a great addition as a default value for the constructor.</p>
+    </div>

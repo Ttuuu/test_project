@@ -1,0 +1,88 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>There are two main things to talk about: checking the input, and buffer handling (your <code>malloc</code> question).</p>
+
+<p>It's a very bad idea to do things like <code>array[i + 1]</code>, unless you're absolutely, 100% sure that this refers to memory that is both allocated and part of the string. If it's not allocated, your program is begging for a crash; if it's not part of the string, it's a vulnerability issue and every script kiddie will be able to read your process' memory.</p>
+
+<h2>Checking the input</h2>
+
+<p>Unless you're absolutely, 100% sure that your user will be supplying you with a valid, NULL-terminated UTF-8 string, you definitely need to do some checking. Note that when I say "user", I mean the developer who will be using your functions.</p>
+
+<p>When writing APIs, it really helps to write, or at least think about, some usage code first, in order to get an idea of what developers would need and how your code will be used. This will help again later, when discussing your <code>malloc</code> question.</p>
+
+<p>Now, think about your general use cases. The developer gets some input through a socket, file, hardware device, form field, whatever. Sockets, files and hardware are prone to losing some bytes due to many different reasons. Forms are generally safe, but you <strong>will</strong> come across a library that will leave off bytes of the last UTF-8 character when you give it a too small buffer, or not null-terminate the string when the last character fits exactly in the buffer (some C standard lib functions are guilty of the latter). Malicious users may also try to exploit the form input field.</p>
+
+<p>Out of all these, only the form field will be naturally NULL-terminated (probably). With all the others, you get a stream of data that simply ends at some point. So you're forcing the user to manually add the NULL byte, which could possibly lead to reallocation... you can see it's not a good idea.</p>
+
+<p>The developer, however, knows exactly how many bytes he got. Why not exploit this? Rewrite your <code>utf8_strlen</code> function like this:</p>
+
+<pre><code>size_t utf8_strlen(uint8_t* text, size_t nb_text, size_t* nb_valid);
+</code></pre>
+
+<p>Do pretty much the same thing you were doing, however:</p>
+
+<ol>
+<li>Do not blindly increment <code>i</code> without testing whether <code>i + NUM_BYTES_IN_NEXT_CHAR &lt;= nb_text</code></li>
+<li>Stop immediately if that fails</li>
+<li>Stop immediately at a null byte, even if you've used less than <code>nb_text</code> bytes</li>
+<li>Stop when you've used <code>nb_text</code> bytes</li>
+<li>You <em>may</em> check that every single byte conforms to the UTF-8 standard.
+Depends on how thorough you want to be.  Best to do it anyways.</li>
+<li>In short, only increment <code>i</code> when you're sure that you've got enough bytes left for the next character, and all bytes of the next character are valid UTF-8. Don't increment <code>i</code> at the terminating null byte and immediately stop.</li>
+<li>In the end, set <code>*nb_valid = i</code>. This allows the user to check how many bytes were valid UTF-8. Note that <code>text + *nb_valid</code> would point to the byte <em>immediately after</em> the last valid UTF-8 character. If the string ended with a null byte, <code>text + *nb_valid</code> would point to it instead.</li>
+<li>Be nice, and allow <code>nb_valid</code> to be a NULL pointer if the developer doesn't care about this information.</li>
+<li>Return the number of valid <em>characters</em> parsed.</li>
+</ol>
+
+<p>Now that you're sure you're only going through valid UTF-8, your <code>utf8_to_utf32</code> can remain the same. Just add the needed parameters:</p>
+
+<pre><code>uint32_t* utf8_to_utf32(uint8_t* text, size_t nb_text, size_t* nb_valid) {
+    size_t num_chars = utf8_strlen(text, nb_text, nb_valid);
+    /* ... rest is the same ... */
+}
+</code></pre>
+
+<p>... but do consider what the previous answers mentioned, especially the portability issue of left-shifts, if you plan to program arduinos or other microcontrollers.</p>
+
+<h2>Buffer handling</h2>
+
+<p>is the reason C is hard. But again, let's think about the use cases. At first, allocating the buffer for the user may seem very helpful, but actually it's rarely something that the user wants. Besides, it burdens them with freeing the buffer, which sucks.</p>
+
+<ol>
+<li>Let's say I'm reading a file or some socket line by line. I'd actually want to allocate just one buffer, and re-use it for each line (reallocating or doing partial reads if I get a very long line). Thus, I'd like for <code>utf8_to_utf32</code> to write to a particular buffer that I give it. Much better than having many, many allocations and deallocations.</li>
+<li>Let's say I'm updating some user input. In most cases I'd already have a UTF-32 buffer where the old user input is stored, and I want to update it. Again, I'd like for <code>utf8_to_utf32</code> to write to a particular buffer.</li>
+<li>I may wish to concatenate or append text. Again, writing to a particular buffer.</li>
+</ol>
+
+<p>So it seems you don't want to actually allocate the buffer, which is just dandy, since the best memory management is none at all. (Side note: the more experienced a C developer, the less you'll see them messing around with memory and allocations, for example see Casey Muratori <a href="https://guide.handmadehero.org/code/day060/#4727" rel="noreferrer">[1]</a> <a href="https://guide.handmadehero.org/code/day014/#903" rel="noreferrer">[2]</a>
+<a href="https://guide.handmadehero.org/code/day035/#5941" rel="noreferrer">[3]</a>, a <strong>very</strong> experienced C developer).</p>
+
+<p>The function signature changes to:</p>
+
+<pre><code>void utf8_to_utf32(uint8_t* text, size_t nb_text, uint32_t* out_buf, size_t* nb_valid) {
+    /* don't allocate c, replace c with out_buf */
+}
+</code></pre>
+
+<p>Great, but how will you ensure that there's enough space in <code>out_buf</code>? Two options, each with its pros and cons.</p>
+
+<h3>A. Let the user worry about it</h3>
+
+<p>You're already providing a function - <code>utf8_strlen</code>, that will let the developer know how many characters to allocate for the buffer (plus one more for the NULL-terminator). If they don't, then that's their problem. Many standard lib functions operate like this: for example <a href="https://linux.die.net/man/3/mbstowcs" rel="noreferrer"><code>mbstowcs</code></a>.</p>
+
+<h3>B. You worry about it</h3>
+
+<p>Add another parameter to the function that tells you the size of <code>out_buf</code>. You should never write more than this number of characters. This is a bit safer, though the programmer can of course still lie. This will make your code a bit more complicated, and will allow for partial conversions, though this usually falls under the <a href="https://deviq.com/yagni/" rel="noreferrer">YAGNI</a> principle. Again, many standard lib functions operate like this too: for example <a href="https://linux.die.net/man/3/strncpy" rel="noreferrer"><code>strncpy</code></a>, <a href="https://linux.die.net/man/3/snprintf" rel="noreferrer"><code>snprintf</code></a></p>
+
+<h3>Pick your poison and keep it consistent</h3>
+
+<p>People are familiar with both styles, so choose whatever you prefer and keep it consistent if you decide to add more functions later.</p>
+
+<p>Now the only question that remains is what to do with the return value, which is currently <code>void</code>. Looking at the standard lib functions, you'll see that they would usually return the number of characters written to <code>out_buf</code>.</p>
+
+<p>Another reasonable thing to do would be to return 1 or 0, based on whether the input UTF-8 string was valid all the way through, or there was some invalid data. I'm suggesting it because the check would be</p>
+
+<pre><code>is_utf8_valid = (nb_text == *nb_valid) || (text[*nb_valid] == '\0');
+</code></pre>
+
+<p>which is something you don't want to bother the user with getting right.</p>
+    </div>

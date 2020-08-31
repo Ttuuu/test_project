@@ -1,0 +1,109 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This  </p>
+
+<blockquote>
+<pre><code>if (serialPort.BytesToRead &lt; 9)
+    return;
+
+while (true)
+{
+    if (headerBytes[0] == FrameHeader &amp;&amp; headerBytes[1] == FrameHeader)
+        break;
+
+    serialPort.Read(headerBytes, 0, headerBytes.Length);
+}  
+</code></pre>
+</blockquote>
+
+<p>can get dangerous. Not only because what @firda has stated in his <a href="https://codereview.stackexchange.com/a/207298/29371">answer</a> but the reading of the serialport without questioning the  <code>serialPort.BytesToRead</code> again. Assume that at the <code>if</code> you get a <code>serialPort.BytesToRead == 9</code> but <code>if (headerBytes[0] == FrameHeader &amp;&amp; headerBytes[1] == FrameHeader)</code> isn't true then somewhere down the road your code could crash with a <code>TimeoutException</code> because you read but there aren't any bytes left to read.  </p>
+
+<p>A better approach would be to just read all the bytes avaible and place them in a <code>ConcurrentQueue&lt;List&lt;byte&gt;&gt;</code> like so  </p>
+
+<pre><code>private static ConcurrentQueue&lt;List&lt;byte&gt;&gt; dataQueue = new ConcurrentQueue&lt;List&lt;byte&gt;&gt;();
+static void DataReceivedHandler(object sender, SerialDataReceivedEventArgs e)
+{
+    var serialPort = sender as SerialPort;
+    if (serialPort == null || serialPort.BytesToRead == 0) { return; }
+
+    var receivedData = new byte[serialPort.BytesToRead];
+    var readBytes = serialPort.Read(receivedData, 0, serialPort.BytesToRead);
+
+    dataQueue.Enqueue(receivedData.Take(readBytes).ToList());
+
+}
+</code></pre>
+
+<p>which keeps your <code>DataReceived</code> eventhandler short and clean.  </p>
+
+<p>To process the received data you can add a <code>Timer</code> e.g set to an interval of 250ms which calls a method <code>ProcessData</code> in its elapsed event only if <code>dataQueue.Count &gt; 0</code> like so  </p>
+
+<pre><code>private static System.Timers.Timer timer = new System.Timers.Timer();
+static void Main(string[] args)
+{
+    timer.Interval = 250;
+    timer.Elapsed += new ElapsedEventHandler(timer_Elapsed);
+    timer.Start();
+
+    // Your SerialPort initialization stuff here
+
+}  
+
+static void timer_Elapsed(object sender, ElapsedEventArgs e)
+{
+    if (dataQueue.Count == 0) { return; }
+    ProcessData();
+}  
+</code></pre>
+
+<p>And last but not least the <code>ProcessData()</code>  </p>
+
+<pre><code>private static readonly ReaderWriterLockSlim locker = new ReaderWriterLockSlim();
+private static void ProcessData()
+{
+    if (dataQueue.Count == 0) { return; }
+    if (!locker.TryEnterWriteLock(100)) { return; }
+
+    if (isProcessing)
+    {
+        locker.ExitWriteLock();
+        return;
+    }
+    isProcessing = true;
+
+
+    List&lt;byte&gt; currentData;
+    var data = new List&lt;byte&gt;();
+    var headerIndex = 0;
+    while (dataQueue.Count &gt; 0)
+    {
+        dataQueue.TryDequeue(out currentData);
+        data.AddRange(currentData);
+        if (data.Count &gt;= 9)
+        {
+            headerIndex = FindHeaderBytesIndex(data);
+            if (headerIndex != -1 &amp;&amp; data.Count - headerIndex &gt;= 9)
+            {
+                // now process the message starting at headerIndex
+                byte[] message = new byte[9];
+                data.CopyTo(message, headerIndex);
+                var checksum = Helpers.CalculateChecksum(message);
+
+                var check = message[8];
+                if (checksum != check)
+                {
+                    Console.WriteLine("Invalid Checksum");
+                }
+                CalculateDistance(message.Skip(2).ToArray());
+            }
+        }
+    }
+
+    isProcessing = false;
+    locker.ExitWriteLock();
+}
+</code></pre>
+
+<p>which needs to be tested by you but at a quick glance it should work.</p>
+
+<p>If you want to know more about <code>SerialPort</code> althought most code is VB.NET, take a look at <a href="https://social.msdn.microsoft.com/Forums/vstudio/en-US/a709d698-5099-4e37-9e10-f66ff22cdd1e/serialport-101?forum=vbgeneral" rel="nofollow noreferrer">this</a>.</p>
+    </div>

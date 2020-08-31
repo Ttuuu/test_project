@@ -1,0 +1,367 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>General design comment</strong></p>
+
+<p>The fact that a binary number needs to access the application using it looks like a huge design issue.</p>
+
+<p>A quick fix for this is to provide the desired numbers of bits instead - I am not sure how relevant this suggestion is but it was enough to get me started. Now, we have a <code>Binary</code> class with no dependencies and some tests for it:</p>
+
+<pre><code>def test(bits = 64):
+    test_equal(Binary(bits, 5) + Binary(bits, 10), 15)
+    test_equal(Binary(bits, 125) + Binary(bits, 125), 250)
+    test_equal(Binary(bits, 5) - Binary(bits, 10), -5)
+    test_equal(Binary(bits, 255) - Binary(bits, 120), 135)
+    test_equal(Binary(bits, 4) * Binary(bits, 5), 20)
+    test_equal(Binary(bits, 125) * Binary(bits, 1000), 125000)
+</code></pre>
+
+<p><strong>Improving <code>def __add__(self, other)</code></strong></p>
+
+<p>The <code>__add__</code> method is interesting because it gives a good chance to see many small techniques to improve Python code.</p>
+
+<ul>
+<li><p><a href="https://docs.python.org/3.4/library/operator.html#inplace-operators" rel="nofollow noreferrer">In Place operators</a>: for most operations (like <code>+</code>) there is a in-place version so that you can write <code>a += b</code> instead of <code>a = a + b</code>.</p></li>
+<li><p>In Python, Booleans <code>True</code> and <code>False</code> are actually integers that evaluate to 1 and 0. Instead of: <code>added_val = e; if carry: added_val += 1</code>, you could write <code>added_val = e + carry</code>.</p></li>
+<li><p><a href="https://nedbatchelder.com/text/iter.html" rel="nofollow noreferrer">Look like a native</a>: I highly recommend the article/talk from Ned Batchelder I've linked to. Basically, pretty much everytime you write are using indices and/or <code>range(len(...))</code> in Python, there is a better way to do it using various Python tools.</p></li>
+</ul>
+
+<p>In our case, we are using indices to loop over 2 iterables in parallel. This could be achieved with <a href="https://docs.python.org/3.4/library/functions.html?highlight=zip#zip" rel="nofollow noreferrer"><code>zip</code></a>.</p>
+
+<p>So far, we have:</p>
+
+<pre><code>def __add__(self, other):
+    first = list(self.binary_value[::-1])  # flips both around to work with left to right rather than opposite
+    second = list(other.binary_value[::-1])
+    assert len(first) == len(second)
+    final_added = ""
+    carry = False
+
+    for i, j in zip(first, second):
+        added_val = int(i) + int(j) + carry
+
+        if added_val == 0 or added_val == 1:
+            final_added += str(added_val)
+            carry = False
+        else:
+            final_added += str(added_val - 2)
+            carry = True
+
+    return Binary(self.bits).from_binary(final_added[::-1])
+</code></pre>
+
+<p>Then, we could re-think the operations we are performing. For a start, we could reduce duplication by performing <code>final_added += str(XXX)</code> in a single place. We'd write:</p>
+
+<pre><code>        if added_val == 0 or added_val == 1:
+            carry = False
+        else:
+            added_val -= 2
+            carry = True
+        final_added += str(added_val)
+</code></pre>
+
+<p>Because we are handling a number with is in <code>(0, 1, 2, 3)</code> at this stage (a sum of 3 bits), we are actually doing the equivalent of integer divisions by 2 by handling the different case. This can be written:</p>
+
+<pre><code>        assert added_val in (0, 1, 2, 3)
+        carry = added_val // 2
+        added_val %= 2
+</code></pre>
+
+<p>Even better, Python has a shortcut to get both the quotient and the remainder of a division: <a href="https://docs.python.org/3.4/library/functions.html?highlight=divmod#divmod" rel="nofollow noreferrer"><code>divmod</code></a>.</p>
+
+<pre><code>       carry, added_val = divmod(added_val, 2)
+</code></pre>
+
+<ul>
+<li><p>We can get rid of useless operations: the conversions to list are not required: as far as we are concerned, we just need to iterate over things: it works if they are strings.</p></li>
+<li><p>We can also get rid of the <code>[::-1]</code> trick and just use <a href="https://docs.python.org/3.4/library/functions.html?highlight=divmod#reversed" rel="nofollow noreferrer"><code>reversed</code></a> instead.</p></li>
+<li><p>Also, we don't even need the additional variables <code>first</code> and <code>second</code> anymore.</p></li>
+</ul>
+
+<p>At this stage, we have</p>
+
+<pre><code>def __add__(self, other):
+    final_added = ""
+    carry = False
+
+    for i, j in zip(reversed(self.binary_value), reversed(other.binary_value)):
+        carry, bit = divmod(int(i) + int(j) + carry, 2)
+        final_added += str(bit)
+    # TODO: Handle inputs of different length or carry overflow ?
+    return Binary(self.bits).from_binary(final_added[::-1])
+</code></pre>
+
+<p>It looks like it can hardly get any better, doesn't it ? Well it could: <a href="https://www.python.org/dev/peps/pep-0008/" rel="nofollow noreferrer">PEP 8, the Style Guide for Python</a> recommends:</p>
+
+<blockquote>
+  <p>do not rely on CPython's efficient implementation of in-place string concatenation for statements in the form a += b or a = a + b. This optimization is fragile even in CPython (it only works for some types) and isn't present at all in implementations that don't use refcounting. In performance sensitive parts of the library, the ''.join() form should be used instead. This will ensure that concatenation occurs in linear time across various implementations.</p>
+</blockquote>
+
+<p><strong>Improving <code>def __mul__(self, other)</code></strong></p>
+
+<p>Now that we've learnt a few Python tricks and best practises, we can have a look at <code>__mul__</code> and re-apply most of them. Here again, we can get rid of <code>range(len(XXX))</code>, use in-place operator, use <code>reversed</code>, remove variables:</p>
+
+<pre><code>def __mul__(self, other):
+    total = Binary(self.bits, 0)
+    for i, val in enumerate(reversed(other.binary_value)):
+        total += Binary(self.bits).from_binary(str(int(self.binary_value) * int(val) * int(10 ** i)))
+    return total
+</code></pre>
+
+<p>Now, something which may not be so interesting in this case but is always good to know is that the <a href="https://docs.python.org/3.4/library/functions.html?highlight=divmod#sum" rel="nofollow noreferrer"><code>sum</code></a> builtin can be use to rewrite such a expression in a more concise and more efficient way. In our case, it leads to an expression getting a bit too complicated:</p>
+
+<pre><code>def __mul__(self, other):
+    return sum(
+            (Binary(self.bits).from_binary(str(int(self.binary_value) * int(val) * int(10 ** i)))
+                for i, val in enumerate(reversed(other.binary_value))),
+            Binary(self.bits, 0))
+</code></pre>
+
+<p><strong>Improving <code>def denary(self)</code></strong></p>
+
+<p>Removing the duplicated logic (and introducing new variables), we could write:</p>
+
+<pre><code>def denary(self):
+    first_bit = self.binary_value[0]
+    if first_bit == "1":
+        sign = -1
+        newval = self.change_state()
+    elif first_bit == "0":
+        sign = 1
+        newval = self
+    value = 0
+    binary = newval.binary_value[::-1]
+    for i in range(0, len(binary) - 1):
+        value += ((2 ** i) * int(binary[i]))
+    return int(value) * sign
+</code></pre>
+
+<p>Now, it seems like the conversion <code>int(value)</code> is not required. Also, we could reuse our friend <code>sum</code>:</p>
+
+<pre><code>    return sign * sum(((2 ** i) * int(binary[i])) for i in range(0, len(binary) - 1))
+</code></pre>
+
+<p>Now, we also can try to get rid of the <code>range(len(XXX))</code> logic but before to do so, we have to understand what is going on: this time we do not handle all elements from <code>binary</code>, we stop before the last one. This is quite unexpected. Actually, it is easier to understand if we look at the whole method: we have handled the first character and we want to handle the remaining ones. The special character is not the last one, it is the first.</p>
+
+<p>Keeping that mind, we can re-use the techniques already described: <code>enumerate</code>, <code>reversed</code>, etc.</p>
+
+<pre><code>def denary(self):
+    first_bit = self.binary_value[0]
+    remaining = self.binary_value[1:]
+    sign = 1
+    if first_bit == "1":
+        sign = -1
+        remaining = self.change_state().binary_value[1:]
+    return sign * sum(((2 ** i) * int(val)) for i, val in enumerate(reversed(remaining)))
+</code></pre>
+
+<p><strong>Improving <code>def allocate_bits(self, value):</code></strong></p>
+
+<p>We could use <code>value += "0"</code> but that would be still using the "in-place string concatenation" which is best to avoid when it is possible. In our case, we have a shorter and more efficient option: the mult operation on strings: </p>
+
+<pre><code>    return value + "0" * rem
+</code></pre>
+
+<p><strong>Improving <code>def flip_bits(self)</code></strong></p>
+
+<p>Here again, we have the <code>range(len(XXX))</code> pattern but we'll handle it slightly differently. Here, it looks like we are trying to update a list as we iterate. What we are actually trying to achieve is to build a new list based on something we can iterate on.  We could use <code>for bit in self.binary_value</code> and <code>list.append</code> but it is a good chance to show off list comprehension:</p>
+
+<pre><code>    binary_list = []
+    for bit in self.binary_value:
+        binary_list.append("1" if bit == "0" else "0" )
+</code></pre>
+
+<p>can also be written:</p>
+
+<pre><code>    binary_list = ["1" if bit == "0" else "0" for bit in self.binary_value]
+</code></pre>
+
+<p>We get</p>
+
+<pre><code>def flip_bits(self):
+    binary = "".join(["1" if bit == "0" else "0" for bit in self.binary_value])
+    return Binary(self.bits).from_binary(binary)
+</code></pre>
+
+<p><strong>Improving <code>def positive_binary_convert(self, integer)</code></strong></p>
+
+<p>We can remove the <code>finished</code> variable: we could just <code>break</code> out of the loop for the time being.</p>
+
+<p>We can remove the useless conversions <code>int(integer)</code>.</p>
+
+<p>We could once more use <code>divmod</code>.</p>
+
+<p>We could use in-place operator.</p>
+
+<p>At this stage, we have:</p>
+
+<pre><code>def positive_binary_convert(self, integer):
+    before = ""
+    while True:
+        divided, remainder = divmod(integer, 2)
+        before += str(remainder)
+        integer = divided
+        if divided == 0:
+            break
+</code></pre>
+
+<p>Also, the <code>divided</code> variable is not useful. We could use <code>integer</code> directly.</p>
+
+<p><strong>Improving <code>def convert_int_to_binary(self, number)</code></strong></p>
+
+<p>You could use directly:</p>
+
+<pre><code>    neg = number &lt; 0
+</code></pre>
+
+<p>Also, you don't even need that variable at all:</p>
+
+<pre><code>def convert_int_to_binary(self, number):
+    binary = self.positive_binary_convert(abs(number))
+    if number &lt; 0:
+        binary = binary.change_state()
+    return binary.binary_value
+</code></pre>
+
+<p><strong>General comment</strong></p>
+
+<p>There is something I find particularly fishy in the <code>from_binary</code> method. From the name, it looks like it should be a class method (used as an alternative constuctor) but it is actually a normal method.</p>
+
+<p>I've tried to re-write the code with a simple constructor and 2 alternative constructors (from int and from binary) and got the results below but I am still not fully convinced:</p>
+
+<pre><code># https://codereview.stackexchange.com/questions/214533/python-binary-calculator
+
+class Binary:
+    def __init__(self, bits):
+        self.bits = bits 
+        self.binary_value = None
+
+    @classmethod
+    def from_int(cls, bits, integer: int):
+        self = cls(bits)
+        self.binary_value = self.convert_int_to_binary(integer)
+        return self
+
+    @classmethod
+    def from_binary(cls, bits, binary: str):
+        self = cls(bits)
+        self.binary_value = self.allocate_bits(binary[::-1])[::-1]
+        return self
+
+    def __str__(self):
+        return self.binary_value
+
+    def __len__(self):
+        return len(self.binary_value)
+
+    def __add__(self, other):
+        final_added = ""
+        carry = False
+
+        for i, j in zip(reversed(self.binary_value), reversed(other.binary_value)):
+            carry, bit = divmod(int(i) + int(j) + carry, 2)
+            final_added += str(bit)
+        # TODO: Handle inputs of different length or carry overflow ?
+        return Binary.from_binary(self.bits, final_added[::-1])
+
+    def __sub__(self, other):
+        return self + (- other)
+
+    def __mul__(self, other):
+        return sum(
+                (Binary.from_binary(self.bits, str(int(self.binary_value) * int(val) * int(10 ** i)))
+                    for i, val in enumerate(reversed(other.binary_value))),
+                Binary.from_int(self.bits, 0))
+
+    def __ge__(self, other):
+        return self.denary() &gt;= other.denary()  # I know this isn't ideal but will come back around to it.
+
+    def __le__(self, other):
+        return self.denary() &lt;= other.denary()
+
+    def __truediv__(self, divisor):
+        dividend = self.binary_value
+        cur_div = ""
+        answer = ""
+        for i in range(0, len(dividend)):
+            cur_div = cur_div + dividend[i]
+            if divisor &lt;= Binary.from_binary(self.bits, cur_div):
+                answer = answer + "1"
+                take_away = divisor * Binary.from_binary(self.bits, answer)
+                cur_div = (Binary.from_binary(self.bits, cur_div) - take_away).binary_value
+
+            else:
+                answer = answer + "0"
+
+        print(answer)
+        answer = Binary.from_binary(self.bits, answer)
+        print(answer.denary())
+        return self
+
+    def __neg__(self):
+        return self.change_state()
+
+    def denary(self):
+        first_bit = self.binary_value[0]
+        remaining = self.binary_value[1:]
+        sign = 1
+        if first_bit == "1":
+            sign = -1
+            remaining = self.change_state().binary_value[1:]
+        return sign * sum(((2 ** i) * int(val)) for i, val in enumerate(reversed(remaining)))
+
+    def convert_int_to_binary(self, number):
+        binary = self.positive_binary_convert(abs(number))
+        if number &lt; 0:
+            binary = binary.change_state()
+        return binary.binary_value
+
+    def positive_binary_convert(self, integer):
+        before = ""
+        while True:
+            integer, remainder = divmod(integer, 2)
+            before += str(remainder)
+            if integer == 0:
+                break
+        binary = self.allocate_bits(before)[::-1]  # Flips the string
+        return Binary.from_binary(self.bits, binary)
+
+    def change_state(self, binary=None):  # Change from negative to positive
+        if binary is not None:
+            flipped = Binary.from_binary(self.bits, binary).flip_bits()
+        else:
+            flipped = self.flip_bits()
+
+        return flipped + Binary.from_int(self.bits, 1)
+
+    def allocate_bits(self, value):
+        length = len(value)
+        if length &lt; self.bits:
+            rem = self.bits - length
+        else:
+            rem = length % self.bits
+        return value + "0" * rem
+
+    def flip_bits(self):
+        binary = "".join(["1" if bit == "0" else "0" for bit in self.binary_value])
+        return Binary.from_binary(self.bits, binary)
+
+
+def test_equal(binary_val, expected_res):
+    res = binary_val.denary()
+    if res == expected_res:
+        print("Passed")
+    else:
+        print("Failed", res, expected_res)
+
+def test(bits = 64):
+    test_equal(Binary.from_int(bits, 5) + Binary.from_int(bits, 10), 15)
+    test_equal(Binary.from_int(bits, 125) + Binary.from_int(bits, 125), 250)
+    test_equal(Binary.from_int(bits, 5) - Binary.from_int(bits, 10), -5)
+    test_equal(Binary.from_int(bits, 255) - Binary.from_int(bits, 120), 135) 
+    test_equal(Binary.from_int(bits, 4) * Binary.from_int(bits, 5), 20)
+    test_equal(Binary.from_int(bits, 125) * Binary.from_int(bits, 1000), 125000)
+
+test()
+
+
+</code></pre>
+    </div>

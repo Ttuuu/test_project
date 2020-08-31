@@ -1,0 +1,147 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The code seems to get more and more questionable as we read downward. Starting at the bottom:</p>
+
+<pre><code>inline auto generate_px8n_palette()
+{
+    std::vector&lt;px32n&gt; result;
+    result.reserve(256);
+    for (auto i = 0; i &lt; 256; ++i)
+        result.emplace_back(reinterpret_cast&lt;px8n&amp;&gt;(i));
+    return result;
+}
+</code></pre>
+
+<ul>
+<li><p>Writing <code>auto</code> instead of explicitly <code>std::vector&lt;px32n&gt;</code> doesn't save you much of anything.</p></li>
+<li><p>Writing <code>auto i = 0</code> instead of <code>int i = 0</code> actually <em>loses</em> you something (in both character count and clarity).</p></li>
+<li><p>Using <code>reinterpret_cast&lt;px8n&amp;&gt;(i)</code> seems completely at odds with the rest of this code. Why not give <code>px8n</code> a proper constructor from <code>int</code>, thus eliminating the undefined behavior and making your code portable to big-endian systems at the same time?</p></li>
+</ul>
+
+<hr>
+
+<pre><code>struct[[gnu::packed]] bgra_2222
+{
+    using T = unsigned;
+    T b : 2;
+    T g : 2;
+    T r : 2;
+    T a : 2;
+
+    static constexpr T rx = 3;
+    static constexpr T gx = 3;
+    static constexpr T bx = 3;
+    static constexpr T ax = 3;
+    static constexpr bool byte_aligned = false;
+};
+</code></pre>
+
+<ul>
+<li><p>I'm not a fan of your whitespace style in <code>struct[[gnu::packed]]</code>.</p></li>
+<li><p>Anytime you're stamping out a bunch of copies of the same code over and over with only minor differences, you should try to use a <em>template</em>. I bet you could reduce these 150 lines of code to about 40 by using a template and a bunch of typedefs like <code>using bgra_2222 = bgra&lt;2,2,2,2,false&gt;;</code> and so on.</p></li>
+</ul>
+
+<hr>
+
+<pre><code>struct [[gnu::packed]] bgr_8880
+</code></pre>
+
+<p>I don't understand why this struct containing only <code>uint8_t</code> fields needs to be <code>[[gnu::packed]]</code> at all.</p>
+
+<hr>
+
+<pre><code>constexpr auto ax = vector_reciprocal&lt;rbits, VT&gt;(P::ax, P::ax, P::ax, 1);
+src *= a;
+src *= ax;
+</code></pre>
+
+<p>Here, I suggest that <code>one_over_ax</code> would be a <em>much</em> more appropriate name than <code>ax</code>. (Or, you could use a more verbose name such as <code>P::max_alpha</code> in the first place. Either way, try to eliminate the misleading parallelism between <code>P::ax</code> and <code>ax</code>.)</p>
+
+<hr>
+
+<pre><code>static constexpr pixel m64(auto value) noexcept // V4HI
+</code></pre>
+
+<p>This use of <code>auto</code> is not valid C++17 (nor is it currently expected to be valid C++20). Shouldn't GCC have given you a warning about this? Compile with at least <code>-std=c++17 -W -Wall</code>, to which some add (but others do not) <code>-Wextra -pedantic</code>.</p>
+
+<hr>
+
+<pre><code>constexpr bool not_constexpr = true;// not is_constexpr(this-&gt;b);
+if constexpr (not_constexpr and sse and (std::is_floating_point_v&lt;typename P::T&gt; or std::is_floating_point_v&lt;typename U::T&gt;))
+    // ...
+else if constexpr (not_constexpr and mmx and (sse or (std::is_integral_v&lt;typename P::T&gt; and std::is_integral_v&lt;typename U::T&gt;)))
+</code></pre>
+
+<p>Two things:</p>
+
+<ul>
+<li><p>What is the purpose of <code>not_constexpr</code>? From the name, I might think that it was intended as a clever way to force the <code>if</code> to be evaluated at runtime not compile-time, except for that <code>not_constexpr</code> is explicitly marked <code>constexpr</code> (so the compiler definitely knows its value at compile-time), and that the entire test is enclosed in <code>if constexpr</code> which means it <em>must</em> be evaluated at compile-time.</p></li>
+<li><p>As <a href="https://yarchive.net/comp/linux/ACCESS_ONCE.html" rel="noreferrer">Linus once said</a>, <code>-EEXPRESSIONTOOCOMPLICATEDTOLIVE</code>.</p></li>
+</ul>
+
+<hr>
+
+<pre><code>*this = m128(m128_blend&lt;U&gt;(m128(), other.m128()));
+if constexpr (std::is_integral_v&lt;typename U::T&gt;) _mm_empty();
+</code></pre>
+
+<p>IIUC, <a href="https://software.intel.com/sites/landingpage/IntrinsicsGuide/#text=_mm_empty&amp;expand=2117" rel="noreferrer"><code>_mm_empty()</code></a> is the way to signal to the processor that you're done doing MMX things for a little while. I don't really understand why or when you'd need to write it explicitly in C++ code, but let's assume that you're right that it needs doing here.</p>
+
+<p>Would it make more sense to express it as an RAII object that is created before you start doing MMX things, perhaps passed <em>to</em> each MMX operation as a parameter, and then destroyed automatically at the end of the MMX computation? So in practice your code above might look something like this after RAIIfication:</p>
+
+<pre><code>MMXComputationIf&lt;std::is_integral_v&lt;typename U::T&gt;&gt; guard;
+*this = m128(m128_blend&lt;U&gt;(m128(), other.m128()));
+</code></pre>
+
+<hr>
+
+<pre><code>template&lt;typename U = P, typename PT = typename U::T, std::enable_if_t&lt;pixel&lt;U&gt;::has_alpha(), bool&gt; = { }&gt;
+constexpr pixel(T cr, T cg, T cb, T ca) noexcept : P { static_cast&lt;PT&gt;(cb), static_cast&lt;PT&gt;(cg), static_cast&lt;PT&gt;(cr), static_cast&lt;PT&gt;(ca) } { }
+</code></pre>
+
+<ul>
+<li><p>All your constructors could productively be marked <code>explicit</code> (to prevent people from accidentally constructing them via unadorned <code>{1,2,3,4}</code>, for example).</p></li>
+<li><p>If I had to pick a short mnemonic name for <code>typename U::T</code>, the name <code>PT</code> would not be my first choice.</p></li>
+<li><p>IIUC, the three template parameters here have three different purposes: one (<code>PT</code>) is just a convenience mnemonic, one is actually being used for SFINAE, and the last (<code>U</code>) is just an implementation detail of the SFINAE. <em>None</em> of them are meant to actually participate in template type deduction. So I think this code is much more confusing than it ought to be.</p></li>
+<li><p>Trivial style nit: <code>class</code> is shorter and thus easier on the eyes than <code>typename</code>.</p></li>
+</ul>
+
+<p>So I would write it like this:</p>
+
+<pre><code>template&lt;class P_ = pixel, class = std::enable_if_t&lt;P_::has_alpha()&gt;&gt;
+constexpr pixel(T cr, T cg, T cb, T ca) noexcept :
+    P { cb, cg, cr, ca } {}
+</code></pre>
+
+<p>This version of course eliminates the <code>static_cast</code>s which you were doing to suppress warnings (or errors) resulting from narrowing conversions in the braced initializer-list. If you really really need those narrowing conversions to happen, then you should make up a convenient way to spell <code>static_cast&lt;typename P::T&gt;</code> — which you would already have, except that you have made the supremely confusing decision that <code>pixel&lt;P&gt;::T</code> should be a <em>different type</em> from <code>P::T</code>.</p>
+
+<p>The easy but non-surgical solution would be to reverse that decision: replace your</p>
+
+<pre><code>using T = std::conditional_t&lt;std::is_integral_v&lt;typename P::T&gt;, unsigned, typename P::T&gt;;
+</code></pre>
+
+<p>with</p>
+
+<pre><code>using T = typename P::T;
+using unsigned_or_T = std::conditional_t&lt;std::is_integral_v&lt;T&gt;, unsigned, T&gt;;
+</code></pre>
+
+<p>and then make the obvious substitions throughout:</p>
+
+<pre><code>template&lt;class P_ = pixel, class = std::enable_if_t&lt;P_::has_alpha()&gt;&gt;
+constexpr pixel(unsigned_or_T cr, unsigned_or_T cg, unsigned_or_T cb, unsigned_or_T ca) noexcept :
+    P { T(cb), T(cg), T(cr), T(ca) } {}
+</code></pre>
+
+<p>The more surgical but needlessly-antagonistic-to-your-maintainer solution would be</p>
+
+<pre><code>using T = std::conditional_t&lt;std::is_integral_v&lt;typename P::T&gt;, unsigned, typename P::T&gt;;
+
+static constexpr inline PTcast(T t) noexcept {
+    return static_cast&lt;typename P::T&gt;(t);
+}
+
+template&lt;class P_ = pixel, class = std::enable_if_t&lt;P_::has_alpha()&gt;&gt;
+constexpr pixel(T cr, T cg, T cb, T ca) noexcept :
+    P { PTcast(cb), PTcast(cg), PTcast(cr), PTcast(ca) } {}
+</code></pre>
+    </div>

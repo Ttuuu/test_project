@@ -1,0 +1,227 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Complex refactoring/improvements:</p>
+
+<p>Involved <em>Refactoring</em> techniques: <strong>Rename variable</strong>, <strong>Rename function</strong>, <strong>Extract variable</strong>, <strong>Extract function</strong>, <strong>Substitute Algorithm</strong>, <strong>Slide statements</strong>, <strong>Split phase</strong> (well-known classics <a href="https://refactoring.com/catalog/" rel="nofollow noreferrer">https://refactoring.com/catalog/</a>) + eliminating duplication and rearranging responsibility</p>
+
+<p>Completely different OOP approach to your script, representing <code>SIRPPipeline</code> (<em>SIRP</em> Pipeline) which is initialized with passed <code>api</code> component/client, composed and running as a set of consecutive operations/phases:<br> 
+<em>loading data | making dataframes | making/building charts | send email</em>.</p>
+
+<p>In more details:</p>
+
+<ul>
+<li><p><strong><code>loading data</code></strong>. Covered by instance method <code>_load_data</code> which initiates API call to fetch the crucial source data and, if successful, populates target days dictionaries with records data (method <code>_fill_day_dicts</code>)</p></li>
+<li><p><strong><code>making dataframes</code></strong>. Covered by method <code>make_dataframes</code> which has a concrete single responsibility: construct 4 crucial dataframes (<em>30 days, 60 days, 90 days, counts</em>)</p></li>
+<li><p><strong><code>making/building charts</code></strong>. Covered by complex method <code>make_charts</code>. It initiates <code>ExcelWriter</code> object, declares inner functions for internal usage: <code>_insert_pie_chart</code> (builds and inserts pie chart to specified worksheet) and <code>_df_days_to_excel</code> (writes passed dataframe to <em>writer</em> object). <code>_set_workbook_layout</code> method establishes workbook/worksheet layout/format and saves it to worksheet.</p></li>
+<li><p><strong><code>send email</code></strong>. Static method <code>send_email</code> builds and sends an email related to "case metrics" pipeline event. The old function <code>send</code> was too generalized while <code>send_email</code> method reflects concrete purpose in scope of pipeline.</p></li>
+</ul>
+
+<hr>
+
+<pre><code>import datetime
+import smtplib
+import time
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+import pandas as pd
+
+
+class SIRPPipeline:
+    TIME_FMT = "%m/%d/%Y %H:%M:%S"
+    DF_INDEX = ['Created', 'Severity', 'Owner', 'Name', 'Closed', 'Resolution']
+
+    def __init__(self, api):
+        """Security Incident Response Platform prosessing pipeline.
+           Accepts API object on initialization phase.
+        """
+        self._api = api
+        self._all30_dict = {}
+        self._all60_dict = {}
+        self._all90_dict = {}
+
+        self._df_30days = None
+        self._df_60days = None
+        self._df_90days = None
+        self._df_counts = None
+        self._dataset = None
+
+    def _load_data(self):
+        # Finds all cases on SIRP endpoint
+        self._api_response = self._api.find_cases(range="all", sort=[])
+
+        if self._api_response.status_code == 200:
+            self._dataset = self._api_response.json()
+            self._fill_day_dicts()
+
+    @staticmethod
+    def _add_record(days_dict, record, key):
+        days_dict[key] = {
+            "Name": record["title"],
+            "ID": record["id"],
+            "Owner": record["owner"],
+            "Severity": record["severity"],
+            "Created": (time.strftime(
+                SIRPPipeline.TIME_FMT,
+                time.gmtime(record["createdAt"] / 1000.0)))
+        }
+        if 'endDate' in record:
+            days_dict.update({
+                "Closed": (time.strftime(
+                    SIRPPipeline.TIME_FMT,
+                    time.gmtime(record["endDate"] / 1000.0))),
+                "Resolution": record["resolutionStatus"]
+            })
+
+    def _fill_day_dicts(self):
+        today = datetime.date.today()
+
+        for i, record in enumerate(self._dataset):
+            if (record["createdAt"] / 1000) &gt; time.mktime(
+                    (today - datetime.timedelta(days=30)).timetuple()):
+                self._add_record(self._all30_dict, record, key=i)
+
+            elif (record["createdAt"] / 1000) &gt; time.mktime(
+                    (today - datetime.timedelta(days=60)).timetuple()):
+                self._add_record(self._all60_dict, record, key=i)
+
+            else:
+                self._add_record(self._all90_dict, record, key=i)
+
+    def make_dataframes(self):
+        """Creates (4) pandas dataframes:
+        - df_30days dataframe from all30 dict
+        - df_60days dataframe from all60 dict
+        - df_90days dataframe from all90 dict
+        - df_counts - separate sheet for chart data
+        """
+        self._df_30days = pd.DataFrame(self._all30_dict, index=SIRPPipeline.DF_INDEX).transpose()
+        self._df_60days = pd.DataFrame(self._all60_dict, index=SIRPPipeline.DF_INDEX).transpose()
+        self._df_90days = pd.DataFrame(self._all90_dict, index=SIRPPipeline.DF_INDEX).transpose()
+        self._df_counts = pd.DataFrame({
+            'Created': (self._df_30days.count()['Created']),
+            'Closed': (self._df_30days.count()['Closed']),
+            'Owner': (self._df_30days['Owner'].value_counts().to_dict()),
+            'Resolution': (self._df_30days['Resolution'].value_counts().to_dict()),
+            'Severity': (self._df_30days['Severity'].value_counts().to_dict())
+        })
+
+    @staticmethod
+    def _set_workbook_layout(workbook, worksheet, df):
+        # add width to columns, filter, freeze
+        worksheet.set_column("A:A", 3.5, workbook.add_format())
+        worksheet.set_column("B:B", 17.25, workbook.add_format())
+        worksheet.set_column("C:C", 10, workbook.add_format())
+        worksheet.set_column("D:D", 10, workbook.add_format())
+        worksheet.set_column("E:E", 100, workbook.add_format())
+        worksheet.set_column("F:F", 17.25, workbook.add_format())
+        worksheet.set_column("G:G", 11.25, workbook.add_format())
+        worksheet.freeze_panes(1, 0)
+        worksheet.autofilter("A1:G100")
+
+        header_format = workbook.add_format({
+            "bold": True,
+            "text_wrap": True,
+            "valign": "top",
+            "fg_color": "#CCCCCC",
+            "border": 1,
+        })
+
+        for col_num, value in enumerate(df.columns.values, 1):
+            worksheet.write(0, col_num, value, header_format)
+
+    def make_charts(self):
+
+        def _insert_pie_chart(wbook, wsheet, title, cell_pos, series):
+            piechart = wbook.add_chart({"type": "pie"})
+            piechart.set_title({'name': title})
+            piechart.set_style(10)
+            piechart.add_series(series)
+            wsheet.insert_chart(cell_pos, piechart, {
+                'x_offset': 25,
+                'y_offset': 10
+            })
+
+        def _df_days_to_excel(writer, sheet_name, df_days):
+            df_days.to_excel(writer, sheet_name=sheet_name, startrow=1, header=False)
+            self._set_workbook_layout(writer.book, (writer.sheets[sheet_name]), df_days)
+
+        # create pie charts, xlsx and save locally
+        with pd.ExcelWriter("foo.xlsx",
+                            engine="xlsxwriter",
+                            options={"strings_to_urls": False}) as writer:
+            workbook = writer.book
+            worksheet = workbook.add_worksheet("Summary Charts")
+            worksheet.hide_gridlines(2)
+
+            _insert_pie_chart(workbook, worksheet, title='New vs. Closed Cases', cell_pos='D2', series={
+                'name': 'Open vs. Closed Cases Last 30',
+                'categories': '=Tracking!$B$1:$C$1',
+                'values': '=Tracking!$B$2:$C$2',
+            })
+            _insert_pie_chart(workbook, worksheet, title='Severities', cell_pos='M2', series={
+                'name': 'Severity Last 30',
+                'categories': '=Tracking!$A$2:$A$4',
+                'values': '=Tracking!$F$2:$F$4',
+            })
+            _insert_pie_chart(workbook, worksheet, title='Resolution Last 30', cell_pos='D19', series={
+                'name': 'Resolution Last 30',
+                'categories': '=Tracking!$A$5:$A$6',
+                'values': '=Tracking!$E$5:$E$6',
+            })
+            _insert_pie_chart(workbook, worksheet, title='Case Ownership Last 30', cell_pos='M19', series={
+                'name': 'Case Ownership Last 30',
+                'categories': '=Tracking!$A$7:$A$10',
+                'values': '=Tracking!$D$7:$D$10',
+            })
+
+            _df_days_to_excel(writer, sheet_name="Cases newer than 30 Days", df_days=self._df_30days)
+            _df_days_to_excel(writer, sheet_name="Cases older than 60 days", df_days=self._df_60days)
+            _df_days_to_excel(writer, sheet_name="Cases newer than 90 Days", df_days=self._df_90days)
+
+            self._df_counts.to_excel(writer, sheet_name="Tracking")
+            writer.save()
+
+    @staticmethod
+    def send_mail():
+        # send_mail the created xlsx
+        msg = MIMEMultipart()
+        msg["From"] = "Address@Domain.com"
+        msg["To"] = send_to  # consider `send_to` declaration
+        msg["Subject"] = "Metrics"
+        msg.attach(
+            MIMEText("Attached are the requested case metrics in .XLSX format."))
+        part = MIMEBase("application", "octet-stream")
+        part.set_payload(open("Foo.xlsx", "rb").read())
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition",
+                        'attachment; filename="Foo.xlsx"')
+        msg.attach(part)
+        smtp = smtplib.SMTP(smtp_server)  # consider `smtp_server` declaration
+        smtp.starttls()
+        smtp.sendmail(msg["From"], [msg["To"]], msg.as_string())
+        smtp.quit()
+
+    def run(self):
+        self._load_data()
+        self.make_dataframes()  # may be protected
+        self.make_charts()      # may be protected
+        self.send_mail()
+
+
+def main(api):
+    pipe = SIRPPipeline(api)
+    pipe.run()
+
+
+# api initialization
+# ...
+start = time.time()
+main(api)
+print('It took', time.time() - start, 'seconds.')
+exit()
+</code></pre>
+
+<p>As for time performance, it requires an appropriate testable sample data for realistic measurements.</p>
+    </div>

@@ -1,0 +1,164 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Copy a list into a slice</h2>
+
+<p>This code:</p>
+
+<pre><code>for c in range(0, len(coeff)):
+    if(c &gt;= len(self.coeff)):
+        print(f'EWMA Coefficients Length Mismatch! len(coeff) = {len(coeff)}, max is 6')
+        break
+    self.coeff[c] = coeff[c]
+</code></pre>
+
+<p>has a couple of problems. It's fine to validate the length of <code>coeff</code>, but it shouldn't be done like this. Also, don't do an element-by-element copy. Instead:</p>
+
+<pre><code>N = 6
+self.coeff = [1]*N
+
+if len(coeff) &gt; N:
+   raise ValueError(f'EWMA Coefficients Length Mismatch! {len(coeff)} &gt; {N}')
+self.coeff[:len(coeff)] = coeff
+</code></pre>
+
+<p>This:</p>
+
+<pre><code>
+    self.states = [0, 0, 0, 0, 0, 0, 0]
+    self.states[0] = initialValue
+    self.states[1] = initialValue
+    self.states[2] = initialValue
+    self.states[3] = initialValue
+    self.states[4] = initialValue
+    self.states[5] = initialValue
+    self.states[6] = initialValue
+</code></pre>
+
+<p>should be</p>
+
+<pre><code>self.states = [initialValue] * (N+1)
+</code></pre>
+
+<p>And so on.</p>
+
+<h2>Docstrings</h2>
+
+<p>Move your function documentation into <code>"""triple quotes"""</code> at the first line inside of your function.</p>
+
+<h2>Never <code>try/except</code></h2>
+
+<p>This breaks Ctrl+C quit, and is too broad to be useful. Narrow your caught exception type.</p>
+
+<h2>Don't repeat yourself</h2>
+
+<p><code>get_cutoff</code> needs to be rewritten as a loop over <code>N</code> values.</p>
+
+<h2>Don't cast unnecessarily</h2>
+
+<p>This:</p>
+
+<pre><code>def ewma(self, alpha: float, this: float, last: float) -&gt; float:
+    return (float(alpha)*float(this)) + ((1.0-float(alpha))*float(last))
+</code></pre>
+
+<p>already assumes that the inputs are floats - so don't call <code>float</code> again. Drop all of your casts.</p>
+
+<h2>Probable bug</h2>
+
+<pre><code>def model_ewma6(self, y0, a, b, c, d, e, f):
+    y1 = self.ewma(a, y0, self.last_ewma3[0])
+</code></pre>
+
+<p>Seems that you're using the wrong array here. Also - why are you hard-coding for 3rd- or 6th-order filters? Can you not just accept N as a parameter?</p>
+
+<h2>General</h2>
+
+<p>Once you've cleaned up your usage of lists, you should really consider moving to <s>numpy</s> the <a href="https://docs.python.org/3/library/array.html" rel="nofollow noreferrer">array</a> module. It'll execute more quickly.</p>
+
+<h2>Suggested</h2>
+
+<p>This comes with a lot of caveats. Since you don't have test usage, I haven't been able to test it, so I don't know whether it's valid. You're going to want to develop a numerical test suite to ensure that it's calculating the right thing. I also assumed that there's no need to hard-code for 3rd- or 6th-order filters, so just added an <code>n</code>. Finally: I don't have micropython, so this is written naively, assuming that standard Python usage is valid.</p>
+
+<pre><code>from array import array
+from math import pi, acos
+from typing import Sequence, Iterable
+
+
+class EWMA:
+    def __init__(self, coeff: Sequence[float], initial_value: float, n: int = None):
+        nc = len(coeff)
+        if n:
+            self.n = n
+            if nc &gt; n:
+                raise ValueError(f'len(coeff)={nc} &gt; n={n}')
+        else:
+            self.n = nc  # default to the length of the coefficients
+
+        # ewma states for coefficient optimization
+        self.last_ewma = array('f', (0 for _ in range(self.n)))
+
+        # default coefficients to 1.0 so the order can be from 0 - n
+        # since cascade elements will pass input signal to output with a=1
+        self.coeff = array('f', (1 for _ in range(self.n)))
+        self.coeff[:nc] = coeff
+
+        self.states = array('f', (0 for _ in range(1 + self.n)))
+
+    def preload(self, value: float):
+        self.states[:] = value
+
+    @staticmethod
+    def ewma(alpha: float, this: float, last: float) -&gt; float:
+        """
+        calculate single EWMA element
+        :param alpha: filter coefficient
+        :param this: current input sample
+        :param last: last output sample from this stage (feedback)
+        :return: EWMA result
+        """
+        return alpha*this + (1 - alpha)*last
+
+    def calculate(self, input_value: float) -&gt; float:
+        """
+        calculate nth order cascade ewma
+        :param input_value: Raw input sample
+        :return: output of nth cascade element
+        """
+        self.states[0] = input_value
+        for i, (c, s) in enumerate(zip(self.coeff, self.states[:-1])):
+            self.states[i + 1] = self.ewma(c, s, self.states[i + 1])
+
+        return self.get_last_output()
+
+    def get_last_output(self) -&gt; float:
+        return self.states[-1]
+
+    def model_ewma_preload(self, v: float):
+        self.last_ewma[:] = v
+
+    def model_ewma(self, y0: float, coeffs: Sequence[float]) -&gt; float:
+        """
+        ewma nth order for IIR Model Fitting via SciPy Optimize
+        :param y0: The input value
+        :param coeffs: Sequence of coefficients
+        :return: IIR output
+        """
+        prev = y0
+        for i, (c, e) in enumerate(zip(coeffs, self.last_ewma)):
+            new = self.ewma(c, prev, e)
+            self.last_ewma[i] = new
+            prev = new
+        return prev
+
+    def get_cutoff(self, fs: float = 1) -&gt; array:
+        return array(
+            'f',
+            (
+                fs*pi/2 * acos(1 - c**2/2/(1 - c))
+                for c in self.coeff
+            )
+        )
+
+    def apply_to_data(self, data: Iterable[float]) -&gt; array:
+        return array('f', (self.calculate(d) for d in data))
+</code></pre>
+    </div>

@@ -1,0 +1,229 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>OK, there's a couple of comments I can make WRT code style looking at what you have now. Things that really stand out, for example, are lines like this:</p>
+
+<pre><code>return "", "", fmt.Errorf(fmt.Sprintf("String '%s' cannot be read as property.", str))
+</code></pre>
+
+<p>The function in the <code>fmt</code> package is called <code>Errorf</code>, where the <code>f</code> at the end stands for <em>format</em>. Why, then bother with the <code>fmt.Sprintf</code> call, just to get a string? <code>fmt.Errorf</code> does the same job as <code>fmt.Sprintf</code>, only it returns an error:</p>
+
+<pre><code>return "", "", fmt.Errorf("string '%s' can't be read as property", str)
+</code></pre>
+
+<p>Golang coding standards also states that error strings should start with a lower-case character (see <a href="https://github.com/golang/go/wiki/CodeReviewComments#error-strings" rel="nofollow noreferrer">here</a>)</p>
+
+<p>Other, general comments - as I usually do, I'll go through your code pretty much line by line, commenting on things as I see them</p>
+
+<pre><code>var DefaultConfig = Config{"2006-01-02"}
+</code></pre>
+
+<p>Now this is a perfectly valid statement. However, it makes code less readable (especially if the declaration of <code>Config</code> sits in a different file, or contains a ton of fields. Imagine you need ~10 config values, some of them have defaults, some of them are not. To this end, I'd recommend you explicitly mention which field you're assigning, rather than relying on the order of the fields never changing:</p>
+
+<pre><code>var DefaultConfig = Config{
+    dateFormat: "2006-01-02",
+}
+</code></pre>
+
+<p>I also don't get why <code>DefaultConfig</code> (a <em>variable</em>) is exposed, even though the field it contains isn't. The default variable clearly is an internal thing, and should as such not be exported.<br>
+The same logic applies to the <code>Config</code> type: if it's exported, then surely there should be some fields or methods that are exported, too. Your snippet shows no such thing.</p>
+
+<pre><code>// FromFile returns the configuration to use for did
+func FromFile(path string) (c Config, e error) {
+</code></pre>
+
+<p>I'd opt to return a pointer, here. It forces people to check for errors. Currently, you're returning a valid <code>Config</code> value, which can be safely used. I can call <code>conf, _ := FromFile("/tmp/does_not_exist")</code>, and assume everything went fine. I'm guaranteed to receive a valid value after all. Not so if I were to change the function to:</p>
+
+<pre><code>func FromFile(path string) (*Config, error) {}
+</code></pre>
+
+<p>If there's an error, I'll get a <code>nil</code> value, accessing that will result in a runtime panic, so I'm forced to defend against that, and check errors. I'll rewrite some of the code to use a pointer return value</p>
+
+<pre><code>// c = DefaultConfig &lt;-- this is now gone
+if lines, err := File2lines(path); err == nil {
+</code></pre>
+
+<p>Yes, again there's a comment I can make. because your <code>if</code> clause is true on <em>success</em>, the rest of your code is essentially wrapped in a big <code>if</code>. Golang programmers prefer to return early, especially if something goes wrong. Rewrite this to:</p>
+
+<pre><code>// don't know why this function is exposed, don't know what this func looks like, but I prefer CamelCasing (or camelCasing) the name - also recommended style
+lines, err := FileToLines(path); err != nil {
+    return nil, err
+}
+// one less level of indentation here
+</code></pre>
+
+<p>Now a bigger one. Your <code>propertyOf</code> function has a triple return value, again this is perfectly valid. However, it's clear that you're returning a key-value pair, and an error. Why not create a <code>type kv struct{ key, value string}</code> or something so it's clear that the first 2 strings belong together. This is safer because it doesn't allow for people being silly and ignoring one of the return values. The key means nothing without the value and vice-versa after all. The data looks better when grouped. Anyway, let's rewrite the body of your <code>FromFile</code> func now:</p>
+
+<pre><code>// not in a func
+type kv struct {
+    key, value string
+}
+
+conf := DefaultConfig
+// in func FromFile
+for _, ln := range lines {
+    kv, err := propertyOf(ln) // we will look at propertyOf later
+    if err != nil {
+        return nil, err // again, return early
+    }
+
+    // valid
+    switch kv.key {
+    case "dateformat":
+        // maybe check for empty strings and return errors here
+        // you could even try parsing a known date, to see if the format is valid
+        conf.dateFormat = kv.value 
+    case "some-other-key":
+        // implement other values
+    default:
+        // optional, unknown config could just as well be skipped
+        return nil, fmt.Errorf("unknown config %s (value %s)", kv.key, kv.value)
+    }
+}
+return &amp;conf, nil // all good
+</code></pre>
+
+<p>Now let's look at the <code>propertyOf</code> function. I must say, the name is confusing to say the least. I'd call it something like <code>lineToKVPair</code> or something. Then again, naming things isn't my speciality. However, when I see <code>propertyOf</code>, I'm expecting either a pointer to a field to be returned (through reflection), a boolean (whether or not an argument of type <code>interface{}</code> is a struct, and has a given property, or simply a bool given a value, telling me whether or not that value is a property of a given object.</p>
+
+<pre><code>// again: return pointer to ensure the error is checked
+func toKVPair(ln string) (*kv, error) {
+    parts := strings.Split(
+        strings.Trim(ln, " \t\n"), // removes all spaces, tabs, and new-line characters from string in one call
+        "=",
+    )
+    if len(parts) != 2 {
+        return nil, fmt.Errorf("string %s could not be parsed to a key-value pair", ln)
+    }
+    return &amp;kv{
+        key: parts[0],
+        value: parts[1],
+    }, nil
+}
+</code></pre>
+
+<p>Now putting all of this together, the code looks something like this:</p>
+
+<pre><code>type Config struct {
+    dateFormat string
+}
+
+type kv struct {
+    key, value string
+}
+
+var DefaultConfig = Config{
+    dateFormat: "2006-02-01",
+}
+
+func FromFile(path string) (*Config, error) {
+    lines, err := FileToLines(path)
+    if err != nil {
+        return nil, err
+    }
+
+    conf := DefaultConfig
+
+    for _, ln := range lines {
+        kv, err := propertyOf(ln)
+        if err != nil {
+            return nil, err
+        }
+
+        switch kv.key {
+        case "dateformat":
+            conf.dateFormat = kv.value 
+        case "some-other-key":
+            // implement other values
+        default:
+            return nil, fmt.Errorf("unknown config %s (value %s)", kv.key, kv.value)
+        }
+    }
+    return &amp;conf, nil // all good
+}
+
+func toKVPair(ln string) (*kv, error) {
+    parts := strings.Split(
+        strings.Trim(ln, " \t\n"), // removes all spaces, tabs, and new-line characters from string in one call
+        "=",
+    )
+    if len(parts) != 2 {
+        return nil, fmt.Errorf("string %s could not be parsed to a key-value pair", ln)
+    }
+    return &amp;kv{
+        key: parts[0],
+        value: parts[1],
+    }, nil
+}
+</code></pre>
+
+<p>This, to my eye, looks a lot tidier, and simpler. But it's still not what I'd actually do. My preferred approach is even simpler, still.</p>
+
+<hr>
+
+<p>Use environment/config packages.</p>
+
+<p>Golang projects are more often than not either CLI tools, or containerised binaries. In case of the latter, they usually get their config from environment variables. There's a lot of packages out there that handle this really nicely.</p>
+
+<p>Now for some shameless self-promotion: I usually use <a href="https://github.com/caarlos0/env" rel="nofollow noreferrer">this package</a>, and it served me well. So much so that I've contributed a bit to it. To do what you're trying to do is dead-easy:</p>
+
+<pre><code>import(
+    "github.com/caarlos0/env"
+)
+
+type Config struct {
+    DateFormat string `env:"DATE_FORMAT" envDefault:"2006-01-02"`
+}
+
+func GetConfig() (*Config, error) {
+    var c Config
+    if err := env.Parse(&amp;c); err != nil {
+        return nil, err
+    }
+    return &amp;c, nil
+}
+</code></pre>
+
+<p>That's it! if you want some validation to be added, you can have a look at the custom parsers, or just add them on to the <code>Config</code> type:</p>
+
+<pre><code>// do validation here, and call that in the GetConfig func before you return
+func (c Config) validate() error {}
+</code></pre>
+
+<p>When you are working on a CLI tool, there's other packages you can use that handle both flags and environment variables. The most commonly used one (in my experience) is <a href="https://github.com/spf13/viper" rel="nofollow noreferrer">viper</a>. It's quite nicely documented, although I find using it can lead to quite verbose code in the end.</p>
+
+<p>What you can quite easily do, however, is use the standard <code>flags</code> package, and use <code>os.Setenv</code> to populate the environment variables accordingly, and then use the code above:</p>
+
+<pre><code>import(
+    "flags"
+    "fmt"
+    "os"
+)
+
+func main() {
+    // create the flag
+    flagSet := map[string]string{
+        "DATE_FORMAT": "2006-01-02",
+    }
+    flags.StringVar(&amp;flagSet["DATE_FORMAT"], "date-format", flagSet["DATE_FORMAT"], "set different date format string")
+    // parse the flags:
+    if err := flags.Parse(); err != nil {
+        fmt.Printf("error: %+v", err)
+        os.Exit(1)
+    }
+    // populate env
+    for k, v := range flagSet {
+        if err := os.Setenv(k, v); err != nil {
+            fmt.Printf("error: %+v", err)
+            os.Exit(1)
+        }
+    }
+    // load config struct from the env vars we just set
+    conf, err := GetConfig()
+    // etc...
+}
+</code></pre>
+
+<hr>
+
+<p>Note: All the code I wrote, I just typed here on the site, I've not tested anything, so there might be some typo's and such, but the basic ideas are all there. I think the code is close to complete enough to be used as a basis to write your own solution.</p>
+
+<p>Have fun</p>
+    </div>

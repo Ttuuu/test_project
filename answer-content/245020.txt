@@ -1,0 +1,181 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Whilst your code is thread safe, since you have a global lock protecting the dictionary (and the lock is relatively long lived), it will be a serious bottleneck under concurrent load. The principal scalability limit in concurrent applications is the exclusive resource lock.</p>
+<p>The chart below shows throughput with an increasing degree of parallelism on a 16 core VM for concurrent LRU reads and writes. It compares an implementation of LRU that does not have a global lock, to an implementation fundamentally the same as your code (with a global lock).</p>
+<p><a href="https://i.stack.imgur.com/1WExx.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/1WExx.png" alt="enter image description here"></a></p>
+<p>In this test I set the concurrent dictionary concurrency level = number of threads. I believe the unusual dip at the beginning is caused by <a href="https://en.wikipedia.org/wiki/False_sharing" rel="nofollow noreferrer">false sharing</a>. It's old now, but <a href="http://igoro.com/archive/gallery-of-processor-cache-effects/" rel="nofollow noreferrer">gallery of processor cache effects</a> has a nice description.</p>
+<p>The implementation with better throughput is a thread safe pseudo LRU designed for concurrent workloads. Latency is very close to ConcurrentDictionary, ~10x faster than MemoryCache and hit rate is better than a conventional LRU algorithm (these are the other two factors that will determine performance). A full analysis provided in the github link below.</p>
+<p>Usage of the ConcurrentLru looks like this:</p>
+<pre><code>int capacity = 666;
+var lru = new ConcurrentLru&lt;int, SomeItem&gt;(capacity);
+
+var value = lru.GetOrAdd(1, (k) =&gt; new SomeItem(k));
+</code></pre>
+<p>GitHub: <a href="https://github.com/bitfaster/BitFaster.Caching" rel="nofollow noreferrer">https://github.com/bitfaster/BitFaster.Caching</a></p>
+<pre><code>Install-Package BitFaster.Caching
+</code></pre>
+<p>Below is the complete source code for the ClassicLRU tested above. It has shorter span locks and uses ConcurrentDictionary. It's not intended for production use (it may have bugs) - it's just to illustrate that even when taking narrow locks throughput is still bad under concurrent load.</p>
+<pre><code>public sealed class ClassicLru&lt;K, V&gt; : ICache&lt;K, V&gt;
+{
+    private readonly int capacity;
+    private readonly ConcurrentDictionary&lt;K, LinkedListNode&lt;LruItem&gt;&gt; dictionary;
+    private readonly LinkedList&lt;LruItem&gt; linkedList = new LinkedList&lt;LruItem&gt;();
+
+    private long requestHitCount;
+    private long requestTotalCount;
+
+    public ClassicLru(int capacity)
+        : this(Defaults.ConcurrencyLevel, capacity, EqualityComparer&lt;K&gt;.Default)
+    { 
+    }
+
+    public ClassicLru(int concurrencyLevel, int capacity, IEqualityComparer&lt;K&gt; comparer)
+    {
+        if (capacity &lt; 3)
+        {
+            throw new ArgumentOutOfRangeException("Capacity must be greater than or equal to 3.");
+        }
+
+        if (comparer == null)
+        {
+            throw new ArgumentNullException(nameof(comparer));
+        }
+
+        this.capacity = capacity;
+        this.dictionary = new ConcurrentDictionary&lt;K, LinkedListNode&lt;LruItem&gt;&gt;(concurrencyLevel, this.capacity + 1, comparer);
+    }
+
+    public int Count =&gt; this.linkedList.Count;
+
+    public double HitRatio =&gt; (double)requestHitCount / (double)requestTotalCount;
+
+    ///&lt;inheritdoc/&gt;
+    public bool TryGet(K key, out V value)
+    {
+        Interlocked.Increment(ref requestTotalCount);
+
+        LinkedListNode&lt;LruItem&gt; node;
+        if (dictionary.TryGetValue(key, out node))
+        {
+            LockAndMoveToEnd(node);
+            Interlocked.Increment(ref requestHitCount);
+            value = node.Value.Value;
+            return true;
+        }
+
+        value = default(V);
+        return false;
+    }
+
+    public V GetOrAdd(K key, Func&lt;K, V&gt; valueFactory)
+    {
+        if (this.TryGet(key, out var value))
+        {
+            return value;
+        }
+
+        var node = new LinkedListNode&lt;LruItem&gt;(new LruItem(key, valueFactory(key)));
+
+        if (this.dictionary.TryAdd(key, node))
+        {
+            LinkedListNode&lt;LruItem&gt; first = null;
+
+            lock (this.linkedList)
+            {
+                if (linkedList.Count &gt;= capacity)
+                {
+                    first = linkedList.First;
+                    linkedList.RemoveFirst();
+                }
+
+                linkedList.AddLast(node);
+            }
+
+            // Remove from the dictionary outside the lock. This means that the dictionary at this moment
+            // contains an item that is not in the linked list. If another thread fetches this item, 
+            // LockAndMoveToEnd will ignore it, since it is detached. This means we potentially 'lose' an 
+            // item just as it was about to move to the back of the LRU list and be preserved. The next request
+            // for the same key will be a miss. Dictionary and list are eventually consistent.
+            // However, all operations inside the lock are extremely fast, so contention is minimized.
+            if (first != null)
+            {
+                dictionary.TryRemove(first.Value.Key, out var removed);
+
+                if (removed.Value.Value is IDisposable d)
+                {
+                    d.Dispose();
+                }
+            }
+
+            return node.Value.Value;
+        }
+
+        return this.GetOrAdd(key, valueFactory);
+    }
+
+    public bool TryRemove(K key)
+    {
+        if (dictionary.TryRemove(key, out var node))
+        {
+            // If the node has already been removed from the list, ignore.
+            // E.g. thread A reads x from the dictionary. Thread B adds a new item, removes x from 
+            // the List &amp; Dictionary. Now thread A will try to move x to the end of the list.
+            if (node.List != null)
+            {
+                lock (this.linkedList)
+                {
+                    if (node.List != null)
+                    {
+                        linkedList.Remove(node);
+                    }
+                }
+            }
+
+            if (node.Value.Value is IDisposable d)
+            {
+                d.Dispose();
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    // Thead A reads x from the dictionary. Thread B adds a new item. Thread A moves x to the end. Thread B now removes the new first Node (removal is atomic on both data structures).
+    private void LockAndMoveToEnd(LinkedListNode&lt;LruItem&gt; node)
+    {
+        // If the node has already been removed from the list, ignore.
+        // E.g. thread A reads x from the dictionary. Thread B adds a new item, removes x from 
+        // the List &amp; Dictionary. Now thread A will try to move x to the end of the list.
+        if (node.List == null)
+        {
+            return;
+        }
+
+        lock (this.linkedList)
+        {
+            if (node.List == null)
+            {
+                return;
+            }
+
+            linkedList.Remove(node);
+            linkedList.AddLast(node);
+        }
+    }
+
+    private class LruItem
+    {
+        public LruItem(K k, V v)
+        {
+            Key = k;
+            Value = v;
+        }
+
+        public K Key { get; }
+
+        public V Value { get; }
+    }
+}
+</code></pre>
+    </div>

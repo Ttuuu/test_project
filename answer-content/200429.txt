@@ -1,0 +1,120 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You don't use <code>typing</code> properly. <a href="https://docs.python.org/3/library/typing.html#generics" rel="nofollow noreferrer">Parametrizing generic types should be done using brackets notation</a> (aka <code>__getitem__</code>) not parenthesis (aka instantiation).</p>
+
+<p>You also don't use any feature of <code>dataclasses</code> in your defined classes, so you might as well drop that dependency. Or you could use it properly so that <code>Country(**json_data)</code> will build the whole thing; but:</p>
+
+<ul>
+<li>Keys in the JSON data are not valid python identifiers, you would need to convert them;</li>
+<li>You would need to handle converting children "manually" <a href="https://docs.python.org/3/library/dataclasses.html#post-init-processing" rel="nofollow noreferrer">after the <code>__init__</code> took place</a>;</li>
+<li>You will need to swap the order in which you define classes due to scope evaluation.</li>
+</ul>
+
+<p>The closest we would come should be something along the lines of:</p>
+
+<pre><code>from dataclasses import dataclass
+from typing import List
+
+
+def convert_keys(dct):
+    return {name.replace('-', '_'): value for name, value in dct.items()}
+
+
+@dataclass
+class Street:
+    city_id: int
+    name: str
+    street_id: int
+
+
+@dataclass
+class City:
+    state_id: int
+    name: str
+    city_id: int
+    streets: List[Street]
+
+    def __post_init__(self):
+        self.streets = [Street(**convert_keys(street)) for street in self.streets]
+
+
+@dataclass
+class State:
+    country_id: int
+    name: str
+    state_id: int
+    cities: List[City]
+
+    def __post_init__(self):
+        self.cities = [City(**convert_keys(city)) for city in self.cities]
+
+
+@dataclass
+class Country:
+    country_id: int
+    name: str
+    states: List[State]
+
+    def __port_init__(self):
+        self.states = [State(**convert_keys(state)) for state in self.states]
+</code></pre>
+
+<p>Initiate the call using <code>Country(**convert_keys(json_data))</code>. But this solution doesn't necessary feel cleaner than yours.</p>
+
+<hr>
+
+<p>Now as regards to using these classes as a mean to store data into a relational database, we need to examine usage.</p>
+
+<p>The <a href="https://www.python.org/dev/peps/pep-0249/#id15" rel="nofollow noreferrer">DB API 2.0</a> tells us that you can expect to be able to:</p>
+
+<pre><code>cursor.execute('INSERT INTO Street VALUES (?, ?, ?)', (city_id, name, street_id))
+</code></pre>
+
+<p>Which means that we need to:</p>
+
+<ol>
+<li>Be able to convert these classes to tuples;</li>
+<li>Remove the reverse relationship that we had so much troubles parsing properly <code>Country.states</code>, <code>State.cities</code>, and <code>City.streets</code>).</li>
+</ol>
+
+<p>So here we go, trying to patch our approach. We could use <a href="https://docs.python.org/3/library/dataclasses.html#dataclasses.astuple" rel="nofollow noreferrer"><code>dataclasses.astuple</code></a> to convert or objects to proper parameters for our query, but we would still need a specific parser to recursively traverse nested JSON layers. Coupling that with the invalid identifiers issue, I don't think storing the data into intermediate classes makes much sense. Instead I would rather write them directly in the database:</p>
+
+<pre><code>def parse_country(cursor, json_data):
+    country_id = json_data['country-id']
+    name = json_data['name']
+    cursor.execute('INSERT INTO Country VALUES (?, ?)', (country_id, name))
+    for state in json_data['states']:
+        parse_state(cursor, state)
+
+
+def parse_state(cursor, json_data):
+    state_id = json_data['state-id']
+    name = json_data['name']
+    country_id = json_data['country-id']
+    cursor.execute('INSERT INTO State VALUES (?, ?, ?)', (state_id, name, country_id))
+    for city in json_data['cities']:
+        parse_city(cursor, city)
+
+
+def parse_city(cursor, json_data):
+    city_id = json_data['city-id']
+    name = json_data['name']
+    state_id = json_data['state-id']
+    cursor.execute('INSERT INTO City VALUES (?, ?, ?)', (city_id, name, state_id))
+    for street in json_data['streets']:
+        parse_street(cursor, street)
+
+
+def parse_street(cursor, json_data):
+    street_id = json_data['street-id']
+    name = json_data['name']
+    city_id = json_data['city-id']
+    cursor.execute('INSERT INTO Street VALUES (?, ?, ?)', (street_id, name, city_id))
+</code></pre>
+
+<p>And that's pretty much your original code except the data is now in DB and not in memory. Usage being:</p>
+
+<pre><code>conn = # create appropriate DB connection here
+with conn:
+    parse_country(conn.cursor(), json_data)
+</code></pre>
+    </div>

@@ -1,0 +1,200 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Your stack implementation is terrible, and so is <a href="https://codereview.stackexchange.com/a/242232/8999">@hc_dev</a>: neither handles memory correctly.</p>
+
+<h3>Resource Handling</h3>
+
+<p>It is generally frowned upon to call <code>new</code> and <code>delete</code> directly, simply because doing it <em>correctly</em> is hard.</p>
+
+<p>Proper resource handling requires:</p>
+
+<ul>
+<li>Thinking about moves.</li>
+<li>Thinking about copies.</li>
+<li>Thinking about destruction.</li>
+</ul>
+
+<p>This used to be called the <a href="https://en.wikipedia.org/wiki/Rule_of_three_(C%2B%2B_programming)" rel="noreferrer">Rule of 3</a> in C++03 (Copy Constructor, Copy Assignment Operator and Destructor) and is called the Rule of 5 since C++11 (+Move Constructor, +Move Assignment Operator).</p>
+
+<p>Your current Stack implements neither of those 5 operations correctly -- it doesn't implement them at all, and the default generated operations are buggy due to your use of a raw pointer.</p>
+
+<p>The best advice for resource handling, though, is to use the <strong>Rule of Zero</strong>: just delegate it to something that works!</p>
+
+<p>In your case, look into <code>std::unique_ptr</code> and <code>std::make_unique</code>!</p>
+
+<p>Corrected resource management:</p>
+
+<pre><code>struct StackElement {
+    char value;
+    std::unique_ptr&lt;StackElement&gt; next;
+
+    StackElement(char value, std::unique_ptr&lt;StackElement&gt; next) : 
+        value(value), next(std::move(next)) {}
+};
+
+struct Stack {
+    std::unique_ptr&lt;StackElement&gt; top = nullptr;
+
+    bool isEmpty() { return top == nullptr; }
+
+    void push(char value) {
+        top = std::make_unique&lt;StackElement&gt;(value, std::move(top));
+    }
+
+    char pop() {
+        assert(!isEmpty());
+
+        char toBeReturned = top-&gt;value;
+
+        top = std::move(top-&gt;next);
+
+        return toBeReturned;
+    }
+};
+</code></pre>
+
+<p>This <code>struct</code> is no longer copiable, as <code>std::unique_ptr</code> is not copiable.</p>
+
+<h3>Limited stack depth.</h3>
+
+<p>The previous rewrite is good, but its destructor suffers from stack overflow (!).</p>
+
+<p>That is, when the destructor is executed, you get:</p>
+
+<ul>
+<li>Call destructor of <code>Stack</code></li>
+<li>Call destructor of <code>Stack::top</code></li>
+<li>Call destructor of <code>StackElement</code> (<code>stack-&gt;top</code>)</li>
+<li>Call destructor of <code>StackElement::next</code>.</li>
+<li>Call destructor of <code>StackElement</code> (<code>stack-&gt;top-&gt;next</code>)</li>
+<li>...</li>
+</ul>
+
+<p>To handle this, create a <code>clear</code> method, and manually write the destructor.</p>
+
+<pre><code>struct Stack {
+    // ...
+
+    Stack(Stack&amp;&amp;) = default; // automatic generation is disabled when
+                              // the destructor is explicit, so explicitly
+                              // ask for it.
+
+    Stack&amp; operator=(Stack&amp;&amp;) = default; // automatic generation...
+
+    ~Stack() { clear(); }
+
+    void clear() {
+        while (!isEmpty()) {
+            pop();
+        }
+    }
+};
+</code></pre>
+
+<h3>General</h3>
+
+<p>Once you have the memory part correct, further improvements:</p>
+
+<ul>
+<li>Encapsulation: do not expose your privates.</li>
+<li>Generalization: make it work for any type.</li>
+</ul>
+
+<p>This yields:</p>
+
+<pre><code>//  No need for a class here, it's internal.
+template &lt;typename T&gt;
+struct StackElement {
+    StackElement(T value, std::unique_ptr&lt;StackElement&gt; next):
+        value(std::move(value)), next(std::move(next)) {}
+
+    T value;
+    std::unique_ptr&lt;StackElement&lt;T&gt;&gt; next;
+};
+
+template &lt;typename T&gt;
+class Stack {
+public:
+    ~Stack() { this-&gt;clear(); }
+
+    Stack() = default;
+
+    Stack(Stack&amp;&amp;) = default;
+    Stack&amp; operator=(Stack&amp;&amp;) = default;
+
+    bool isEmpty() const { return this-&gt;head == nullptr; }
+
+    T const&amp; top() const {
+        assert(!this-&gt;isEmpty());
+
+        return this-&gt;head-&gt;value;
+    }
+
+    void clear() {
+        while (!isEmpty()) {
+            this-&gt;pop();
+        }
+    }
+
+    void push(T value) {
+        //  Create empty node first, in case moving `value` throws an exception.
+        auto neo = std::make_unique&lt;StackElement&lt;T&gt;&gt;(std::move(value), nullptr);
+
+        neo-&gt;next = std::move(this-&gt;head);
+        this-&gt;head = std::move(neo);
+    }
+
+    T pop() {
+        assert(!isEmpty());
+
+        //  Pop top first, in case moving `current-&gt;value` throws an exception.
+        auto current = std::move(this-&gt;head);
+        this-&gt;head = std::move(current-&gt;next);
+
+        return std::move(current-&gt;value);
+    }
+
+private:
+    std::unique_ptr&lt;StackElement&lt;T&gt;&gt; head;
+};
+</code></pre>
+
+<h3>Miscellaneous</h3>
+
+<p>There are few nits in your <code>main</code>:</p>
+
+<ul>
+<li>There is no need to allocate <code>Stack</code> on the heap, just <code>Stack stack;</code> works.</li>
+<li>Don't use <code>std::endl</code>, just use <code>'\n'</code> or <code>"\n"</code>.
+
+<ul>
+<li><code>std::endl</code> <em>both</em> appends <code>\n</code> <em>and</em> calls <code>flush</code>, the latter kills all performance benefit of internally buffering.</li>
+</ul></li>
+</ul>
+
+<p>With that in mind, the rewritten <code>main</code> is:</p>
+
+<pre><code>int main() {
+    Stack&lt;char&gt; stack;
+    std::cout &lt;&lt; "Created a stack at " &lt;&lt; &amp;stack &lt;&lt; "\n";
+
+    int number_of_inputs;
+    std::cout &lt;&lt; "Enter the number of elements you want to push at the stack: ";
+    std::cin &gt;&gt; number_of_inputs;
+
+    for (int i = 0; i &lt; number_of_inputs; i++) {
+        char input;
+        std::cin &gt;&gt; input;
+        stack.push(input);
+    }
+
+    std::cout &lt;&lt; "- - - - - - - - - - - - - - - - " &lt;&lt; "\n";
+    std::cout &lt;&lt; "Displaying content of the stack: " &lt;&lt; "\n";
+
+    while (!stack.isEmpty()) {
+        std::cout &lt;&lt; stack.pop() &lt;&lt; "\n";
+    }
+
+    return 0;
+}
+</code></pre>
+    </div>

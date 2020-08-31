@@ -1,0 +1,121 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This is a poor way to test primality:</p>
+
+<pre><code>bool isPrime(int n) {
+    for (int i = 2; i &lt; n/2; ++i) {
+        if (n % i == 0)
+            return false;
+    }
+    return true;
+}
+</code></pre>
+
+<p>Even sticking with trial division, we can stop at √n, which is generally much less than n/2.  It's also well worth treating 2 as a special case, to reduce the iterations by half (i.e. <code>i += 2</code> instead of <code>++i</code>).</p>
+
+<p>Why are we using signed integers, given that we don't need any negative values?</p>
+
+<p>You say the "output is tested", but don't show any of the test code.  It's useful to see <em>how</em> the test works, to identify tests that are missing or erroneously passing.  I mention this because it's notoriously difficult to create reliable tests for multithreaded code.</p>
+
+<p>In <code>PrimeNumberMultiThread::solve</code>, we have opportunity to reduce duplication, and we don't need to hard-code the number of threads to two.  Instead, we can use as many threads as we have cores available, using a <code>for</code> loop to start them and another <code>for</code> loop to join them all.</p>
+
+<p>The mutex <code>m</code> and the commented-out <code>lock_guard</code> should just be removed: these aren't necessary, because only one thread accesses each vector between the worker threads starting and finishing (which points are memory barriers).</p>
+
+<p>Instead of <code>result.insert()</code>, the general case might benefit from <code>std::move</code> algorithm - in any case, it's well worth a <code>reserve</code> before adding the results.</p>
+
+<p>With OpenMP, much of the work can be automated for you - you'll just need a custom reduction to combine vectors - I think that's available from OpenMP 4.0 onwards.</p>
+
+<p>An alternative to using vectors is to use an array of flags to indicate which values are to be included in the result (the flags could even be in the input vector: overwrite the non-primes with zero to discard them).  Then there's no reallocation within either thread, and you can use OpenMP of older versions because we no longer need a custom reduction.</p>
+
+<p>Here's one version that uses the OpenMP approach I've just described:</p>
+
+<pre><code>#include &lt;algorithm&gt;
+#include &lt;iostream&gt;
+#include &lt;iterator&gt;
+#include &lt;random&gt;
+#include &lt;vector&gt;
+
+bool isPrime(unsigned n) {
+        if (n &lt; 2) return false;
+        if (n &lt; 4) return true;
+        if (n%2 == 0) return false;
+        for (auto i = 3ul;  i*i &lt; n;  i += 2) {
+            if (n % i == 0)
+                return false;
+        }
+
+        return true;
+}
+
+std::vector&lt;unsigned&gt; solve(std::vector&lt;int&gt;&amp; source)
+{
+    auto const len = source.size();
+    std::size_t result_size = 0;
+
+#pragma omp parallel for reduction(+:result_size)
+    for (std::size_t i = 0;  i &lt; len;  ++i) {
+        if (isPrime(source[i])) {
+            ++result_size;
+        } else {
+            source[i] = 0;
+        }
+    }
+
+    std::vector&lt;unsigned&gt; result;
+    result.reserve(result_size);
+
+    std::copy_if(source.begin(), source.end(),
+                 std::back_inserter(result),
+                 [](unsigned i){ return i; });
+
+    return result;
+}
+
+
+int main(){
+    const std::size_t size = 1000000u;
+    const unsigned min = 0u;
+    const unsigned max = 5000000u;
+
+    std::vector&lt;int&gt; randoms;
+    randoms.reserve(size);
+
+    {
+        std::uniform_int_distribution&lt;std::mt19937::result_type&gt; dist(min, max);
+        std::mt19937 rng;
+        rng.seed(0);            // for a reproducible test
+        for (std::size_t i = 0;  i &lt; size;  ++i) {
+            randoms.push_back(dist(rng));
+        }
+    }
+
+    auto primes = solve(randoms);
+    std::clog &lt;&lt; "Found " &lt;&lt; primes.size() &lt;&lt; " primes "
+              &lt;&lt; " from " &lt;&lt; randoms.size() &lt;&lt; " inputs\n";
+}
+</code></pre>
+
+<p>Compile with <code>g++ -fopenmp</code>, or the equivalent for your compiler.</p>
+
+<p>To test a single-threaded version, we just have to remove (manually, or with <code>#ifdef</code>) the <code>#pragma omp</code> line.</p>
+
+<hr>
+
+<p>Note that since C++17, we're able to specify an execution policy for <code>std::copy_if</code>, so we could reduce that code even further, especially if we're not fussy about the order of the results:</p>
+
+<pre><code>#include &lt;execution&gt;
+
+std::vector&lt;unsigned&gt; solve(std::vector&lt;int&gt;&amp; source)
+{
+    std::vector&lt;unsigned&gt; result;
+
+    std::copy_if(std::execution::par_unseq
+                 source.begin(), source.end(),
+                 std::back_inserter(result),
+                 [](unsigned i){ return isPrime(i); });
+
+    return result;
+}
+</code></pre>
+
+<p>I haven't been able to test this, as I'm still working with an old standard library that doesn't have <code>&lt;execution&gt;</code>.</p>
+    </div>

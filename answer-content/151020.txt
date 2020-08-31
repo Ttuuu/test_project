@@ -1,0 +1,172 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I have combined this builder with the <a href="https://codereview.stackexchange.com/questions/150965/declarative-dependencyproperety-registration">declarative one</a>.</p>
+
+<hr>
+
+<p>Now the <code>Build</code> resolves the <code>DefaultValue</code> and <code>Validation</code> attributes on the property:</p>
+
+<pre><code>public DependencyProperty Build()
+{
+    BuildDefaultValue();
+    BuildValidateValueCallback();
+
+    return DependencyProperty.Register(
+        _name,
+        _propertyType,
+        _ownerType,
+        _propertyMetadata,
+        _validateValueCallback
+    );
+}
+
+private void BuildDefaultValue()
+{
+    var property = _ownerType.GetProperty(_name);
+
+    // Use the default value specified by the user or try to use the attribute.
+    _propertyMetadata.DefaultValue =
+        _propertyMetadata.DefaultValue ??
+        new Func&lt;object&gt;(() =&gt;
+            // Get the defualt value from the attribute...
+            property.GetCustomAttribute&lt;DefaultValueAttribute&gt;()?.Value ??
+            // or use the default value for the type.
+            (property.PropertyType.IsValueType
+                ? Activator.CreateInstance(property.PropertyType)
+                : null
+            )
+        )();
+}
+
+private void BuildValidateValueCallback()
+{
+    var property = _ownerType.GetProperty(_name);
+
+    // Use the callback specified by the user or try to use the attributes.
+    _validateValueCallback =
+        _validateValueCallback ??
+        (value =&gt;
+            new Func&lt;bool&gt;(() =&gt; (
+                property.GetCustomAttributes&lt;ValidationAttribute&gt;() ??
+                Enumerable.Empty&lt;ValidationAttribute&gt;()
+            ).All(x =&gt; x.IsValid(value)))()
+        );
+}
+</code></pre>
+
+<hr>
+
+<p>I changed the <code>PropertyChanging</code> API back to <code>CoerceValue</code>. The main one works like the WPF implementation:</p>
+
+<pre><code>public PropertyMetadataBuilder&lt;T, TValue&gt; CoerceValue(
+    Func&lt;T, TValue, object&gt; coerceValueCallback
+)
+{
+    _propertyMetadata.CoerceValueCallback = (d, baseValue) =&gt; 
+        coerceValueCallback((T) d, (TValue)baseValue);
+    return this;
+}
+</code></pre>
+
+<p>and I extended it via an extension to work  with <code>EventArgs</code>.</p>
+
+<pre><code>public static PropertyMetadataBuilder&lt;T, TValue&gt; CoerceValue&lt;T, TValue&gt;(
+    this PropertyMetadataBuilder&lt;T, TValue&gt; builder,
+    Action&lt;T, CoerceValueEventArgs&lt;TValue&gt;&gt; coerceValueCallback
+) where T : DependencyObject
+{
+    builder.CoerceValue((d, baseValue) =&gt;
+    {
+        var e = new CoerceValueEventArgs&lt;TValue&gt;(baseValue);
+        coerceValueCallback(d, e);
+        return
+            e.Canceled
+                ? DependencyProperty.UnsetValue
+                : e.CoercedValue;
+    });
+    return builder;
+}
+</code></pre>
+
+<p>The custom <code>EventArgs</code></p>
+
+<pre><code>public class CoerceValueEventArgs&lt;TValue&gt; : EventArgs
+{
+    internal CoerceValueEventArgs(TValue baseValue)
+    {
+        NewValue = baseValue;
+        CoercedValue = baseValue;
+    }
+    public TValue NewValue { get; }
+    public TValue CoercedValue { get; set; }
+    public bool Canceled { get; set; }
+}
+</code></pre>
+
+<hr>
+
+<p>This is the new <code>TestObject</code></p>
+
+<pre><code>internal class TestObject : DependencyObject
+{
+    public static readonly DependencyProperty CountProperty =
+        DependencyPropertyBuilder
+        .Register&lt;TestObject, int&gt;(nameof(Count))
+        .PropertyMetadata(b =&gt; b
+            .PropertyChanged((testObject, e) =&gt;
+            {
+                Console.WriteLine($"{e.Property.Name} = {e.OldValue} --&gt; {e.NewValue}");
+            })            
+            .CoerceValue((testObject, e) =&gt;
+            {
+                if (e.NewValue &gt; 20)
+                {
+                    e.CoercedValue = 15;
+                }
+
+                if (e.NewValue &lt; 1)
+                {
+                    e.Canceled = true;
+                }
+            })
+        );
+
+    [DefaultValue(5)]
+    [Range(0, 15)]
+    public int Count
+    {
+        get { return CountProperty.GetValue&lt;int&gt;(this); }
+        set { CountProperty.SetValue(this, value); }
+    }
+}
+</code></pre>
+
+<p>and the tests</p>
+
+<pre><code>[TestMethod]
+public void Count_DefaultValue()
+{
+    var testObject = new TestObject();
+    Assert.AreEqual(5, testObject.Count, "Default value.");
+}
+
+[TestMethod]
+public void Count_ChangeValue()
+{
+    var testObject = new TestObject
+    {
+        Count = 8
+    };
+    Assert.AreEqual(8, testObject.Count, "Changed value");
+}
+
+[TestMethod]
+[ExpectedException(typeof(ArgumentException))]
+public void Count_ValueOutOfRange()
+{
+    new TestObject
+    {
+        Count = 22
+    };
+}
+</code></pre>
+    </div>

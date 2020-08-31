@@ -1,0 +1,100 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I think there's a lot of room for improvement here. The 'syntax' could be made less verbose and extending the system could be made easier with a better selection of core expressions, among other things.</p>
+
+<h1>Syntax</h1>
+
+<p>Using JSON as a serialization format saves a lot of work, but the resulting syntax is, in my opinion, quite terrible. 60+ lines of JSON, littered with repetitive <code>$t</code>'s and property names, for just a couple of lines of code. That makes these scripts difficult to write and read, increasing the likelyhood of bugs and the cost of fixing them. For example, let's translate that example to C#:</p>
+
+<pre><code>if (!(HasColor("Red", "Blue") &amp;&amp; HasFeature("PowerSteering")) ||
+    HasColor("Red") ? !HasFeature("PowerBrake") : 1.0)
+{
+    if (Color + SeatCount + HasFeature("PowerBrake"))
+    {
+        return 3.0;
+    }
+}
+</code></pre>
+
+<p>It's now much more obvious that the code is broken: it's adding a color, a number and a boolean together and treating it as a boolean. It's also missing else branches so it's not always returning a result, and there's an if-statement that returns either a boolean or a number, depending on its condition. The logic itself is also somewhat complicated - a few descriptively named local variables would be helpful.</p>
+
+<p><strong>Alternatives</strong></p>
+
+<p>I'd suggest taking some inspiration from Lisp, in this case the s-expression format it uses:</p>
+
+<pre><code>(if (not (any (all (HasColor "Red" "Blue")
+                   (HasFeature "PowerSteering"))
+              (if (HasColor "Red")
+                  (not (HasFeature "PowerBrake"))
+                  1.0)))
+    (sum Color
+         SeatCount
+         (if (HasFeature "PowerBrake")
+             3.0)))
+</code></pre>
+
+<p>Quite readable if you ask me, and fairly easy to parse as well. Parenthesis denote lists, and the first item in a list is either a function or a special form (a keyword), with the rest of the items being arguments (or keyword-specific parts). You could do something similar with JSON arrays. It'll be less terse, and you may have to get creative to distinguish between identifiers and strings (I've prefixed identifiers with a <code>'</code> below), but it could be a reasonable trade-off between development time and usability:</p>
+
+<pre><code>["'if", ["'not", ["'any", ["'all", ["'HasColor", "Red", "Blue"],
+                                   ["'HasFeature", "PowerSteering"]],
+                          ["'if", ["'HasColor", "Red"],
+                                  ["'not", ["'HasFeature", "PowerBrake"]],
+                                  1.0]]],
+        ["'sum", "'Color",
+                 "'SeatCount",
+                 ["'if", ["'HasFeature", "PowerBrake"],
+                         3.0]]]
+</code></pre>
+
+<hr>
+
+<h1>Expressions</h1>
+
+<p>If you look at the types in <code>System.Linq.Expressions</code>, you'll notice that all of them represent a <em>language construct</em>. Most of your expression types however represent standard library <em>functions</em>. This means that in C#, you only need to extend the language if you want to introduce a new syntactical construct. But in your language, every function and variable you wish to expose requires an extension.</p>
+
+<p>I would replace all of <code>Min</code>, <code>Max</code>, <code>Sum</code>, <code>Equals</code>, <code>Matches</code>, <code>GreaterThan</code>, <code>GreaterThanOrEqual</code>, <code>LessThan</code>, <code>LessThanOrEqual</code>, <code>Not</code> and other application-specific expression classes with just two expression types: <code>FunctionCall</code> and <code>Identifier</code>. That enables a more data-driven extension approach:</p>
+
+<pre><code>// Initialize the context with bindings to standard library functions:
+context.Items["Min"] = StandardFunctions.Min;
+
+// Which can then be referenced via identifiers:
+new FunctionCall(
+    function: new Identifier("Min"),
+    arguments: new IExpression[] {
+        new Constant&lt;double&gt;(4.0),
+        new Identifier("height")
+    });
+</code></pre>
+
+<p>Other useful expression types would be <code>MemberAccess</code> and <code>Index</code>, and perhaps a <code>Scope</code> expression that allows you to introduce local variables:</p>
+
+<pre><code>// [scope, [[local-identifier, value-expression], ...], body-expression]:
+// [member, object-expression, member-identifier]:
+// [index, indexable-expression, index-expression]:
+["'scope", [["'minHeight", 12.5],
+            ["'maxHeight", 37.5],
+            ["'firstCarHeight", ["'member", ["'index", "'cars", 0], "'height"]]],
+           ["'all", ["'&gt;=", "'firstCarHeight", "'minHeight"],
+                    ["'&lt;=", "'firstCarHeight", "'maxHeight"]]]
+</code></pre>
+
+<hr>
+
+<h1>Usability</h1>
+
+<p>Other (mostly usability) issues:</p>
+
+<ul>
+<li>A lack of documentation. There are almost no comments in the code, and there's no high-level explanation of how the system is meant to be used. How does each expression work? Are all their parts required or are some optional? What types does each expression expect and return? How should the system be extended? How are those <code>In</code>/<code>Out</code> attributes supposed to work?</li>
+<li>A confusing 'entry-point': <code>ExpressionSerializer.Deserialize</code> takes a generic parameter, but the most obvious choice, <code>IExpression</code>, failed (due to a typo in your example, I later found out). I would've expected a more simple signature like <code>IExpression Parse(...)</code> instead.</li>
+<li>Error reporting could be better. A few examples:
+
+<ul>
+<li>A <code>"$t:"</code> typo in your example resulted in a serialization exception that did point out the location, but the rest of the message wasn't very helpful (<code>Type is an interface or abstract class and cannot be instantiated.</code>).</li>
+<li>Trying to sum two incompatible types gives an invalid-expression exception that says <code>Invalid expression type. Expected: Constant`1; Actual: Constant`1.</code>. That doesn't show the actual types or the location of the problem.</li>
+<li>Evaluating an empty <code>IIf</code> expression resulted in a null-reference exception. I would've expected a parsing failure instead.</li>
+</ul></li>
+<li>What's with the typo in <code>IIf</code>?</li>
+<li><code>ISwitchable</code>'s <code>Enabled</code> only affects child expressions within <code>Any</code> and <code>All</code> expressions, yet every expression is switchable regarless of their parent. How exactly are expressions disabled in practice, and shouldn't this be taken care of by <code>Any</code> and <code>All</code> instead?</li>
+<li>Why does <code>ExpressionContextScope</code> have a <em>static</em> <code>Current</code> property? That seems brittle.</li>
+</ul>
+    </div>

@@ -1,0 +1,169 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I would encourage you to take a step back and look at how this code will be used. Here's what I noticed as I read the code.</p>
+
+<ol>
+<li><p>The definition of a valid batch seems to be "A batch with at least one valid row, and no invalid ones". I would have guessed that a valid batch would simply be one with no invalid rows, and that it would be checked for emptiness elsewhere. That doesn't mean the definition is wrong, just a bit surprising - and it's a good idea to avoid surprises in your code base.</p></li>
+<li><p>It seems like your function has two purposes: One is to determine, as quickly as possible, whether a batch is valid. The other is to collect a list of the invalid rows. This sounds like it might be best as two separate functions (in fact, "should this be two functions" is my first question <em>whenever</em> I see a function with a <code>bool</code> parameter).</p></li>
+<li><p>This implementation treats the collection of invalid rows and the logging of empty batches as side effects of the validation code. This isn't necessarily a problem, but it can be inconvenient. Suppose you want to validate multiple batches in parallel - you can't, because <code>this.InvalidRows</code>, as a <code>List</code>, is not thread-safe. Suppose you want to test your validation code without touching the system logs - you can't<sup>*</sup>, because the call to <code>logger.Error</code> takes place directly in the validation code.</p></li>
+</ol>
+
+<p><sup>*without injecting the logger dependency</sup></p>
+
+<p>With that in mind, you could make a one-line function for the first use case, leveraging Linq's <code>All</code>, <a href="https://docs.microsoft.com/en-us/dotnet/api/system.linq.enumerable.all?view=netframework-4.7.2#remarks" rel="noreferrer">which <em>does</em> short-circuit for efficiency</a>:</p>
+
+
+
+<pre class="lang-cs prettyprint-override"><code>public bool BatchIsValid(IEnumerable&lt;DataRow&gt; batch)
+{
+    return batch.All(ValidateRow);
+}
+</code></pre>
+
+<p>And another one-liner for the second use case:</p>
+
+
+
+<pre class="lang-cs prettyprint-override"><code>public IEnumerable&lt;DataRow&gt; InvalidRowsIn(IEnumerable&lt;DataRow&gt; batch)
+{
+    return batch.Where(row =&gt; !ValidateRow(row));
+}
+</code></pre>
+
+<p>And, if you account for empty batches from your calling code, that may be all you need. Here's a third one-liner you could use for that (As <a href="https://codereview.stackexchange.com/a/203550">Heslacher pointed out</a>, <code>Any</code> also short-circuits for efficiency):</p>
+
+
+
+<pre class="lang-cs prettyprint-override"><code>public bool BatchIsEmpty(IEnumerable&lt;DataRow&gt; batch)
+{
+    return batch == null || !batch.Any();
+}
+</code></pre>
+
+<hr>
+
+<p>In fact, I usually like to make one-line, one-argument functions into lambda-bodied extension methods. Here's what that might look like:</p>
+
+
+
+<pre class="lang-cs prettyprint-override"><code>// In an appropriate namespace
+public static class ValidationExtensions
+{
+    public static bool IsValid(this IEnumerable&lt;DataRow&gt; batch)
+        =&gt; batch.All(row =&gt; row.IsValid());
+
+    public static IEnumerable&lt;DataRow&gt; InvalidRows(this IEnumerable&lt;DataRow&gt; batch)
+        =&gt; batch.Where(row =&gt; !row.IsValid());
+
+    public static bool IsEmpty(this IEnumerable&lt;DataRow&gt; batch)
+        =&gt; batch is null || !batch.Any();
+
+    public static bool IsValid(this DataRow row)
+    {
+        // Your validation logic here
+    }
+}
+</code></pre>
+
+<p>And that might make your calling code look like this (I am guessing here at what the larger context may be):</p>
+
+
+
+<pre class="lang-cs prettyprint-override"><code>public void Process(IEnumerable&lt;DataRow&gt; batch)
+{
+    if (batch.IsEmpty())
+    {
+        logger.Error(MSG_NO_DATAROWS);
+        return;
+    }
+
+    if (!batch.IsValid())
+    {
+        foreach (var row in batch.InvalidRows())
+        {
+            LogDataError(row);
+        }
+        return;
+    }
+
+    foreach (var row in batch)
+    {
+        Process(row);
+    }
+}
+</code></pre>
+
+<hr>
+
+<p>BUT at this point you might ask what you're gaining from those extension methods. Why not just use Linq's <code>All</code>, <code>Where</code>, and <code>Any</code> directly? And indeed, that looks about the same (and without hiding any logic in extension methods):</p>
+
+
+
+<pre class="lang-cs prettyprint-override"><code>public void Process(IEnumerable&lt;DataRow&gt; batch)
+{
+    if (batch is null || !batch.Any())
+    {
+        logger.Error(MSG_NO_DATAROWS);
+        return;
+    }
+
+    if (!batch.All(IsValid))
+    {
+        foreach (var row in batch.Where(r =&gt; !IsValid(r)))
+        {
+            LogDataError(row);
+        }
+        return;
+    }
+
+    foreach (var row in batch)
+    {
+        Process(row);
+    }
+}
+</code></pre>
+
+<p>This is the track I usually take with these sorts of functions: Very rarely do I find it's "worth it" to filter a list or find a list element within my own <code>foreach</code> or function. The only reason I might go that direction is for absolute efficiency, when it's very important that I iterate the list no more than once (perhaps because I am lazily streaming a very large amount of data). That might look like this:</p>
+
+
+
+<pre class="lang-cs prettyprint-override"><code>public bool Process(IEnumerable&lt;DataRow&gt; batch, out List&lt;DataRow&gt; invalidRows)
+{
+    if (batch is null)
+    {
+        logger.Error(MSG_NO_DATAROWS);
+        return;
+    }
+
+    bool allRowsAreValid = true;
+    bool batchIsEmpty = true;
+    invalidRows = new List&lt;DataRow&gt;();
+
+    foreach (var row in batch)
+    {
+        batchIsEmpty = false;
+
+        if (IsValid(row))
+        {
+            Process(Row);
+        }
+        else
+        {
+            allRowsAreValid = false;
+            invalidRows.Add(row);
+        }
+    }
+
+    if (batchIsEmpty)
+    {
+        logger.Error(MSG_NO_DATAROWS);
+        return;
+    }
+
+    return allRowsAreValid;
+}
+</code></pre>
+
+<p>Note that this solution uses no Linq. Everything (empty checks, logging, validation, collecting invalid rows, processing) is integrated because that's the most efficient way to do it. The next measures to improve efficiency would cause even bigger hits to the quality of life of the maintenance programmer: things like switching to a <code>while</code> loop directly on your <code>DataReader</code>, or switching <code>batchIsEmpty</code> from <code>bool</code> to <code>int</code> so that the body of the <code>foreach</code> could be made into a <code>switch</code>, <a href="https://blogs.msdn.microsoft.com/abhinaba/2006/12/18/switches-and-jump-tables/" rel="noreferrer">suggesting to the compiler that a jump table should be used</a> to avoid touching that variable after the first iteration...</p>
+
+<p>I hope you also note that this solution is more difficult to read. It's up to you to choose the best balance between efficiency and separation of concerns.</p>
+    </div>

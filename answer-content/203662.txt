@@ -1,0 +1,144 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>1. Review</h3>
+
+<ol>
+<li><p>There are no docstrings. What does <code>process_file</code> do? What does it return?</p></li>
+<li><p>The name <code>process_file</code> is vague. It's better to use specific names, for example <code>kmz_coordinates</code>.</p></li>
+<li><p>The <code>saved_file</code> logic should be unnecessary, because the caller already knows which <code>filename</code> they passed to <code>process_file</code>. So you could write something like:</p>
+
+<pre><code>results = executor.map(kmz_coordinates, kmz_files, chunksize=10)
+for filename, coords in zip(kmz_files, results):
+    print("{} / {}".format(count,len(kmz_files)))
+    count = count + 1
+    f.write(f"File {filename}:\n")
+    for line in coords:
+        f.write(line);
+</code></pre>
+
+<p>using <a href="https://docs.python.org/3/library/functions.html#zip" rel="nofollow noreferrer"><code>zip</code></a> to match up the filenames with the results, and remove the <code>saved_file</code> logic from <code>kmz_coordinates</code>.</p></li>
+<li><p>Similarly, the <code>count</code> logic is unnecessary, because you could use <a href="https://docs.python.org/3/library/functions.html#enumerate" rel="nofollow noreferrer"><code>enumerate</code></a> to generate the counts:</p>
+
+<pre><code>results = executor.map(kmz_coordinates, kmz_files, chunksize=10)
+for count, (filename, coords) in enumerate(zip(kmz_files, results)):
+    print("{} / {}".format(count, len(kmz_files)))
+    f.write(f"File {filename}:\n")
+    f.writelines(coords)
+</code></pre></li>
+<li><p>The use of <code>try: ... except: pass</code> to suppress exceptions is a bad idea. There are two reasons for this. First, a bare <code>except:</code> catches all exceptions, including <code>KeyboardInterrupt</code>, which might make it difficult to stop the program by typing control-C. Second, the exceptions might be due to bugs in your program, but by suppressing them you make the bugs difficult to spot.</p>
+
+<p>If you really do have a good reason for suppressing exceptions, then you should localize the <code>try: ... except</code> as tightly as you can around the line of code that might raise the exception, and you should pick the appropriate exception classs. For example, if the problem you are worrying about is that <code>lxml.html.fromstring</code> will raise <code>lxml.etree.ParserError</code>, write something like:</p>
+
+<pre><code>try:
+    doc = html.fromstring(kml)
+except lxml.etree.ParserError:
+    continue # skip this file
+</code></pre></li>
+<li><p>When opening a file, it is a good idea to use <code>with</code>. For example, instead of:</p>
+
+<pre><code>f=open('kmz_search_output.txt', 'wt')
+# ... code using f ...
+f.close()
+</code></pre>
+
+<p>write:</p>
+
+<pre><code>with open('kmz_search_output.txt', 'w') as f:
+    # ... code using f ...
+</code></pre>
+
+<p>This saves a line of code (no need to close the file explicitly), and ensures that the file gets closed in a timely manner even if an exception occurs inside the <code>... code using f ...</code>.</p></li>
+<li><p>The content of a KML file XML, not HTML, so shouldn't you be using <a href="https://lxml.de/api/lxml.etree-module.html" rel="nofollow noreferrer"><code>lxml.etree</code></a> instead of <code>lxml.html</code>?</p></li>
+<li><p>The code tries to parse every file in the KMZ as if it is a KML file:</p>
+
+<pre><code>for kml_name in kmz.namelist():
+    if 'doc.kml' in kml_name:
+        continue
+    kml = kmz.open(kml_name, 'r').read()
+    doc = html.fromstring(kml)
+</code></pre>
+
+<p>But a KMZ can include other kinds of data, for example images and audio, so I would expect some check on the filename, for example to see if has the .kml extension:</p>
+
+<pre><code>for kml_name in kmz.namelist():
+    if not kml_name.endswith('.kml') or 'doc.kml' in kml_name:
+        continue
+</code></pre>
+
+<p>If you did this then maybe you could omit the <code>try: ... except:</code> completely.</p></li>
+<li><p>The name <code>tmp</code> is vague. Better to be as specific as possible, for example <code>track</code>.</p></li>
+<li><p>This section of code loops over the first track in each placemark:</p>
+
+<pre><code>for pm in doc.cssselect('Document Placemark'):
+    tmp = pm.cssselect('track')
+    if len(tmp):
+        # Track Placemark
+        tmp = tmp[0]  # always one element by definition
+</code></pre>
+
+<p>But if there is only one track in each placemark, then it looks to me as though this can be as a single loop:</p>
+
+<pre><code>for track in doc.cssselect('Document Placemark track'):
+</code></pre></li>
+<li><p>Similarly, the code then loops through the descendents of the track looking for <code>coord</code> elements. So you could combine that into the same loop:</p>
+
+<pre><code>for coord in doc.cssselect('Document Placemark track coord'):
+</code></pre></li>
+<li><p>Instead of splitting the content of the <code>coord</code> element twice:</p>
+
+<pre><code>lon = float(content.split()[0])
+lat = float(content.split()[1])
+</code></pre>
+
+<p>Split it just once and use <a href="https://docs.python.org/3/library/functions.html#map" rel="nofollow noreferrer"><code>map</code></a> and tuple assignment:</p>
+
+<pre><code>lon, lat = map(float, content.split())
+</code></pre></li>
+<li><p>The search coordinates are always the same, so they should be assigned outside the loop. It would make sense for them to be keyword arguments to the <code>kml_track_coordinates</code>, then you could use the function to search for coordinates of your choice.</p></li>
+<li><p>Similarly, the tolerance of 1 degree is arbitrary and should also be a keyword argument to the function.</p></li>
+</ol>
+
+<h3>2. Revised code</h3>
+
+<p>This is untested, so probably contains some mistakes.</p>
+
+<pre><code>def kmz_coordinates(filename, search_lon=-47, search_lat=47, tolerance=1):
+    """Return list of track coordinates found in a KMZ file that are
+    within tolerance degrees of (search_lon, search_lat).
+
+    """
+    coords = []
+    with ZipFile(filename, 'r') as kmz:
+        for kml_name in kmz.namelist():
+            if not kml_name.endswith('.kml') or 'doc.kml' in kml_name:
+                continue
+            with kmz.open(kml_name, 'r') as kml:
+                doc = html.fromstring(kml.read())
+            for coord in doc.cssselect('Document Placemark track coord'):
+                content = coord.text_content()
+                lon, lat = map(float, content.split())
+                if (abs(lat - search_lat) &lt;= tolerance
+                    and abs(lon - search_lon)) &lt;= tolerance):
+                    coords.append(content + '\n')
+    return coords
+
+def kmz_search_directory(directory, output_filename='kmz_search_output.txt'):
+    """Search directory for KMZ files, find matching coordinates within
+    the files, and write the results to output_filename.
+
+    """
+    kmz_files = []
+    for root, _, files in os.walk(directory):
+        for filename in files:
+            if filename.endswith('.kmz'):
+                kmz_files.append(os.path.join(root, filename))
+
+    with open(output_filename, 'w') as f:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=8) as executor:
+            results = executor.map(kmz_coordinates, kmz_files, chunksize=10)
+            for count, (filename, coords) in enumerate(zip(kmz_files, results)):
+                print("{} / {}".format(count, len(kmz_files)))
+                f.writelines(coords)
+
+    print('Done')
+</code></pre>
+    </div>

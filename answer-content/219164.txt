@@ -1,0 +1,74 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>A straightforward transliterating to AVX2 intrinsics works, but I didn't like what the compilers made of it.</p>
+
+<p>For example, an obvious approach is to load 8 bytes, widen them to 8 ints, etc. And that obvious way to do that, I think, is with <code>_mm_loadl_epi64</code> to do the loading. Unfortunately, MSVC and even GCC refuse to merge a <code>_mm_loadl_epi64</code> into the memory operand of <code>_mm256_cvtepu8_epi32</code>, and there is no overload of <code>_mm256_cvtepu8_epi32</code> with an explicit memory operand.. Using <code>_mm_loadu_si128</code> to do the loading is fine and does merge, but that merger means that the 16-byte loading intrinsic is used but only 8 bytes of memory are actually loaded. It's strange, but it works, though it may make some people nervous to use this near the end of the data as it <em>looks</em> like it would read past the end.</p>
+
+<p>Anyway, my first concern was the stores. The GCC auto-vectorized version split the 256bit store into two 128bit stores, perhaps to avoid unaligned 256bit stores. But it's not so hard to align the destination, assuming <code>mO</code> is at least 8-aligned, so I'd say that's a better approach. The ICC auto-vectorized version doesn't try to avoid the big potentially-unaligned stores, perhaps it hopes for the best or thinks it shouldn't matter much. It is my understanding though that we should avoid wide unaligned stores (in the sense of the address actually being unaligned) as long as the cost for doing so is reasonable. The ICC versions also avoids small loads, preferring this construct:</p>
+
+<pre><code>vmovdqu ymm3, YMMWORD PTR [r9+rsi] #15.26
+vextracti128 xmm7, ymm3, 1 #15.26
+vpsrldq xmm4, xmm3, 8 #15.26
+vpsrldq xmm8, xmm7, 8 #15.26
+</code></pre>
+
+<p>I don't like it, this trades 4 loads (in the form of memory operands of <code>vpmovzxbd</code>) for a large load and some shuffle-type operations. That raises the total to 7 shuffle-type operations per iteration, they all need to go to p5 on current Intel µarchs, so that's a likely bottleneck. LLVM-MCA agrees with that and calculates that the loop takes just over 7 cycles per iteration on average, due to p5 contention. Plus, such a larger load increases to ratio of "slow loads" (eg 4K crossings and cache misses) to "fast loads", and makes more work dependent on that slow load, making it less likely that OoOE can hide the slowness.</p>
+
+<p>On the other hand with 4 separate loads, the loop is like this (code below, compiled with ICC):</p>
+
+<pre><code>..B2.8: # Preds ..B2.47 ..B2.6 ..B2.8
+  vpmovzxbd ymm2, QWORD PTR [rax+rsi] #34.42
+  vpmovzxbd ymm5, QWORD PTR [8+rax+rsi] #36.42
+  vpmovzxbd ymm8, QWORD PTR [16+rax+rsi] #38.42
+  vpmovzxbd ymm11, QWORD PTR [24+rax+rsi] #40.42
+  vcvtdq2ps ymm3, ymm2 #34.23
+  vcvtdq2ps ymm6, ymm5 #36.23
+  vcvtdq2ps ymm9, ymm8 #38.23
+  vcvtdq2ps ymm12, ymm11 #40.23
+  vmulps ymm4, ymm0, ymm3 #35.42
+  vmulps ymm7, ymm0, ymm6 #37.46
+  vmulps ymm10, ymm0, ymm9 #39.47
+  vmulps ymm13, ymm0, ymm12 #41.47
+  vmovups YMMWORD PTR [rdi+rax*4], ymm4 #35.33
+  vmovups YMMWORD PTR [32+rdi+rax*4], ymm7 #37.33
+  vmovups YMMWORD PTR [64+rdi+rax*4], ymm10 #39.33
+  vmovups YMMWORD PTR [96+rdi+rax*4], ymm13 #41.33
+  add rax, 32 #33.43
+  cmp rax, rcx #33.39
+  jb ..B2.8 # Prob 82% #33.39
+</code></pre>
+
+<p>Which LLVM-MCA thinks is just under 5 cycles per iteration, which seems good to me. This could be improved slightly by unrolling even more, because the scalar arithmetic does "get in the way" a bit.</p>
+
+<p>By the way I changed some <code>int</code> to <code>size_t</code> to avoid some sign-extension, it wasn't really a big deal though.</p>
+
+<pre><code>void ConvertFromUint8_AVX2(float* mO, unsigned char* mI, size_t numElements, float scalingFctr)
+{
+    size_t ii;
+    __m256 vscalingFctr, tmp;
+
+    vscalingFctr = _mm256_set1_ps(scalingFctr);
+
+    // prologue, do scalar iterations until the output address is 32-aligned
+    for (ii = 0; ii &lt; numElements &amp;&amp; ((uintptr_t)(mO + ii) &amp; 31); ii++) {
+        mO[ii] = (float)(mI[ii]) * scalingFctr;
+    }
+    // main loop
+    if (numElements &gt;= 32) {
+        for (; ii &lt; numElements - 31; ii += 32) {
+            tmp = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadu_si128((__m128i*)(mI + ii))));
+            _mm256_store_ps(mO + ii, _mm256_mul_ps(tmp, vscalingFctr));
+            tmp = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadu_si128((__m128i*)(mI + ii + 8))));
+            _mm256_store_ps(mO + ii + 8, _mm256_mul_ps(tmp, vscalingFctr));
+            tmp = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadu_si128((__m128i*)(mI + ii + 16))));
+            _mm256_store_ps(mO + ii + 16, _mm256_mul_ps(tmp, vscalingFctr));
+            tmp = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadu_si128((__m128i*)(mI + ii + 24))));
+            _mm256_store_ps(mO + ii + 24, _mm256_mul_ps(tmp, vscalingFctr));
+        }
+    }
+    // epilogue
+    for (; ii &lt; numElements; ii++) {
+        mO[ii] = (float)(mI[ii]) * scalingFctr;
+    }
+}
+</code></pre>
+    </div>

@@ -1,0 +1,176 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The rewritten code (below) is much easier to follow - nicely done!</p>
+<p>Below are some general follow-up comments that you may find useful.</p>
+<ol>
+<li><p>Use a <code>Function</code> when a procedure is required to return a value to the caller.  From the code:
+<code>Sub WsExistsAndDelete(ByVal Name As String, ByVal OptionErase As Long, ByRef Result As Boolean)</code>
+The procedure is expected to modify the input parameter <code>Result</code> with the outcome.  And, <code>Result</code> has no meaning until the procedure is called.  So, a <code>Function</code> would be preferred here. (e.g, <code>Private Function WsExistsAndDelete(ByVal Name As String, ByVal OptionErase As Long) As Boolean</code>).</p>
+</li>
+<li><p>Procedure versus variable/parameter casing:  Typically procedures begin with a capital letter.  Variables and parameters begin with a lower case letter.  This makes it easier to know what an identifier <em>is</em> as you scan through code.</p>
+</li>
+<li><p>Application Structure: I'm going to assume that this process is launched by a button on a worksheet that is linked to the macro <code>ImportDatabase</code>.  This makes the worksheet with the button the user interface (UI) and the macro is the UI's <em>code-behind</em>.  Generally, UI code-behind has as little behavior as possible (other than managing UI presentation).  Using this analogy, organize the button-click-initiated macros into its own dedicated module (making it your code-behind module).  So, <code>Sub ImportDatabase()</code> and  <code>Sub Reset_workbook()</code> should be in a module dedicated to handling user interactions.  Then organize non-user interaction code into other module(s).  This organizes your code into a Presentation tier and an Application tier (Data tier is also common and may be something to consider eventually).  This is an important distinction to maintain and manage as your application grows.  See comment #6 below for an example.</p>
+</li>
+<li><p>Assign <code>Public</code> or <code>Private</code> visibility to all procedures.  Leaving them unassigned defaults to <code>Public</code>.  If a <code>Function</code> or <code>Sub</code> is only called from within the module where it is declared, assign it <code>Private</code> visibility.  By doing so, when a procedure needs to be made <code>Public</code> because some other module uses it...there is a built-in reminder to consider making it <code>Public</code> and moving the procedure to a module with commonly used code/utilities.</p>
+</li>
+<li><p>Single Responsibility Principle (SRP): <code>WsExistsAndDelete</code> is an example of a procedure that has too many responsibilities.  By its name, the word 'and' betrays that it does at least two things. Its responsibilities include: a) detecting that a worksheet exists. b) Deleting the sheet (sometimes) and, c) Interacting with the User - with a return value that terminates the import. Consider breaking <code>WsExistsAndDelete</code> this into two procedures.  As a bonus, the <code>OptionErase</code> parameter and comment are no longer needed once the procedure is broken into single responsibilities.</p>
+<pre><code> Private Function IsExistingWorksheet(worksheetName As String) As Boolean
+    IsExistingWorksheet = False
+    Dim wrkSheet As Worksheet
+    For Each wrkSheet In Worksheets
+        If wrkSheet.Name = worksheetName Then
+            IsExistingWorksheet = True
+            Exit Function
+        End If
+    Next wrkSheet
+ End Function
+
+ Private Sub DeleteWorksheet(worksheetName As String)
+    If IsExistingWorksheet(worksheetName) Then
+        Worksheets(worksheetName).Delete
+    End If
+ End Sub
+</code></pre>
+</li>
+<li><p>The logic flow allows changes to be made (e.g., create files and folders) before all required conditions to import a database have been met.  It is preferred, to get all required conditions resolved before executing any code that will create permanent artifacts.  Consider organizing the <code>ImportDatabase()</code> macro to have clear Presentation and Application tiers...something like:</p>
+<pre><code> 'Presentation tier
+ Sub ImportDatabase()
+     Dim createNewProject As Boolean
+     createNewProject = False
+
+ 'Validate criteria to proceed
+ '1. Project has to exist
+ '2. "REGISTER" worksheet does not exist
+ '3. Valid file is selected by user
+
+ ChDir MainWBPath
+
+ If Dir(MainWBPath &amp; ProjectName, vbDirectory) = "" Then
+     Call OKCancelButton(createNewProject, "Project " &amp; ProjectName &amp; " Does not exist." &amp; vbNewLine &amp; vbNewLine &amp; "Do You want to Create it?")
+     If createNewProject = False Then
+         Exit Sub
+     End If
+ End If
+
+ 'May want this to be the first validation check
+ If IsExistingWorksheet("REGISTER") Then
+     Call OKButton("Reset before Import.  Exiting database import")
+     Exit Sub
+ End If
+
+ 'Not sure what the user can do here other than click OK...does not appear to have the option of
+ 'terminating the import.
+ Call OKButton("Please, be confirm that the DB to import is stored in the REGISTER tab of the file")
+
+ 'Opening the File and copy to my workbook
+ Dim fileName As Variant
+ fileName = Application.GetOpenFilename(FileFilter:="Excel Files (*.XLSX), *.XLSX", Title:="Select File To Be Opened")
+ If fileName = False Then
+     Call OKButton("File not selected.  Exiting database import")
+     Exit Sub
+ End If
+
+ UnhideAll True
+ UnprotectAll True
+ ScreenAndAlertsOff True
+
+ On Error GoTo ResetFlags
+ 'Validation requirements met, flags set...call the Application tier to do the work
+ Dim errors As Long
+ errors = ImportDatabaseImpl(fileName, createNewProject)
+
+ OKButtonBig "Ex DataBase Import Completed" &amp; vbNewLine &amp; vbNewLine _
+ &amp; "TOTAL EQUIPMENT IN Ex DATABASE :  " &amp; RegisterNumb &amp; vbNewLine _
+ &amp; "EQUIPMENT EXCLUDED DUE TO ERROR :  " &amp; errors &amp; vbNewLine _
+ &amp; "TOTAL EQUIPMENT IMPORTED :  " &amp; RegisterNoError &amp; vbNewLine &amp; vbNewLine _
+ &amp; "The Equipment with errors have been recorded on the ERRROR_LOG. You can continue discarting those elements or correct them in the originalfile and do the Import again." &amp; vbNewLine
+
+ ResetFlags:
+ UnhideAll False
+ UnprotectAll False
+ ScreenAndAlertsOff False
+ CalculationsOff False
+
+ End Sub
+</code></pre>
+</li>
+</ol>
+<p>And in another module (Application tier):</p>
+<pre><code>    Public Function ImportDatabaseImpl(fileName As Variant, createNewProject As Boolean) As Long
+    ImportDatabaseImpl = 0
+
+    If createNewProject Then
+        Call CreateProjectFolders
+        Call SaveStep(0)
+    End If
+
+    Call ResetWorkBookValues
+        
+    'Opening the File and copy to my workbook
+    Dim RegisterWorkBook As Workbook, Mainworkbook As Workbook
+    Set Mainworkbook = ActiveWorkbook
+    Dim t#, TimerReg(1 To 10) As Long
+    t = Timer
+    Set RegisterWorkBook = Workbooks.Open(fileName:=fileName)
+
+    RegisterWorkBook.Sheets("REGISTER").Copy After:=Mainworkbook.Sheets("LOTEVAL")
+    RegisterWorkBook.Close SaveChanges:=False
+
+    TimerReg(1) = Timer - t
+
+    CalculationsOff True
+
+    Dim WS_REG As Worksheet
+    Set WS_REG = Sheets("REGISTER")
+    WS_REG.Unprotect Password:="lukenandmeia"
+
+    'Change the formulas to Values
+    With WS_REG
+        .Range("B1:B12000").value = .Range("B1:B12000").value
+        .Range("V1:V12000").value = .Range("V1:V12000").value
+        .Range("Y1:Y12000").value = .Range("Y1:Y12000").value
+        .Range("G2").value = .Range("G2").value
+        .AutoFilterMode = False
+    End With
+
+    TimerReg(2) = Timer - t
+
+    'RemoveConditional Formating
+    Dim RegFirstCell As Range, RegLastCell As Range, RegisterData As Range
+    Set RegFirstCell = WS_REG.Range("A6")
+    Set RegLastCell = GetLastCell(WS_REG.Range("A1:AH12000"))
+    Set RegisterData = WS_REG.Range(RegFirstCell.Address &amp; ":" &amp; RegLastCell.Address)
+
+    With WS_REG.Cells
+        .FormatConditions.Delete
+        .Validation.Delete
+        .Hyperlinks.Delete
+    End With
+
+    Dim RegisterTemp As Long
+    RegisterTemp = RegLastCell.Row - Register_Offset
+    RegisterNumb = RegisterTemp
+    RegisterNoError = RegisterTemp
+
+    TimerReg(3) = Timer - t
+
+    CalculationsOff False
+
+    'Error Filtering
+    RemoveErrors RegisterData
+    'Reorder
+    OrderRegisters WS_REG, "C7", "H7", "T7", 7
+
+    AssignAreasAndLots 'Area Asignation and calculation of Registers and last Rows
+
+    ExportErrorsAndRegisters 'Mirar por si se puede mejorar
+        
+    ActualStep = 1
+    SaveStep 1
+
+    CalculationsOff False
+
+    ImportDatabaseImpl = Sheets("LOTS").Range("B5").value
+
+    End Function
+</code></pre>
+    </div>

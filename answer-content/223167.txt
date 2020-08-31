@@ -1,0 +1,172 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><code>Proposer</code> and <code>Responder</code> are basically identical. The only difference is a single variable name. So get rid of one of them. This reduces code duplication and makes refactoring easier.</p>
+
+<h1>1. Profiling</h1>
+
+<p>It's always a good idea to analyze thoroughly what it is that makes your code slow. Everything else is premature optimization. In the spirit of "Measure twice, cut once", enter cProfile for (results for <code>Games(10, 10, 2000)</code>):</p>
+
+<pre class="lang-none prettyprint-override"><code>         19137129 function calls (19134785 primitive calls) in 43.470 seconds
+
+   Ordered by: cumulative time
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+    146/1    0.002    0.000   43.471   43.471 {built-in method builtins.exec}
+        1    0.000    0.000   43.470   43.470 cr-222974_pre.py:1(&lt;module&gt;)
+        1    0.801    0.801   43.192   43.192 cr-222974_pre.py:130(run_game)
+   299740    0.385    0.000   28.192    0.000 cr-222974_pre.py:69(update_all)
+   599480    0.597    0.000   27.807    0.000 cr-222974_pre.py:58(update)
+   200000    3.809    0.000   23.708    0.000 cr-222974_pre.py:142(play_rounds)
+   599480    0.662    0.000   15.075    0.000 cr-222974_pre.py:48(update_strategy)
+   599680    5.023    0.000   14.418    0.000 cr-222974_pre.py:28(pick_strat)
+   599480    8.525    0.000   12.134    0.000 cr-222974_pre.py:51(update_probablities)
+   599680    5.486    0.000    5.486    0.000 {method 'multinomial' of 'mtrand.RandomState' objects}
+   200000    1.142    0.000    3.022    0.000 random.py:286(sample)
+   599686    2.936    0.000    2.936    0.000 {built-in method builtins.max}
+   174021    2.565    0.000    2.565    0.000 cr-222974_pre.py:110(get_error_term)
+   200000    2.511    0.000    2.511    0.000 cr-222974_pre.py:145(&lt;listcomp&gt;)
+   599680    0.508    0.000    2.017    0.000 cr-222974_pre.py:39(calculate_sum)
+  5397120    1.593    0.000    1.593    0.000 cr-222974_pre.py:36(calculate_probability)
+   599680    1.355    0.000    1.355    0.000 {built-in method builtins.sum}
+   403609    0.342    0.000    1.300    0.000 {built-in method builtins.isinstance}
+   200000    0.974    0.000    1.169    0.000 cr-222974_pre.py:81(von_neumann_neighbourhood)
+   400000    0.665    0.000    1.055    0.000 random.py:224(_randbelow)
+   200000    0.168    0.000    1.025    0.000 random.py:218(randint)
+   400000    0.149    0.000    0.957    0.000 abc.py:137(__instancecheck__)
+   200000    0.354    0.000    0.857    0.000 random.py:174(randrange)
+   599680    0.845    0.000    0.845    0.000 {built-in method numpy.where}
+...
+</code></pre>
+
+<p>First of all, that sets our baseline to around <span class="math-container">\$43 s\$</span> (to be precise: I actually measured several times and all the results where around that time). Also looking at the results IMHO reveals the following "hot spots":</p>
+
+<ul>
+<li><code>update_probabilies</code> takes about a quarter of the time (almost <span class="math-container">\$12 s\$</span>) where <span class="math-container">\$8 s\$</span> are spent in the method itself, which leave about <span class="math-container">\$4 s\$</span> to be spent in <code>calculate_sum</code> and <code>calculate_probability</code>. That matches the cumtime values for those two methods as measured by the compiler.</li>
+<li><code>pick_strat</code> accounts for another <span class="math-container">\$14 s\$</span> of the total time. More than a third of this is spent on <code>numpy.random.multinomial</code>. This is quite a lot of time for picking a (few) random value(s) in such a small range.</li>
+</ul>
+
+<h1>2. Optimization</h1>
+
+<p>Measuring: Done! Not comes the cut...</p>
+
+<h2>Picking a strategy</h2>
+
+<p>You will have to verify this, but I think the strategy selection can be simplified heavily. If I understood your code correctly, your basically choosing random values between 1 and 9 following a given probability distribution. This can be done with the following piece of code:</p>
+
+<pre><code>def pick_strat(self, n_trials):
+    chosen = choices((1, 2, 3, 4, 5, 6, 7, 8, 9), self.probabilites, k=n_trials)
+    if n_trials &gt; 1:
+        return chosen
+    return chosen[0]
+</code></pre>
+
+<p>This simple change brings the overall execution time down to about <span class="math-container">\$28 s\$</span> here on my machine.</p>
+
+<h2>Probability updates</h2>
+
+<p>For some reason you picked a <code>dict</code> to store your propensity values, which is a bit unusual in that context, especially considering that the probabilities are stored in a plain list. A <code>dict</code> with consecutive integers as key <em>screams</em> to be an list or something similar. Further looking at the kinds of operation that are be performed on these values supports this assumption even further. For <code>update_probablities</code> this means we go from</p>
+
+<blockquote>
+<pre><code>def update_probablities(self):
+    for i in range(9):
+        self.propensities[1 + i] *= 1 - mew
+    pensity_sum = self.calculate_sum(self.propensities)
+    for i in range(9):
+        self.probabilites[i] = self.calculate_probability(self.propensities, 1 + i, pensity_sum) 
+</code></pre>
+</blockquote>
+
+<p>to this</p>
+
+<pre><code>mew_complement = 1 - mew
+
+# ... lot of code here
+
+def update_probablities(self):
+    for i in range(9):
+        self.propensities[i] *= mew_complement
+    pensity_sum = sum(self.propensities)
+    for i in range(9):
+        self.probabilites[i] = self.propensities[i] / pensity_sum
+</code></pre>
+
+<p>As you can see, I aggressively removed function calls to improve the performance even further. IMHO the code is still quite readable though. Since I was at it, I also decided to give <code>create_random_propensities</code> and <code>initialize</code> a makeover:</p>
+
+<pre><code>def create_random_propensities(self):
+    pre_propensities = [random.uniform(0, 1) for i in range(9)]
+    pensity_sum = sum(pre_propensities) / 10
+    return [pre / pensity_sum for pre in pre_propensities]
+
+def initialize(self):
+    init_sum = sum(self.propensities)
+    self.probabilites = [prop / init_sum for prop in self.propensities]
+    self.update_strategy()
+</code></pre>
+
+<p>(Just by the way: I'm not entirely sure what the purpose of <code>* 10</code> is.) As you can see, I allowed myself to move <code>create_random_propensities</code> into the class as well. Keep in mind that the strategy picking and reward parts later on will have to be slightly adapted to account for the 0-based indexing. With all of these changes in place the runtime is now down to about <span class="math-container">\$20 s\$</span>.</p>
+
+<p>I also decided to implement these changes using NumPy, but at least for <code>Games(10, 10, 2000)</code> using <a href="https://docs.scipy.org/doc/numpy/reference/generated/numpy.ndarray.html" rel="nofollow noreferrer"><code>numpy.ndarray</code></a> instead of list and array operations instead of explicit loops performed considerably worse.</p>
+
+<h2>The game</h2>
+
+<p>Now the two mentioned hotspots are handled and allowed the performance to double for the chosen setting. Time to look at the rest of the code.</p>
+
+<p>The first thing that caught my eye was</p>
+
+<blockquote>
+<pre><code>neighbour = random.sample(neighbours, 1).pop()
+        neighbour_index = [(ix, iy) for ix, row in enumerate(self.lattice) for iy, i in enumerate(row) if i == neighbour]
+        if self.lookup_table[neighbour_index[0][0]][neighbour_index[0][1]] ==
+False: # see if neighbour has already updated their strat
+            neighbour.update_all() 
+</code></pre>
+</blockquote>
+
+<p>This seems like a really wasteful approach to check if <code>update_all</code> has already been called on an agent, especially if you take into account that the list comprehension will have to look at all agents even if the correct position has already been found. It would be much more straightforward to have a bool variable in each agent that stores if the update was done or not. This variable could even be set automatically when calling <code>update_all()</code> on an agent.</p>
+
+<pre><code>class Agent:
+
+    def __init__(self):
+        # Participant is the name I chose when I collapsed Proposer and Responder into a single class
+        self.prop_side = Participant()
+        self.resp_side = Participant()
+        self.prop_side.initialize()
+        self.resp_side.initialize()
+        self.has_updated_strategy = False
+
+    def update_all(self):
+        self.has_updated_strategy = True
+        self.prop_side.update()
+        self.resp_side.update()
+</code></pre>
+
+<p>With these change the part from above becomes as simple as</p>
+
+<pre><code>if not neighbour.has_updated_strategy:
+    neighbour.update_all()
+</code></pre>
+
+<p>The changes to <code>run_game</code> and <code>reset_look_tab</code> should be straightforward. Oh, and while you are at it, the outermost loop in <code>run_game</code> should also be a <code>for</code> loop as well. With all of the changes from above in place we are now at a runtime of about <span class="math-container">\$14 s\$</span>. Not bad, I would say.</p>
+
+<h1>3. Other considerations</h1>
+
+<p>The main part of <code>play_rounds</code> also presents a severe case of code duplication, especially if you follow my advice from above and merge <code>Proposer</code> and <code>Responder</code> into a single class, leaving you with just one name for <code>demand</code>/<code>max_tresh</code>. Then the only difference between the two large code blocks is which agent assumes which role and how the reward is being computed. <strong>Sidenote/Bug:</strong> In the first block there is <code>payoff, adjacent_payoff, index = get_error_term(player.prop_side.demand, player.prop_side.demand)</code> which is likely a bug.</p>
+
+<p>The code could heavily profit from some documentation. In essence, it's good practice to desribe your methods with a short <a href="https://www.python.org/dev/peps/pep-0008/#documentation-strings" rel="nofollow noreferrer"><code>"""documation string"""</code></a>. So instead of</p>
+
+<pre><code>def pick_strat(self, n_trials): # gets strategy, an integer in the interval [1, 9]
+
+</code></pre>
+
+<p>do</p>
+
+<pre><code>def pick_strat(self, n_trials):
+    """gets strategy, an integer in the interval [1, 9]"""
+
+</code></pre>
+
+<p>Please check the official <a href="https://www.python.org/dev/peps/pep-0008/" rel="nofollow noreferrer">Python Style Guide</a> if you want to learn more about that topic.</p>
+
+<h1>4. Conclusion</h1>
+
+<p>So most of your original observations what contributes a bottleneck were quite right. As it stands, I would say that using NumPy arrays without a deeper refactoring will not improve the performance, and might even decrease it. Instead, it might be worth to have a look at <a href="https://numba.pydata.org/" rel="nofollow noreferrer">numba</a>, a just-in-time compiler for Python code. Under the right circumstances it can automatically optimize plain Python code to massively boost the performance, especially when it comes to tight loops.</p>
+    </div>

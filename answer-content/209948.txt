@@ -1,0 +1,315 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>I can tell you're concerned about performance</strong> (and not just because of the tag on the question). This is a good impulse, because it helps you avoid selecting terribly inefficient algorithms. But it can also hurt, when it leads you to micromanage details that would be better left to (for example) a regular expression engine.</p>
+
+<p><strong>You have some good habits.</strong> I love to see <code>foreach</code> loops. I'm very glad that you used a <code>StringBuilder</code> rather than just the <code>+</code> operator. Putting sanitization logic in the public setter for a property so that you can maintain a "clean" private backing field is a great idea.</p>
+
+<p><strong>Passing <code>ref</code> parameters</strong> generally makes code more difficult to maintain. In fact, I'll go farther than that: Anything that increases the scope of a variable usually makes code more difficult to maintain. Imagine I'm reading your <code>lineSplitter</code> function, I've never seen it before, and I'm in a big hurry because there's a bug in the company's legacy chat log parsing program that's costing us thousands of dollars for every minute it's down. <em>I can't tell</em> what I am and am not allowed to change with how the <code>indexer</code> variable is treated, without reading other functions. I can't tell what it will be when it's passed in, I can't tell how it will change when I pass it to <code>stringFill</code>, and I don't know if I'll break anything in <code>CoreAction</code> if I change its value within <code>lineSplitter</code>.</p>
+
+<p>Now, the fact that you've made all three of those functions private is a big help - I can be sure that there are no other places in the codebase that I might be breaking with edits to <code>lineSplitter</code>. But it would still be vastly preferable to find an approach that doesn't require <code>ref</code> variables at all.</p>
+
+<p><strong>An object should always be valid.</strong> Take this contrived example:
+</p>
+
+<pre class="lang-csharp prettyprint-override"><code>public class Foo
+{
+    public string Value;
+    public int Length()
+    {
+        return value.Length;
+    }
+}
+
+// elsewhere
+var a = new Foo();
+a.Value = "hello";
+Console.WriteLine(a.Length()); // Prints "5"
+
+var b = new Foo();
+Console.WriteLine(b.Length()); // Error!
+</code></pre>
+
+<p>I've heard this called "temporal coupling". It's unfriendly because there's no warning that I <em>can't</em> call <code>Length()</code> on an invalid object - just the error when I try. My favorite approach to provide that warning is by required constructor arguments; simply don't allow invalid objects to exist.
+</p>
+
+<pre class="lang-csharp prettyprint-override"><code>public class Foo
+{
+    public string Value { get; } // no "set" -&gt; must be assigned at construction
+
+    /// &lt;param name="value"&gt;
+    /// The value used for &lt;see cref="Length()"/&gt;. Cannot be null.
+    /// &lt;/param&gt;
+    public Foo(string value)
+    {
+        Value = value ?? throw new ArgumentNullException("Foo requires a non-null value");
+    }
+
+    public int Length()
+    {
+        return Value.Length;
+    }
+}
+
+// elsewhere
+var a = new Foo("hello");
+Console.WriteLine(a.Length()); // Prints "5"
+
+var b = new Foo(); // Doesn't compile
+
+var c = new Foo(null); // *Immediate* feedback
+</code></pre>
+
+<p>Why am I ranting about this? It applies to your strategy of creating a list of MessageInfo objects, only some of which are valid. That works, so long as you <em>always remember to check</em>. I would much rather see the invalid input lines completely filtered out.</p>
+
+<p><strong>String.Join is often nicer than StringBuilder,</strong> in the same way Linq is often nicer than a for- or foreach-loop. A <code>StringBuilder</code> generally requires four lines of code:</p>
+
+<pre class="lang-csharp prettyprint-override"><code>var builder = new StringBuilder();
+foreach (var w in words)
+    builder.Append(w + " ");
+return builder.ToString()
+</code></pre>
+
+<p>Whereas <code>string.Join</code> (which has similar performance characteristics), often requires only one (or perhaps two for readability):</p>
+
+<pre class="lang-csharp prettyprint-override"><code>return string.Join(" ", words);
+</code></pre>
+
+<p><strong>Regex Capture Groups</strong> are your friends, as Alan T pointed out. <a href="http://rubular.com/r/EcwWznsfu4" rel="nofollow noreferrer">Here's a demo</a> you can play around with and see live results (That site uses the Ruby regex engine rather than the .NET regex engine, but the differences are minor enough that you can ignore them here).</p>
+
+<p><strong>Linq is a beautiful library</strong> in C# for transforming sequences, with extension functions on <code>IEnumerable</code> like <code>Select(mapper)</code>, <code>Where(filter)</code>, and <code>ToList()</code>. To me, this task is <em>begging</em> for the application of Linq. My solution uses <code>foreach</code> in 1 place, Linq in 5 places, and 0 <code>for</code>s or <code>while</code>s. I'll show you more below.</p>
+
+<p><strong>Separate classes to hold separate logic.</strong> You've already done some of this; I would take it even further. Here's how I sliced it all up:</p>
+
+<ul>
+<li>A <code>Program</code> class to hold <code>Main</code> (and almost nothing else)</li>
+<li>A <code>ChatLog</code> class to hold the messages and drive the validation/parsing</li>
+<li>A <code>LineParser</code> class to validate each line, and construct a <code>ChatMessage</code></li>
+<li>A <code>ChatMessage</code> class to hold each message's info</li>
+<li>A <code>NameParser</code> class to calculate payload sizes, and sanitize names</li>
+</ul>
+
+<p><strong>An outline of my solution</strong> - brace yourself, because I may have gone a little too far (but I'll let you be the judge):
+</p>
+
+<pre class="lang-csharp prettyprint-override"><code>// Program - "build these objects, then ask them questions"
+public class Program
+{
+    static void Main()
+    {
+        var log = new ChatLog(Console.ReadLine);
+        foreach (var message in log.Messages)
+        {
+            Console.WriteLine($@"{message.Sender} says ""{message.Message}"" to {message.Receiver}");
+        }
+        Console.WriteLine($"Total data transferred: {log.TotalPayloadSize}MB");
+    }
+}
+</code></pre>
+
+
+
+<pre class="lang-csharp prettyprint-override"><code>using System.Collections.Generic;
+using System.Linq;
+
+// ChatLog - "Filter bad lines, build ChatMessages, and summarize"
+public class ChatLog
+{
+    public IEnumerable&lt;ChatMessage&gt; Messages { get; }
+    public int TotalPayloadSize { get; }
+
+    public ChatLog(Func&lt;string&gt; readLine)
+    {
+        var numberOfLines = int.Parse(readLine())
+        var lines = Enumerable       // My Linq approach to avoid a foreach loop:
+            .Range(1, numberOfLines) // Generate a sequence of N integers
+            .Select(_ =&gt; readLine()) // Replace each integer with a string from the input
+
+        Messages = Parse(lines);
+        TotalPayloadSize = Messages.Sum(message =&gt; message.PayloadSize);
+    }
+
+    private List&lt;ChatMessages&gt; Parse(IEnumerable&lt;string&gt; lines)
+    {
+        // Here I used Linq to
+        //     transform each line to a LineParser object (Select)
+        //     filter out invalid lines (Where)
+        //     transform each remaining LineParser to a ChatMessage (Select)
+        //     return a list, to avoid the multiple enumeration trap (ToList)
+    }
+}
+</code></pre>
+
+
+
+<pre class="lang-csharp prettyprint-override"><code>// LineParser - "Filter out junk and calculate size"
+public class LineParser
+{
+    public bool Success { get; }
+
+    private ChatMessage _message;
+    public ChatMessage Message =&gt; _message ?? throw new InvalidOperationException("Line could not be parsed");
+
+    private static Regex _format { get; } = new Regex("...");
+    public LineParser(string line)
+    {
+        Success = match.Success;
+
+        if (Success)
+        {
+            // set the _message variable to a new ChatMessage from on match.Groups
+        }
+    }
+}
+</code></pre>
+
+
+
+<pre class="lang-csharp prettyprint-override"><code>// ChatMessage - "Hold"
+public class ChatMessage
+{
+    public int PayloadSize { get; }
+    public string Sender { get; }
+    public string Receiver { get; }
+    public string Message { get; }
+
+    public ChatMessage(string rawSender, string rawReceiver, string message)
+    {
+        // Construct two NameParsers, and set field values
+    }
+}
+</code></pre>
+
+
+
+<pre class="lang-csharp prettyprint-override"><code>// NameParser - "Filter out junk and calculate size"
+public class NameParser
+{
+    public string CleanName { get; }
+    public int PayloadSize { get; }
+
+    public NameParser(string rawName)
+    {
+        // set field values
+    }
+
+    private int SumOfDigitCharacters(string rawName)
+    {
+        // Here I used Linq to
+        //     transform rawName to an array of characters
+        //     filter out non-digit characters
+        //     transform each digit character to an int
+        //     sum them
+    }
+
+    private static Regex _letterOrSpace { get; } = new Regex("...");
+    private string StripNonAlphaCharacters(string rawName)
+    {
+        var lettersAndSpaces = // Here I used Linq to
+        //     transform rawName to an array of chars
+        //     filter out invalid chars
+
+        return string.Join(
+            separator: string.Empty,
+            values: lettersAndSpaces);
+    }
+}
+</code></pre>
+
+<p><strong>Why so many classes?</strong> It might look awkward, but it's hugely valuable in terms of testability. The same goes for the <code>Func&lt;string&gt;</code> parameter to <code>ChatLog</code> - it feels strange but it allows <code>ChatLog</code> to be completely independent of <code>Console</code>, which is a big win. This means that I can create a suite of unit tests automatically verifying the behavior of the program without manually inspecting what was printed to the console after each run of the program. For example:</p>
+
+
+
+<pre class="lang-csharp prettyprint-override"><code>[TestClass]
+public class NameParserTests
+{
+    [TestMethod]
+    public void NameParser_CalculatesSizeCorrectly()
+    {
+        var testCases = new List&lt;(string rawName, int expectedSize)&gt;
+        {
+            ("s1ender", 1),
+            ("sen2d3r", 5),
+            ("s123der", 6),
+            ("s10nd11", 3),
+        };
+
+        foreach (var (rawName, expectedSize) in testCases)
+        {
+            var parser = new NameParser(rawName);
+            Assert.AreEqual(expectedSize, parser.PayloadSize, $"'{rawName}' should have a payload of size {expectedSize}, not {parser.PayloadSize}");
+        }
+    }
+}
+</code></pre>
+
+<p>Now that I've verified the behavior of <code>NameParser</code> directly, I don't need to worry about it in any of my other tests. If I make any changes, I can run all of my tests again in a matter of seconds. If there are any problems, the tests immediately show what went wrong.</p>
+
+<p><strong>A final note about performance.</strong> The three situations where you should be concerned about code performance, in my opinion, are these:</p>
+
+<ul>
+<li>You know your code that will be called thousands of times per second in a tight loop</li>
+<li>You are entering a coding competition where you will be judged on speed</li>
+<li>You have noticed performance problems in your application</li>
+</ul>
+
+<p>Short of those situations, the <em>maintainability</em> of your code is far more important than the speed. <em>I don't know</em> whether my solution is faster than yours, but</p>
+
+<ul>
+<li>If it is, I'll bet it's too small of a difference for a human to notice</li>
+<li>If there's a bug, I'd rather be troubleshooting the one with unit tests</li>
+<li>When the requirements change, I'd rather be expanding the one with unit tests</li>
+</ul>
+
+<p><strong>I've gone on long enough</strong>, so I'll spare you any more preaching about Separation of Concerns and Unit Testing. Let me just include some snippets from my other tests:</p>
+
+<pre class="lang-csharp prettyprint-override"><code>// NameParser should sanitize like this
+("sender", "sender"),
+("SENDER", "SENDER"),
+("S12end3456er", "Sender"),
+("@$s e^&amp;*", "s e"),
+
+// LineParser should reject these
+"",
+"asdf",
+"s:sender;r:receiver;m:\"message\"",
+"s:sender;r:receiver;m-\"message\"",
+"s:sender;r:receiver;m--\"message",
+"s:sender; r:receiver;m--\"message\"",
+"s:sender;r:receiver; m--\"message\"",
+"s:sen;er;r:receiver;m--\"message\"",
+"s:sender;r:rece;iver;m--\"message\"",
+"s:sender;r:receiver;m--\"me55age\"",
+"s:sender;r:receiver;m--\"mess@ge\"",
+"s:sender;r:receiver;m--\"mess;ge\"",
+"s:sender;r:receiver;m--\"mes\"ge\"",
+" s:sender;r:receiver;m--\"message\"",
+"s:sender;r:receiver;m--\"message\" ",
+
+// LineParser should accept these
+"s:sender;r:receiver;m--\"message\"",
+"s:SENDER;r:receiver;m--\"message\"",
+"s:123456;r:receiver;m--\"message\"",
+"s:@$ ^&amp;*;r:receiver;m--\"message\"",
+"s:sender;r:receiver;m--\"message\"",
+"s:sender;r:RECEIVER;m--\"message\"",
+"s:sender;r:12345678;m--\"message\"",
+"s:sender;r:!@#$ ^&amp;*;m--\"message\"",
+"s:sender;r:receiver;m--\"THIS is a MESSAGE\"",
+
+// Helper function to test ChatLog
+private Func&lt;string&gt; Enumerate(params string[] lines)
+{
+    var enumerator = lines.GetEnumerator();
+
+    return () =&gt; enumerator.MoveNext()
+        ? (string)enumerator.Current
+        : throw new InvalidOperationException($"There were only {lines.Length} lines of input!");
+}
+
+// Helper function usage:
+var log = new ChatLog(Enumerate(
+    "3",
+    "s:P5%es4#h@o;r:G3#o!!s2h#2o;m--\"Attack\"",
+    "s:G3er%6g43i;r:Kak€$in2% re3p5ab3lic%an;m--\"I can sing\"",
+    "s:BABAr:Ali;m-No cave for you"));
+</code></pre>
+    </div>

@@ -1,0 +1,135 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Don't use member variables for temporary storage</h1>
+
+<p>Your <code>class Timer</code> has a member variable <code>mvSession</code>, which is unnecessary. It is only used in <code>SessionTime()</code>, where it is filled in and returned. No other functions use it. Instead, just declare <code>std::vector&lt;int64_t&gt; mvSession(3)</code> inside <code>SessionTime()</code>.</p>
+
+<p>By making it a member variable, you introduced two problems: first, your class now uses more memory than necessary. Second, the function <code>SessionTime()</code> is now no longer reentrant; if two threads would call <code>SessionTime()</code> simultaneously, they would both write to the same <code>mvSession</code> variable, potentially corrupting it.</p>
+
+<h1>Use <code>std::chrono::steady_clock</code> for timers</h1>
+
+<p>The problem with <code>std::chrono::high_resolution_clock()</code> is that it is not guaranteed what kind of clock it is. It can represent wall clock time, which can jump ahead or forwards because of summer and winter time, leap seconds, the computer suspending and resuming. This is not something you want for a timer where you are interested in a simple duration. For this, you want to use <code>std::chrono::steady_clock</code>, which is guaranteed to be a monotonically increasing clock. Also, your function <code>SessionTime()</code> returns the time in a resolution of seconds, so you don't need a high resolution clock anyway.</p>
+
+<h1>Don't use Hungarian notation</h1>
+
+<p>There might be some merits to Hungarian notation, but it really isn't necessary to use it for C++, since the compiler will do type checking for you. Moreover, it's easy to use the wrong prefix, and it's hard to come up with a reasonable prefix when you can have complex types.</p>
+
+<p>You are already making mistakes in your code. For example, <code>mtpNow</code> and <code>mtPause</code> are both of type <code>cppTimer::time_point</code>. So the prefix should have been the same. And <code>mtRestart</code> has a different type than <code>mtPause</code>, so their prefixes should have been different. I recommend that you just avoid using Hungarian notation altoghether.</p>
+
+<h1>Be consistent with <code>using</code></h1>
+
+<p>You are declaring <code>using seconds = std::chrono::seconds</code>, and use <code>seconds</code> in a few places, but you also use <code>std::chrono::seconds</code> in a lot of places. Furthermore, you also use <code>std::chrono::minutes</code> and <code>std::chrono::hours</code>, but have not declared an alias for them. In this case, I suggest you don't declare <code>using seconds</code> at all.</p>
+
+<p>I would keep <code>using cppTimer</code> though, since it basically selects which clock to use. That makes it easier to change the clock later by just changing one line of code. I would write <code>using clock = ...</code> though, to be consistent with the C++ library itself.</p>
+
+<h1>Don't cast to <code>seconds</code> too early</h1>
+
+<p>Instead of <code>seconds mtRestart</code>, use <code>cppTimer::duration mtRestart</code>. This will keep the accuracy of the duration to the same as the clock itself. Only cast durations to seconds or other time intervals until the last moment possible. The same goes for the calculation of <code>delay</code> in <code>SessionTime()</code>, just write:</p>
+
+<pre><code>auto delay = now - mtpNow;
+</code></pre>
+
+<h1>Use nouns for variable names, verbs for function names</h1>
+
+<p>A variable holds (the value of) a thing, so its name should naturally be a noun. Functions <em>do</em> stuff, so there names should generally be verbs. The function <code>Now()</code> should actually be named <code>Start()</code>. Your function <code>Start()</code> should probably be named <code>Continue()</code>. The function <code>SessionTime()</code> calculates how long the timer has been running for, so probably should be named <code>GetDuration()</code>.</p>
+
+<p>Conversely, the variables <code>mtPause</code> and <code>mtRestart</code> should be renamed to nouns as well. They are a bit confusing. Sure, you set <code>mtPause</code> in the <code>Pause()</code> function, but it doesn't describe what the value actually means. The same goes for <code>mtRestart</code>. I would instead write:</p>
+
+<pre><code>clock::time_point StartTime;
+clock::time_point PauseTime;
+clock::duration PausedDuration;
+bool IsPaused;
+</code></pre>
+
+<p>Now you can rewrite the function <code>Now()</code> to:</p>
+
+<pre><code>void Start() {
+    StartTime = clock::now();
+    IsPaused = false;
+    PausedDuration = {};
+}
+</code></pre>
+
+<h1>Remove <code>mtRestart</code></h1>
+
+<p>You are using two variables to handle the timer being paused, <code>mtPause</code> and <code>mtRestart</code>. However, you only need one. In the <code>Pause()</code> function, you indeed just record when this function is called. However, when restarting the timer, instead of adding the duration of being paused to <code>mtRestart</code>, just add that duration to <code>mtpNow</code> instead:</p>
+
+<pre><code>void Start() {
+    if(mbIsPause) {
+         mtpNow += cppTimer::now() - mtPause;
+         mbIsPause = false;
+    }
+}
+</code></pre>
+
+<p>This also simplifies <code>SessionTime()</code>:</p>
+
+<pre><code>std::vector&lt;int64_t&gt; SessionTime() {
+    auto end = mbIsPause ? mtPause : cppTimer::now();
+    auto tp = std::chrono::duration_cast&lt;std::chrono::seconds&gt;(end - mtpNow);
+    ...
+}
+</code></pre>
+
+<p>Also, since <code>mtPause</code> is only ever <code>0</code> when you didn't pause, you can use that to signal whether the timer is paused instead of having <code>bool mbIsPause</code>.</p>
+
+<p>Another option is @user673679's suggestion of storing only the start time and the accumulated elapsed time so far. You would then use the start time being equal to <code>{}</code> as a signal that the timer has not been started.</p>
+
+<h1>Just return a <code>std::chrono::duration</code></h1>
+
+<p>When you want the elapsed time, I would avoid having the <code>Timer</code> class be responsible for converting the duration to a vector of integers representing hours, minutes and seconds. It reduces the accuracy of your timer. Instead, I would just return a <code>std::chrono::duration</code>, and have the caller decide whether it wants to convert that to something. It also is much more efficient than having to construct a <code>std::vector&lt;int64_t&gt;</code>.</p>
+
+<h1>Try to make it behave reasonable in all situations</h1>
+
+<p>One issue with your code is that it only gives reasonable results for <code>SessionTime()</code> if you have called <code>Now()</code> at least once. You didn't initialize <code>mtpNow</code>, and even if it was value-initialized to zero, then <code>SessionTime()</code> will return the time that has passed since the epoch.</p>
+
+<p>If you want the <code>Timer</code> to behave like it was started at construction time, then initialize <code>mtpNow</code> to <code>cppTimer::now()</code>. If you want it to behave like it was paused, then ensure both <code>mtpNow</code> and <code>mtPause</code> are initialized to the same value (I suggest just using <code>{}</code>), and that <code>mbIsPause</code> is <code>true</code>.</p>
+
+<h1>Make it work like a real stopwatch</h1>
+
+<p>As already suggested by others, it helps to think of a timer as a stopwatch. A real stopwatch starts in a stopped state, showing an elapsed time of zero. Then, you can start and stop the timer mechanism with buttons. Usually, there is a separate button to reset the stopwatch to its initial state. By making the class act like something a lot of people are already familiar with, the code is easier to understand for others.</p>
+
+<h1>Reworked code</h1>
+
+<p>Here is an example of what the code would look like with my suggestions applied, as well as @user673679's way of storing the elapsed time between previous start and stops of the clock:</p>
+
+<pre><code>#include &lt;chrono&gt;
+
+class Timer {
+  using clock = std::chrono::steady_clock;
+  clock::time_point StartTime = {};
+  clock::duration ElapsedTime = {};
+
+public:
+  bool IsRunning() const {
+     return StartTime != clock::time_point{};
+  }
+
+  void Start() {
+    if(!IsRunning()) {
+      StartTime = clock::now();
+    }
+  }
+
+  void Stop() {
+    if(IsRunning()) {
+      ElapsedTime += clock::now() - StartTime;
+      StartTime = {};
+    }
+  }
+
+  void Reset() {
+    StartTime = {};
+    ElapsedTime = {};
+  }
+
+  clock::duration GetElapsed() {
+    auto result = ElapsedTime;
+    if(IsRunning()) {
+      result += clock::now() - StartTime;
+    }
+    return result;
+  }
+};
+<span class="math-container">```</span>
+</code></pre>
+    </div>

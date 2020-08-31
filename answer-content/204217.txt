@@ -1,0 +1,68 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Let's start off with what's probably the most important note here: if you are running into issues with atomic transactions, pushing the database work off to Celery (or another worker thread) inherently makes your transactions non-atomic. It sounds like this has been working for you currently, but this will not always work and may have unintended consequences.</p>
+
+<p>So I'm going to review this from two different angles:</p>
+
+<ol>
+<li>Handling atomic transactions within APIs when you only need part of it to be atomic</li>
+<li>Chaining Celery tasks that need to execute conditionally</li>
+</ol>
+
+<h1>If only part of your handling needs to be atomic, don't make everything atomic</h1>
+
+<p>In your hypothetical example, you make it clear that <code>db_operation</code> needs to be atomic and that's why you are wrapping the entire handle in <code>transaction.atomic</code>. I'm assuming that <code>db_operation</code> is actually a series of calls, or something more complex than just a single call, which is why you couldn't just decorate that call with <code>transaction.atomic</code>. But you only appear to care about these calls being atomic, which is why the call to <code>refresh_token</code> still needs to be committed to the database even if there are issues within <code>db_operation</code>.</p>
+
+<p>My suggestion would be to use <code>transaction.atomic</code> as a <a href="https://docs.python.org/3/glossary.html#term-context-manager" rel="nofollow noreferrer">context manager</a> instead of as a <a href="https://docs.python.org/3/glossary.html#term-decorator" rel="nofollow noreferrer">decorator</a>. This would result in your hypothetical view looking something like:</p>
+
+<pre><code>def post(request):
+    response = api_call()
+    with @transaction.atomic():
+        db_operation(response['result']) #  Could potentially have an exception
+</code></pre>
+
+<p>This still allows <code>db_operation</code> to remain atomic while ensuring that <code>api_call</code> is always committed to the database.</p>
+
+<h1>Celery has advanced method chaining, use it to your advantage</h1>
+
+<p>You correctly identified that calling one Celery task and waiting for a response can easily cause a deadlock or starvation, which is why Celery explicitly recommends that you don't do it.</p>
+
+<p>Getting an error when making an API call because your access token has expired is generally considered to be an <em>exceptional case</em>. Celery provides functionality for handling exceptions, so don't be afraid to use it. You found Celery's chaining functionality, but what is also useful is the <a href="http://docs.celeryproject.org/en/latest/userguide/calling.html#linking-callbacks-errbacks" rel="nofollow noreferrer">linking functionality between tasks</a> that works very similarly.</p>
+
+<pre><code>def post(request):
+    api_call_task.apply_async(
+        link=[db_operation_task.s()],
+        link_error=[refresh_token_task.s(), api_call_task.s(), db_operation_task.s()]
+    )
+</code></pre>
+
+<p>You'll see in this case that if the original call to <code>api_call_task</code> returns an error, we are instructing Celery to call <code>refresh_token_task</code>, then <code>api_call_task</code> again (it should have a valid token) and then eventually <code>db_operation_task</code> like we originally planned. This allows for <code>api_call_task</code> to error out twice, such as if there was an error not relating to the token refresh, without risking calling <code>db_operation_task</code> with potentially invalid data.</p>
+
+<p>Because Celery provides a clear callback format and allows you to define a chain of methods to be called during the callbacks, you can design your tasks to only focus on what they really care about: calling those other methods.</p>
+
+<pre><code>@task
+def api_call_task():
+    response = requests.post(url, params)
+
+    if response.status_code == 401:
+        raise Exception('Access token needs to be refreshed')
+
+    return response
+
+@task
+def refresh_token_task():
+    refresh_token()
+
+@task
+@transaction.atomic()
+def db_operation_task(response):
+    db_operation(response['result'])
+</code></pre>
+
+<p>This has the benefit of allowing you to handle errors naturally within the flow, without forcing every step in the chain to perform the error handling for you.</p>
+
+<h1>Bonus: Celery tasks can also be run synchronously, use that to your advantage</h1>
+
+<p>In your hypothetical example, you defined <code>api_call</code> and <code>api_call_task</code> when talking about the Celery task and the actual API call itself. If you have control over <code>api_call</code> (it's not a third-party call), you can actually just condense this down to a single method. If you call a method wrapped with <code>@task()</code> without calling <code>.delay()</code> or <code>.apply_async()</code>, the method is called synchronously and Celery is never contacted. This allows you to design methods which can be called either asynchronously using Celery, or synchronously in the course of your own application, without having to duplicate a lot of code or add in additional special cases.</p>
+
+<p>Because Celery allows you to execute the code synchronously that would otherwise be executed asynchronously, this also makes testing of these tasks much easier. In tests you can call them synchronously and ensure the functionality works as expected, while knowing that in the real world there may be a time delay that you need to account for.</p>
+    </div>

@@ -1,0 +1,152 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p>So your probably asking why im using a Queue as a buffer? Basically the Queue allows me to more efficiently store bytes in an array format. byte[] is un-acceptable due to the fact its size can't be changed dynamically (you would have to make a new byte, move over the old data, add the new, replace the old byte[], in-efficient)  </p>
+</blockquote>
+
+<p>Well if you read the docs for <code>Stream.ReadByte()</code> you would see this </p>
+
+<blockquote>
+  <p><strong>Notes to Inheritors</strong></p>
+  
+  <p>The default implementation on Stream creates a new single-byte array and then calls Read(Byte[], Int32, Int32). While this is formally correct, it is inefficient. Any stream with an internal buffer should override this method and provide a much more efficient version that reads the buffer directly, avoiding the extra array allocation on every call.  </p>
+</blockquote>
+
+<p>and if we dig into the <a href="https://referencesource.microsoft.com/#mscorlib/system/io/stream.cs,6fb9c001d7524ba2" rel="nofollow noreferrer">reference source of <code>Stream</code></a> we would stumble over the default implementation  </p>
+
+<blockquote>
+<pre><code>public abstract int Read([In, Out] byte[] buffer, int offset, int count);
+
+// Reads one byte from the stream by calling Read(byte[], int, int). 
+// Will return an unsigned byte cast to an int or -1 on end of stream.
+// This implementation does not perform well because it allocates a new
+// byte[] each time you call it, and should be overridden by any 
+// subclass that maintains an internal buffer.  Then, it can help perf
+// significantly for people who are reading one byte at a time.
+public virtual int ReadByte()
+{
+    Contract.Ensures(Contract.Result&lt;int&gt;() &gt;= -1);
+    Contract.Ensures(Contract.Result&lt;int&gt;() &lt; 256);
+
+    byte[] oneByteArray = new byte[1];
+    int r = Read(oneByteArray, 0, 1);
+    if (r==0)
+        return -1;
+    return oneByteArray[0];
+}  
+</code></pre>
+</blockquote>
+
+<p>which isn't overwritten neither by <a href="https://referencesource.microsoft.com/#system/net/system/net/Sockets/NetworkStream.cs,6006b93b3942e29b,references" rel="nofollow noreferrer"><code>NetworkStream</code></a> nor by <a href="https://referencesource.microsoft.com/#system/net/system/net/SecureProtocols/AuthenticatedStream.cs,fbed26bc39472099,references" rel="nofollow noreferrer"><code>AuthenticatedStream</code></a> (which is inherited by <a href="https://referencesource.microsoft.com/#system/net/system/net/SecureProtocols/SslStream.cs,ec9f254e5caa0d3d,references" rel="nofollow noreferrer"><code>SslStream</code></a>).</p>
+
+<p>That beeing said, let's dig into the code...  </p>
+
+<p><code>Region</code>'s are considered as an antipattern especially if they occur inside a method. Take a look at <a href="https://softwareengineering.stackexchange.com/questions/53086/are-regions-an-antipattern-or-code-smell">Are #regions an antipattern or code smell?</a>  </p>
+
+<p>Take e.g </p>
+
+<pre><code>    #region If Byte is \n or \r
+    if (b == 10 || b == 13)
+    {  
+</code></pre>
+
+<p>this should be replaced by either  </p>
+
+<pre><code>    if (b == '\n' || b == '\r')
+    {  
+</code></pre>
+
+<p>or by  </p>
+
+<pre><code>    const char NewLine = '\n';
+    const char Return = '\r';
+
+    if (b == NewLine || b == Return)
+    {
+</code></pre>
+
+<p>I don't really like the <code>catch</code> here because it isn't specific. You should consider to remove the <code>try..catch</code> completely and let the calling code handle any thrown exception. This leads to another problem: The method is <code>public</code> but you don't validate if <code>stream</code> is <code>null</code>. You will just let the exception be thrown and catched by the <code>catch</code> I mentioned.  </p>
+
+<hr>
+
+<p>I would add two overloaded <code>ReadLine()</code> methods to distinguish between needing the <code>bodySize</code> and let these methods return an <code>IEnumerable&lt;byte&gt;</code> which I would then convert to a <code>byte[]</code>. The methods would be called like so  </p>
+
+<pre><code> public static string ReadLine(this Stream stream, ref int bodySize, Encoding encoding)
+{
+    if (stream == null) { throw new ArgumentNullException("stream"); }
+
+    byte[] result;
+
+    if (bodySize &gt; 0)
+    {
+        result = stream.ReadLine(bodySize).ToArray();
+        bodySize -= result.Length;
+    }
+    else
+    {
+        result = stream.ReadLine().ToArray();
+    }
+
+    return encoding.GetString(result);
+
+}
+</code></pre>
+
+<p>which is much easier to read.  </p>
+
+<p>The methods themself could look like so  </p>
+
+<pre><code>private const char NewLine = '\n';
+private const char Return = '\r';
+
+private static IEnumerable&lt;byte&gt; ReadLine(this Stream stream, int bodySize)
+{
+    int i;
+    int counter = 0;
+    while (bodySize &gt; 0 &amp;&amp; (i = stream.ReadByte()) &gt; 0)
+    {
+        byte b = (byte)i;
+        if (b == NewLine || b == Return)
+        {
+            // Break only if it isn't the first byte.
+            if (counter &gt; 0 || b != NewLine) { yield break; }
+
+            continue;
+
+        }
+        counter++;
+        bodySize--;
+        yield return b;
+    }
+}
+
+private static IEnumerable&lt;byte&gt; ReadLine(this Stream stream)
+{
+    int i;
+    int counter = 0;
+    while ((i = stream.ReadByte()) &gt; 0)
+    {
+        byte b = (byte)i;
+        if (b == NewLine || b == Return)
+        {
+            // Break only if it isn't the first byte.
+            if (counter &gt; 0 || b != NewLine) { yield break; }
+
+            continue;
+
+        }
+        counter++;
+        yield return b;
+    }
+}  
+</code></pre>
+
+<p>or if we want to be clever we could change the second method like so  </p>
+
+<pre><code>private static IEnumerable&lt;byte&gt; ReadLine(this Stream stream)
+{
+    return stream.ReadLine(int.MaxValue);
+}
+</code></pre>
+
+<p>Please note that the provided code isn't tested.  </p>
+    </div>

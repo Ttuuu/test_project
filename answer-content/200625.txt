@@ -1,0 +1,90 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>DRY (Don't repeat yourself)</h1>
+
+<p>There are lots of snippets that are repeated the same or very similar across many functions:</p>
+
+<ul>
+<li><p>Error handling: All cases of error handling have the following form:</p>
+
+<pre><code>std::stringstream error;
+error &lt;&lt; pNof &lt;&lt; some_string &lt;&lt; some_id;
+throw std::runtime_error( error.str() );
+</code></pre>
+
+<p>This could easily be extracted into a helper function:</p>
+
+<pre><code>template&lt;typename ID&gt;
+static void report_error(std::string func_name, std::string error_msg, const ID&amp; id) {
+    std::string_stream error;
+    error &lt;&lt; func_name &lt;&lt; ": " &lt;&lt; error_msg &lt;&lt; id;
+    throw std::runtime_error( error.str() );
+}
+</code></pre>
+
+<blockquote>
+  <p>For C++17 and beyond, I'd use <code>std::string_view</code> instead of <code>std::string</code> in the example above. Actually, I might use a variadic template and a fold expression over <code>&lt;&lt;</code> to simply pass every argument (excluding the function name) to <code>error</code> if this pattern is used across multiple files with different usages.</p>
+</blockquote></li>
+<li><p><code>static char pNof[] = __FUNCTION__ ": ";</code></p>
+
+<p>If this really has to be repeated for <strong>every</strong> member function (because of some requirement), maybe use a macro instead? That way each declaration is uniform, and any possible future changes are limited to one place.</p>
+
+<p>If there is no requirement, then using <code>__func__</code> (as <code>__FUNCTION__</code> is not portable) where appropriate (e.g. when calling the helper function above) might be even better.</p></li>
+<li><p>Some of the error messages repeat verbatim in different locations. Maybe extract them (possibly all of them) into some <code>static</code> variables to be reused?</p></li>
+</ul>
+
+<h1>Naming</h1>
+
+<p>Some variables have poor names. Examples:</p>
+
+<ul>
+<li><p><code>pNof</code>: What does this even stand for? "pointer to name of function"? <code>function_name</code> (or <code>func_name</code>) might be more readable.</p></li>
+<li><p>I get it, <code>list</code> inside <code>registerRequest</code> is a <code>std::list</code> - but what does it represent?</p></li>
+<li><p>Similarly, I have no idea what <code>m_topQueue</code> stands for.</p></li>
+<li><p><code>m_topResponces</code> is inconsistenly named (a typo?), <code>m_topResponses</code> would match other usages of <code>Response</code>.</p></li>
+</ul>
+
+<h1>Multithreading issues</h1>
+
+<blockquote>
+  <p>None of the <code>std::unique_lock&lt;std::mutex&gt; lck;</code> actually acquire a lock, because no reference to a mutex is passed.</p>
+  
+  <p><strong>This means that there is no synchronization at all in the whole class!</strong></p>
+  
+  <p>I guess <code>std::unique_lock&lt;std::mutex&gt; lck{m_Mtx};</code> was meant instead.</p>
+</blockquote>
+
+<p>Once that is fixed, there are these issues left:</p>
+
+<ul>
+<li><p>Unsychronized access to <code>m_id2SocketMap</code> in <code>registerRequest</code>: Another thread might invalidate any of the iterators returned by <code>find(id)</code> or <code>end()</code> before the comparison is made.</p></li>
+<li><p><code>registerResponse</code> calls <code>putTopResponseToQueue</code> while still holding the lock on <code>m_Mtx</code>, which <code>putTopResponseToQueue</code> will try to acquire - and fail, resulting in a dead-lock.</p></li>
+<li><p>Unsynchronized access to <code>m_id2SocketMap</code> in <code>getSocket</code>:  Another thread might invalidate any of the iterators returned by <code>find(id)</code> or <code>end()</code> before the comparison is made or before <code>it-&gt;second</code> is accessed.</p></li>
+<li><p>Unsynchronized access to <code>m_topResponces</code> and <code>m_storedResponses</code> in <code>pullResponse</code>. (Even worse, those accesses might modify the respective containers!)</p></li>
+<li><p><code>removeResponse</code> calls <code>putTopResponseOnQueue</code> while still holding the lock on <code>m_Mtx</code>, which <code>putTopResponseToQueue</code> will try to acquire - and fail, resulting in a dead-lock.</p></li>
+<li><p><code>Dump</code> acquires no lock at all, and at any point the used iterators might be invalidated by other threads.</p></li>
+</ul>
+
+<blockquote>
+  <p>There seems to be an assumption that calling any <code>const</code> container member function is thread-safe. This is only true if there are no concurrent modifications on the same container! Otherwise, even <code>const</code> member function calls might result in data races, or iterators returned might be invalidated before further use.</p>
+</blockquote>
+
+<hr>
+
+<p>Fixing all these issues will likely mean that every operation on <code>ResponseDispatcher</code> will rely on locking the same mutex <code>m_Mtx</code>, removing any direct benefit of concurrency inside this class.</p>
+
+<p>Some of that can be improved by introducing one mutex per member variable, so operations on different members can be done in parallel. However, those mutexes would have to be used with care in order to prevent deadlocks due to different order of acquisition in different locations.</p>
+
+<blockquote>
+  <p>Even better if that mutex is similar to the C++17 <code>std::shared_mutex</code> which allows parallel reads but no parallel writes. IIRC <code>boost</code> offered a reader/writer lock for C++14 which could be used.</p>
+  
+  <p>However, as always if performance is required, measure if it is indeed better, as those results might vary for different use cases.</p>
+</blockquote>
+
+<h1>Other issues</h1>
+
+<ul>
+<li><p>Any reason <code>std::map</code> is used instead of <code>std::unordered_map</code>? The latter will likely result in better performance, as insertion, lookup and deletion are \$\mathcal{O}(1)\$ (amortized for insertion/deletion) instead of \$\mathcal{O}(\log n)\$.</p></li>
+<li><p>In a lot of variable declarations <code>auto</code> could be used instead of long unwindy explicit type names. (<a href="https://herbsutter.com/2013/08/12/gotw-94-solution-aaa-style-almost-always-auto/" rel="nofollow noreferrer">See this Guru of the Week post</a> for more info why that might be useful.)</p></li>
+<li><p>In <code>removeResponse</code> the second call to <code>m_id2SocketMap.find(id)</code> is unnecessary, the earlier obtained iterator <code>itID</code> could be reused.</p></li>
+</ul>
+    </div>

@@ -1,0 +1,145 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Let's start with the basics: names and namespaces.</p>
+
+<p>To me the following names have the following meanings:</p>
+
+<ul>
+<li><code>Deck</code>: either the set of 52 cards (basically a wrapper around <code>ISet&lt;Card&gt;</code>), or, more likely, the cards which haven't yet been dealt (basically a wrapper around <code>IList&lt;Card&gt;</code>). In the latter case I'd expect it to have methods to deal from the top, and receive cards back and shuffle.</li>
+<li><code>Card</code>: a Cartesian product of rank and suit. Could probably be a <code>struct</code>. In performance-oriented code, would be just an <code>int</code>.</li>
+<li><code>Hand</code>: a wrapper around <code>ISet&lt;Card&gt;</code> representing the cards held by a single player</li>
+<li><code>HandResult</code>: the result of scoring the hand. Probably implements <code>IComparable&lt;HandResult&gt;</code>.</li>
+<li><code>PokerGame</code>: the top-level object which holds a <code>Deck</code> and the <code>Hand</code>s of the players and contains the logic for evaluating a hand. Possibly an abstract class to allow subclasses for variants.</li>
+</ul>
+
+<p>None of these logically belongs in the namespace of another.</p>
+
+<p>Also, I find it misleading to use <code>set</code> for the name of a variable whose type isn't <code>ISet&lt;T&gt;</code>.</p>
+
+<hr>
+
+<p>To expand on one of the points in the previous section, <code>Card.UsedByPlayerID</code> is a big red flag to me. The location of the card is a property of the game state, not a property of the card. The necessity to apply a filter in methods such as</p>
+
+<blockquote>
+<pre><code>    private IOrderedEnumerable&lt;Card&gt; GetPlayerSet(int playerID)
+    {
+        return DeckCards.Where(x =&gt; x.UsedByPlayerID == 0 || x.UsedByPlayerID == playerID).OrderByDescending(x =&gt; x.Face);
+    }
+</code></pre>
+</blockquote>
+
+<p>should by itself have been a red flag that the design was wrong.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>        for (int i = 2; i &lt;= 14; i++)
+        {
+            result.Add(new Card(i, Suit.Club));
+            result.Add(new Card(i, Suit.Diamond));
+            result.Add(new Card(i, Suit.Heart));
+            result.Add(new Card(i, Suit.Spade));
+        }
+</code></pre>
+</blockquote>
+
+<p>Why 2 to 14? That needs a comment.</p>
+
+<p>It would be cleaner to use a double loop and get the suits from <code>Enum.GetValues(typeof(Suit))</code>.</p>
+
+<p>I'm puzzled by the asymmetry between <code>Face</code> being an <code>int</code> and <code>Suit</code> being an <code>enum</code>.</p>
+
+<hr>
+
+<p>As should be obvious from my previous comments, I would eliminate <code>SetCards</code> in a major refactor, but for completeness:</p>
+
+<blockquote>
+<pre><code>            c.UsedByPlayerID = playerID.HasValue ? playerID : 0;
+</code></pre>
+</blockquote>
+
+<p>Prefer <code>playerID.GetValueOrDefault()</code>.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>    private HandResult GetRoyalFlush(IEnumerable&lt;Card&gt; set)
+    {
+        HandResult straightflush = GetStraightFlush(set);
+        if (straightflush != null)
+        {
+            return straightflush.resultCards.Any(x =&gt; x.Face == 14 &amp;&amp; x.Face == 13) ? new HandResult(straightflush.resultCards, Hand.RoyalFlush) : null;
+        }
+        return null;
+    }
+</code></pre>
+</blockquote>
+
+<p><code>x =&gt; x.Face == 14 &amp;&amp; x.Face == 13</code> could be optimised to <code>x =&gt; false</code>, so I think this is buggy.</p>
+
+<hr>
+
+<p>In some senses the reuse of methods to find more specific results is attractive, although I'd rather have one method of twenty or so lines with a few nested <code>if</code>s. That would, I think, allow more reuse of logic. For example, 4 of a kind, full house, 3 of a kind, two pairs, pair, and high card all boil down to: group cards by face, sort the groups by size descending then face descending, and check prefixes of that sorted result.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>    private HandResult GetStraight(IEnumerable&lt;Card&gt; set)
+    {
+        if (set.Any())
+        {                
+            bool isAceStraight = !new List&lt;int&gt;() { 14, 2, 3, 4, 5 }.Except(set.Select(x =&gt; x.Face)).Any();
+            if (isAceStraight)
+            {
+                return  new HandResult( set.Where(x =&gt; new List&lt;int&gt;() { 14, 2, 3, 4, 5 }.Contains(x.Face)).GroupBy(x =&gt; x.Face).Select(x =&gt; x.First()), Hand.Straight);
+            }
+            int? temp = null;
+            int conseductiveIndex = 0;
+            for (int i = 0; i &lt; set.Count(); i++)
+            {
+                if (temp.HasValue)
+                {
+                    if (temp != set.ElementAt(i).Face - 1)
+                    {
+                        conseductiveIndex = i;
+                    }
+                    if (i - conseductiveIndex == 4)
+                    {
+                        return new HandResult(  set.Skip(conseductiveIndex).Take(5), Hand.Straight);
+                    }
+                }
+                temp = set.ElementAt(i).Face;
+            }
+        }
+        return null;
+    }
+</code></pre>
+</blockquote>
+
+<p>For a start, that outer <code>if</code> would be unnecessary if you refactored <code>GetStraightFlush</code> to return <code>null</code> as soon as it found that a straight flush was impossible.</p>
+
+<blockquote>
+<pre><code>!new List&lt;int&gt;() { 14, 2, 3, 4, 5 }.Except(set.Select(x =&gt; x.Face)).Any();
+</code></pre>
+</blockquote>
+
+<p>is horrible to read. Inverting the logic to <code>new List&lt;int&gt;() { 14, 2, 3, 4, 5 }.All(face =&gt; set.Any(x =&gt; x.Face == face))</code> makes it more comprehensible, although (a) the inefficiency of the test still grates, and (b) the constant list should be pulled out, probably as a <code>readonly static IReadOnlyList&lt;&gt;</code>.</p>
+
+<p>Then the rest of the method is also rather cryptic. IMO it would benefit from a complete rewrite along the lines of</p>
+
+<pre><code>modifiers HandResult GetStraight(IEnumerable&lt;Card&gt; cards)
+{
+    Card[] representativePerFace = ...; // Place aces in position 0, 2s in position 1, ...
+    // Highest straight is TJQKA, lowest is A2345
+    for (int i = 9; i &gt;= 0; i--)
+    {
+        if (Enumerable.Range(i, 5).All(x =&gt; representativePerFace[x % 13] != null))
+        {
+            return new ...
+        }
+    }
+    return null;
+}
+</code></pre>
+
+<p>Of course, that can then be optimised à la Knuth-Morris-Pratt.</p>
+    </div>

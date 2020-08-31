@@ -1,0 +1,91 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><em>Note: This review focuses on the use of C++, rather than the functionality.</em></p>
+
+<hr>
+
+<p>Naming:</p>
+
+<ul>
+<li>IMHO, the use of "do" at the start of function names is unnecessary and makes the code harder to read. The names would be fine without it (e.g. <code>sendSuccess</code>, <code>sendError</code>, <code>createSocket</code> all make perfect sense).</li>
+</ul>
+
+<hr>
+
+<p>Server:</p>
+
+<ul>
+<li><p>If the port must always fit in a 16 bit unsigned int, we can use <code>std::uint16_t</code> (from the <code>&lt;cstdint&gt;</code> header) instead of an <code>unsigned int</code>.</p></li>
+<li><p>The <code>new</code> keyword should almost never be used in modern C++. If we need to create it on the heap, <code>_routes</code> should be a <code>std::unique_ptr</code> (from <code>&lt;memory&gt;</code>), which will be cleaned up automatically for us. In this case it looks like the variable could just be created on the stack (i.e. declared as <code>Routes _routes;</code>).</p></li>
+<li><p><code>_doCreateSocket()</code> returns a bool, but the <code>Server</code> constructor uses an <code>int</code> to hold the return type.</p></li>
+<li><p>It's better to use the constructor's member initializer list to initialize variables where possible (it's neater, and we don't have to worry about initializing objects twice), e.g.:</p>
+
+<pre><code>Server::Server(std::uint16_t port, unsigned int max_connections, unsigned int thread_count):
+    _port(port),
+    _max_connections(max_connections),
+    _thread_count(thread_count),
+    _signal(false),
+    _thread_consume(nullptr),
+    _thread_process(nullptr),
+    _routes(nullptr),
+    _socket(-1), // or something
+    _listen(false)
+{
+    if (max_connections &lt; 1) {
+        Logger::doSendMessage(Logger::TYPES::ERROR, "Max connections can't be lower than 1 on Server::Constructor.");
+    }
+
+    if (!_doCreateSocket(_socket)) {
+        Logger::doSendMessage(Logger::TYPES::ERROR, "Failed to create socket on Server::Constructor.");
+    }
+
+    if (!_doBindSocket(_socket)) {
+        Logger::doSendMessage(Logger::TYPES::ERROR, "Failed to bind socket on Server::Constructor.");
+    }
+}
+</code></pre></li>
+<li><p>Note that plain data variables (e.g. pointers, ints) are left uninitialized (and may contain any random value) unless we explicitly initialize them. It's safest to always set them to a known value in the constructor.</p></li>
+<li><p><code>_thread_consume</code> can also be created on the stack (the <code>std::thread</code> default constructor doesn't launch a new thread), and <code>_thread_process</code> can be a <code>std::vector&lt;std::thread&gt;</code>. This saves us from having to do any manual memory management.</p></li>
+<li><p>Prefer to use <code>std::function</code> from the <code>&lt;functional&gt;</code> header, instead of raw function pointers. (e.g. <code>std::function&lt;void(Request*, Response*)&gt;</code>).</p></li>
+<li><p>The <code>request</code> and <code>response</code> variables in <code>Server::_doProcessSocket</code> should be created on the stack. We can still pass them by pointers if necessary by taking their addresses (<code>_doProcessRequest(&amp;request, &amp;response)</code>), or (better) we could pass them by reference.</p></li>
+<li><p>The status code returned by <code>Server::_doProcessRequest()</code> isn't used.</p></li>
+<li><p>In <code>Server::_doProcessRequest()</code>, the <code>if (route.method != method)</code> check is unnecessary, since we used the <code>method</code> while finding the route.</p></li>
+<li><p>The forwarding from <code>doStop</code> to <code>_doStop</code> is unnecessary.</p></li>
+<li><p>This class is doing several things. It manages a thread pool, as well as doing raw socket stuff. We could definitely split the socket functionality into a separate class.</p></li>
+</ul>
+
+<hr>
+
+<p>Request:</p>
+
+<ul>
+<li><p>Member functions that don't alter the member variables of a class should be declared <code>const</code>, e.g.: <code>bool isValid() const;</code>. This means we can make proper use of <code>const</code> and <code>const&amp;</code> variables, allowing the compiler to perform better optimisations, and preventing programmer error.</p></li>
+<li><p>The getter functions in this class all return by value. This probably results in some unnecessary copies being made, which may be expensive where the objects require allocation of memory (e.g. copying the <code>unordered_map</code> / <code>string</code>s). It might be better to return by <code>const&amp;</code> instead, e.g.: <code>std::unordered_map&lt;std::string, std::string&gt; const&amp; getHeaders();</code>. This still prevents the caller from altering referenced variable, but allows them to decide whether to copy it, copy part of it, or not copy it at all.</p></li>
+<li><p>In <code>Request::_doReceiveData</code>, we can use a <code>std::vector&lt;char&gt;</code> for the buffer rather than doing manual memory management. (It's guaranteed to provide contiguous memory, which we can access using the <code>.data()</code> member function).</p></li>
+</ul>
+
+<hr>
+
+<p>Routes:</p>
+
+<ul>
+<li><p><code>Routes::setRoute</code> should probably use the <code>Route::isValid</code> method, rather than duplicating the checks.</p></li>
+<li><p>There's some unnecessary <code>string</code> copies in <code>getRoute</code>. We should pass the variable as a reference: <code>const std::string&amp; path</code> instead.</p></li>
+<li><p>Using iterators and the standard library search algorithms is more idiomatic C++ than indices. e.g.:</p>
+
+<pre><code>auto route = std::find_if(_routes.begin(), routes.end(), 
+    [] (Route const&amp; route) { return (route.path == path) &amp;&amp; (route-&gt;method == method); });
+
+if (route == routes.end()) // route not found!
+</code></pre></li>
+<li><p>(Unless it's reused elsewhere, I'd be inclined to remove the <code>Routes</code> class in favor of a <code>std::vector&lt;Route&gt; _routes;</code> in the <code>Server</code> class.)</p></li>
+</ul>
+
+<hr>
+
+<p>Main:</p>
+
+<ul>
+<li><p>(Use <code>std::this_thread::sleep_for</code> for a portable sleep function.)</p></li>
+<li><p>I think <a href="https://en.cppreference.com/w/cpp/thread/condition_variable/wait" rel="noreferrer"><code>std::condition_variable::wait()</code></a> may be what you're looking for.</p></li>
+</ul>
+    </div>

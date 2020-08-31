@@ -1,0 +1,116 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<ul>
+<li>I think <code>RetryClient</code> is a bad name as it doesn't highlight that you're wrapping a session.</li>
+<li><p>Taking lots of <code>retry_*</code> parameters screams to me that you should make a class.</p>
+
+<p>For example popular libraries like <a href="https://stackoverflow.com/a/15431343">requests</a> and <a href="https://urllib3.readthedocs.io/en/latest/user-guide.html#retrying-requests" rel="nofollow noreferrer">urllib3</a> use a <a href="https://urllib3.readthedocs.io/en/latest/reference/urllib3.util.html#urllib3.util.retry.Retry" rel="nofollow noreferrer">Retry class</a>.</p></li>
+<li><p>You can pass a tuple to <code>isinstance</code> to check against multiple types in one call.</p></li>
+<li>You use a tuple with <code>except</code> to filter to only those exceptions. Removing the need for <code>isinstance</code> at all.</li>
+<li>You can make <code>_exponential_timeout</code> a function that makes a full-fledged itarable.</li>
+<li><p>Making the <code>Retry</code> class take an iterable on how long each delay should be allows for easy customization from users.</p>
+
+<p>Want a 3 gap 20 times is easy:</p>
+
+<pre class="lang-py prettyprint-override"><code>Retry(timeouts=[3] * 20)
+</code></pre>
+
+<p>Users can also make it so it retries infinitely.</p>
+
+<pre class="lang-py prettyprint-override"><code>class InfinateOnes:
+    def __iter__(self):
+        while True:
+            yield 1
+</code></pre></li>
+<li><p>I would prefer to see an explicit <code>while True</code> and iteration over recursion.</p></li>
+<li><p>I would prefer if <code>Retry</code> was designed in a way in which it would work with any function that returns a <code>ClientResponse</code>.</p>
+
+<p>A part of me that likes to make things as generic as possible, would prefer changing statuses to a callback to check if the return is valid. However this doesn't make too much sense in a bespoke library.</p></li>
+</ul>
+
+<p>In all I think this drastically simplifies <code>_RequestContext</code>.<br>
+<sup><strong>Note</strong>: untested</sup></p>
+
+<pre class="lang-py prettyprint-override"><code>import asyncio
+import logging
+from aiohttp import ClientSession, ClientResponse
+from typing import Any, Callable, Optional, Set, Type, Iterable
+
+# Options
+_RETRY_ATTEMPTS = 3
+_RETRY_START_TIMEOUT = 0.1
+_RETRY_MAX_TIMEOUT = 30
+_RETRY_FACTOR = 2
+
+
+def exponential(
+    attempts: int = _RETRY_ATTEMPTS,
+    start: int = _RETRY_START_TIMEOUT,
+    maximum: int = _RETRY_MAX_TIMEOUT,
+    factor: int = _RETRY_FACTOR,
+) -&gt; Iterable[float]:
+    return [
+        min(maximum, start * (factor ** i))
+        for i in range(attempts)
+    ]
+
+
+class Retry:
+    def __init__(
+        self,
+        timeouts: Iterable[float] = exponential(),
+        statuses: Optional[Set[int]] = None,
+        exceptions: Optional[Tuple[Type]] = None,
+    ) -&gt; None:
+        self._timeouts = timeouts
+        self._statuses = statuses or set()
+        self._exceptions = exceptions or ()
+
+    def _is_retry_status(self, code):
+        return 500 &lt;= code &lt;= 599 or code in self._statuses
+
+    async def retry(
+        self,
+        callback: Callable[[...], ClientResponse],
+        *args,
+        **kwargs,
+    ) -&gt; ClientResponse:
+        timeouts = iter(self.timeouts)
+        while True:
+            try:
+                response = await self._request(*args, **kwargs)
+                if not self._is_retry_status(response.status):
+                    return response
+                try:
+                    retry_wait = next(timouts)
+                except StopIteration:
+                    return response
+            except self._retry_exceptions as e:
+                try:
+                    retry_wait = next(timouts)
+                except StopIteration:
+                    raise e from None
+            await asyncio.sleep(retry_wait)
+
+
+class _RequestContext:
+    def __init__(
+        self,
+        request: Callable[..., Any],
+        url: str,
+        retry: Retry,
+        **kwargs: Any
+    ) -&gt; None:
+        self._request = request
+        self._url = url
+        self._kwargs = kwargs
+        self._retry = retry
+
+    async def __aenter__(self) -&gt; ClientResponse:
+        return await self._retry.retry(self._request, self._url, **self._kwargs)
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -&gt; None:
+        if self._response is not None:
+            if not self._response.closed:
+                self._response.close()
+</code></pre>
+    </div>

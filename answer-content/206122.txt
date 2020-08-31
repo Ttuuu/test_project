@@ -1,0 +1,186 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Good clear template code - well done!</p>
+
+<p>I'd consider changing the name, as the class itself isn't an iterator, it's an iterator pair, or <em>range</em>, that wraps a <em>container</em> and provides a reversed <em>view</em> of it.</p>
+
+<p>Constructor should be <code>explicit</code>.</p>
+
+<p>We should use free-function <code>rbegin()</code> and <code>rend()</code> to give us greater flexibility of container types (e.g. C-style arrays) - fall back to the <code>std</code> versions in <code>&lt;iterator&gt;</code> if argument-dependent lookup fails.</p>
+
+<p>It could be improved by overloading <code>Reverse</code> with a version that accepts a <code>const Container</code>:</p>
+
+<pre><code>template &lt;typename ContainerT&gt;
+auto Reverse(const ContainerT&amp; iContainer)
+{
+    return ReverseIterator&lt;const ContainerT&gt;(iContainer);
+}
+</code></pre>
+
+<p>For this to work properly, we need to change the return type of <code>begin()</code> and <code>end()</code> to <code>auto</code>, so that we get <code>const_reverse_iterator</code> back from them.  If you're really stuck with C++11, then we'll have to add the trailing return type: <code>auto begin()-&gt; decltype(m_container.begin())</code>, for example.  For my own convenience, I'll work with C++17 from here onwards.</p>
+
+<hr>
+
+<p>Applying these suggested changes gives us:</p>
+
+<pre><code>template &lt;typename ContainerT&gt;
+class ReverseContainerView
+{
+public:
+    explicit ReverseContainerView(ContainerT&amp; iContainer)
+      : m_container{iContainer}
+    {
+    }
+
+    auto begin() {
+        using std::rbegin;
+        return rbegin(m_container);
+    }
+    auto end() {
+        using std::rend;
+        return rend(m_container);
+    }
+
+private:
+    ContainerT&amp;  m_container;
+};
+
+
+template&lt;typename ContainerT&gt;
+auto Reverse(ContainerT&amp; iContainer)
+{
+    return ReverseContainerView&lt;ContainerT&gt;(iContainer);
+}
+
+template&lt;typename ContainerT&gt;
+auto Reverse(const ContainerT&amp; iContainer)
+{
+    return ReverseContainerView&lt;const ContainerT&gt;(iContainer);
+}
+</code></pre>
+
+<p>and demo:</p>
+
+<pre><code>#include &lt;iostream&gt;
+#include &lt;vector&gt;
+int main()
+{
+    auto list = std::vector&lt;int&gt;{1, 2, 3};
+    for (auto&amp; i: Reverse(list)) {
+        std::cout &lt;&lt; ++i &lt;&lt; ' ';
+    }
+    std::cout &lt;&lt; '\n';
+    for (const auto&amp; i: list) {
+        std::cout &lt;&lt; i &lt;&lt; ' ';
+    }
+    std::cout &lt;&lt; '\n';
+
+    const auto const_list = std::vector&lt;int&gt;{1, 2, 3};
+    for (auto i: Reverse(const_list)) {
+        std::cout &lt;&lt; i &lt;&lt; ' ';
+    }
+    std::cout &lt;&lt; '\n';
+}
+</code></pre>
+
+<hr>
+
+<p>Note that the proposed usage <code>for (auto i: Reverse(std::vector&lt;int&gt;{10, 20, 30}))</code> (where the constructor argument is an xvalue) won't work with the above code.  That's because the temporary has gone out of scope after the <code>ReverseContainer</code> was constructed but before the <code>for</code> loop completes, leaving a dangling reference in the container.  We'll need a version that captures and stores any rvalue type passed to it.</p>
+
+<p>The easiest way I know to do this is to split the class into its two responsibilities: a base class to capture the wrapped container and a subclass to access the reversed view (we might want to put some or all of these classes into an inner namespace to hide them from users; I'll leave that question open here).</p>
+
+<pre><code>#include &lt;iterator&gt;
+#include &lt;type_traits&gt;
+#include &lt;utility&gt;
+
+template &lt;typename T, bool CopyValue = !std::is_lvalue_reference_v&lt;T&gt;&gt;
+struct ContainerContainer;
+
+template &lt;typename T&gt;
+struct ContainerContainer&lt;T, false&gt;
+{
+    // lvalue version: contains a reference to the container
+    T&amp; container;
+    explicit ContainerContainer(T&amp; container)
+      : container{container}
+    {}
+};
+
+template &lt;typename T&gt;
+struct ContainerContainer&lt;T, true&gt;
+{
+    // rvalue version: move-constructs a new copy of container
+    const T container;
+    explicit ContainerContainer(T container)
+      : container{std::move(container)}
+    {}
+};
+</code></pre>
+
+
+
+<pre><code>template &lt;typename Container&gt;
+class ReverseContainerView : ContainerContainer&lt;Container&gt;
+{
+    using Base = ContainerContainer&lt;Container&gt;;
+public:
+    explicit ReverseContainerView(Container&amp;&amp; container)
+        : Base{std::forward&lt;Container&gt;(container)}
+    {}
+
+    auto begin() {
+        using std::rbegin;
+        return rbegin(Base::container);
+    }
+    auto end() {
+        using std::rend;
+        return rend(Base::container);
+    }
+};
+
+
+template&lt;typename Container&gt;
+auto Reverse(Container&amp;&amp; container)
+{
+    return ReverseContainerView&lt;Container&gt;(std::forward&lt;Container&gt;(container));
+}
+</code></pre>
+
+
+
+<pre><code>// test program
+#include &lt;iostream&gt;
+#include &lt;vector&gt;
+int main()
+{
+    int list[] = {1, 2, 3};
+    for (auto&amp; i: Reverse(list)) {
+        std::cout &lt;&lt; ++i &lt;&lt; ' ';
+    }
+    std::cout &lt;&lt; '\n';
+
+    const auto const_list = {1, 2, 3}; // initializer_list
+    for (auto&amp; i: Reverse(const_list)) {
+        // ++i; ERROR: 'i' is read-only
+        std::cout &lt;&lt; i &lt;&lt; ' ';
+    }
+    std::cout &lt;&lt; '\n';
+
+    for (auto&amp; i: Reverse(std::vector&lt;int&gt;{10, 20, 30})) {
+        // ++i; ERROR: 'i' is read-only
+        std::cout &lt;&lt; i &lt;&lt; ' ';
+    }
+    std::cout &lt;&lt; '\n';
+}
+</code></pre>
+
+<hr>
+
+<p>From C++17 onwards, we don't really need the <code>Reverse()</code> helper function: we can instead simply provide a template deduction guide:</p>
+
+<pre><code>template&lt;typename Container&gt;
+explicit ReverseContainerView(Container&amp;&amp; container)
+    -&gt; ReverseContainerView&lt;Container&gt;;
+</code></pre>
+
+<p>We might want to choose a shorter name for the class now that it's more visible to the users.</p>
+    </div>

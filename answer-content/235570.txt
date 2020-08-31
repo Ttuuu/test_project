@@ -1,0 +1,362 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I hope you don't mind a pure C solution. For me it is easier to
+optimize code without C++ abstractions. But it should be
+straightforward to convert it to idiomatic C++ code.</p>
+
+<pre><code>#include &lt;assert.h&gt;
+#include &lt;math.h&gt;
+#include &lt;stdbool.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+
+#ifdef _WIN32
+#include &lt;windows.h&gt;
+#else
+#include &lt;fcntl.h&gt;
+#include &lt;pthread.h&gt;
+#include &lt;sys/mman.h&gt;
+#include &lt;sys/stat.h&gt;
+#endif
+
+//////////////////////////////////////////////////////////////////////////////
+// Range of numbers, number of numbers and number of parser threads.
+//////////////////////////////////////////////////////////////////////////////
+#define MIN_VALUE (1 * 1000 * 1000)
+#define MAX_VALUE (2 * 1000 * 1000)
+#define N_VALUES 400 * 1000 * 1000
+#define N_THREADS 8
+
+//////////////////////////////////////////////////////////////////////////////
+// Timing functions.
+//////////////////////////////////////////////////////////////////////////////
+#define NS_TO_S(x)      ((double)(x) / 1000 / 1000 / 1000)
+
+uint64_t
+nano_count() {
+#ifdef _WIN32
+    static double scale_factor;
+    static uint64_t hi = 0;
+    static uint64_t lo = 0;
+
+    LARGE_INTEGER count;
+    BOOL ret = QueryPerformanceCounter(&amp;count);
+    if (ret == 0) {
+        printf("QueryPerformanceCounter failed.\n");
+        abort();
+    }
+    if (scale_factor == 0.0) {
+        LARGE_INTEGER frequency;
+        BOOL ret = QueryPerformanceFrequency(&amp;frequency);
+        if (ret == 0) {
+            printf("QueryPerformanceFrequency failed.\n");
+            abort();
+        }
+        scale_factor = (1000000000.0 / frequency.QuadPart);
+  }
+#ifdef CPU_64
+    hi = count.HighPart;
+#else
+    if (lo &gt; count.LowPart) {
+        hi++;
+    }
+#endif
+    lo = count.LowPart;
+    return (uint64_t)(((hi &lt;&lt; 32) | lo) * scale_factor);
+#else
+    struct timespec t;
+    int ret = clock_gettime(CLOCK_MONOTONIC, &amp;t);
+    if (ret != 0) {
+        printf("clock_gettime failed.\n");
+        abort();
+    }
+    return (uint64_t)t.tv_sec * 1000000000 + t.tv_nsec;
+#endif
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Generate the data file.
+//////////////////////////////////////////////////////////////////////////////
+static int
+rand_in_range(int lo, int hi) {
+    int range = hi - lo;
+    int val = (rand() &amp; 0xff) &lt;&lt; 16 |
+        (rand() &amp; 0xff) &lt;&lt; 8 |
+        (rand() &amp; 0xff);
+    return (val % range) + lo;
+}
+
+static void
+run_generate(const char *path) {
+    srand(1234);
+    FILE *f = fopen(path, "wb");
+    for (int i = 0; i &lt; N_VALUES; i++) {
+        fprintf(f, "%d\n", rand_in_range(MIN_VALUE, MAX_VALUE));
+    }
+    fclose(f);
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Fast number parser using loop unrolling macros.
+//////////////////////////////////////////////////////////////////////////////
+#define PARSE_FIRST_DIGIT              \
+    if (*at &gt;= '0')         {          \
+        val = *at++ - '0';             \
+    } else {                           \
+        goto done;                     \
+    }
+#define PARSE_NEXT_DIGIT               \
+    if (*at &gt;= '0') {                  \
+        val = val*10 + *at++ - '0';    \
+    } else {                           \
+        goto done;                     \
+    }
+
+static void
+parse_chunk(char *at, const char *end, size_t *accum) {
+    uint64_t val = 0;
+    while (at &lt; end) {
+        // Parse up to 7 digits.
+        PARSE_FIRST_DIGIT;
+        PARSE_NEXT_DIGIT;
+        PARSE_NEXT_DIGIT;
+        PARSE_NEXT_DIGIT;
+        PARSE_NEXT_DIGIT;
+        PARSE_NEXT_DIGIT;
+        PARSE_NEXT_DIGIT;
+    done:
+        #ifdef _WIN32
+        InterlockedExchangeAdd64(&amp;accum[val], val);
+        #else
+        __sync_fetch_and_add(&amp;accum[val], val);
+        #endif
+        // Skip newline character.
+        at++;
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Thread definition
+//////////////////////////////////////////////////////////////////////////////
+typedef struct {
+    char *chunk_start;
+    char *chunk_end;
+    uint64_t *accum;
+} parse_chunk_thread_args;
+
+#ifdef _WIN32
+static DWORD WINAPI
+parse_chunk_thread(LPVOID args) {
+    parse_chunk_thread_args *a = (parse_chunk_thread_args *)args;
+    parse_chunk(a-&gt;chunk_start, a-&gt;chunk_end, a-&gt;accum);
+    return 0;
+}
+#else
+static void*
+parse_chunk_thread(void *args) {
+    parse_chunk_thread_args *a = (parse_chunk_thread_args *)args;
+    parse_chunk(a-&gt;chunk_start, a-&gt;chunk_end, a-&gt;accum);
+    return NULL;
+}
+#endif
+
+//////////////////////////////////////////////////////////////////////////////
+// Parse the whole file.
+//////////////////////////////////////////////////////////////////////////////
+static bool
+run_test(const char *path) {
+    uint64_t time_start = nano_count();
+
+    #ifdef _WIN32
+    FILE *f = fopen(path, "rb");
+    fseek(f, 0, SEEK_END);
+    uint64_t n_bytes = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *buf_start = (char *)malloc(sizeof(char) * n_bytes);
+    char *buf_end = buf_start + n_bytes;
+    assert(fread(buf_start, 1, n_bytes, f) == n_bytes);
+    fclose(f);
+    #else
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) {
+        return false;
+    }
+    struct stat sb;
+    if (fstat(fd, &amp;sb) == -1) {
+        return false;
+    }
+    uint64_t n_bytes = sb.st_size;
+    char *buf_start = mmap(NULL, n_bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+    char *buf_end = buf_start + n_bytes;
+    #endif
+
+    uint64_t time_read = nano_count();
+
+    char *chunks[N_THREADS];
+    for (int i = 0; i &lt; N_THREADS; i++) {
+        chunks[i] = buf_start + (n_bytes / N_THREADS) * i;
+        if (i &gt; 0) {
+            // Adjust the chunks starting points until they reach past
+            // a newline.
+            while (*chunks[i] != '\n') {
+                chunks[i]++;
+            }
+            chunks[i]++;
+        }
+    }
+    uint64_t *accum = calloc(MAX_VALUE, sizeof(uint64_t));
+
+    #if _WIN32
+    HANDLE threads[N_THREADS];
+    #else
+    pthread_t threads[N_THREADS];
+    #endif
+    parse_chunk_thread_args args[N_THREADS];
+    for (int i = 0; i &lt; N_THREADS; i++) {
+        char *chunk_start = chunks[i];
+        char *chunk_end = buf_end;
+        if (i &lt; N_THREADS - 1) {
+            chunk_end = chunks[i + 1];
+        }
+        args[i].chunk_start = chunk_start;
+        args[i].chunk_end = chunk_end;
+        args[i].accum = accum;
+        #if _WIN32
+        threads[i] = CreateThread(NULL, 0, parse_chunk_thread,
+                                  &amp;args[i], 0, NULL);
+        #else
+        pthread_create(&amp;threads[i], NULL, parse_chunk_thread, &amp;args[i]);
+        #endif
+    }
+    for (int i = 0; i &lt; N_THREADS; i++) {
+        #if _WIN32
+        WaitForSingleObject(threads[i], INFINITE);
+        #else
+        pthread_join(threads[i], NULL);
+        #endif
+    }
+    uint64_t max = 0;
+    for (int i = 0; i &lt; MAX_VALUE; i++) {
+        uint64_t val = accum[i];
+        if (val &gt; max) {
+            max = val;
+        }
+    }
+    uint64_t time_parsed = nano_count();
+
+    free(accum);
+    #if _WIN32
+    free(buf_start);
+    #else
+    if (munmap(buf_start, n_bytes) == -1) {
+        return false;
+    }
+    #endif
+
+    // Print timings.
+    double read_secs = NS_TO_S(time_read - time_start);
+    double parse_secs = NS_TO_S(time_parsed - time_read);
+    double total_secs = NS_TO_S(time_parsed - time_start);
+    printf("Read  : %.3f seconds\n", read_secs);
+    printf("Parse : %.3f seconds\n", parse_secs);
+    printf("Total : %.3f seconds\n", total_secs);
+    printf("-- Max: %zu\n", max);
+    return true;
+}
+
+int
+main(int argc, char *argv[]) {
+    if (argc != 3) {
+        printf("%s: [generate|test] path\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    char *cmd = argv[1];
+    if (strcmp(cmd, "generate") == 0) {
+        run_generate(argv[2]);
+    } else if (strcmp(cmd, "test") == 0) {
+        if (!run_test(argv[2])) {
+            printf("Test run failed!\n");
+            return EXIT_FAILURE;
+        }
+    } else {
+        printf("%s: [generate|test] path\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+</code></pre>
+
+<p>On my i7-6700 CPU desktop with 32 GB RAM, my code parses a 3.2 GB file
+in about 1.62 seconds and your code takes about eight
+seconds. I compile both programs with <code>-march=native -mtune=native -O3</code></p>
+
+<p>The main difference is that I'm using an array shared by all threads
+while you are using a hashmap for each thread. That is inefficient
+since the range of possible values is only one million. A hashmap
+would have the advantage over an array if the range of values was much
+larger than the number of values but that is not the case in your
+scenario.</p>
+
+<p>The array can be concurrently modified by all threads by using locking
+compiler intrinsics:</p>
+
+<pre><code>#ifdef _WIN32
+InterlockedExchangeAdd64(&amp;accum[val], val);
+#else
+__sync_fetch_and_add(&amp;accum[val], val);
+#endif
+</code></pre>
+
+<p>The intrinsics ensure that the updates are atomic and that threads
+don't interfere with each other.</p>
+
+<p>The last difference is</p>
+
+<pre><code>#define PARSE_FIRST_DIGIT              \
+    if (*at &gt;= '0') {                  \
+        val = *at++ - '0';             \
+    } else {                           \
+        goto done;                     \
+    }
+#define PARSE_NEXT_DIGIT               \
+    if (*at &gt;= '0') {                  \
+        val = val*10 + *at++ - '0';    \
+    } else {                           \
+        goto done;                     \
+    }
+while (buf &lt; end) {
+    // Parse up to 7 digits.
+    PARSE_FIRST_DIGIT;
+    PARSE_NEXT_DIGIT;
+    PARSE_NEXT_DIGIT;
+    PARSE_NEXT_DIGIT;
+    PARSE_NEXT_DIGIT;
+    PARSE_NEXT_DIGIT;
+    PARSE_NEXT_DIGIT;
+  done:
+</code></pre>
+
+<p>Here I have manually unrolled the parsing loop using macros. It
+improves performance by about 100 ms over your formulation when
+compiling with gcc.</p>
+
+<h3>Linux vs. Windows</h3>
+
+<p>On my laptop, the code runs a lot faster on Linux than on Windows. On
+Windows with an 1 600 MB file and 4 threads:</p>
+
+<pre><code>Read  : 1.170 seconds
+Parse : 3.119 seconds
+Total : 4.289 seconds
+-- Max: 498631000
+</code></pre>
+
+<p>Same setup on Linux:</p>
+
+<pre><code>Read  : 0.000 seconds
+Parse : 2.814 seconds
+Total : 2.814 seconds
+-- Max: 498631000
+</code></pre>
+    </div>

@@ -1,0 +1,262 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Correctness of the solution</h1>
+
+<p>On reflection, I'm not sure either the C++ or the Rust code solves the problem as stated. I'm not completely sure I understand the shoe shine shop model so I may be wrong. Here's what it looks like the code does: you generate a bunch of random events of all kinds, and order them in time. Then you process the events one by one starting with the earliest. But that doesn't make sense!</p>
+
+<blockquote>
+  <p>Customers arrive according to PP with rate <span class="math-container">\$\lambda\$</span>, and enter only if first chair is empty. Shoe-shiners takes <span class="math-container">\$\exp(\mu_1)\$</span> time for brushing and <span class="math-container">\$\exp(\mu_2)\$</span> time for polishing. </p>
+</blockquote>
+
+<p>The way I'm reading it, your random variables should be ordered <em>not</em> with respect to other events of the same kind, but with respect to the <em>order of events in the shop</em>. A shop can't finish shining a shoe before it has been brushed, and it can't finish brushing a shoe before any customers have arrived. Therefore, you need to schedule a <code>FirstFinished</code> event with respect to the <code>Arrived</code> event that initiated it, not with respect to the previous <code>FirstFinished</code> event.</p>
+
+<p>A <code>BTreeMap</code> isn't the right solution to this problem. One way to solve it might be a priority queue with both the event kind and the time of the event (possibly a <code>BinaryHeap&lt;(OrderedFloat&lt;f64&gt;, Events)&gt;</code>). Your event queue starts out filled with only <code>Arrival</code>s, randomly distributed according to <span class="math-container">\$PP(\lambda)\$</span>. As you process the queue, you pull off an arrival, and schedule the <code>FirstFinished</code> event at some time in the future <em>relative to the arrival time</em>. Then you pull off the next event, which could either be another <code>Arrival</code> (which you would have to drop) or the <code>FirstFinished</code> event you just pushed on (which would enable you to transition to the next state, and schedule the <code>SecondFinished</code> event), and continue processing.</p>
+
+<blockquote>
+  <p>I thought so too, but my group mate guessed that it doesn't make a difference. When the results produced by this program matched theoretical ones, I was convinced. Out of interest I just programmed your version of the solution and the results are the same.</p>
+</blockquote>
+
+<p>Okay, I'm not an expert but I do think this is technically true, because the expected time remaining until the next event does not depend on the time since the last event. So from a pure results perspective your colleague may be correct. However, there are still two good reasons to write the solution the way it is formulated:</p>
+
+<ol>
+<li>You are relying, perhaps unaware, on a feature unique to exponential distributions. Suppose you were asked to model the same problem, but use a normal distribution for the time it takes to brush or shine shoes (which is probably more reasonable, anyway). Your current code can't be easily changed to account for that; you'll have to rewrite it. Also, if somebody else came along after you, they might not realize this code depends on an exponential distribution; they are likely to be confused (as I was).</li>
+<li>Generating a lot of random numbers has performance implications. Consider the difference between <code>cargo run 1 50 50 10</code> and <code>cargo run 1 1000000000 1000000000 10</code>. These simulations should serve roughly the same number of customers, but the second one calculates nearly two billion random numbers that never get used!</li>
+</ol>
+
+<p>That said, a lot of the advice I have to give here is applicable generally, so let's proceed as if the program's behavior is correct as written. I will restrict myself to comments on the Rust code, as that's what I am more familiar with.</p>
+
+<h1>Versions</h1>
+
+<p>You may be using an older version of Rust. <code>extern crate</code> declarations are not
+needed anymore in the 2018 edition. If you're still on 2015, that's fine; I just
+thought you might like to know.</p>
+
+<p>Most distributions in the <code>rand::distributions</code> module have been moved to a separate
+crate, <code>rand_distr</code>. The old versions are deprecated; I got warnings about it during compilation. I don't know how long ago
+this change was made; you might want to update your dependencies. Again, not necessarily a problem, just FYI.</p>
+
+<h1>Style</h1>
+
+<p>Thank you for using <code>rustfmt</code>.</p>
+
+<p><code>States</code> and <code>Events</code> should be named <code>State</code> and <code>Event</code>, because each <code>enum</code>
+represents a <em>single</em> state or event, not several.</p>
+
+<p>Star imports (like <code>use rand::distributions::*;</code>) are usually inadvisable, like <code>using namespace</code> in C++,
+because they pollute the module namespace. If you have a lot of them you can
+easily lose track of which names come from where. You're only using a couple
+of specific names here, so just write them explicitly:</p>
+
+<pre><code>use rand::distributions::{Distribution, Exp};
+pub use ordered_float::OrderedFloat;
+</code></pre>
+
+<p>(Seeing as nothing else is marked <code>pub</code>, that can presumably go too.)</p>
+
+<p>Don't loop over integers and then index into a slice. Instead, loop over the slice, and possibly throw an <code>.iter().enumerate()</code> in if you need access to the index, so</p>
+
+<pre><code>for i in 0..s.len() { /* do something with s[i] */ }
+</code></pre>
+
+<p>becomes</p>
+
+<pre><code>for element in s { /* do something with element */ }
+// or
+for (i, element) in s.iter().enumerate() { /* if you need i too */ }
+</code></pre>
+
+<h1>Questions</h1>
+
+<h2>Variant is never constructed</h2>
+
+<pre><code>// variant is never constructed: `FirstFinished`, why do I get this message? I can see this variant printed when running the program
+</code></pre>
+
+<p>This looks like a compiler bug in that it doesn't realize that converting from
+an integer, with or without <code>unsafe</code>, can create variants without naming them.</p>
+
+<h2>Integer to <code>enum</code> conversions</h2>
+
+<pre class="lang-rust prettyprint-override"><code>// 1 template function for this? Or any other way to cast integer to enum? Or I should use libraries for this?
+impl From&lt;usize&gt; for States {
+    fn from(s: usize) -&gt; States {
+        let tmp: u8 = s as u8;
+        unsafe { std::mem::transmute(tmp) }
+    }
+}
+</code></pre>
+
+<p>There is no reason to use <code>unsafe</code> here. In fact, as written it is incorrect,
+because passing a <code>usize</code> that doesn't correspond to a valid <code>States</code> could
+cause undefined behavior. As long as you're using safe Rust, the compiler
+protects you from unsafety; when you use <code>unsafe</code>, you assume responsibility
+for writing a <em>safe abstraction</em> that can't be used unsafely.</p>
+
+<p><s>C-like <code>enum</code>s implement the <code>TryInto</code> trait, which you should use instead.
+You can replace the bodies of both functions with <code>s.try_into().unwrap()</code>.</s> Oops, this was a blunder on my part. <code>TryFrom</code>/<code>TryInto</code> are not automatically implemented for C-like enums; that was a requested feature that I thought had been implemented, and compiled when I tried it but actually is incorrect. Instead you should probably just write <code>TryFrom</code> yourself; <a href="https://stackoverflow.com/a/57578431/3650362">here's one example</a>. However, converting enums to integers isn't particularly idiomatic in Rust; if you rewrite the code to use a <code>match</code> as under "Design concerns" below, it's not necessary.</p>
+
+<h2><code>report</code></h2>
+
+<pre class="lang-rust prettyprint-override"><code>//what do I need lifetime 'a for? Is there supertrait that specifies multiple traits? ("Number", "container", idk)
+//Or can I just say that allowed types are f64 and i32?
+fn report&lt;'a, T&gt;(title: &amp;str, counts: &amp;'a [T; States::Dropping as usize])
+where
+    T: std::iter::Sum&lt;&amp;'a T&gt; + std::ops::Div + Copy + Into&lt;f64&gt; + std::fmt::Display,
+{
+</code></pre>
+
+<blockquote>
+  <p>What do I need <code>'a</code> for?</p>
+</blockquote>
+
+<p>Not much, in this example. Named lifetimes are all about specifying
+relationships, in this case, the relationship between <code>counts</code>, which is a
+reference, and <code>Sum&lt;&amp;T&gt;</code> which is a trait satisfied by <code>T</code>. You have <code>T:
+Sum&lt;&amp;'a T&gt;</code>, which means that you can add a bunch of <code>&amp;'a T</code>s and get the sum
+as a <code>T</code>. You have a bunch of <code>&amp;'a T</code>s (the slice) and you need a <code>T</code>, so
+that's the right constraint. There's not much more to it than that.</p>
+
+<blockquote>
+  <p>Is there a supertrait that specifies multiple [number-like] traits?</p>
+</blockquote>
+
+<p>There are traits like that, defined in the <code>num_traits</code> crate. You usually
+want <code>num_traits::Num</code> to do general math on a generic type. But it's not
+really needed here; if you change the <code>events</code> line to</p>
+
+<pre><code>    let events: f64 = counts.iter().copied().map(Into&lt;f64&gt;::into).sum();
+</code></pre>
+
+<p>you only need <code>T: Copy + Into&lt;f64&gt;</code> to implement the whole function. (This line looks pretty ugly; probably there's something nice and elegant I'm overlooking.)</p>
+
+<h2>Calling <code>into</code></h2>
+
+<pre class="lang-rust prettyprint-override"><code>            Into::&lt;States&gt;::into(i),
+            Into::&lt;f64&gt;::into(counts[i]) / Into::&lt;f64&gt;::into(events) // How to call Into properly? this looks bad
+</code></pre>
+
+<p>If you really need to specify the type argument to <code>Into</code>, that's how you
+would do it, but that's unusual. Most of the time you can just write
+<code>.into()</code>. When the types implement <code>From</code>, that is also often somewhat
+cleaner.</p>
+
+<pre class="lang-rust prettyprint-override"><code>            States::from(i),
+            counts[i].into() / events.into()
+</code></pre>
+
+<p>You have several other <code>into</code>s scattered in this loop:</p>
+
+<pre><code>    for (time, event) in timeline { ... }
+</code></pre>
+
+<p>But they're all turning <code>time</code>, which is an <code>OrderedFloat&lt;f64&gt;</code>, into a
+regular <code>f64</code>. You don't need to do that; because <code>OrderedFloat</code> is just a
+newtype struct, you can just access the inner value with <code>.0</code>. Or in this
+case, since you don't actually need the <code>OrderedFloat</code> inside the loop, you
+may use a destructuring pattern to pull it out as you iterate.</p>
+
+<pre><code>    for (OrderedFloat(time), event) in timeline { ... }
+</code></pre>
+
+<h2><code>OrderedFloat</code></h2>
+
+<pre class="lang-rust prettyprint-override"><code>    // I don't like OrderedFloat because it's a wrapper. Is there a way to implement Ord for floats and keep nice syntax?
+    // Maybe it's the problem of algorithm. Any proposals?
+    let mut timeline: BTreeMap&lt;OrderedFloat&lt;f64&gt;, Events&gt; = BTreeMap::new();
+</code></pre>
+
+<p>Not really, you need to decide somehow how to handle NaNs. If NaNs aren't a
+possibility, maybe floating-point numbers aren't an appropriate type. An
+alternative might be to pick a unit, like 1 nanosecond, and just keep all your
+times and durations as integers, only converting them for display purposes.</p>
+
+<h2>Emulating <code>do</code> loops</h2>
+
+<pre class="lang-rust prettyprint-override"><code>        //Is it ok to emulate do while loops like this?
+        while {
+            /* loop body that returns true or false */
+        } {}
+</code></pre>
+
+<p>I mean, I guess it works, but ew. Just use <code>loop</code> and have <code>if condition {
+break; }</code> in there somewhere.</p>
+
+<h1>Design concerns</h1>
+
+<p><code>main</code> is too long. pacmaninbw's advice applies as well to Rust as to C++. I'd try to move some of that logic out to methods of <code>State</code>.</p>
+
+<p>I like the way you use <code>derive(Default)</code> to avoid doing unnecessary work;
+that feels nice and idiomatic.</p>
+
+<p>The <code>Invalid</code> state of your machine makes me slightly uncomfortable. There are
+uses for such things but it looks like you could get rid of it entirely and
+just panic immediately when you encounter an invalid state/event combination,
+rather than making your state temporarily invalid until the next loop
+iteration.</p>
+
+<p>There's another thing that also seems awkward to me, and that's the repeated
+use of <code>States::Dropping as usize</code> for an array size. This use of <code>enum</code>s is
+normal in C but in Rust it just feels out of place; <code>enum</code> is not just a
+renamed integer but a full-featured sum type. Ideally, you would make use of
+this to write a <code>next_state</code> function that is statically guaranteed to cover
+all the bases:</p>
+
+<pre class="lang-rust prettyprint-override"><code>fn next_state(sr: State, event: Event) -&gt; Option&lt;State&gt; {
+    match sr {
+        State::Empty =&gt; match event {
+            Event::Arrived =&gt; Some(State::First),
+            _ =&gt; None,
+        }
+        State::First =&gt; match event {
+            Event::Arrived =&gt; Some(State::Dropping),
+            Event::FirstFinished =&gt; Some(State::Second),
+            _ =&gt; None,
+        }
+        /* ... */
+    }
+}
+</code></pre>
+
+<p>Turning this into a macro so you can keep the nice table format in the source
+code seems pretty doable.</p>
+
+<h1>Miscellaneous tips</h1>
+
+<pre class="lang-rust prettyprint-override"><code>    let event_to_state: [[States; 5]; 3] = [
+        //                     EMPTY            FIRST             SECOND           WAITING           BOTH
+        /* Arrived */         [States::First,   States::Dropping, States::Both,    States::Dropping, States::Dropping],
+        /* First_Finished */  [States::Invalid, States::Second,   States::Invalid, States::Invalid,  States::Waiting],
+        /* Second_Finished */ [States::Invalid, States::Invalid,  States::Empty,   States::Second,   States::First],
+    ];
+</code></pre>
+
+<p>This is a bit long and noisy compared to the C++ version; you can trim it down
+by adding a <code>use States::*;</code>. Also it should be a <code>const</code> (not quite like C's <code>const</code>; more analogous to <code>constexpr</code> in C++).</p>
+
+<pre class="lang-rust prettyprint-override"><code>    use States::*;
+    #[rustfmt::skip]
+    const EVENT_TO_STATE: [[States; 5]; 3] = [
+        //                     EMPTY    FIRST     SECOND   WAITING   BOTH
+        /* Arrived */         [First,   Dropping, Both,    Dropping, Dropping],
+        /* First_Finished */  [Invalid, Second,   Invalid, Invalid,  Waiting],
+        /* Second_Finished */ [Invalid, Invalid,  Empty,   Second,   First],
+    ];
+</code></pre>
+
+<p>I might consider using a declarative macro instead of a generic function for
+<code>report</code>. It's internal, the abstraction is mostly syntax and the trait bounds
+are not terribly interesting.</p>
+
+<blockquote>
+  <p>I don't really like macros since I come from c++. Are they widely used by Rust community?</p>
+</blockquote>
+
+<p>Yes. Declarative macros (those defined with <code>macro_rules!</code>) are quite different from preprocessor macros (fancy text substitution) like in C.</p>
+
+<ul>
+<li>They resemble C++ templates in that they must be syntactically valid at definition, but don't type check until instantiated.</li>
+<li>Macros are hygienic (names defined in the macro don't leak to the outer scope, or vice versa).</li>
+<li>They are also scoped, so they don't leak out of the function or module in which they are defined.</li>
+</ul>
+
+<p>As with any form of metaprogramming, it's possible to go overboard, but you shouldn't be afraid of using a macro now and again to reduce repetitive code that can't easily be made into a function or generic. Procedural macros are a different story, but they're even more infrequently needed.</p>
+    </div>

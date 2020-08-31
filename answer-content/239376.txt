@@ -1,0 +1,258 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This is the nth version, it is broken down into smaller functions, but uses more CPU to operate.
+I took the above advice to reduce comparisons and also attacked the Collections namespace and And Tuples.</p>
+
+<p>I also changed it from eagerly parsing the entire bitmap search area upfront to only parsing 4 lines at a time. </p>
+
+<p>In an attempt to make it more readable, I broke down operations that could take 1 line into multiline statements.</p>
+
+<p>Small improvements over last version.updates: Fourth Cache Line(QuadCache) Coding conventions followed, removed stackalloc and resulting copy from the stack, added summaries and comments.</p>
+
+<pre><code>using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using NoAlloq;
+
+namespace SlidingBitmap
+{
+    /// &lt;summary&gt;
+    /// Ref struct reads bitmap and stores boolean caches of input to search for, and iterates over the internal bitmap passed in constructor
+    /// Expanding Span with some NoAllog's Linq functionality for Span
+    /// &lt;/summary&gt;
+
+    public ref struct SlidingBitmapCache
+    {
+        /// &lt;summary&gt;
+        /// QuadCache holds Spans to 4 blocks of memory
+        /// &lt;/summary&gt;
+        private ref struct QuadCache
+        {
+            public Span&lt;bool&gt; CacheFirst;
+            public Span&lt;bool&gt; CacheSecond;
+            public Span&lt;bool&gt; CacheThird;
+            public Span&lt;bool&gt; CacheFourth;
+
+            public QuadCache(Span&lt;bool&gt; cacheFirst, Span&lt;bool&gt; cacheSecond, Span&lt;bool&gt; cacheThird, Span&lt;bool&gt; cacheFourth)
+            {
+                CacheFirst = cacheFirst;
+                CacheSecond = cacheSecond;
+                CacheThird = cacheThird;
+                CacheFourth = cacheFourth;
+            }
+        }
+
+        // Desktop QuadCache
+        private QuadCache DesktopCache;
+
+        // Target QuadCache
+        private QuadCache TargetCache;
+
+        // Storage for localizing the Bitmaps width passed in Constructor to SlidingBitmapCache
+        private readonly int DesktopWidth;
+        // Indexes for Desktop and Target bitmaps
+        private Span&lt;int&gt; DesktopIndexes;
+        private Span&lt;int&gt; TargetIndexes;
+
+        // Storage for holding the Locked Bitmap Data for unlocking 
+        // I can't unlock bits unless I cache input from the constructor, 
+        // caching leads to parsing entire bitmap upfront, not the path I want to take.
+        private BitmapData DesktopData { get; }
+
+        /// &lt;summary&gt;
+        /// SlidingBitmapCache 
+        /// Initializes all the necessary variables Start the operation 
+        /// &lt;/summary&gt;
+        /// &lt;param name="desktop"&gt;&lt;/param&gt;
+        public SlidingBitmapCache(Bitmap desktop)
+        {
+            DesktopData = desktop.LockBits(new Rectangle(0, 0, desktop.Width, desktop.Height), ImageLockMode.ReadOnly, PixelFormat.Format1bppIndexed);
+
+            DesktopWidth = desktop.Width;
+
+            DesktopIndexes = new int[4] { 0,  1, desktop.Height - 2, desktop.Height - 1 };
+
+            TargetIndexes = new int[4] { 0, 0, 0, 0 };
+
+            DesktopCache = new QuadCache(new Span&lt;bool&gt;(new bool[DesktopWidth]),
+                                         new Span&lt;bool&gt;(new bool[DesktopWidth]),
+                                         new Span&lt;bool&gt;(new bool[DesktopWidth]),
+                                         new Span&lt;bool&gt;(new bool[DesktopWidth]));
+
+            TargetCache = new QuadCache(Span&lt;bool&gt;.Empty,
+                                        Span&lt;bool&gt;.Empty,
+                                        Span&lt;bool&gt;.Empty,
+                                        Span&lt;bool&gt;.Empty);
+
+            CacheLinesAt(DesktopData, DesktopIndexes, DesktopCache);
+        }
+
+        /// &lt;summary&gt;
+        /// CacheLinesAt 
+        /// copies lines referenced by indexes in data to cache
+        /// &lt;/summary&gt;
+        /// &lt;param name="data"&gt;&lt;/param&gt;
+        /// &lt;param name="indexes"&gt;&lt;/param&gt;
+        /// &lt;param name="cache"&gt;&lt;/param&gt;
+        private void CacheLinesAt(BitmapData data, Span&lt;int&gt; indexes, QuadCache cache)
+        {
+            var dataStride = data.Stride;
+            // iterate over the width of the bitmap on all lines
+            for (int x = 0; x &lt;= data.Width - 1; x++)
+            {
+                unsafe
+                {
+                    byte* ptr = (byte*)data.Scan0;
+                    byte* calcPtr = ptr + (indexes[0] * dataStride) + (x &gt;&gt; 3);
+                    byte firstRet = *calcPtr;
+                    calcPtr = ptr + ((indexes[1]) * dataStride) + (x &gt;&gt; 3);
+                    byte secondRet = *calcPtr;
+                    calcPtr = ptr + (indexes[2] * dataStride) + (x &gt;&gt; 3);
+                    byte thirdRet = *calcPtr;
+                    calcPtr = ptr + (indexes[3] * dataStride) + (x &gt;&gt; 3);
+                    byte fourthRet = *calcPtr;
+                    byte Mask = (byte)(0x80 &gt;&gt; (x &amp; 0x7));
+                    firstRet &amp;= Mask;
+                    secondRet &amp;= Mask;
+                    thirdRet &amp;= Mask;
+                    fourthRet &amp;= Mask;
+                    cache.CacheFirst[x] = firstRet &gt; 0;
+                    cache.CacheSecond[x] = secondRet &gt; 0;
+                    cache.CacheThird[x] = thirdRet &gt; 0;
+                    cache.CacheFourth[x] = fourthRet &gt; 0;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// GetLineAt is used for inline repositioning of a Single Cache line.
+        /// Works the same as above.
+        /// &lt;/summary&gt;
+        /// &lt;param name="data"&gt;&lt;/param&gt;
+        /// &lt;param name="index"&gt;&lt;/param&gt;
+        /// &lt;param name="cache"&gt;&lt;/param&gt;
+        private void GetLineAt(BitmapData data, int index, Span&lt;bool&gt; cache)
+        {
+            unsafe
+            {
+                void* ptr = (byte*)data.Scan0;
+                // iterate over the width of the bitmap on both lines
+                for (int x = 0; x &lt;= data.Width - 1; x++)
+                {
+                    byte ret = *((byte*)ptr + (index * data.Stride) + (x &gt;&gt; 3));
+                    ret &amp;= (byte)(0x80 &gt;&gt; (x &amp; 0x7));
+                    cache[x] = ret &gt; 0;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// GetGoodCacheLinesAt is designed for pulling cache lines with bits set for top and bottom Cache Lines
+        /// as well as setting 2nd and 3rd lines.
+        /// &lt;/summary&gt;
+        /// &lt;param name="target"&gt;&lt;/param&gt;
+        /// &lt;returns name ="Span&lt;int&gt;"&gt;&lt;/returns&gt;
+        private Span&lt;int&gt; GetGoodCacheLines(Bitmap target)
+        {
+            int targetWidth = target.Width;
+            int targetHeight = target.Height - 1;
+            TargetIndexes = new int[] { 0, 1, targetHeight -2, targetHeight -1 };
+            TargetCache = new QuadCache(new Span&lt;bool&gt;(new bool[targetWidth]),
+                                        new Span&lt;bool&gt;(new bool[targetWidth]),
+                                        new Span&lt;bool&gt;(new bool[targetWidth]),
+                                        new Span&lt;bool&gt;(new bool[targetWidth]));
+
+            Span&lt;int&gt; result = new int[] { -1, -1, -1, -1 };
+
+            BitmapData Data = target.LockBits(new Rectangle(0, 0, targetWidth, targetHeight), ImageLockMode.ReadOnly, PixelFormat.Format1bppIndexed);
+
+            while (TargetIndexes[1] &lt;= (target.Height - 1) / 2)
+            {
+                CacheLinesAt(Data, TargetIndexes, TargetCache);
+
+                if (result[0] == -1 &amp;&amp; TargetCache.CacheFirst.AnyTrue())
+                {
+                    result[0] = TargetIndexes[0];
+                }
+
+                if (result[3] == -1 &amp;&amp; TargetCache.CacheFourth.AnyTrue())
+                {
+                    result[3] = TargetIndexes[3];
+                }
+
+                if( result[0] &gt; -1 &amp;&amp; result[3] &gt; -1)
+                {
+                    target.UnlockBits(Data);
+                    result[1] = TargetIndexes[1];
+                    result[2] = TargetIndexes[2];
+                    return result;
+                }
+
+                ++TargetIndexes[0];
+                ++TargetIndexes[1];
+                --TargetIndexes[2];
+                --TargetIndexes[3];
+            }
+            target.UnlockBits(Data);
+            return result;
+        }
+        // TODO:
+        /// &lt;summary&gt;
+        /// Check 4  Cached lines of target against that of search area
+        /// offsets desktop caches to find matches restoring changes
+        /// I want to avoid allocations and copying here as much as feasible
+        /// &lt;/summary&gt;
+        /// &lt;param name="offsets"&gt;&lt;/param&gt;
+        private Point CheckCaches(Span&lt;int&gt; offsets)
+        {
+            int firstIndex = DesktopCache.CacheFirst.IndexOf(TargetCache.CacheFourth);
+            if (firstIndex &gt; -1)
+            {
+
+            }
+            int secondIndex = DesktopCache.CacheSecond.IndexOf(TargetCache.CacheFourth);
+            if (secondIndex &gt; -1)
+            {
+
+            }
+            int thirdIndex = DesktopCache.CacheThird.IndexOf(TargetCache.CacheFirst);
+            if (thirdIndex &gt; -1)
+            {
+
+            }
+            int fourthIndex = DesktopCache.CacheFourth.IndexOf(TargetCache.CacheFirst);
+            if (fourthIndex &gt; -1)
+            {
+
+            }
+            return default;
+        }
+
+        /// &lt;summary&gt;
+        /// The public API for 
+        /// this takes target bitmap and iterates of iternal search area
+        /// checking the cache at each iteration
+        /// &lt;/summary&gt;
+        /// &lt;param name="target"&gt;&lt;/param&gt;
+        /// &lt;returns&gt;Point&lt;/returns&gt;
+        public Point LineCachingSearch(Bitmap target)
+        {
+            Span&lt;int&gt; indexes = GetGoodCacheLines(target);
+            while (DesktopIndexes[1] &lt;= (DesktopData.Height - 2) / 2)
+            {
+                if (CheckCaches(indexes) == default)
+                {
+                    ++DesktopIndexes[0];
+                    ++DesktopIndexes[1];
+                    --DesktopIndexes[2];
+                    --DesktopIndexes[3];
+                    CacheLinesAt(DesktopData, DesktopIndexes, DesktopCache);
+                }
+            }
+            return default;
+        }
+    }
+}
+</code></pre>
+
+<p>Not complete, just POC, Search algorithm with NoAlloq LINQ on Span forthcoming.</p>
+    </div>

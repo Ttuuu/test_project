@@ -1,0 +1,278 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Let’s define some executable example. First: resources to protect. They are not thread safe:</p>
+
+<pre><code>class ResourceA
+{
+    public void A() { Console.WriteLine("A!"); }
+}
+class ResourceB
+{
+    public void B() { Console.WriteLine("B!"); }
+}
+class ResourceC
+{
+    public void C() { Console.WriteLine("C!"); }
+}
+</code></pre>
+
+<p>Resource locator to get access to resources (you manager class). Please also see <a href="http://blog.ploeh.dk/2010/02/03/ServiceLocatorisanAnti-Pattern/" rel="nofollow">here</a>.</p>
+
+<pre><code>class ResourceLocator
+{
+    public T Get&lt;T&gt;() =&gt; Instances
+        .OfType&lt;T&gt;()
+        .FirstOrDefault();
+
+    IEnumerable&lt;object&gt; Instances = new object[] 
+    {
+        new ResourceA(), new ResourceB(), new ResourceC()
+    };
+}
+</code></pre>
+
+<p>Now let's implement protected thread safe <a href="https://en.wikipedia.org/wiki/Facade_pattern" rel="nofollow">façade</a>, which unifies order of locking (like A -&gt; B -&gt; C) to get rid of <a href="https://en.wikipedia.org/wiki/Deadlock" rel="nofollow">dead locks</a>:</p>
+
+<pre><code>class ABCService
+{
+    public ABCService(ResourceLocator resources)
+    {
+        Resources = resources;
+    }
+
+    // Try-Parse pattern, operation here can be skipped if
+    // resources are busy: 
+    // (https://msdn.microsoft.com/en-us/library/ms229009(v=vs.110).aspx)
+    public bool TryAB()
+    {
+        var a = Resources.Get&lt;ResourceA&gt;();
+        var b = Resources.Get&lt;ResourceB&gt;();
+        using (Capture capture = new MultiCapture(a, b))
+        {
+            if (capture)
+            {
+                a.A(); b.B(); a.A();
+            }
+
+            return capture;
+        }
+    }
+
+    // Required operation, Exception will be thrown 
+    // if resources are busy, so operation can not be completed
+    public void BC()
+    {
+        var b = Resources.Get&lt;ResourceB&gt;();
+        var c = Resources.Get&lt;ResourceC&gt;();
+        using (new RequiredCapture(b, c))
+        {
+                c.C(); b.B(); 
+        }
+    }
+
+    // Required operation, takes all three resources
+    // Please note the order of resource capturing - 
+    // it should be the same
+    public void ABC()
+    {
+        var a = Resources.Get&lt;ResourceA&gt;();
+        var b = Resources.Get&lt;ResourceB&gt;();
+        var c = Resources.Get&lt;ResourceC&gt;();
+        using (new RequiredCapture(a, b, c))
+        {
+            c.C(); b.B(); a.A();
+        }
+    }
+
+    ResourceLocator Resources { get; }
+}
+</code></pre>
+
+<p>Now let's define an active (threaded) component. You could find it useful to pass <code>CancellationToken</code> to resource actions to support long running processes termination:</p>
+
+<pre><code>class Actor : IDisposable
+{
+    public Actor(ResourceLocator resources)
+    {
+        var service = new ABCService(resources);
+        Cts = new CancellationTokenSource();
+        Token = Cts.Token;
+        Task.Run(async () =&gt;
+        {
+            while (!Token.IsCancellationRequested)
+            {
+                await Task.Delay(50);
+                if (!service.TryAB())
+                    Console.WriteLine("AB was busy.");
+            }
+        });
+        Task.Run(async () =&gt;
+        {
+            while (!Token.IsCancellationRequested)
+            {
+                await Task.Delay(100);
+                try
+                {
+                    service.BC();
+                }
+                catch
+                {
+                    Console.WriteLine("BC was busy.");
+                }                    
+            }
+        });
+    }
+
+    public void Dispose()
+    {
+        Cts.Cancel();
+        Cts.Dispose();
+    }
+
+    CancellationTokenSource Cts { get; }
+    CancellationToken Token { get; }
+}
+</code></pre>
+
+<p>Let’s run:</p>
+
+<pre><code>class Program
+{
+    static void Main(string[] args)
+    {
+        var resources = new ResourceLocator();
+
+        // we can safely have more than one actor
+        var a1 = new Actor(resources); 
+        var a2 = new Actor(resources);
+
+        Console.ReadLine();
+    }
+}
+</code></pre>
+
+<p>Library code:</p>
+
+<pre><code>public abstract class Capture : IDisposable
+{
+    public static implicit operator bool(Capture capture) =&gt;
+        capture.Active;
+
+    protected abstract bool Active { get; }
+    public abstract void Dispose();
+}
+
+public class TargetCapture : Capture
+{
+    public TargetCapture(object target)
+    {
+        if (Monitor.TryEnter(target))
+            Target = target;
+    }
+
+    protected override bool Active =&gt; Target != null;
+
+    public override void Dispose()
+    {
+        if (!Active)
+            return;
+
+        Monitor.Exit(Target);
+        Target = null;
+    }
+
+    object Target { get; set; }
+}
+
+public class MultiCapture : Capture
+{
+    public MultiCapture(params object[] targets)
+    {
+        Captures = targets
+            .Select(t =&gt; new TargetCapture(t))
+            .ToArray();
+
+        if (!Active)
+            Dispose();
+    }
+
+    protected override bool Active =&gt; 
+        Captures.All(c =&gt; c);
+
+    public override void Dispose()
+    {
+        foreach (var capture in Captures)
+            capture.Dispose();
+    }
+
+    IEnumerable&lt;Capture&gt; Captures { get; }
+}
+
+public class RequiredCapture : MultiCapture
+{
+    public RequiredCapture(params object[] targets)
+        : base(targets)
+    {
+        if (!Active)
+            throw new InvalidOperationException();
+    }
+}
+</code></pre>
+
+<p><strong>UPDATE</strong> Just in case if you never block a sequence of resources:</p>
+
+<pre><code>class ResourceLocator
+{
+    public void Lock&lt;T&gt;(Action&lt;T&gt; handler)
+    {
+        var obj = Get&lt;T&gt;();
+        using (new RequiredCapture(obj))
+            handler(obj);
+    }
+
+    public bool TryLock&lt;T&gt;(Action&lt;T&gt; handler)
+    {
+        var obj = Get&lt;T&gt;();
+        using (var capture = new TargetCapture(obj))
+        {
+            handler(obj);
+            return capture;
+        }
+    }
+
+    T Get&lt;T&gt;() =&gt; Instances
+        .OfType&lt;T&gt;()
+        .FirstOrDefault();
+
+    IEnumerable&lt;object&gt; Instances = new object[] 
+    {
+        new ResourceA(), new ResourceB(), new ResourceC()
+    };
+}
+</code></pre>
+
+<p>Now:</p>
+
+<pre><code>class Program
+{
+    static void Main(string[] args)
+    {
+        var resources = new ResourceLocator();
+        Task.Run(() =&gt; 
+        {
+            while (true)
+                resources.Lock&lt;ResourceA&gt;(a =&gt; a.A());                                
+        });
+        Task.Run(() =&gt; 
+        {
+            while (true)
+            {
+                resources.Lock&lt;ResourceA&gt;(a =&gt; a.A());                                
+                resources.Lock&lt;ResourceB&gt;(b =&gt; b.A());                                
+            }
+        });
+
+        Console.ReadLine();
+    }
+}
+</code></pre>
+    </div>

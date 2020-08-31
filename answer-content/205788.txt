@@ -1,0 +1,149 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Some problems</h1>
+<h2>Complex, indeterminate, non intuitive behaviour</h2>
+<p>There is a fundamental flaw in the <code>Pool</code> object due to the use of a resolved promise to reset the object.</p>
+<p>Calling <code>free</code> and <code>allocate</code> in the same execution context will result in allocated object having either a reset content or assigned content in later execution context. As event and call stack order is indeterminate this means the content of any allocated objects is also indeterminate after the function using pool exits.</p>
+<p>Consider the example below</p>
+<ul>
+<li><p>Create pool with default object <code>const pool = new Pool({a: 1}, 10)</code></p>
+</li>
+<li><p>Get pooled object with <code>pool.allocate()</code> assign to <code>o1</code> then free it with <code>pool.free(o1)</code>.</p>
+</li>
+<li><p>In the same execution,  get another pooled object <code>Pool.allocate()</code> assigned to <code>o2 = {a : 3}</code> which will be the free object <code>o1</code> so that  <code>o1===o2</code> is <code>true</code>. The promise to reset <code>o1</code> is still pending and will not execute until execution is idle and event queue empty of any events registered before the promise was created.</p>
+</li>
+<li><p>In separate execution context the content of <code>o2</code> will not be as casually expected <code>{a : 3}</code> but <code>{a : 1}</code></p>
+</li>
+</ul>
+<p></p><div class="snippet" data-lang="js" data-hide="false" data-console="true" data-babel="false">
+<div class="snippet-code">
+<pre class="snippet-code-js lang-js prettyprint-override"><code>setTimeout(() =&gt; {
+  const test = {a: 1};
+  const pool = new Pool({a: 1}, 10);
+
+  function logObject(name, obj, mess) {
+    console.log("Ref " + name + " {a : " + obj.a +"}; // " + mess);
+  }
+
+  function createTest(val) { // function to allocate
+    const ref = pool.allocate();
+    ref.a = val;
+    return ref
+  }
+  console.log("Call pool.allocate();");
+  var o1 = createTest("2");
+  logObject("o1", o1, "Ref assigned to o1");
+  
+  console.log("Call pool.free(o1);");
+  pool.free(o1);
+  logObject("o1", o1, "After pool.free(o1).");
+  
+  // Allocate another
+  console.log("Call pool.allocate();");
+  var o2 = createTest("3");
+  logObject("o2", o2, "Ref assigned to o2");
+
+  // however the pending promise will reset the object 
+  setTimeout(() =&gt; {
+    // 
+    logObject("o2", o2, "o2 in new execution context reset, expected {a: 3}"); 
+  });
+  console.log("Exit current execution context.");
+}, 0);
+
+
+
+
+
+/* OP's Pool */
+const Pool = function() {
+  const Free = new WeakMap,
+        Next = new WeakMap,
+        Default = new WeakMap,
+        {setPrototypeOf, defineProperty, getOwnPropertyNames, freeze} = Object,
+        {toString, hasOwnProperty} = {},
+  empty = ( obj, template ) =&gt; {
+        let templateNames = getOwnPropertyNames( template ),
+     ownNames = getOwnPropertyNames( obj );
+        for ( let name of [...templateNames, ...ownNames] ) {
+            if( hasOwnProperty.call( template, name ) ) {
+                if( typeof template[name] === 'object' ) {
+                    obj[name] = empty( obj[name], template[name] );
+                } else {
+                    obj[name] = template[name];
+                }
+            } else {
+                delete obj[name];
+            }
+        }
+        return obj;
+    },
+  deepFreeze = (object) =&gt; {
+    let propNames = getOwnPropertyNames(object);
+    for (const name of propNames) {
+      let value = object[name];
+      object[name] = value &amp;&amp; typeof value === "object" ? deepFreeze(value) : value;
+    }
+    return Object.freeze(object);
+  }, deepClone = (object) =&gt; {
+    let result = {}, propNames = getOwnPropertyNames(object);
+    for (let name of propNames) {
+      let value = object[name];
+      result[name] = value &amp;&amp; typeof value === "object" ? deepClone(value) : value;
+    }
+    return setPrototypeOf(result, object.__proto__);
+  };
+  class Pool {
+    constructor(obj, size) {
+      Default.set(this, deepClone(obj));
+      Free.set(this, Array(size).fill().map((item) =&gt; {
+        return deepClone(obj);
+      }).map((item, index, array) =&gt; {
+        return Next.set(item, array[index + 1] || null), item;
+      })[0]);
+    }
+    allocate() {
+      let result = Free.get(this);
+      Free.set(this, Next.get(result));
+      return result;
+    }
+    free(obj) {
+      if (Next.has(obj)) {
+        Next.set(obj, Free.get(this));
+        Free.set(this, obj);
+        Promise.resolve().then(empty.bind(null, obj, Default.get(this)));
+        return;
+      }
+    }
+  }
+  return Pool;
+}();</code></pre>
+</div>
+</div>
+
+<p>It can become very complex as the execution order of events can not be guaranteed, thus what the content of the second allocated object will be is indeterminate.</p>
+<p>Personally I would not consider the responsibility of the Pool to reset the content of pooled objects.</p>
+<h2>Cyclic reference.</h2>
+<p>Your deep clone is unsafe and will result in a call stack overflow for any object that contains a cyclic reference.</p>
+<p>Example</p>
+<pre><code>const test = {};
+test.test = test;
+const pool = new Pool(test,1);  // throws RangeError max call stack size exceeded
+</code></pre>
+<p>You should safeguard the constructor either catching the RangeError, or correctly handling cyclic references.</p>
+<h2>Why <code>weakMaps</code>?</h2>
+<p>I can not workout why you use 3 weakMaps, it seems overly complex and limits the usefulness of the pool restricting the pool to hold only the objects created when pool instantiated.</p>
+<p>Once a reference to an allocated object is lost the pool is reduced with no method available to replenish the pool.</p>
+<p>Would it not be far simpler to use a <code>stack</code> or <code>queue</code> to hold the pool. With <code>Pool.allocate</code> popping from the stack if an object available (undefined if empty). <code>Pool.free(obj)</code> pushing back to the pool and also to preallocate the pool with objects. This would be much simpler.</p>
+<h2>Should the pool construct?</h2>
+<p>Is the pool's role to construct default objects? My view is that it should not be the pool's job to instantiate objects, and as pointed out above, assign default values to free objects.</p>
+<h2>There are also some style issues</h2>
+<p>To name a few...</p>
+<ul>
+<li>Don't capitalize variables that are not constructors (eg <code>Free</code>, <code>Next</code>, and <code>Default</code> should be lowercase).</li>
+<li>Use <code>const</code> for variables that do not change.</li>
+<li>Space between <code>of</code> and <code>[</code> in <code>for of</code> loop</li>
+<li>Keep source code complexity down and avoid one use variables, <code>var propNames = getOwnPropertyNames(object); for (const name of propNames) {</code> can be <code>for (const name of getOwnPropertyNames(object)) {</code></li>
+<li>Use consistent naming. You use <code>object</code> and <code>obj</code> to reference the same type of argument (preference to the idiomatic abbreviation)</li>
+<li>Don't add code that is redundant. In <code>Pool.free</code> the <code>return</code> is redundant and should not be there.</li>
+</ul>
+    </div>

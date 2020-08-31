@@ -1,0 +1,216 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>On the big picture question, you ask for the best OOP conventions, to which the answer is probably “don’t use OOP; use POP (protocol oriented programming)”. Use OOP where you really need hierarchies of concrete types, but that would not appear to the be case here. For example, you’re never instantiating what you called an <code>Events</code> object, but rather you are only instantiating <code>iCal</code> (and <code>GoogleCal</code>, etc.). So we should use a protocol rather than a concrete base type that you never use.</p>
+
+<p>For more information on POP, see WWDC 2015 video <a href="https://developer.apple.com/videos/play/wwdc2015/408/" rel="nofollow noreferrer">Protocol-Oriented Programming in Swift</a> or the equivalent WWDC 2016 video <a href="https://developer.apple.com/videos/play/wwdc2016/419/" rel="nofollow noreferrer">Protocol and Value Oriented Programming in UIKit Apps</a>.</p>
+
+<hr>
+
+<p>So, I would advise replacing <code>Base.swift</code> with:</p>
+
+<pre><code>struct Event {
+    var title: String
+    var startDate: Date
+    var endDate: Date
+    var organizerName: String?
+    var notes: String?
+    var location: String?
+}
+
+struct Calendar {
+    var title: String
+    var isSubscribed: Bool
+}
+
+enum CalendarAuthorizationStatus {
+    case authorized
+    case notAuthorized
+    case notDetermined
+}
+
+protocol CalendarManager {
+    func authorizationStatus() -&gt; CalendarAuthorizationStatus
+    func requestAuthorization(completion: @escaping (Result&lt;Bool, Error&gt;) -&gt; Void)
+    func calendars() -&gt; [Calendar]
+    func events(for calendarName: String, from: Date, to: Date) -&gt; [Event]?
+}
+</code></pre>
+
+<p>I’m doing a few things there:</p>
+
+<ul>
+<li><p>I’ve renamed <code>Events</code> to be <code>CalendarManager</code>. The <code>Events</code> name suggests it’s a collection of event objects, but it’s not. It’s a protocol for interfacing with a calendar subsystem.</p></li>
+<li><p>If an event might not have an organizer name, notes, or a location, then those really should be optionals.</p></li>
+<li><p>I’ve eliminated the redundant/confusing <code>Data</code> suffix to the type names. <code>Data</code> is a very specific type (binary data), and using it as a suffix is unnecessarily confusing and adds cruft to our code.</p></li>
+<li><p>You really want to give <code>requestAuthorization</code> a completion handler (and not bury it in <code>checkAuthorization</code>) because the caller needs to know what to do in the UI if authorization is was not granted, which happens asynchronously. If you don’t supply a completion handler, the app has no way to defer requests until permission is granted, it has no way to present some meaningful error message in the UI if it wasn’t granted, etc.</p></li>
+<li><p>When retrieving events, it strikes me that “no matching data found” is different from “invalid calendar name supplied”, so I might use an optional and use <code>nil</code> to indicate some error.</p></li>
+</ul>
+
+<hr>
+
+<p>On stylistic matters, the code is unswifty. I’d suggest removing the semicolons, eliminate unnecessary enumeration type names, don’t use <code>break</code> in <code>switch</code> statements (this isn’t C, it’s Swift), remove redundant <code>self</code> references. For example, the following:</p>
+
+<pre><code>override func checkForAuthorization() {
+    let status = EKEventStore.authorizationStatus(for: EKEntityType.event);
+
+    switch (status) {
+        case EKAuthorizationStatus.notDetermined:
+            self.requestAccess();
+            break;
+        case EKAuthorizationStatus.authorized:
+            break;
+        case EKAuthorizationStatus.restricted, EKAuthorizationStatus.denied:
+            break;
+     }
+}
+</code></pre>
+
+<p>Can be reduced to:</p>
+
+<pre><code>func checkForAuthorization() {
+    if EKEventStore.authorizationStatus(for: .event) == .notDetermined {
+        requestAccess()
+    }
+}
+</code></pre>
+
+<p>I’d also suggest using trailing closure syntax and not using <code>== true</code> syntax with booleans. Thus, for example, the following:</p>
+
+<pre><code>override func requestAccess() {
+    eventStore.requestAccess(to: EKEntityType.event, completion:{ (accessGranted: Bool, error: Error?) in
+        if accessGranted == true {
+            print("Granted")
+        } else {
+            print("Denied")
+        }
+    });
+}
+</code></pre>
+
+<p>That might be better written as:</p>
+
+<pre><code>func requestAccess() {
+    eventStore.requestAccess(to: .event) { granted, error in
+        if !granted {
+            print("Denied", error ?? "Unknown error")
+        }
+    }
+}
+</code></pre>
+
+<p>Also, in Swift, if you want to get an array of <code>Event</code> from an array of <code>EKEvent</code>, you’d generally use <code>map</code>, eliminating that unnecessary local variable. Also, rather than big <code>if</code> statements that encompass nearly the whole function, you might use <code>guard</code> with early exit</p>
+
+<p>Thus this:</p>
+
+<pre><code>override func getEvents(calendarName: String, from: Date, to: Date) -&gt; [EventData] {
+    let cals = self.eventStore.calendars(for: .event);
+    var events: [EventData] = [];
+
+    if let calIndex: Int = cals.firstIndex(where: { $0.title == calendarName }) {
+        let selectedCalendar: EKCalendar = cals[calIndex];
+
+        let predicate = eventStore.predicateForEvents(withStart: from, end: to, calendars: [selectedCalendar])
+        let _events = eventStore.events(matching: predicate) as [EKEvent];
+
+        for ev: EKEvent in _events {
+            events.append(
+                EventData(
+                    title: ev.title,
+                    startDate: ev.startDate,
+                    endDate: ev.endDate,
+                    organizerName: ev.organizer?.name ?? "",
+                    notes: ev.notes ?? "",
+                    location: ev.location ?? ""
+                )
+            );
+        }
+
+    }
+
+    return events;
+}
+</code></pre>
+
+<p>Might become:</p>
+
+<pre><code>func events(for calendarName: String, from: Date, to: Date) -&gt; [Event] {
+    let calendars = eventStore.calendars(for: .event)
+
+    guard let calendar = calendars.first(where: { $0.title == calendarName }) else {
+        return []
+    }
+
+    let predicate = eventStore.predicateForEvents(withStart: from, end: to, calendars: [calendar])
+
+    return eventStore
+        .events(matching: predicate)
+        .map {
+            Event(
+                title: $0.title,
+                startDate: $0.startDate,
+                endDate: $0.endDate,
+                organizerName: $0.organizer?.name,
+                notes: $0.notes,
+                location: $0.location
+            )
+    }
+}
+</code></pre>
+
+<hr>
+
+<p>Pulling that all together, you end up with a <code>iCal</code> implementation (which I’d call <code>AppleCalendar</code> because the “iCal” brand name isn’t used anymore and this name violates type naming conventions, namely that types should start with uppercase letter), that might look like:</p>
+
+<pre><code>class AppleCalendar: CalendarManager {
+    let eventStore = EKEventStore()
+
+    func authorizationStatus() -&gt; CalendarAuthorizationStatus {
+        switch EKEventStore.authorizationStatus(for: .event) {
+        case .notDetermined:
+            return .notDetermined
+
+        case .authorized:
+            return .authorized
+
+        default:
+            return .notAuthorized
+        }
+    }
+
+    func requestAuthorization(completion: @escaping (Result&lt;Bool, Error&gt;) -&gt; Void) {
+        eventStore.requestAccess(to: .event) { granted, error in
+            if let error = error {
+                completion(.failure(error))
+            } else {
+                completion(.success(granted))
+            }
+        }
+    }
+
+    func calendars() -&gt; [Calendar] {
+        eventStore
+            .calendars(for: .event)
+            .map { Calendar(title: $0.title, isSubscribed: $0.isSubscribed) }
+    }
+
+    func events(for calendarName: String, from: Date, to: Date) -&gt; [Event] {
+        let calendars = eventStore.calendars(for: .event)
+
+        guard let calendar = calendars.first(where: { $0.title == calendarName }) else {
+            return []
+        }
+
+        let predicate = eventStore.predicateForEvents(withStart: from, end: to, calendars: [calendar])
+        return eventStore
+            .events(matching: predicate)
+            .map {
+                Event(title: $0.title,
+                      startDate: $0.startDate,
+                      endDate: $0.endDate,
+                      organizerName: $0.organizer?.name,
+                      notes: $0.notes,
+                      location: $0.location)
+        }
+    }
+}
+</code></pre>
+    </div>

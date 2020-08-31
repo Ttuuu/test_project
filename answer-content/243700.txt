@@ -1,0 +1,422 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Your code seems to be pretty solid and following best practices, so these are going to be fairly nit-picky.</p>
+<h1>Use consistent spacing</h1>
+<p>You seem to be using <code>rustfmt</code>, so that's good. However, main.rs appears to be using tabs and bubble_host is using tabs. It's fine to use either, but don't mix and match them.</p>
+<p>Additionally, markdown headings typically have spacing after them. So instead of:</p>
+<pre><code>///
+///####`remove_socket` Removes given TcpStream from server's `clients`
+///
+/// * Locks `clients` vec (Vec&lt;TcpStream&gt;)
+/// * Removes `socket` from clients list.
+</code></pre>
+<p>In fact, that doesn't even render correctly when using docs.rs: it shows a verbatim <code>####</code>. Instead, write:</p>
+<pre><code>/// #### `remove_socket` Removes given TcpStream from server's `clients`
+///
+/// * Locks `clients` vec (Vec&lt;TcpStream&gt;)
+/// * Removes `socket` from clients list.
+</code></pre>
+<p>However, typically, you don't begin with the function name in its own documentation.</p>
+<h1>Link in your docs</h1>
+<p>When building your documentation with a nightly compiler, as <a href="https://docs.rs" rel="nofollow noreferrer">docs.rs</a> does, simply placing code tags in brackets will automatically create a link to it. So if your docs look like:</p>
+<pre><code>This is a description that mentions `TcpStream`
+</code></pre>
+<p>You can change it to:</p>
+<pre><code>This is a description that mentions [`TcpStream`]
+</code></pre>
+<p>And a link will automatically be created in the generated docs. If the type isn't available locally, or you'd like to describe it with different words, you can do:</p>
+<pre><code>If `TcpStream` is at the root level:
+[`TcpStream`][crate::TcpStream]
+Describe it with [other words][crate::TcpStream] that aren't code
+</code></pre>
+<h1>Use the <a href="https://docs.rs/log/" rel="nofollow noreferrer"><code>log</code></a> crate</h1>
+<p>Instead of</p>
+<pre><code>#[cfg(feature = "bubble_dbg")]
+macro_rules! bubble_print{
+    ($($args:expr), *)=&gt; {println!($($args), *);}
+
+}
+#[cfg(not(feature = "bubble_dbg"))]
+macro_rules! bubble_print {
+    ($($args:expr), *) =&gt; {};
+}
+
+bubble_print!("Removed client {}", &amp;sock_addr.to_string());
+</code></pre>
+<p>Use the <code>debug!</code> macro (or another macro corresponding to your log level):</p>
+<pre><code>debug!("Removed client {}", &amp;sock_addr.to_string());
+</code></pre>
+<p>That way, end users can choose to change log levels and enable/disable logging at runtime in a standard manner.</p>
+<h1>Run <a href="https://github.com/rust-lang/rust-clippy" rel="nofollow noreferrer"><code>cargo clippy</code></a></h1>
+<p>clippy helps fix some problems in your code, so let's take a look at what it suggests.</p>
+<h2>methods called <code>new</code> usually return <code>Self</code></h2>
+<pre><code>warning: methods called `new` usually return `Self`
+  --&gt; src/bubble_host.rs:33:5
+   |
+33 | /     pub fn new() -&gt; ClientsListTS {
+34 | |         Arc::new(Mutex::new(Vec::&lt;TcpStream&gt;::new()))
+35 | |     }
+   | |_____^
+   |
+   = note: `#[warn(clippy::new_ret_no_self)]` on by default
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#new_ret_no_self
+</code></pre>
+<p>Looking at that code:</p>
+<pre><code>pub type ClientsListTS = Arc&lt;Mutex&lt;Vec&lt;TcpStream&gt;&gt;&gt;;
+
+//Helper struct
+struct ClientsList(ClientsListTS);
+impl ClientsList {
+    pub fn new() -&gt; ClientsListTS {
+        Arc::new(Mutex::new(Vec::&lt;TcpStream&gt;::new()))
+    }
+}
+</code></pre>
+<p>That's a bit unusual. In fact, you don't need that at all! The <a href="https://doc.rust-lang.org/nightly/core/default/trait.Default.html" rel="nofollow noreferrer"><code>Default</code></a> trait can be <code>derive</code>d manually, but many things derive it automatically. Specifically, <code>Arc</code> implements it if what it holds does. <code>Mutex</code> implements it if what it holds does. So, does <code>Vec</code> implement <code>Default</code>? <a href="https://doc.rust-lang.org/std/vec/struct.Vec.html#impl-Default" rel="nofollow noreferrer">Sure does</a>! So instead of</p>
+<pre><code>BubbleServer {
+    ip,
+    clients: ClientsList::new(),
+    error_sender: None,
+}
+</code></pre>
+<p>You can write</p>
+<pre><code>BubbleServer {
+    ip,
+    clients: Default::default(),
+    error_sender: None,
+}
+</code></pre>
+<p>And get rid of <code>ClientsList</code> entirely. However, even if that wasn't available, you still shouldn't use that pattern—either make <code>ClientsList</code> a wrapper struct that you actually use, or create a new freestanding function that creates a new <code>ClientsListTS</code>.</p>
+<h2>writing <code>&amp;Vec&lt;_&gt;</code> instead of <code>&amp;[_]</code> involves one more reference and cannot be used with non-Vec-based slices.</h2>
+<pre><code>warning: writing `&amp;Vec&lt;_&gt;` instead of `&amp;[_]` involves one more reference and cannot be used with non-Vec-based slices.
+  --&gt; src/bubble_host.rs:58:18
+   |
+58 |         clients: &amp;ClientsVec,
+   |                  ^^^^^^^^^^^
+   |
+   = note: `#[warn(clippy::ptr_arg)]` on by default
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#ptr_arg
+</code></pre>
+<p>Here, you're forcing the caller to have a <code>Vec</code> of clients. <strong>Generally, you should never take a reference to a <code>Vec</code></strong>. Instead, just write <code>&amp;[TcpStream]</code>.</p>
+<h2>using <code>clone</code> on a double-reference; this will copy the reference instead of cloning the inner type</h2>
+<pre><code>error: using `clone` on a double-reference; this will copy the reference instead of cloning the inner type
+   --&gt; src/bubble_host.rs:155:34
+    |
+155 |         let handle_client_func = handle_client.clone();
+    |                                  ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[deny(clippy::clone_double_ref)]` on by default
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#clone_double_ref
+</code></pre>
+<p>Why are you cloning the callback? Cloning a reference of a type that doesn't implement <code>Clone</code>, which you do, does nothing. However, you should generally use generics for this type of thing, as there could be issues if you want to use a closure—you currently require that you pass a <code>static</code> reference, which may not be possible. Instead, do:</p>
+<pre><code>fn handle_client(
+...,
+handle_client: impl Fn(HandleClientType) + Send + 'static,
+)
+</code></pre>
+<p>There's also no need for it to be <code>Sync</code>, because it's only ever sent across a thread boundary, not shared.</p>
+<h1>Don't send to many clients one-after-another</h1>
+<pre><code>for mut client in clients.iter() {
+    if let Err(e) = client.write_all(&amp;msg) {
+        println!(
+            "Error {} for {}",
+            e,
+            client.peer_addr().unwrap().to_string()
+        )
+    }
+}
+</code></pre>
+<p>What if a client is on a 1 bit per second connection? That's still fast enough for the OS to still leave a connection open (default timeouts are generally in the hours), but they would slow stuff down for every client after them. <code>async</code>/<code>await</code> would fix that, but I understand that you're just learning and don't want to get into that just yet. So instead, the way it's typically done is to have one thread per connection, and then loop over a bunch of <code>mpsc</code>s to send to it. You should also move to a <code>RwLock</code> instead of a <code>Mutex</code>, as that would allow you to have many threads doing non-destructive reading and writing, although you'll need to put in some work in to make sure that you're not waiting forever to write to it.</p>
+<p>However, you could replace that entire thing with a concurrent hashmap, like <a href="https://docs.rs/dashmap/3/dashmap/struct.DashMap.html" rel="nofollow noreferrer"><code>DashMap</code></a>. You could store an <code>AtomicU64</code> that you increase every client, add that as the key and the <code>Sender</code> for the <code>mpsc</code> of the broadcast thread, then just remove the key when the client disconnects.</p>
+<h1>Final code</h1>
+<h2>main.rs</h2>
+<pre><code>mod bubble_host;
+use crate::bubble_host::{BubbleServer, HandleClientType, ServerEvent};
+use std::io;
+use std::io::prelude::*;
+use std::io::{Error, ErrorKind};
+use std::net::TcpStream;
+use std::thread;
+
+///Example implementation of BubbleServer
+
+trait TextChatServer {
+    fn broad_cast_msg(&amp;mut self, msg: &amp;[u8]) -&gt; Result&lt;(), std::io::Error&gt;;
+}
+impl TextChatServer for BubbleServer {
+    fn broad_cast_msg(&amp;mut self, msg: &amp;[u8]) -&gt; Result&lt;(), std::io::Error&gt; {
+        let clients = self.get_clients()?;
+        let clients = clients
+            .lock()
+            .map_err(|e| Error::new(ErrorKind::Other, e.to_string()))?;
+
+        for mut client in clients.iter() {
+            if let Err(e) = client.write_all(&amp;msg) {
+                println!(
+                    "Error {} for {}",
+                    e,
+                    client.peer_addr().unwrap().to_string()
+                )
+            }
+        }
+        Ok(())
+    }
+}
+fn read_stream(stream: &amp;mut TcpStream, recv_buf: &amp;mut [u8], read_bytes: &amp;mut usize) -&gt; usize {
+    *read_bytes = match stream.read(recv_buf) {
+        Ok(read_bytes) =&gt; read_bytes,
+        Err(_) =&gt; 0,
+    };
+    *read_bytes
+}
+trait TcpHelper {
+    fn send_str(&amp;mut self, msg: &amp;str) -&gt; io::Result&lt;()&gt;;
+}
+impl TcpHelper for TcpStream {
+    fn send_str(&amp;mut self, msg: &amp;str) -&gt; io::Result&lt;()&gt; {
+        let data = msg.as_bytes();
+        self.write_all(&amp;data)?;
+        Ok(())
+    }
+}
+//This Function will be called and ran in a new thread every time a new user connects.
+fn handle_new_text_client(client_data: HandleClientType) {
+    // HandleClientType provides the stream that is being handled and the server it's being called from so the user could access functions from the server
+    let buffer_size = 1000;
+    let (stream, server_reference) = client_data;
+    println!(
+        "Client connected!! ip {}",
+        stream.peer_addr().unwrap().to_string()
+    );
+    stream
+        .send_str(&amp;stream.peer_addr().unwrap().to_string())
+        .unwrap_or_else(|err| {
+            println!(
+                "err writing ip to stream, ip {}, err :{}",
+                &amp;stream.peer_addr().unwrap().to_string(),
+                err
+            )
+        });
+    let mut recv_buf = vec![0u8; buffer_size];
+    let mut bytes_read: usize = 0;
+    while read_stream(stream, &amp;mut recv_buf, &amp;mut bytes_read) &gt; 0 {
+        if let Err(e) = server_reference.broad_cast_msg(&amp;recv_buf[..bytes_read]) {
+            println!("Error: {}", e);
+        };
+    }
+}
+
+fn main() {
+    env_logger::init();
+    let server = BubbleServer::new(String::from("localhost:25568"));
+    //Receive events from Server
+    server.set_on_event(|event: ServerEvent| match event {
+        ServerEvent::Disconnection(socket_addr) =&gt; println!("Disconnection from {}", socket_addr),
+        _ =&gt; (),
+    });
+    if let Err(e) = server.start(&amp;handle_new_text_client) {
+        println!("Error starting server: {}", e);
+    };
+    //Blocks this thread here as server.start runs in another thread
+    thread::park();
+}
+</code></pre>
+<h2>bubble_host.rs</h2>
+<pre><code>use std::io;
+use std::io::{Error, ErrorKind};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::mpsc::{channel, Sender};
+use std::sync::*;
+use std::thread;
+use std::vec::Vec;
+use log::debug;
+
+/// Events for debugging and getting information from the server.
+pub enum ServerEvent {
+    None,
+    Disconnection(SocketAddr),
+}
+type ErrorSender = Option&lt;Sender&lt;ServerEvent&gt;&gt;;
+
+/// Clients List Thread Safe
+pub type ClientsListTS = Arc&lt;Mutex&lt;Vec&lt;TcpStream&gt;&gt;&gt;;
+
+/// Data that is sent to user provided FnMut `set in fn start` when a client connects to a
+/// started(fn start) server
+pub type HandleClientType&lt;'a&gt; = (&amp;'a mut TcpStream, &amp;'a mut BubbleServer);
+
+#[derive(Clone)]
+pub struct BubbleServer {
+    ip: String,
+    error_sender: ErrorSender,
+    clients: ClientsListTS,
+}
+
+impl BubbleServer {
+    pub fn new(ip: String) -&gt; Self {
+        BubbleServer {
+            ip,
+            clients: Default::default(),
+            error_sender: None,
+        }
+    }
+
+    fn get_sock_index(
+        clients: &amp;[TcpStream],
+        socket_addr: &amp;std::net::SocketAddr,
+    ) -&gt; io::Result&lt;usize&gt; {
+        clients
+            .iter()
+            .position(|x| &amp;x.peer_addr().unwrap() == socket_addr)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("Could not find socket address: '{}' ", socket_addr),
+                )
+            })
+    }
+    /// used to retrieve socket from clients by ip address
+    /// # Example:
+    /// ```
+    /// let server = BubbleServer::new(String::from("localhost:25568"));
+    /// let addr_to_find: SocketAddr = "127.0.0.1:25565"
+    ///     .parse()
+    ///     .expect("Could not parse ip address!");
+    /// let socket = server.get_sock(&amp;addr_to_find);
+    /// assert!(socket.is_none());
+    /// ```
+    #[allow(dead_code)]
+    pub fn get_sock(&amp;self, socket_addr: &amp;SocketAddr) -&gt; Option&lt;TcpStream&gt; {
+        let clients = self.get_clients().ok()?;
+        let clients = clients.lock().ok()?;
+        if let Ok(index) = BubbleServer::get_sock_index(&amp;clients, socket_addr) {
+            Some(clients[index].try_clone().unwrap())
+        } else {
+            None
+        }
+    }
+
+    /// Shutdown the socket, then send a disconnection event to the `error_sender`.
+    fn handle_socket_disconnection(&amp;self, socket: &amp;TcpStream) -&gt; io::Result&lt;()&gt; {
+        self.remove_socket(&amp;socket)?;
+        let sock_addr = socket.peer_addr().unwrap();
+
+        socket
+            .shutdown(Shutdown::Both)
+            .expect("Could not shutdown stream..");
+        let event = ServerEvent::Disconnection(sock_addr);
+        let sender = self.error_sender.as_ref();
+        if let Some(sender) = sender {
+            sender
+                .send(event)
+                .unwrap_or_else(|e| println!("error sending to error_sender {}", e));
+        }
+        debug!("Removed client {}", sock_addr);
+        Ok(())
+    }
+
+    /// `get_clients` Returns clients list reference using [`Arc::clone`].
+    pub fn get_clients(&amp;self) -&gt; io::Result&lt;ClientsListTS&gt; {
+        Ok(Arc::clone(&amp;self.clients))
+    }
+    #[allow(dead_code)]
+    pub fn set_on_event&lt;F: Fn(ServerEvent) + Send + Sync + 'static&gt;(&amp;self, callback: F) {
+        let (err_send, err_rec) = channel::&lt;ServerEvent&gt;();
+        self.error_sender.as_ref().get_or_insert(&amp;err_send);
+        let call = Arc::new(callback);
+        std::thread::spawn(move || loop {
+            let event = err_rec.recv().unwrap_or(ServerEvent::None);
+            call(event);
+        });
+    }
+    /// Removes given TcpStream from server's `clients`
+    ///
+    /// * Locks `clients` vec ([`Vec`]`&lt;`[`TcpStream`]`&gt;`)
+    /// * Removes `socket` from clients list.
+    fn remove_socket(&amp;self, socket: &amp;TcpStream) -&gt; io::Result&lt;()&gt; {
+        //Is this the least verbose way to dereference this?
+        let clients = self.get_clients()?;
+        let mut clients = clients
+            .lock()
+            .map_err(|err| io::Error::new(ErrorKind::Other, err.to_string()))?;
+
+        let socket_addr = socket.peer_addr()?;
+
+        let index = BubbleServer::get_sock_index(&amp;clients, &amp;socket_addr)?;
+        clients.remove(index);
+        Ok(())
+    }
+    /// Runs the user's defined function in a new thread passing in the newly connected socket.
+    fn handle_client(
+        &amp;self,
+        socket: &amp;mut TcpStream,
+        handle_client: impl Fn(HandleClientType) + Send + 'static,
+    ) -&gt; io::Result&lt;()&gt; {
+        let mut socket = socket.try_clone()?;
+        let mut _self = self.clone();
+        thread::spawn(move || {
+            handle_client((&amp;mut socket, &amp;mut _self));
+
+            _self
+                .handle_socket_disconnection(&amp;socket)
+                .unwrap_or_else(|e| {
+                    println!("Error in handling socket disconnection, Err: '{}' ", e);
+                });
+        });
+        Ok(())
+    }
+    ///Locks `clients` ([`Vec`]`&lt;`[`TcpStream`]`&gt;`) and adds `socket` to Vec
+    fn add_client(&amp;self, socket: TcpStream) {
+        self.clients.lock().unwrap().push(socket);
+    }
+
+    /// Continously accepts incoming connections
+    /// * Is non blocking.
+    /// * Locks clients list when user connects
+    pub fn start(&amp;self, handle_client_cb: impl Fn(HandleClientType) + Send + Clone + 'static) -&gt; io::Result&lt;()&gt; {
+        let ip = &amp;self.ip;
+        debug!("server with  ip of {} has started...", ip);
+        let socket_acceptor = TcpListener::bind(ip).expect("Failed to initialize server...");
+
+        //I'm not a fan of cloning the server struct, but I didn't want the user to have the potential to deadlock the server
+        //without explicitly locking mutex's in their own code.
+        //for example it should be obvious that this will deadlock when a user connects
+        // ```
+        // {
+        //     let server = BubbleServer::new(String::from("localhost:25568"));
+        //     let clients = server.get_clients().expect("could not get clients!");
+        //     let clients = clients.lock().unwrap();
+        //     server.start(&amp;|data: HandleClientType| {
+        //         println!("new connection! dropping now!");
+        //     });
+
+        //     thread::park();
+        // }
+        // ```
+        let self_ = self.clone();
+
+        // Accept new incoming connections
+        thread::spawn(move || loop {
+            println!("waiting for next client..");
+            if let Ok((mut socket, _)) = socket_acceptor.accept() {
+                //Add Client to the clients vector
+                self_.add_client(
+                    socket
+                        .try_clone()
+                        .expect("Could not clone socket before handling socket.."),
+                );
+                //Run user's implementation on how to deal with new client
+                self_
+                    .handle_client(&amp;mut socket, handle_client_cb.clone())
+                    .unwrap_or_else(|e| {
+                        println!("Error in handle_client : {}", e);
+                    });
+            }
+            // Could provide implementation for an erroneous accept, and send that to the error_sender.
+            // but if many clients were to make erroneous connections this might just clutter the error_sender's receive.
+        });
+        Ok(())
+    }
+}
+<span class="math-container">```</span>
+</code></pre>
+    </div>

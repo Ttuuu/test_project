@@ -1,0 +1,169 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Networking Concerns</h1>
+
+<p>I'm going to assume that <code>stream</code> is a <code>NetworkStream</code> in the Server. It is <em>really really</em> important that you understand that stuff which 'just happens to work' with a 'normal' stream, <em>won't</em> work with a <code>NetworkStream</code>, which also doesn't provide a 'complete' <code>Stream</code> implementation (being non-seeking and such it can't).</p>
+<p>Your code currently could behave <em>very oddly</em> and somewhat non-deterministically depending on the interface between the server and client computers, and likely the lengths of messages.</p>
+<p>I'm going to provide a full-enough answer here, because I can't find any that I really like on SO (I'm sure there are good ones, I just can't find them). Networked code is hard enough to write that I won't say anything about buffering and the performance implications thereof (not least because I don't really understand it myself, and have never bothered to properly profile any of my code).</p>
+<p>Note that there are <em>loads</em> of examples of this deficiency all over the web (and not enough explanations of the problem, I hope mine isn't too painful).</p>
+<hr>
+<p>Unfortunately, network programming isn't quite so easy: because TCP is stream based, you never really know when a 'message' has ended. The problem with your code is a result of the lone call to <a href="https://msdn.microsoft.com/en-us/library/system.net.sockets.networkstream.read%28v=vs.110%29.aspx?f=255&amp;MSPPError=-2147217396" rel="nofollow noreferrer"><code>stream.Read(byte[], int, int)</code></a>... and unfortunately the MSDN example has the same problem!</p>
+<p>Essentially, this code is insufficient:</p>
+<pre><code>byte[] msg = new byte[4096];
+var count = stream.Read(msg, 0, msg.Length);
+string returnData = Encoding.ASCII.GetString(msg, 0, count);
+string command = returnData.Substring((returnData.IndexOf("%") + 1), (returnData.IndexOf("&amp;") -1));
+</code></pre>
+<p>I <em>imagine</em> you will never see this problem if you test the code on a single machine; however, over the internet I suspect it will become somewhat apparent with longer messages. As I said, <code>Read</code> can't know when the message your client has sent ends... so when should it return? The answer is... I don't know, it just does at some point: I don't know if there are any guarantees, and it's most certainly OS/Configuration dependant, so you shouldn't make any assumptions.</p>
+<p>Currently you are just hoping that when calling "Read" you will receive a full message: you could well receive only part of a message, or even two messages (or parts of two messages, etc.). TCP ensures that you will receive the stream of bytes in the right order, or know that you have lost communications, but it has no concept of 'packets' (or messages) like UDP does, which is why TcpClient exposes a <code>NetworkStream</code>.</p>
+<p>Example:</p>
+<pre><code>Client Sends "%DisplayRemoteMessageBox&amp;Hello, World!#"
+Server Received "%DisplayRemoteMessageB" -&gt; print to console
+Server Received "ox&amp;Hello, World!#" -&gt; print to console
+</code></pre>
+<p>The server can cut-up the stream any way it likes, so you have to design a protocol so that <em>you</em> can work out where stuff starts and ends (if necessary, which it is for you).</p>
+<p>How exactly you want to 'fix' this depends on your system. You are using ASCII explicitly, so you could easily enough do a byte-by-byte (char-by-char) 'text' stream analysis to extract messages (e.g. look for <code>%</code> to start a message, and wait for <code>#</code> to end it). This is how some older protocols like IRC work, where they use some method to identify new-lines in communications, which defines the separation between messages. This involves looking at each byte you read, deciding if it has a special meaning, and acting on it accordingly. This can be fiddly and is easy to make inefficient.</p>
+<p>A cleaner solution is to define a simple protocol which allows you to determine the length of a 'message' before you read it. The main advantage of this is that you no longer need to know what a message 'looks like' to read it: this means it can look like )anything_ (note that your current code doesn't allow you to send a <code>#</code> as part of a message, because <code>#</code> has meaning). This will (probably) be a binary protocol, where you define each message as a 'packet', which starts by declaring its length, and then streams the message.</p>
+<p>On the client, you simply have to work out how long your messages are, and send the length before you send the message. On the server, you start by reading the length, and then you read <em>that many bytes</em> so you know that you have the full message. You could process the message as you receive it (e.g. for file transfer, you wouldn't wait until you've received all the bytes to start writing it disk), but for small messages you can just accumulate all the bytes in a buffer and process it in one.</p>
+<p>I always use this binary 'packet' method for networking - not least because I have no desire to think about Unicode and its implications - so here is a rough sketch of how you might implement it to send individual strings (with lots of comments for in-line explanation). I'll make no guarantees that this code will work out-of-the-box.</p>
+<h3>Notice about <code>BinaryWriter</code> and friends</h3>
+<p>Much of what I have just described (and below implement) is facilitated by the <a href="https://msdn.microsoft.com/en-us/library/system.io.binaryreader.aspx" rel="nofollow noreferrer"><code>BinaryReader</code></a> and <a href="https://msdn.microsoft.com/en-us/library/system.io.binarywriter(v=vs.110).aspx" rel="nofollow noreferrer"><code>BinaryWriter</code></a> classes in the BCL. However, both these classes assume/enforce little-endian byte order, which is not ideal when most of the networking world has agreed on big-endian. I present the below <s>because I forgot that <code>BinaryWriter</code> was little-endian</s> to show the concepts above explicitly, and to show a viable solution for big-endian communications (e.g. when interoping with existing big-endian protocols / variable endian protocols (I'm sure they exist))</p>
+<h2>Client Side</h2>
+<p>As suggested by BKSpurgeon, factor out the message writing in your two event handlers: the code is basically the same at the moment. What you want is a new method to send a string to the server, a very simple API indeed (which is no bad thing).</p>
+<pre><code>/// &lt;summary&gt; Sends a length-prepended (Pascal) string over the network &lt;/summary&gt;
+private void SendMessage(string message)
+{
+    NetworkStream networkStream = client.GetStream();
+
+    // turn the string message into a byte[] (encode)
+    byte[] messageBytes = Encoding.ASCII.GetBytes(message); // a UTF-8 encoder would be 'better', as this is the standard for network communications
+
+    // determine length of message
+    int length = messageBytes.Length;
+
+    // convert the length into bytes using BitConverter (encode)
+    byte[] lengthBytes = System.BitConverter.GetBytes(length);
+
+    // flip the bytes if we are a little-endian system: reverse the bytes in lengthBytes to do so
+    if (System.BitConverter.IsLittleEndian)
+    {
+        Array.Reverse(lengthBytes);
+    }
+
+    // send length
+    networkStream.Write(lengthBytes, 0, lengthBytes.Length);
+
+    // send message
+    networkStream.Write(messageBytes, 0, length);
+}
+
+// example calls
+private void btnSend_Click(object sender, EventArgs e)
+{
+    msg = "%" + txtMsg.Text + "&amp;";
+    SendMessage(msg);
+}
+
+// example calls
+private void btnMsgBox_Click(object sender, EventArgs e)
+{
+    msg = "%DisplayRemoteMessageBox&amp;" + txtMsg.Text + "#";
+    SendMessage(msg);
+}
+</code></pre>
+<p>Hopefully this is mostly pretty easy to follow. Note the 'endian flip' of the length: <a href="https://en.wikipedia.org/wiki/Endianness" rel="nofollow noreferrer">Endianness</a> is a nightmare on its own, and the .NET libraries do not help much. Note the remarks for <a href="https://msdn.microsoft.com/en-us/library/de8fssa4(v=vs.110).aspx" rel="nofollow noreferrer"><code>BitConverter.GetBytes(int)</code></a>: to be efficient, this will just be a blit, which means the result depends on the hardware you are using. This is fine if the destination has the same endianness, but with networking you can't assume that, so we agree to send big-endian, which means flipping the bytes if we are on a little-endian machine. We don't use a <code>BinaryWriter</code> because it is little-endian only, so it's harder to change the endianness (useful for demonstration and compatibility). This is only necessary for primitives like integers; ASCII (and UTF) are both defined the same way for a big- or little-endian system, so there is no issue with the string.</p>
+<p>When you start writing more and more code like this, you'll end up writing dedicated methods for sending integers, strings (the protocol above is basically just sending a <a href="https://en.wikipedia.org/wiki/String_(computer_science)#Length-prefixed" rel="nofollow noreferrer">length-prefix 'Pascal' string</a>), and other primitives; similarly for the server.</p>
+<h2>Server Side</h2>
+<p>on the client, we provide a method to 'send' a string. Duly, on the server, we should probably provide a message to 'receive' a string. I will sketch a very simple blocking solution. For real code, you probably won't something asynchronous, and that facilitates buffer reuse.</p>
+<p>Reading a string requires reading the length, and then the string itself. This is two separate reads, so let's write one method to do this:</p>
+<p>Essentially, because we can't trust <code>NetworkStream.Read(,,)</code> to give us the right number of bytes, we have to repeatedly call <code>NetworkStream.Read(,,)</code> and accumulate the bytes it gives us into a buffer. We only return the buffer to the caller when it is full (i.e. we have read exactly the requested number of bytes).</p>
+<pre><code>/// &lt;summary&gt; Reads a number of bytes from the stream &lt;/summary&gt;
+private byte[] ReadBytes(int count)
+{
+    NetworkStream networkStream = client.GetStream();
+
+    byte[] bytes = new byte[count]; // buffer to fill (and later return)
+    int readCount = 0; // bytes is empty at the start
+
+    // while the buffer is not full
+    while (readCount &lt; count)
+    {
+        // ask for no-more than the number of bytes left to fill our byte[]
+        int left = count - ReadCount; // we will ask for `left` bytes
+        int r = networkStream.Read(bytes, readCount, left); // but we are given `r` bytes (`r` &lt;= `left`)
+
+        if (r == 0)
+        { // I lied, in the default configuration, a read of 0 can be taken to indicate a lost connection
+            throw new Exception("Lost Connection during read");
+        }
+
+        readCount += r; // advance by however many bytes we read
+    }
+
+    return bytes;
+}
+</code></pre>
+<p>There are few ways that the code above can go wrong depending on the configuration (timeout, lost client, etc.), most of which involving a complete breakdown in communication, so the exception thrown will be a welcome one, and can be handled as appropriate. It is 'blocking', which means that it will not return until it has read <code>count</code> many bytes. Asynchronous versions can be written using <code>async</code> or simple call-backs (again, I can't find a good SO reference for this at the moment, but I'm sure I've seen one in the past). With the while loop, it <em>looks</em> like this code will cook your computer, but in reality <code>NetworkStream</code> plays 'nicely' with the TCP stack, and will block until at least the first byte is read.</p>
+<p>Using this <code>ReadBytes(int)</code> method, we can write the <code>ReadMessage</code> method we really want:</p>
+<pre><code>/// &lt;summary&gt; Reads the next message from the stream &lt;/summary&gt;
+private string ReadMessage()
+{
+    // read length bytes, and flip if necessary
+    byte[] lengthBytes = ReadBytes(sizeof(int)); // int is 4 bytes
+    if (System.BitConverter.IsLittleEndian)
+    {
+        Array.Reverse(lengthBytes);
+    }
+
+    // decode length
+    int length = System.BitConverter.ToInt32(lengthBytes, 0);
+
+    // read message bytes
+    byte[] messageBytes = ReadBytes(length);
+
+    // decode the message
+    string message = System.Text.Encoding.ASCII.GetString(messageBytes);
+
+    return message;
+}
+</code></pre>
+<p>Note that there is an obvious <code>read -&gt; decode -&gt; consume</code> process going on here. For anything but the most simple system, I would write a separate <code>ReadInt</code> method which the <code>ReadMessage</code> method would call.</p>
+<p>With <code>ReadMessage</code> written, you can refit the server code, which becomes much tidier:</p>
+<pre><code>while(client.Connected)
+{
+    string message = ReadMessage();
+
+    string command = message.Substring((message.IndexOf("%") + 1), (message.IndexOf("&amp;") -1));
+
+    switch(command)
+    {
+        // ...
+    }
+}
+</code></pre>
+<p>Note that not much has changed in the server or client: they are still using the same protocol you have set up for sending a command: all that has been added is a robust mechanism for sending and receiving a single string. Breaking the code up so that each unit of work is its own method makes it <em>much</em> more maintainable.</p>
+<p><em>As this is really meant to be a code review, I should point out that the second argument for <a href="https://msdn.microsoft.com/en-us/library/aka44szs(v=vs.110).aspx" rel="nofollow noreferrer"><code>message.Substring(,)</code></a>: it is meant to be a length, so you need to subtract the start position for this to work as intended). I have also taken the liberty of renaming <code>returnData</code> as suggested in BKSpurgeon's answer.</em></p>
+<p><em>I put the above into a petty test program to content myself that it compiles and isn't completely broken: <a href="https://gist.github.com/VisualMelon/9e1e8425b0e44012c79d932c2f1ca92b" rel="nofollow noreferrer">example gist</a>; it starts a simple server which just prints messages to the screen, and demonstrates simple lost connection handling (which can be jolly annoying)</em></p>
+<h3>More comments on <code>BinaryWriter</code> and friends in the context of the question</h3>
+<p>Essentially, the above <code>SendMessage</code> and <code>ReadMessage</code> methods perform a big-endian 32bit-length-prefix string transmission. If you can accept little-endian encoding, and the particulr prefix regime that they use, then you can get away with just wrapping your <code>NetworkStream</code>  with a <code>BinaryReader</code>/<code>BinaryWriter</code> and using <a href="https://msdn.microsoft.com/en-us/library/system.io.binaryreader.readstring.aspx" rel="nofollow noreferrer"><code>ReadString()</code></a> and <a href="https://msdn.microsoft.com/en-us/library/yzxa6408(v=vs.110).aspx" rel="nofollow noreferrer"><code>Write(String)</code></a>. Note that these classes use UTF-8 by default, but this is configurable in the constructors. These methods use a variable prefix length for efficiency purposes: you can see an implementation on <a href="https://source.dot.net/#System.Private.CoreLib/BinaryWriter.cs,166b0572d9c907b3,references" rel="nofollow noreferrer">source.dot.net</a>. Note also that length-prefixing is invaluable when sending any discrete packet, and using these built-ins will only help if you are exclusively sending strings. If you do only need strings (e.g. if you are serialising everything as text/XML/JSON before transmitting it), and you can get way with the other constraints (e.g. if you control the protocol so can choose the endianness and prefix regime), then the following may suffice for you:</p>
+<pre><code>public void SendMessage(string message)
+{
+    NetworkStream networkStream = TcpClient.GetStream();
+    using (var binaryWriter = new System.IO.BinaryWriter(networkStream, System.Text.Encoding.UTF8, leaveOpen: true))
+    {
+        binaryWriter.Write(message);
+    }
+}
+
+public string ReadMessage()
+{
+    NetworkStream networkStream = TcpClient.GetStream();
+    using (var binaryReader = new System.IO.BinaryReader(networkStream, System.Text.Encoding.UTF8, leaveOpen: true))
+    {
+        return binaryReader.ReadString();
+    }
+}
+</code></pre>
+<p>The parameter <code>leaveOpen</code> is important here, because the code creates a new <code>BinaryReader</code>/<code>Writer</code> each call, and otherwise it would close the stream when it is disposed. Ideally you would create and hold onto a single instance of each, and dispose them along with the <code>TCPClient</code>.</p>
+<h3>Other</h3>
+<p><a href="https://stackoverflow.com/a/1896865/383598">This SO answer about detecting a lost TCP connection while reading</a> may be of general interest: note that it uses a combination of <code>BinaryRead</code> and a <code>ReadBytes</code> style loop to read a length-prefixed packet for a specific purpose.</p>
+    </div>

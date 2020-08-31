@@ -1,0 +1,248 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Alright, there's a number of issues with the code you posted here. I'll go through it all, and point out issues, step by step:</p>
+
+<pre><code>func (c *Consumer) scanShards(col Collector, streamName string, ids []string) error {
+</code></pre>
+
+<p>Alright, so we have a <code>*Consumer</code> (exported type), with a non-exported <code>scanShards</code> function. That's fine. The thing I'm slightly baffled by is why the <code>Collector</code> is passed as an argument here. In AWS Kinesis terms, a <code>Collector</code> is what you use to send stuff to Kinesis in a single request. To me, it's sort of like a buffered writer. This collector, however, seems to provide the consumer with data about the shards that you're about to consume. The collector is actually a core dependency of your consumer, it seems. It'd make sense for the consumer to have the underlying collector assigned to a field:</p>
+
+<pre><code>type Consumer struct {
+    collector   Collector // Rename needed, though
+    cancelFuncs []context.CancelFunc // more on this later!
+}
+</code></pre>
+
+<p>Because you're dealing with streams, I'd strongly recommend you use the context package, too (I know you are, but you're not getting the most out of it - see below). Convention dictates that the context argument comes first, so the function would now look like this:</p>
+
+<pre><code>func (c *Consumer) scanShards(ctx context.Context, streamName string, ids []string) error {
+</code></pre>
+
+<p>The arguments could probably do with some renaming, but I'm probably the worst person to suggest a good variable name. Anyway, onwards:</p>
+
+<pre><code>    checkpoints, err := col.GetSequenceNumberForShards(streamName, ids)
+    if err != nil {
+        return fmt.Errorf("error retrieving stored checkpoints for shards: %v", err)
+    }
+</code></pre>
+
+<p>Right, so the <em>"collector"</em> has an <em>exported</em> function getting sequence, and you're expecting the collector to be passed in as an argument. This is kind of weird. It'd make much more sense for someone to use a <code>Consumer</code> object and call something like <code>consumer.GetShards()</code>, because that actually <em>tells</em> me something: I know that I'm working with a consumer that is taking its data from a shards X, Y, and Z.<br>
+I've looked at what comes next, but I'll be returning to the <code>checkpoints</code> variable later on. First let me just recommend you look at <a href="https://github.com/pkg/errors" rel="nofollow noreferrer">this package</a> for errors. You're essentially returning a specific error (which is OK), but it's a hard one to detect on the caller-side. The string value of the error still contains all of the raw/initial error value. With the package I linked to, you'd be able to write the same like so:</p>
+
+<pre><code>return errors.Wrap(err, "error retrieving stored checkpoints for shards")
+</code></pre>
+
+<p>Replace the string constant with an exported constant like so</p>
+
+<pre><code>const ErrRetrievingCheckpoints = "error retrievign stroed checkpoints for shards")
+// and use:
+return errors.Wrap(err, ErrRetrievingCheckpoints)
+</code></pre>
+
+<p>And you'll have a much easier time actually detecting what error was returned, without losing the underlying error details.</p>
+
+<p>OK, let's move on to the channel stuff now:</p>
+
+<pre><code>    errc := make(chan error, 1)
+    done := make(chan error, 1)
+    wg := sync.WaitGroup{}
+    wg.Add(len(ids))
+</code></pre>
+
+<p>Right, So you're creating a waitgroup, and add the length of ids to it, so there's going to be 1 routine per ID. Fine. Then you create an error and done channel, both with a buffer of 1. I'll explain how in a bit, but you can (and should) get rid of the <code>done</code> channel entirely. Having said that, channels like <code>done</code> are generally defined as <code>done := make(chan struct{})</code>: no buffer needed, and an empty struct is defined in the golang specs as a 0-byte type. </p>
+
+<p>The error channel, however, has a bit of a problem: Suppose I'm going to start 10 routines, and I've got 3 errors. The first routine to err will write its error value onto the channel, and be done with it. The second and third routines to fail will be blocked, waiting for you to read the error from the channel. You have the code to do this, so you'll get that error, and the second routine will now write a new error value to the channel. The third routine is still blocked!</p>
+
+<p>What your code does next, is cancel all routines (sort of), and wait for the <code>wg.Wait()</code> call to return. Because the third routine is blocked, this will never happen. You've got a deadlock on your hands. The <code>done</code> channel won't get closed, and thus this function won't return, all because your error channel is blocking routines from completing. That's not what we want. There's a quick (and not always ideal) solution to this problem: increase the channel buffer:</p>
+
+<p>errCh := make(chan error, len(ids) -1) // we'll always read 1, hence -1 is big enough</p>
+
+<p>Of course, we're assuming <code>ids</code> is not empty. Just in case, it's always a good idea to add some basic checks like <code>if len(ids) == 0</code> and return early.</p>
+
+<p>Still, I'll explain later how we fix this without having to increase the channel buffers too much. For now, let's carry on with the line-by-line review:</p>
+
+<pre><code>    for _, id := range ids {
+        seqNum := checkpoints[id]
+</code></pre>
+
+<p>Yes, I have an issue with this already. <code>checkpoints</code> clearly is a var of type <code>map[string]string</code>. I know this because <code>ids</code> is <code>[]string</code>, and the <code>seqNum</code> variable is passed to a goroutine with the type <code>string</code>. Why, then, iterate over a slice, and then perform a lookup in a map to get the corresponding value? Why not simply write:</p>
+
+<pre><code>for id, seqNum := range checkpoints {
+</code></pre>
+
+<p>That's a lot cleaner, and reduces the risk of someone else looking at your code and adding something like this:</p>
+
+<pre><code>seqNum, ok := checkpoints[id]
+if !ok {
+    return errors.New("checkpoint missing")
+}
+</code></pre>
+
+<p>Nevermind the risk of someone changing the <code>GetSequenceNumberForShards</code> function to not return an error if not all id's were found! Suppose your <code>ids</code> var holds <code>{"foo", "bar", "zar", "car"}</code>, but the <code>checkpoints</code>  map only was returned without the <code>zar</code> key...</p>
+
+<p>For the same reason, you really should replace <code>wg.Add(len(ids))</code> with <code>wg.Add(len(checkpoints))</code></p>
+
+<p>Right, onwards, let's get stuck in with the context:</p>
+
+<pre><code>        ctx, cancel := context.WithCancel(context.Background())
+        c.cancelFuncs = append(c.cancelFuncs, cancel)
+</code></pre>
+
+<p>Why? Why on earth? You're creating a cancel context for <em>each</em> routine, and append the cancel func to a slice without a way to retrieve a specific cancel function. The slice is also stored on the <code>Consumer</code> type. The function uses a pointer receiver, so there's a genuine risk of race conditions here! Suppose I do this:</p>
+
+<pre><code>go consumer.scanShards(col1, "foo", []string{"a", "b", "c"})
+go consumer.scanShards(col2, "bar", []string{"foo", "bar", "car", "zar"})
+</code></pre>
+
+<p>Both routines are appending to the same slice of cancel functions. They're both calling all of them blindly, too. These routines are messing things up for eachother. And that's just one example, imagine someone coming along and writing this:</p>
+
+<pre><code>func (c *Consumer) Reset() {
+    // restoring some fields
+    c.cancelFuncs = []context.CancelFunc{}
+    // more fields here
+}
+</code></pre>
+
+<p>These kind of things can be really hard to debug, and your code is very vulnerable to these issues. You may think that the <code>Reset</code> func I've written here is an unlikely scenario, but given that there's nothing in your code that actually <em>removes</em> the <code>cancel</code> values from the slice, your slice will grow, and grow, and grow, and things will get slowed down.</p>
+
+<p>OK, I had to rant about these things somewhat, but remember how I said that you ought to have your first argument be a context? Right, do it, it allows the caller to pass in a <code>context.WithCancel</code>, or <code>context.WithTimeout</code>, for example, so the caller can determine whether they want to/need to wait on your function to return. Secondly: why not have <em>all your routines share the same context?</em>. You're just re-wrapping the <code>Background</code> context anyway. Instead of doing that, I'd simply wrap the context from the argument once (outside the loop):</p>
+
+<pre><code>rctx, cfunc := context.WithCancel(ctx)
+</code></pre>
+
+<p>If the context passed as an argument gets cancelled, the cancellation will propagate, if you want to cancel the context, call <code>cfunc</code>, and all your routines will receive the cancellation signal (<code>&lt;-ctx.Done()</code>). The caller is unaffected.</p>
+
+<p>So with this in mind, let's rewrite the loop a bit (more improvements to follow below, but what we have thusfar):</p>
+
+<pre><code>func (c *Consumer) scanShards(ctx context.Context, stream string, ids []string) error {
+    if len(ids) == 0 {
+        return ErrNoIdsProvided
+    }
+    checkpoints, err := c.collector.GetSequenceNumberForShards(stream, ids)
+    if err != nil {
+        return errors.Wrap(err, ErrRetrievingCheckpoints)
+    }
+    if len(checkpoints) == 0 {
+        return ErrNothingToCheck // something like this, should be handled properly
+    }
+    // note ids is irrelevant, checkpoints is the source of truth now
+    errCh := make(chan error, len(checkpoints) - 1)
+    // we'll get rid of this, but I've not explained how, so it's here still:
+    done := make(chan struct{})
+    wg := sync.WaitGroup{}
+    wg.Add(len(checkpoints))
+    // wrap around ctx argument once!
+    rctx, cfunc := context.WithCancel(ctx)
+
+    for id, seqNum := range checkpoints {
+        go func(ctx context.Context, shardID, startSeqNum string) {
+            defer wg.Done()
+            if err := c.scanShard(ctx, shardID, startSeqNum); err != nil {
+                errc &lt;- fmt.Errorf("error in shard %q: %v", shardID, err)
+            }
+        }(rctx, id, seqNum)
+    }
+</code></pre>
+
+<p>OK, that's where we are now. Because the <code>rctx</code> is not in the <code>for</code> scope, and is shared by all routines, you can simply write the routine like so:</p>
+
+<pre><code>go func(id, seqNum string) {
+    defer wg.Done()
+    // note: rctx, not ctx!
+    if err := c.scanShard(rctx, id, seqNum); err != nil {
+        errCh &lt;- err
+    }
+}(id, seqNum)
+</code></pre>
+
+<p>The routine centers around <code>c.scanShard</code>, a function you've not posted, and thus I have no idea what it does (how it uses the context etc...). What is clear to me, though, is that it's an unexported function, and you have control over it. You could just as easily make it into a function that behaves exactly like the routine you wrapped the call in, so you can replace the <code>go func()</code> bit simply with this:</p>
+
+<pre><code>go c.scanShard(rctx, &amp;wg, id, seqNum, errCh)
+// given scanShard looks like this:
+func (c *Consumer) scanShard(ctx context.Context, wg *sync.WaitGroup, id, seqNum string, errCh chan&lt;- error)
+</code></pre>
+
+<p>Anyway, the rest of your code is about tying things together:</p>
+
+<pre><code>    go func() {
+        wg.Wait()
+        close(errc)
+        close(done)
+    }()
+</code></pre>
+
+<p>So waiting for the routines to return before closing the channels, which is fair enough, seeing as writing to a closed channel is bad. Closing the <code>done</code> channel here, though is what actually allows your function to return. But does it add any value?</p>
+
+<pre><code>    err = &lt;-errc
+    if err != nil {
+        for _, cancel := range c.cancelFuncs {
+            cancel()
+        }
+    }
+    &lt;-done // Wait for all goroutines to exit.
+    return err
+}
+</code></pre>
+
+<p>And this is where things get realy messy: you're first checking the error channel (fair enough), but because you're not sure whether or not you've passed the blocking read (<code>err = &lt;-errCh</code>) because the channel was closed or not, you have to check whether or not you actually have an error. If not, you're still checking the  <code>done</code> channel, completely pointlessly. Even with your code as it stands, the <code>done</code> channel is completely redundant, the error channel already does the same thing.</p>
+
+<p>Get rid of <code>done</code>, even with your current code, it serves no purpose whatsoever.</p>
+
+<hr>
+
+<h2>Alternative approach</h2>
+
+<p>I've been ranting plenty for now, and I think this is a decent starting point. When I started looking at your code, my mind did jump to <code>select</code> statements, and using the <code>ctx.Done()</code> to stop calling the <code>scanShard</code> function. I'm not sure if it's actually the better way for this particular case, but it might be worth considering. I'll just include a quick write-up of how I'd write this function using <code>ctx.Done</code> and <code>select</code> to control the flow. It's a bit more verbose, and actually looks more complex than it needs to be IMHO, but it's just to show an alternative approach, that in some cases might be worth considering. I have to say, all code in the answer is untested, and just written as I went along, so typo's and bugs are possible:</p>
+
+<pre><code>package main
+
+import (
+    "context"
+    "fmt"
+    "sync"
+)
+
+func (c *Consumer) scanShards(ctx context.Context, streamName string, ids []string) error {
+    checkpoints, err := c.collector.GetSequenceNumberForShards(streamName, ids)
+    if err != nil {
+        // zerolog
+        c.logger.Error().Err(err).Msg("Error retrieving stored checkpoints for shards")
+        return err
+    }
+
+    errc := make(chan error, 1)
+    defer close(errc)
+    wg := sync.WaitGroup{}
+    wg.Add(len(checkpoints))
+    rctx, cfunc := context.WithCancel(ctx)
+    for id, seqNum := range checkpoints {
+        go func(shardID, startSeqNum string) {
+            defer wg.Done()
+            select {
+            case &lt;-rctx.Done():
+                // context cancelled, no need to do anything
+                return
+            default:
+                if err := c.scanShard(rctx, shardID, startSeqNum); err != nil {
+                    c.logger.Error().Err(err).Msg("Error in shard %q", shardID)
+                    errc &lt;- fmt.Errorf("error in shard %q: %v", shardID, err)
+                }
+            }
+        }(id, seqNum)
+    }
+    go func() {
+        // wg cleared -&gt; cancel context
+        wg.Wait()
+        cfunc()
+    }()
+    select {
+    case &lt;-ctx.Done():
+        // ctx was closed after waitgroup, so nothing to do here
+        return nil
+    case err := &lt;-errc:
+        // error -&gt; cancel routines
+        cfunc()
+        return err // return, this will close channel
+    }
+}
+</code></pre>
+    </div>

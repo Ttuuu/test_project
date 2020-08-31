@@ -1,0 +1,250 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>A constant <code>Zip</code> can't easily be iterated:</p>
+<pre><code>  auto const zip = Zip(a,b);
+
+  for (const auto &amp; z: zip) std::cout &lt;&lt; z &lt;&lt; std::endl;
+</code></pre>
+<p>All that's necessary for that to work is to add some <code>const</code> operators:</p>
+<pre><code>  #define HELPER(OP) \
+    auto OP() const {return std::apply([](auto&amp;&amp;... args){ return ZipIter((args.OP())...);}, zip);}
+    HELPER( begin) HELPER( end)
+    HELPER(rbegin) HELPER(rend)
+    HELPER( cbegin) HELPER( cend)
+    HELPER(crbegin) HELPER(crend)
+  #undef HELPER
+</code></pre>
+<p>There's still more to do here, as it's surprising that a <code>const Zip</code> returns mutable iterators.  Unfortunately, I haven't yet come up with a solution to that problem.  The nearest I got was to separate out the const <code>(r){begin,end}</code> like this:</p>
+<pre><code>#define HELPER(OP)                                                      \
+    auto OP() const {return std::apply([](auto&amp;&amp;... args) { return ZipIter((args.c##OP())...);}, zip);}
+    HELPER(begin) HELPER(end)
+    HELPER(rbegin) HELPER(rend)
+#undef HELPER
+</code></pre>
+<p>but it fails because <code>ZipIter::reference</code> is based on <code>IT::value_type</code>, which doesn't carry the constness with it.  I think I'd need to define a parallel <code>const_ZipIter</code> to support that.</p>
+<hr>
+<p>From C++20 onwards, we can implement <code>operator &lt;=&gt;</code> instead of all the relational operators in <code>ZipIter</code>.</p>
+<hr>
+<p><code>std::size_t</code> is misspelt (and is missing its header), where it's used as a non-type template argument.</p>
+<p>We're also missing an include of <code>&lt;utility&gt;</code>, for <code>std::swap</code> used in <code>ZipRef</code>.</p>
+<hr>
+<p>I think we should be allowing argument-dependent lookup of <code>swap</code> here:</p>
+<blockquote>
+<pre><code>  template &lt;size_t I = 0&gt;
+  void swap(const ZipRef&amp; o) const {
+    std::swap(*(std::get&lt;I&gt;(ptr)), *(std::get&lt;I&gt;(o.ptr)));
+    if constexpr( I+1 &lt; sizeof...(T) ) swap&lt;I+1&gt;(o);
+  }
+</code></pre>
+</blockquote>
+<p>I suggest:</p>
+<pre><code>    void swap(const ZipRef&amp; o) const {
+        swap_impl&lt;0&gt;(o);
+    }
+
+private:
+    template &lt;std::size_t I&gt;
+    void swap_impl(const ZipRef&amp; o) const {
+        using std::swap;
+        swap(*std::get&lt;I&gt;(ptr), *std::get&lt;I&gt;(o.ptr));
+        if constexpr(I+1 &lt; sizeof...(T)) swap_impl&lt;I+1&gt;(o);
+    }
+</code></pre>
+<p>I guess that reversing the order might make for simpler code, but could fail the strong exception guarantee if an element's <code>swap()</code> might throw.</p>
+<p>Also with <code>swap()</code>, I think that this being <code>const</code> is sufficiently weird to justify a decent explanatory comment in the code.  It might save you trying to "fix" this "bug" later!</p>
+<hr>
+<p>Just before our non-member swap, we have a <code>using</code> declaration:</p>
+<pre><code>using std::swap;
+</code></pre>
+<p>Not only do we not need this, it's also poor practice to inflict this on users of the header.</p>
+<hr>
+<p>Misuse can give hard-to-detect problems.  For example, the program crashed when I tried passing inputs of different length.  We could add some error checking to the <code>Zip</code> constructor:</p>
+<pre><code>#include &lt;algorithm&gt;
+#include &lt;functional&gt;
+</code></pre>
+
+<pre><code>    Zip(Container&amp;... z)
+        : zip{z...}
+    {
+        auto const len = {(zip.size())...,};
+        if (std::adjacent_find(len.begin(), len.end(), std::not_equal_to()) != len.end())
+            throw std::invalid_argument("array lengths differ");
+    }
+</code></pre>
+<p>A little further work should be able to add the actual lengths to the exception message to improve its value to the programmer.</p>
+<hr>
+<h1>Modified code</h1>
+<p>This is with my changes; I'm sure there's more improvements that could be made.</p>
+<pre><code>#include &lt;cstdint&gt;
+#include &lt;algorithm&gt;
+#include &lt;functional&gt;
+#include &lt;tuple&gt;
+#include &lt;utility&gt;
+
+template &lt;typename ...T&gt;
+class ZipRef {
+    std::tuple&lt;T*...&gt; ptr;
+public:
+    ZipRef() = delete;
+    ZipRef(const ZipRef&amp; z) = default;
+    ZipRef(ZipRef&amp;&amp; z) = default;
+    ZipRef(T* const... p): ptr(p...) {}
+
+    ZipRef&amp; operator=(const ZipRef&amp; z)             { return copy_assign(z); }
+    ZipRef&amp; operator=(const std::tuple&lt;T...&gt;&amp; val) { return val_assign(val); }
+
+    template &lt;std::size_t I = 0&gt;
+    ZipRef&amp; copy_assign(const ZipRef&amp; z) {
+        *(std::get&lt;I&gt;(ptr)) = *(std::get&lt;I&gt;(z.ptr));
+        if constexpr(I+1 &lt; sizeof...(T)) return copy_assign&lt;I+1&gt;(z);
+        return *this;
+    }
+    template &lt;std::size_t I = 0&gt;
+    ZipRef&amp; val_assign(const std::tuple&lt;T...&gt;&amp; t) {
+        *(std::get&lt;I&gt;(ptr)) = std::get&lt;I&gt;(t);
+        if constexpr(I+1 &lt; sizeof...(T)) return val_assign&lt;I+1&gt;(t);
+        return *this;
+    }
+
+    std::tuple&lt;T...&gt; val() const {return std::apply([](auto&amp;&amp;...args) { return std::tuple((*args)...); }, ptr);}
+    operator std::tuple&lt;T...&gt;() const { return val(); }
+
+    void swap(const ZipRef&amp; o) const {
+        swap_impl&lt;sizeof...(T)-1&gt;(o);
+    }
+
+private:
+    template &lt;std::size_t I&gt;
+    void swap_impl(const ZipRef&amp; o) const {
+        using std::swap;
+        swap(*std::get&lt;I&gt;(ptr), *std::get&lt;I&gt;(o.ptr));
+        if constexpr(I) swap_impl&lt;I-1&gt;(o);
+    }
+
+public:
+#define OPERATOR(OP)                                                    \
+    bool operator OP(const ZipRef &amp; o) const { return val() OP o.val(); } \
+    inline friend bool operator OP(const ZipRef&amp; r, const std::tuple&lt;T...&gt;&amp; t) { return r.val() OP t; } \
+    inline friend bool operator OP(const std::tuple&lt;T...&gt;&amp; t, const ZipRef&amp; r) { return t OP r.val(); }
+
+    OPERATOR(==) OPERATOR(&lt;=) OPERATOR(&gt;=)
+    OPERATOR(!=) OPERATOR(&lt;)  OPERATOR(&gt;)
+#undef OPERATOR
+
+};
+
+template&lt;typename ...IT&gt;
+class ZipIter {
+    std::tuple&lt;IT...&gt; it;
+
+    template&lt;int N, typename... T&gt; using NthTypeOf =
+        typename std::tuple_element&lt;N, std::tuple&lt;T...&gt;&gt;::type;
+    template&lt;typename... T&gt; using FirstTypeOf = NthTypeOf&lt;0, T...&gt;;
+
+public:
+    using iterator_category = typename std::iterator_traits&lt;FirstTypeOf&lt;IT...&gt;&gt;::iterator_category;
+    using difference_type   = typename std::iterator_traits&lt;FirstTypeOf&lt;IT...&gt;&gt;::difference_type;
+    using value_type        = std::tuple&lt;typename std::iterator_traits&lt;IT&gt;::value_type ...&gt;;
+    using pointer           = std::tuple&lt;typename std::iterator_traits&lt;IT&gt;::pointer ...&gt;;
+    using reference         = ZipRef&lt;typename std::iterator_traits&lt;IT&gt;::value_type ...&gt;;
+
+    ZipIter() = default;
+    ZipIter(const ZipIter &amp;rhs) = default;
+    ZipIter(ZipIter&amp;&amp; rhs) = default;
+    ZipIter(IT... rhs): it(std::move(rhs)...) {}
+
+    ZipIter&amp; operator=(const ZipIter&amp; rhs) = default;
+    ZipIter&amp; operator=(ZipIter&amp;&amp; rhs) = default;
+
+    ZipIter&amp; operator+=(const difference_type d) {
+        std::apply([&amp;d](auto&amp;&amp;...args) {((std::advance(args,d)),...);}, it); return *this;
+    }
+    ZipIter&amp; operator-=(const difference_type d) { return operator+=(-d); }
+
+    reference operator* () const {return std::apply([](auto&amp;&amp;...args) {return reference(&amp;(*(args))...);}, it);}
+    pointer   operator-&gt;() const {return std::apply([](auto&amp;&amp;...args) {return pointer(&amp;(*(args))...);}, it);}
+    reference operator[](difference_type rhs) const {return *(operator+(rhs));}
+
+    ZipIter&amp; operator++() { return operator+=(1); }
+    ZipIter&amp; operator--() { return operator+=(-1); }
+    ZipIter operator++(int) {ZipIter tmp(*this); operator++(); return tmp;}
+    ZipIter operator--(int) {ZipIter tmp(*this); operator--(); return tmp;}
+
+    difference_type operator-(const ZipIter&amp; rhs) const {return std::get&lt;0&gt;(it)-std::get&lt;0&gt;(rhs.it);}
+    ZipIter operator+(const difference_type d) const {ZipIter tmp(*this); tmp += d; return tmp;}
+    ZipIter operator-(const difference_type d) const {ZipIter tmp(*this); tmp -= d; return tmp;}
+    inline friend ZipIter operator+(const difference_type d, const ZipIter&amp; z) {return z+d;}
+    inline friend ZipIter operator-(const difference_type d, const ZipIter&amp; z) {return z-d;}
+
+#define OPERATOR(OP)                                                    \
+    bool operator OP(const ZipIter&amp; rhs) const {return it OP rhs.it;}
+    OPERATOR(==) OPERATOR(&lt;=) OPERATOR(&gt;=)
+    OPERATOR(!=) OPERATOR(&lt;)  OPERATOR(&gt;)
+#undef OPERATOR
+};
+
+template&lt;typename ...Container&gt;
+class Zip {
+    std::tuple&lt;Container&amp;...&gt; zip;
+
+public:
+    Zip() = delete;
+    Zip(const Zip&amp; z) = default;
+    Zip(Zip&amp;&amp; z) = default;
+    Zip(Container&amp;... z)
+        : zip {z...}
+    {
+        auto const len = {(z.size())...,};
+        if (std::adjacent_find(len.begin(), len.end(), std::not_equal_to()) != len.end())
+            throw std::invalid_argument("array lengths differ");
+    }
+
+#define HELPER(OP)                                                      \
+    auto OP() {return std::apply([](auto&amp;&amp;... args) { return ZipIter((args.OP())...);}, zip);}
+    HELPER(begin) HELPER(end)
+    HELPER(rbegin) HELPER(rend)
+#undef HELPER
+
+#define HELPER(OP)                                                      \
+    auto OP() const {return std::apply([](auto&amp;&amp;... args) { return ZipIter((args.OP())...);}, zip);}
+    HELPER(begin) HELPER(end)
+    HELPER(rbegin) HELPER(rend)
+    HELPER(cbegin) HELPER(cend)
+    HELPER(crbegin) HELPER(crend)
+#undef HELPER
+};
+
+#include &lt;utility&gt;
+using std::swap;
+template&lt;typename ...T&gt; void swap(const ZipRef&lt;T...&gt;&amp; a, const ZipRef&lt;T...&gt;&amp; b) { a.swap(b); }
+
+#include &lt;sstream&gt;
+template&lt; class Ch, class Tr, class...IT, typename std::enable_if&lt;(sizeof...(IT)&gt;0), int&gt;::type = 0&gt;
+auto&amp; operator&lt;&lt;(std::basic_ostream&lt;Ch, Tr&gt;&amp; os, const ZipRef&lt;IT...&gt;&amp; t) {
+    std::basic_stringstream&lt;Ch, Tr&gt; ss;
+    ss &lt;&lt; "[ ";
+    std::apply([&amp;ss](auto&amp;&amp;... args) {((ss &lt;&lt; args &lt;&lt; ", "), ...);}, t.val());
+    ss.seekp(-2, ss.cur);
+    ss &lt;&lt; " ]";
+    return os &lt;&lt; ss.str();
+}
+
+
+#include &lt;vector&gt;
+#include &lt;string&gt;
+#include &lt;algorithm&gt;
+#include &lt;iostream&gt;
+
+int main() {
+    std::vector&lt;int&gt; a {3,1,4,2};
+    std::vector&lt;std::string&gt; b {"Alice","Bob","Charles","David"};
+
+    auto const zip = Zip(a,b);
+
+    for (const auto &amp; z: zip) std::cout &lt;&lt; z &lt;&lt; std::endl;
+
+    std::cout &lt;&lt; std::endl;
+    std::sort(zip.begin(), zip.end());
+    for (const auto &amp; z: zip) std::cout &lt;&lt; z &lt;&lt; std::endl;
+}
+</code></pre>
+    </div>

@@ -1,0 +1,93 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Prefer <code>static const</code> variables over <code>#define</code>s</h1>
+
+<p>Don't <code>#define</code> constants if you could just as well declare them as regular <code>static const</code> variables. One advantage of this is that you can put those variables inside a namespace, whereas macros are always globally visible.</p>
+
+<h1>Avoid giving new names to existing types</h1>
+
+<p>Don't make a new type <code>Byte</code> when it's just the same as <code>uint8_t</code>. It saves hardly any typing, and now someone reading your code first has to figure out what a <code>Byte</code> actually is, whereas <code>uint8_t</code> is a standard type that should be known to anyone.</p>
+
+<p>If you can use C++17, then you can use <code>std::byte</code>.</p>
+
+<p>Apart from <code>Bytes</code>, the other typedefs in <code>abstractsocket.h</code> are not used at all in either <code>abstractsocket.h</code> or <code>abstractsocket.cpp</code>. So they should not be there at all.</p>
+
+<h1>Make <code>send()</code> and <code>receive()</code> member functions of <code>AbstractSocket</code></h1>
+
+<p>These functions are supposed to be used on sockets, so make this explicit: they should be member functions of <code>AbstractSocket</code>.</p>
+
+<h1>Inherit from <code>std::runtime_error</code> instead of <code>std::exception</code></h1>
+
+<p>Instead of making <code>SocketException</code> inherit from <code>std::exception</code>, make it inherit <code>std::runtime_error</code>. The latter is more specific, so it provides more information to the application.</p>
+
+<h1>Use further inheritance for exceptions</h1>
+
+<p>Instead of having <code>enum Type</code> to distinguish between possible socket exceptions, just use more inheritance to follow the pattern already used by exceptions. So:</p>
+
+<pre><code>class SocketException: public std::runtime_error {...};
+class SocketBindError: public SocketException {...};
+class SocketReceiveError: public SocketException {...};
+class SocketSendError: public SocketException {...};
+</code></pre>
+
+<h1>Avoid repeating yourself</h1>
+
+<p>There is some repetition going on in your class names. For example, <code>SocketExpection</code> is part of namespace <code>EpollSocket</code>, so "<code>Socket</code>" appears twice. You could get rid of some duplication there.</p>
+
+<h1><code>AbstractSocket</code> is not abstract at all</h1>
+
+<p>Your class <code>AbstractSocket</code> is actually a concrete socket implementation, so why does it have "<code>Abstract</code>" in the name?</p>
+
+<h1>Be consistent in reporting errors</h1>
+
+<p>Your code is printing errors in many different ways:</p>
+
+<ul>
+<li><code>fprintf(stderr, ...)</code></li>
+<li><code>printf(...)</code></li>
+<li><code>perror(...)</code></li>
+</ul>
+
+<p>Make sure there is a consistent way of printing errors, if this is at all desired. If this is meant to be a library, it's probably best not to print anything, and let the application that calls these library functions decide how to report errors.</p>
+
+<p>Also, sometimes you <code>return false</code>, other times you <code>throw</code> a <code>SocketException</code>. While there are sometimes good reasons to have both ways of returning an error, there doesn't seem to be much consistency in your code. In general, exceptions should be used for really exceptional conditions. Network errors however are quite common. I would recommend you use the boolean return type to indicate whether a function succeeded or not, and possibly have the functions take a reference to a <a href="https://en.cppreference.com/w/cpp/error/error_code" rel="nofollow noreferrer"><code>std::error_code</code></a> so it can fill in more details about the error in it.</p>
+
+<h1>You are not binding outgoing sockets</h1>
+
+<p>In <code>AbstractSocket::establish()</code>, you are calling <code>socket()</code> to create an outgoing socket, but don't call <code>bind()</code> on it. That's is perfectly normal. But when it fails, you are throwing a <code>SocketBindError</code>. That is incorrect, it is more likely it's a connection error, so you should add a <code>SocketConnectError</code>.</p>
+
+<h1>Do cleanup on errors in <code>establish()</code>, not in the <code>action()</code> callback</h1>
+
+<p>It's always best to clean up resources in the same scope as where you created them. So if a connection fails, then call <code>close()</code> in <code>establish()</code>.</p>
+
+<h1>Avoid capturing return values by reference</h1>
+
+<p>In <code>AbstractSocket::close()</code> you write this line:</p>
+
+<pre><code>const int &amp;r = ::close(mSockfd);
+</code></pre>
+
+<p>That's quite weird. By using a reference here, the return value of <code>::close()</code> is actually stored in a temporary, and you are creating a const reference to a temporary value. Luckily, in C++11 and later, this extends the lifetime of the temporary until the end of the function scope, so it is not undefined behavior, but the normal way to write this is:</p>
+
+<pre><code>int r = ::close(mSockfd);
+</code></pre>
+
+<h1>A call to <code>::close()</code> always closes the socket, even if it returns an error</h1>
+
+<p>So in <code>AbstractSocket::close()</code>, you should unconditionally set <code>mState = UnconnectedState</code>.</p>
+
+<h1><code>receive()</code> and <code>send()</code> are broken</h1>
+
+<p>You are calling <code>receive()</code> with a given <code>size</code>, but there is no guarantee that that many bytes have actually been received by the kernel. In fact, you have no guarantee that any bytes have been received; <code>epoll()</code> might spuriously returned and set the <code>POLLIN</code> flag even if nothing is received. In any case, if you call <code>receive(..., 1000)</code>, and only 900 bytes were received so far by the kernel, then the first call to <code>::read()</code> will succeed and return <code>900</code>, but the second one will return <code>-1</code> and set <code>errno</code> to <code>EWOULDBLOCK</code>.</p>
+
+<p>Similarly, <code>send()</code> will also fail if the size of <code>buffer</code> if the other side doesn't process the data fast enough and the sending side's kernel buffers are filled up.</p>
+
+<p>These things are normal behavior, you have to deal with that in your code instead of throwing an exception.</p>
+
+<h1>Use <code>getnameinfo()</code> instead of <code>inet_ntop()</code></h1>
+
+<p>The counterpart to <code>getaddrinfo()</code> is <code>getnameinfo()</code>. It takes a <code>struct sockaddr *</code>, so you don't have to do the trick with <code>get_in_addr()</code> to give <code>inet_ntop()</code> a pointer to the actual address. While <code>getnameinfo()</code> normally tries to resolve an address to a hostname, if you only want to see a numeric address you can pass <code>NI_NUMERICHOST | NI_NUMERICSERV</code> as the <code>flags</code> argument.</p>
+
+<h1>You are not implementing asynchronous I/O at all</h1>
+
+<p>There is nothing asynchronous about your code. It is just a basic event loop, where you sequentially process events as they are coming in. A real asynchronous I/O framework would allow the application to submit multiple concurrent read and write requests, and have the framework process this in the background while the application can do something else.</p>
+    </div>

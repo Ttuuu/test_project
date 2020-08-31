@@ -1,0 +1,104 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>The Hash</h1>
+
+<p>Your table looks to have a power-of-two size, starting at 8 and then doubling if needed. That's fine, good even, depending on how you use it.</p>
+
+<p>But then this happens:</p>
+
+<blockquote>
+<pre><code>int HashTable::GetHash(std::string text, int table_size) {
+    //Hash function for string. Calculates polynom value using Horner method
+    int b = text[0];
+    int point = (int)sqrt(table_size); //x value for polynom
+    for(int i = 1; i &lt; text.size(); i++) {
+        b = (text[i] + b*point) % table_size;
+    }
+    return b % table_size;
+}
+</code></pre>
+</blockquote>
+
+<p>The slow square root is a problem of its own (how big of a problem depends on the size of the strings), but a <em>very bad effect</em> happens if <code>table_size</code> is a power of <em>four</em> (which it is half the time): <code>point</code> would be a power of two. So the multiplication (modulo a power of two) just shifts bits out of the top and loses them, deleting bits in a first-in-first-out fashion: the final hash is only affected by the last couple of characters, the bits from the first characters get shifted out. The effect gets worse as the table gets bigger, eventually only the very last character would be part of the hash.</p>
+
+<p>The overall effect on your program is that as the table gets bigger, performance fluctuates between OK (probably) for odd power sizes and Increasingly Bad for even power sizes, getting worse and worse for bigger tables and long strings that share a suffix.</p>
+
+<p>This wouldn't have been an issue for prime size tables, but that comes with a significant downside of its own.</p>
+
+<p>What to use instead: <code>std::hash&lt;std::string&gt;</code> probably, or write a hash that does not suffer from this problem, there are many string hashing algorithms that don't have this issue.</p>
+
+<p>Also <code>b</code> should really be some unsigned type, both to avoid the scary UB nature of signed integer overflow and also the more practical concern of avoiding a negative value as result (as a reminder, <code>%</code> on signed types returns the <em>signed remainder</em>, the result can be negative depending on the inputs). Which leads to:</p>
+
+<h1>The Types</h1>
+
+<p>A lot of variables and return types here are of type <code>int</code>. Many of them should be something else, such as <code>size_t</code>. Using <code>int</code> results in many unexpected type conversions, for example in <code>index %= this-&gt;table.size();</code> which actually converts <code>index</code> to <code>size_t</code> first, then does the remainder, then converts back to an <code>int</code> again. Having a signed index risks overflowing it if the <code>step</code> gets big, and often costs an explicit sign-extension operation.</p>
+
+<p>The first <code>index</code>, which comes from <code>GetHash</code>, could be negative, which would be bad (indexing the vector at a negative index).</p>
+
+<h1>The Quadratic step</h1>
+
+<p>You wrote:</p>
+
+<blockquote>
+  <p><code>new_index += pow(step, 2);</code></p>
+</blockquote>
+
+<p>That's a common thing for beginners to write, but unfortunately, that's a floating point square. The resulting code on x64 with Clang 9 and -O2 is:</p>
+
+<pre><code>    xorps   xmm0, xmm0
+    cvtsi2sd        xmm0, r14d
+    xorps   xmm1, xmm1
+    cvtsi2sd        xmm1, ebx
+    mulsd   xmm0, xmm0
+    addsd   xmm1, xmm0
+    cvttsd2si       eax, xmm1
+</code></pre>
+
+<p>A lot of converting and other floating point operations.</p>
+
+<p>Writing it as <code>new_index += step * step;</code> results in:</p>
+
+<pre><code>    mov     eax, edi
+    imul    eax, edi
+    add     eax, ebx
+</code></pre>
+
+<p>But it turns out you don't even need this, see further below..</p>
+
+<h1>The Modulo</h1>
+
+<p>You wrote:</p>
+
+<blockquote>
+  <p><code>index %= this-&gt;table.size();</code></p>
+</blockquote>
+
+<p>Which does not use that the table size is a power of two, so for example on x64 with Clang 9 and -O2 again, that results in:</p>
+
+<pre><code>    cdqe
+    xor     edx, edx
+    div     rsi
+    ; use rdx (the remainder)
+</code></pre>
+
+<p>A 64-bit <code>div</code> ranges from slow to very slow. The time depends on the processor model and on the values being divided and on whether we're measuring latency or throughput (or a bit of both?), so it's difficult to pin a single number to it, but as a ballpark number let's say it's around 50x as slow as integer addition. Division (and therefore remainder) is a difficult operation, so this issue is not restricted to x64 processors.</p>
+
+<p>Having a power-of-two sized table is perfect to avoid that operation, you can use (and it's a waste of the opportunity to not use this):</p>
+
+<pre><code>index &amp;= this-&gt;table.size() - 1;
+</code></pre>
+
+<p>Unfortunately compilers are not yet so sophisticated that they can discover and track the property of the size being a power of two through the program. Such optimizations do happen locally, <a href="https://godbolt.org/z/cHSTke" rel="nofollow noreferrer">if the divisor is obviously a power of two</a> which is much easier for a compiler to discover than a more "global" invariant of your data structure.</p>
+
+<h1>Non-termination of <code>Set</code></h1>
+
+<p>It's unlikely, but <code>Set</code> could loop forever. What that takes is a probe sequence that visits only filled slots. You might expect the 75% fullness bound to prevent that, but this probe sequence (cumulatively adding <code>i²</code> modulo a power of two), while not too bad, does not guarantee visiting 75% of the slots. There is a probe sequence that <em>does</em> guarantee that:</p>
+
+<pre><code>index += step;
+</code></pre>
+
+<p>Doesn't look quadratic? It is! <code>step</code> goes up by 1 every step, so the sequence formed by <code>index</code> has the closed form formula <code>index(i) = initialHash + (i² + i) / 2</code>: the famous <a href="https://fgiesen.wordpress.com/2015/02/22/triangular-numbers-mod-2n/" rel="nofollow noreferrer">triangular numbers based quadratic probing</a>. That will visit <em>every</em> slot (if necessary, of course escaping from the loop early is encouraged!) with no duplicates, so there would be no accidental infinite loop.</p>
+
+<hr>
+
+<p>Well this may all look pretty negative, but there are a couple of things I definitely liked in that code: firstly using <code>std::vector</code> for the storage, so this class does not need to concern itself with memory management. And this trick, <code>this-&gt;fullness*4 &gt;= this-&gt;table.size()*3</code>, rather than multiplying by a floating point number.</p>
+    </div>

@@ -1,0 +1,184 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Missing headers</h1>
+
+<p>The code as presented won't compile, because many of the required definitions are missing:</p>
+
+<pre><code>#include &lt;chrono&gt;
+#include &lt;condition_variable&gt;
+#include &lt;mutex&gt;
+#include &lt;thread&gt;
+</code></pre>
+
+<h1>Global variables</h1>
+
+<p>I think it would be better to take those global variables and package them into an object, so that it's possible to have more than one interruptible worker in your program.  Then it would look something more like:</p>
+
+<pre><code>class worker
+{
+    std::thread thr;
+    bool keepWorking;
+    std::mutex mtx;
+    std::condition_variable cv;
+
+public:
+    worker()
+        : thr{&amp;worker::threadLoop, this},
+          keepWorking{true},
+          mtx{},
+          cv{}
+    {}
+
+    void stopThread();
+
+private:
+
+    static void threadLoop(worker *w);
+};
+</code></pre>
+
+<h1>Unfinished code</h1>
+
+<p>This comment suggests that the code isn't yet finished (and therefore not ready for review).</p>
+
+<blockquote>
+<pre><code>   // Do Work.
+</code></pre>
+</blockquote>
+
+<p>Moreover, it suggests that the loop will only ever execute a single, fixed block of code, which makes it very inflexible.  Instead, we should allow the caller to provide the work to be done:</p>
+
+<pre><code>template&lt;typename Func&gt;
+class worker
+{
+    std::thread thr;
+    bool keepWorking;
+    std::mutex mtx;
+    std::condition_variable cv;
+    Func f;
+
+public:
+    worker(Func f)
+        : thr{&amp;worker::threadLoop, this},
+          keepWorking{true},
+          mtx{},
+          cv{},
+          f{std::move(f)}
+    {}
+</code></pre>
+
+<p>Then the comment becomes useful:</p>
+
+<pre><code>        // Do some work
+        w-&gt;f();
+</code></pre>
+
+<h1>Choice of names</h1>
+
+<p><code>l</code> is a very poor choice of names.  I'd prefer <code>lock</code>, or anything that doesn't look like a number.</p>
+
+<h1>Excess complexity</h1>
+
+<p>Instead of computing <code>toSleep</code>, why not use <code>wait_until()</code> instead of <code>wait_for()</code>?  We can keep the mutex locked outside the loop, allowing the interrupting thread access only during the condition-variable wait; that will cause it to block whilst work is running, but it was already waiting in that case (in <code>thr.join()</code>).  That makes the code much simpler:</p>
+
+<pre><code>static void threadLoop(worker *w)
+    {
+        auto endTime = std::chrono::system_clock::now();
+
+        std::unique_lock lock{w-&gt;mtx};
+        while (!w-&gt;cv.wait_until(lock, endTime += w-&gt;duration,
+                                 [w]{ return !w-&gt;keepWorking; }))
+        {
+            // Do some work
+            w-&gt;f();
+        }
+    }
+</code></pre>
+
+<h1>Tests</h1>
+
+<p>There isn't even a simple <code>main()</code> to show how usable this is, or to demonstrate it working at all.</p>
+
+<hr>
+
+<p>Modified code</p>
+
+<pre><code>#include &lt;chrono&gt;
+#include &lt;condition_variable&gt;
+#include &lt;atomic&gt;
+#include &lt;thread&gt;
+
+// Func should be a function of no arguments
+template&lt;typename Func&gt;
+class worker
+{
+    std::thread thr;
+    bool keepWorking;
+    std::mutex mutex;
+    std::condition_variable cv;
+    Func f;
+    const std::chrono::system_clock::duration duration;
+
+public:
+    worker(Func f, std::chrono::system_clock::duration duration = std::chrono::seconds{15})
+        : thr{&amp;worker::threadLoop, this},
+          keepWorking{true},
+          mutex{},
+          cv{},
+          f{std::move(f)},
+          duration{duration}
+    {}
+
+    void stopThread()
+    {
+        std::unique_lock lock{mutex};
+        keepWorking = false;
+        lock.unlock();
+
+        cv.notify_one();
+        thr.join();
+    }
+
+private:
+
+    static void threadLoop(worker *const w)
+    {
+        auto endTime = std::chrono::system_clock::now();
+
+        std::unique_lock lock{w-&gt;mutex};
+        while (!w-&gt;cv.wait_until(lock, endTime += w-&gt;duration,
+                                 [w]{ return !w-&gt;keepWorking; }))
+        {
+            // Do some work
+            w-&gt;f();
+        }
+    }
+};
+</code></pre>
+
+
+
+<pre><code>// Simple test program
+#include &lt;iostream&gt;
+
+int main()
+{
+    using namespace std::literals::chrono_literals;
+    using clock = std::chrono::system_clock;
+
+    auto task = []{
+                    std::cout &lt;&lt; "working..." &lt;&lt; std::endl;
+                    std::this_thread::sleep_for(700ms);
+                };
+    auto w = worker{task, 1s};
+
+    std::this_thread::sleep_for(2400ms);
+    auto const start_time = clock::now();
+    w.stopThread();
+    auto const time_taken = clock::now() - start_time;
+
+    auto const millis =
+        std::chrono::duration_cast&lt;std::chrono::milliseconds&gt;(time_taken);
+    std::cout &lt;&lt; "Thread stop took " &lt;&lt; millis.count() &lt;&lt; " ms\n";
+}
+</code></pre>
+    </div>

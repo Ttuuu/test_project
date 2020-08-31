@@ -1,0 +1,133 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>static inline bool fillBuffer(FILE *, char [], size_t *, size_t *);
+</code></pre>
+
+<p>It'd be nice to provide names for these function parameters, especially since two of them have the same type (<code>size_t *</code>).</p>
+
+<p>It's fairly unusual to see a pointer parameter declared with <code>[]</code> instead of <code>*</code> — I infer your rationale, something like "This pointer is expected to point to an array of contiguous objects, not just one object," but the inconsistency (and risk of some maintainer forgetting and writing <code>sizeof buffer</code> just once) is too costly IMHO. The fact that <code>char *buffer</code> is immediately followed by <code>size_t bufferlen</code> should be a dead giveaway that <code>buffer</code> points to an array.</p>
+
+<p>...Oh, what do you mean <code>char *buffer</code> <em>isn't</em> followed by <code>size_t bufferlen</code>?!</p>
+
+<pre><code>static inline bool fillBuffer(FILE *file, char buffer[], size_t *numBytesRead, size_t *numBytesUsed) {
+    *numBytesRead = fread(buffer, 1, BUFFER_SIZE, file);
+</code></pre>
+
+<p>Yep, that's a buffer overflow waiting to happen. Your <code>fillBuffer</code> function takes a pointer (<code>buffer</code>) and unconditionally writes up to <code>BUFFER_SIZE</code> (4096) bytes into it. If the caller passes in a smaller buffer... boom.
+So what we want to see here is more like the API to <code>fread</code> itself:</p>
+
+<pre><code>static inline bool fillBuffer(FILE *file, char *buffer, size_t bufferlen, size_t *numBytesRead, size_t *numBytesUsed) {
+    *numBytesRead = fread(buffer, 1, bufferlen, file);
+    *numBytesUsed = 0;
+
+    return (0 &lt; *numBytesRead);
+}
+</code></pre>
+
+<p>I know that <code>fread</code> returns <code>numBytesRead</code> as its return value, so I'm suspicious of the way <code>fillBuffer</code> returns <code>numBytesRead</code> via an <em>out-parameter</em>. Out-parameters are a code smell. So I look at what we're using our return value for.</p>
+
+<pre><code>    return (0 &lt; *numBytesRead);
+</code></pre>
+
+<p>Comparing a <code>size_t</code> against <code>0</code> should generally be done with <code>!=</code>, not <code>&lt;</code>, since the <em>only</em> value of type <code>size_t</code> that is not <code>&gt; 0</code> is <code>0</code> itself.</p>
+
+<pre><code>    return (0 != *numBytesRead);
+</code></pre>
+
+<p>But this function returns <code>bool</code>, and <code>size_t</code> converts to <code>bool</code> in the obvious way, so:</p>
+
+<pre><code>    return *numBytesRead;
+</code></pre>
+
+<p>Oh look! We just eliminated that out-parameter!</p>
+
+<pre><code>static inline size_t fillBuffer(FILE *fp, char *buffer, size_t bufferlen, size_t *numBytesUsed) {
+    size_t numBytesRead = fread(buffer, 1, bufferlen, fp);
+    *numBytesUsed = 0;
+    return numBytesRead;
+}
+</code></pre>
+
+<p>Now simplify:</p>
+
+<pre><code>static inline size_t fillBuffer(FILE *fp, char *buffer, size_t bufferlen, size_t *numBytesUsed) {
+    *numBytesUsed = 0;
+    return fread(buffer, 1, bufferlen, fp);
+}
+</code></pre>
+
+<p>Now pause. Notice that <code>numBytesUsed</code> is not actually used by this function at all, except to unconditionally set it to <code>0</code>. The Single Responsibility Principle suggests that perhaps setting this arbitrary <code>size_t</code> to <code>0</code> could be done by the caller, so as not to bother us with an essentially unrelated task. But then our whole function becomes a tail-call to <code>fread(...)</code>, which seems ridiculous. Let's eliminate this function. Find its caller...</p>
+
+<pre><code>static inline bool nextCharEquals(FILE *file, char buffer[], size_t *numBytesRead, size_t *numBytesUsed, char value) {
+    return (((*numBytesUsed &lt; *numBytesRead) || fillBuffer(file, buffer, numBytesRead, numBytesUsed)) &amp;&amp; (buffer[*numBytesUsed] == value));
+}
+</code></pre>
+
+<p>Oh dear me. Let's rewrite this mess using <code>if</code> and <code>else</code>:</p>
+
+<pre><code>static inline bool nextCharEquals(FILE *file, char buffer[], size_t *numBytesRead, size_t *numBytesUsed, char value) {
+    if (*numBytesUsed &gt;= *numBytesRead) {
+        if (fillBuffer(file, buffer, numBytesRead, numBytesUsed) == 0) {
+            return false;
+        }
+    }
+    return buffer[*numBytesUsed] == value;
+}
+</code></pre>
+
+<p>Okay, now for the inlining step!</p>
+
+<pre><code>static inline bool nextCharEquals(FILE *fp, char *buffer, size_t bufferlen, size_t *numBytesUsed, char value) {
+    if (*numBytesUsed &gt;= *numBytesRead) {
+        *numBytesRead = fread(buffer, 1, bufferlen, fp);
+        *numBytesUsed = 0;
+        if (*numBytesRead == 0) {
+            return false;
+        }
+    }
+    return buffer[*numBytesUsed] == value;
+}
+</code></pre>
+
+<p>Now we can start to make out where the real problems lie. For example, it is tempting to observe that <code>if (*numBytesRead == 0)</code> is equivalent to <code>if (*numBytesUsed &gt;= *numBytesRead)</code> (since we just set <code>*numBytesUsed</code> to <code>0</code> on the previous line). So we are tempted to rewrite this function as</p>
+
+<pre><code>static inline bool nextCharEquals(FILE *fp, char *buffer, size_t bufferlen, size_t *numBytesUsed, char value) {
+    while (*numBytesUsed &gt;= *numBytesRead) {
+        *numBytesRead = fread(buffer, 1, bufferlen, fp);
+        *numBytesUsed = 0;
+        // TODO: check errno? check feof(fp)?
+    }
+    return buffer[*numBytesUsed] == value;
+}
+</code></pre>
+
+<p>Of course <em>as written</em> that would be an infinite loop on EOF; but it makes us ponder in what situations we <em>expect</em> to see <code>fread(...) == 0</code>... which starts us thinking about error handling.</p>
+
+<hr>
+
+<p>Meanwhile, we can apply the Single Responsibility Principle again to figure out that perhaps <code>char value</code> doesn't belong in this function. Why would our caller want to write</p>
+
+<pre><code>nextCharEquals(dataFile, buffer, &amp;numBytesRead, &amp;numBytesUsed, '\n')
+</code></pre>
+
+<p>when they could write</p>
+
+<pre><code>nextChar(dataFile, buffer, &amp;numBytesRead, &amp;numBytesUsed) == '\n'
+</code></pre>
+
+<p>instead?</p>
+
+<p>Any time you're spelling out the name of a built-in operator (<code>==</code>) in your function name, it's a good sign that your function is doing more than it should be. Let the built-in operator pull its own weight!</p>
+
+<hr>
+
+<p>One more random tip: Instead of hard-coding <code>BUFFER_SIZE</code> all over your program, try to use <code>sizeof buffer</code>.</p>
+
+<pre><code>char buffer[BUFFER_SIZE];
+foo(buffer, BUFFER_SIZE);  // bad, repetitive, easy to typo
+
+char buffer[4096];
+foo(buffer, sizeof buffer);  // good, clean, hard to typo
+</code></pre>
+
+<p>It'll also train you to pass your buffer sizes around properly, since you won't have all your buffers' sizes so promiscuously available in "global variables." And <em>that</em> will help you prepare for the world of multi-source-file programs.</p>
+    </div>

@@ -1,0 +1,163 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Global namespace pollution</h1>
+
+<p>Don't do this in a header:</p>
+
+<pre><code>using namespace QGst;
+using namespace QGst::Utils;
+</code></pre>
+
+<p>This will add many, many names to the global namespace of every source file that includes this header.  It's much less harmful to import vast numbers of names in your implementation file (though I still recommend using just the names you need, in the smallest reasonable scope).</p>
+
+<hr>
+
+<h1>Includes</h1>
+
+<p><code>&lt;QtCore&gt;</code> is a <em>big</em> include, and will hit your compilation speed (again, for every translation unit that needs this header).  Don't drag all of that in; include just what you need, and forward-declare what you can:</p>
+
+<pre><code>#include &lt;QByteArray&gt;
+#include &lt;QMutex&gt;
+#include &lt;QObject&gt;
+#include &lt;QReadWriteLock&gt;
+#include &lt;QThread&gt;
+
+#include &lt;QGst/Element&gt;
+
+class QIODevice;
+
+namespace QGst {
+    namespace Utils {
+        class ApplicationSource;
+        class ApplicationSink;
+    }
+}
+</code></pre>
+
+<hr>
+
+<h1>Naming</h1>
+
+<p>Qt naming convention is to use PascalCase <em>nouns</em> for class names:</p>
+
+<pre><code>class Converter
+</code></pre>
+
+<p>That's still very broad; consider alternatives such as <code>Downsampler</code> or <code>SpeechCompressor</code>.</p>
+
+<p>Other identifiers I'd suggest changing:</p>
+
+<ul>
+<li><code>retval</code> -&gt; <code>flacData</code></li>
+<li><code>dat</code> -&gt; <code>pcmData</code></li>
+<li><code>channes</code> -&gt; <code>channels</code></li>
+</ul>
+
+<hr>
+
+<p>The debugging macros can be written with the <code>do while(0)</code> idiom so that they can be used like statements:</p>
+
+<pre><code>#define SP() do { qDebug() &lt;&lt; "convert::setupPipeline()" &lt;&lt; i++; } while (0)
+#define TS() do { qDebug() &lt;&lt; "convert::threadStart()" &lt;&lt; i++; } while (0)
+#define CRTF() do { qDebug() &lt;&lt; "convert::convertRawToFlac()" &lt;&lt; i++; } while (0)
+</code></pre>
+
+<p>That said, I don't really like them at all - macros are always a bit suspect, and these touch a variable called <code>i</code> which is extremely likely to collide with the code.  Also, I don't think this code needs to be quite so chatty.</p>
+
+<hr>
+
+<h1>Initialization</h1>
+
+<p>We don't need these:</p>
+
+<pre><code>bool convert::inited = false;
+QMutex convert::initLock;
+</code></pre>
+
+<p>Instead, we can make the language work for us with an immediately-invoked initializer expression for a static local:</p>
+
+<pre><code>convert::convert(QObject *parent)
+    : QObject(parent),
+      thread(this),
+      lock(QReadWriteLock::Recursive),
+      data(NULL),
+      channels(0)
+{
+    static const bool inited = []{
+        QGst::init();
+        qDebug() &lt;&lt; "GStreamer has been inited in convert constructor.";
+        return true;
+    }();
+    (void)inited;               // suppress "unused variable" warning
+</code></pre>
+
+<p>When you do need a lock, prefer to use a scoped lock-guard, rather than manual <code>lock()</code> and <code>unlock()</code>.  It's much easier to ensure that locks and unlocks are balanced that way, without having to examine all execution paths.</p>
+
+<hr>
+
+<h1>Signal connection</h1>
+
+<p>I don't think you want a direct connection here:</p>
+
+<pre><code>connect(&amp;thread, &amp;QThread::started, this, &amp;convert::threadStart, Qt::DirectConnection);
+</code></pre>
+
+<p>It defeats the point of having a thread if we execute this code directly in the owning thread.  We should let that just default, so that <code>threadStart()</code> is executed in <code>convert</code>'s thread:</p>
+
+<pre><code>connect(&amp;thread, &amp;QThread::started, this, &amp;convert::threadStart);
+</code></pre>
+
+<hr>
+
+<h1>Tricky timing</h1>
+
+<p>This code is suspect:</p>
+
+<pre><code>thread.start(QThread::NormalPriority);
+this-&gt;moveToThread(&amp;thread);
+</code></pre>
+
+<p>We want to move this object to the thread <em>before</em> we start the thread - remember that there's a signal emitted by thread start that's connected to this object.  Yes, Qt won't deliver it until it gets back into the correct event loop, but why write code that's so hard to reason about when we can simply re-order these two lines?</p>
+
+<hr>
+
+<h1>Useless use of thread</h1>
+
+<p>Here, we do nothing while we wait for the thread we just started:</p>
+
+<pre><code>thread.start(QThread::NormalPriority);
+this-&gt;moveToThread(&amp;thread);
+CRTF();
+QThread::yieldCurrentThread();
+CRTF();
+thread.wait(); //TODO: Error handling
+</code></pre>
+
+<p>So there really was no point running that in its own thread, after all.</p>
+
+<hr>
+
+<h1>Magic numbers</h1>
+
+<pre><code>    appsrc-&gt;setMaxBytes(1073741824);
+</code></pre>
+
+<p>What's the significance of that number?  It looks like <code>1 &lt;&lt; 30</code> but it's hard to tell at a glance. Regardless, it's surprisingly big for 48kHz 16-bit input - over three hours' worth, even in stereo.  It would be better to give it a good name near the start of the file.</p>
+
+<hr>
+
+<h1>Memory allocation</h1>
+
+<p>We prefer <code>new</code>/<code>new[]</code> and <code>delete</code>/<code>delete[]</code> over <code>malloc()</code> in C++ code.  And we prefer self-reclaiming allocations using smart pointers over either of those:</p>
+
+<pre><code>        if(sz &gt; 0)
+        {
+            auto const raw = std::make_unique&lt;char[]&gt;(sz);
+            bp-&gt;extract(0, raw.get(), sz);
+            retval.append(raw.get(), sz);
+        }
+</code></pre>
+
+<p>(you'll want to catch <code>std::bad_alloc</code> outside of the loop, I think).</p>
+
+<p>I don't think you need a buffer for this at all, though - it should be straightforward to resize <code>retval</code> and extract directly to its <code>data()</code> buffer without copying.</p>
+    </div>

@@ -1,0 +1,967 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p>Handling embedded null bytes in content returned from <code>ReadFile</code>
+  function</p>
+</blockquote>
+
+<p>you not need handle this at all. <code>ReadFile</code> return number of bytes read. and you need use it. no any difference what bytes you read.</p>
+
+<pre><code>(*rsp)[dwRead] = 0;
+size_recv = (int)strlen(*rsp);
+</code></pre>
+
+<p>this code wrong and senseless.</p>
+
+<p>correct (by sense)</p>
+
+<pre><code>size_recv = dwRead
+</code></pre>
+
+<p>the <code>dwRead</code> is exactly how many bytes you read (if <code>ReadFile</code> not fail)</p>
+
+<hr>
+
+<p><strong>SetCommTimeouts</strong></p>
+
+<p>again - senseless code. this api simply send <a href="https://msdn.microsoft.com/en-us/library/windows/hardware/ff546772(v=vs.85).aspx" rel="nofollow noreferrer"><code>IOCTL_SERIAL_SET_TIMEOUTS</code></a> control code to device on which file open. usually only serial controller driver handle this ioctl. the <em>npfs.sys</em>, which implement pipes - not understand and not support this ioctl. driver return to you <code>STATUS_INVALID_DEVICE_REQUEST</code> ( mapped to <code>ERROR_INVALID_FUNCTION</code> win32 error) but you not check for errors here.</p>
+
+<hr>
+
+<blockquote>
+  <p>Method for dynamically growing response buffer (very interested in
+  feedback on this)</p>
+</blockquote>
+
+<p>the code is appalling. completely wrong in everything. begin from interface declaration:  </p>
+
+<p><code>_Inout_ char **chunk, _In_ unsigned int chunk_size</code></p>
+
+<p>here <code>chunk</code> - in/out parameter, but <code>chunk_size</code> in only - if you reallocate user buffer - you must return new buffer size to user. may be next signature:</p>
+
+<p><code>_Inout_ char **chunk, _Inout_ unsigned int* chunk_size</code></p>
+
+<p>then <strong>reallocate</strong> caller supplied buffer - this is very bad idea. for reallocate you need exactly know how caller allocate buffer. you must add to interface contract - how caller must allocate initial buffer and free final. which concrete routine use. say for example caller must allocate initial buffer with <code>LocalAlloc(LMEM_FIXED, *)</code> and free with <code>LocalFree</code>. but nobody do this. usual used 2 ways:</p>
+
+<ol>
+<li><p>api use user buffer as is </p>
+
+<pre><code>_In_ char *chunk, _In_ SIZE_T chunk_size, _Out_ SIZE_T* ReturnSize
+</code></pre>
+
+<p>if buffer not big enough - error is returned -
+<code>ERROR_INSUFFICIENT_BUFFER</code> (in case no valid data in buffer at all)
+or <code>ERROR_BUFFER_OVERFLOW</code> - in case exist some valid data in
+buffer, but need large buffer anyway. anyway you need here
+additional out parameter <code>ReturnSize</code></p></li>
+<li><p>allocate buffer yourself</p>
+
+<pre><code>_Out_ char** chunk, _Out_ SIZE_T* chunk_size
+</code></pre>
+
+<p>in this case <code>chunk</code> and <code>chunk_size</code> out only parameters. and you
+need say to caller - which api need use for free returned buffer.</p></li>
+</ol>
+
+<p>then look for <code>ReadFromPipe</code> (full nightmare)</p>
+
+<p><code>bSuccess = ReadFile(io-&gt;out_pipe_read, *rsp, size-1, &amp;dwRead, NULL)</code>;</p>
+
+<p>you all time read to <code>size-1</code> to buffer begin (<code>*rsp</code>) and never change <code>size</code>. so what sense try reallocate buffer if you any way try read only <code>size-1</code> bytes. then you all time read to buffer begin - so new read <strong>overwrite</strong> previous data. you use wrong and senseless <code>strcpy</code>, <code>strcat</code>, <code>strlen</code> instead of <code>memcpy</code>. for what you use <code>free</code> before <code>realloc</code> ? when you try reallocate buffer after <strong>every</strong> read ? even if still exist free space in current buffer ? on which size you try realloc buffer ? on 1 byte ?? and every time anyway try read constant <code>size-1</code> to begin ??</p>
+
+<p>for dynamic buffer buffer usually used 2 strategy: </p>
+
+<p>allocate memory chunk (<em>usually 0x1000..0x10000 size</em>). read to this chunk until exist free space in it (of course not all time to the begin of chunk but to the begin of free space inside chunk). when no more free space in current chunk - allocate new chunk (<strong>not reallocate existing !!</strong>) and so on. but <strong>not copy anything</strong>. when read will be completed - <strong>once</strong> allocate new buffer and <strong>once</strong> copy content of chunks to this buffer. for example.</p>
+
+<pre><code>struct DATA_BUFFER 
+{
+    struct DATA_CHUNK 
+    {
+        DATA_CHUNK* _next;
+        ULONG _cbData;
+        BYTE _buf[0x10000];
+
+        DATA_CHUNK() : _next(0), _cbData(0) {}
+    };
+
+    DATA_CHUNK* _first, *_last;
+
+    DATA_BUFFER() : _first(0), _last(0) {}
+
+    ~DATA_BUFFER()
+    {
+        if (DATA_CHUNK * chunk = _first)
+        {
+            do 
+            {
+                PVOID pv = chunk;
+                chunk = chunk-&gt;_next;
+                delete pv;
+            } while (chunk);
+        }
+    }
+
+    PVOID AllocBuffer(PULONG pcb)
+    {
+        DATA_CHUNK* chunk = _last;
+
+        if (!chunk || chunk-&gt;_cbData == sizeof(chunk-&gt;_buf))
+        {
+            if (chunk = new DATA_CHUNK)
+            {
+                if (_first)
+                {
+                    _last-&gt;_next = chunk;
+                    _last = chunk;
+                }
+                else
+                {
+                    _first = chunk;
+                    _last = chunk;
+                }
+            }
+            else
+            {
+                return 0;
+            }
+        }
+
+        *pcb = sizeof(chunk-&gt;_buf) - chunk-&gt;_cbData;
+        return chunk-&gt;_buf + chunk-&gt;_cbData;
+    }
+
+    void AddData(ULONG cb)
+    {
+        _last-&gt;_cbData += cb;
+    }
+
+    PVOID GatherBuffer(PULONG pcb)
+    {
+        *pcb = 0;
+
+        if (DATA_CHUNK* chunk = _first)
+        {
+            ULONG cb = 0;
+            do 
+            {
+                cb += chunk-&gt;_cbData;
+            } while (chunk = chunk-&gt;_next);
+
+            if (cb)
+            {
+
+                *pcb = cb;
+
+                if (PBYTE pb = new BYTE[cb])
+                {
+                    PVOID pv = pb;
+
+                    chunk = _first;
+
+                    do 
+                    {
+                        memcpy(pb, chunk-&gt;_buf, chunk-&gt;_cbData);
+                        pb += chunk-&gt;_cbData;
+                        PVOID p = chunk;
+                        chunk = chunk-&gt;_next;
+                        delete p;
+                    } while (chunk);
+
+                    _first = 0, _last = 0;
+
+                    return pv;
+                }
+            }
+        }
+
+        return 0;
+    }
+};
+</code></pre>
+
+<p>and possible usage</p>
+
+<pre><code>        DATA_BUFFER db;
+        ULONG cb;
+        PVOID pv;
+
+        while (pv = db.AllocBuffer(&amp;cb))
+        {
+            if (ReadFile(hFile, pv, cb, &amp;cb, 0) &amp;&amp; cb)
+            {
+                db.AddData(cb);
+            }
+            else break;
+        }
+
+        if (pv = db.GatherBuffer(&amp;cb))
+        {
+            // use pv..
+            delete [] pv;
+        }
+</code></pre>
+
+<p>another way - use <code>VirtualAlloc</code> for buffer. windows let reserve memory space. we can reserve tens of megabytes how minimum. this operation not allocate any memory but simply mark memory region as reserved. then we can already commit memory to region begin. when, after read, will be not enough committed memory - we commit more and so on. advantage - we from begin will be have contiguous memory - we never will be need copy/move/reallocate memory with this way. this solution is better when we assume big enough final data. example:</p>
+
+<pre><code>class DynamicBuffer
+{
+    PBYTE _BaseAddress;
+    SIZE_T _dwReserve, _dwSize, _dwCommit;
+
+    static SIZE_T RoundSize(SIZE_T size)
+    {
+        static SIZE_T s_dwAllocationGranularity;
+
+        if (!s_dwAllocationGranularity)
+        {
+            SYSTEM_INFO si;
+            GetSystemInfo(&amp;si);
+            s_dwAllocationGranularity = si.dwAllocationGranularity - 1;
+        }
+
+        return (size + s_dwAllocationGranularity) &amp; ~s_dwAllocationGranularity;
+    }
+
+public:
+
+    DynamicBuffer()
+    {
+        _BaseAddress = 0, _dwReserve = 0, _dwSize = 0, _dwCommit = 0;
+    }
+
+    ~DynamicBuffer()
+    {
+        Reset();
+    }
+
+    ULONG Create(SIZE_T dwSize)
+    {
+        if (_BaseAddress = (PBYTE)VirtualAlloc(0, dwSize = RoundSize(dwSize), MEM_RESERVE, PAGE_READWRITE))
+        {
+            _dwReserve = dwSize;
+            return NOERROR;
+        }
+
+        return GetLastError();
+    }
+
+    ULONG AllocBuffer(PVOID* ppv, SIZE_T cb)
+    {
+        if (_dwReserve - _dwSize &lt; cb)
+        {
+            return ERROR_OUTOFMEMORY;
+        }
+
+        SIZE_T dwSize = _dwSize + cb;
+
+        if (dwSize &gt; _dwCommit)
+        {
+            SIZE_T dwCommit = RoundSize(dwSize);
+
+            if (!VirtualAlloc(_BaseAddress + _dwCommit, dwCommit - _dwCommit, MEM_COMMIT, PAGE_READWRITE))
+            {
+                return GetLastError();
+            }
+
+            _dwCommit = dwCommit;
+        }
+
+        *ppv = _BaseAddress + _dwSize;
+
+        return NOERROR;
+    }
+
+    void AddData(SIZE_T cb)
+    {
+        _dwSize += cb;
+
+        if (_dwSize &gt; _dwCommit)
+        {
+            __debugbreak();
+        }
+    }
+
+    PVOID getData()
+    {
+        return _BaseAddress;
+    }
+
+    SIZE_T getDataSize()
+    {
+        return _dwSize;
+    }
+
+    SIZE_T getFreeSpace()
+    {
+        return _dwReserve - _dwSize;
+    }
+
+    void Reset()
+    {
+        if (_BaseAddress)
+        {
+            VirtualFree(_BaseAddress, 0, MEM_RELEASE);
+            _BaseAddress = 0;
+        }
+        _dwReserve = 0, _dwSize = 0, _dwCommit = 0;
+    }
+};
+</code></pre>
+
+<p>and usage</p>
+
+<pre><code>    DynamicBuffer db;
+    ULONG cb;
+    PVOID pv;
+
+    if (!db.Create(0x1000000))
+    {
+        while (!db.AllocBuffer(&amp;pv, cb = 0x10000))
+        {
+            if (ReadFile(hFile, pv, cb, &amp;cb, 0) &amp;&amp; cb)
+            {
+                db.AddData(cb);
+            }
+            else break;
+        }
+    }
+
+    CloseHandle(hFile);
+
+    // use data
+    db.getData();
+    db.getDataSize();
+
+    // free in destructor
+</code></pre>
+
+<p>but main question - <strong>are you need Contiguous Memory buffer at all</strong> ? for what you need <em>cmd</em> output ? for send it to remote system, display it in interface ? for this not need. after you read some data from cmd in <strong>fixed size</strong> buffer - just display this chunk in interface or send to remote system. and begin read new data chunk. of course you need absolute another interface for this. for parsing cmd output ? for this yes - need Contiguous Memory buffer.. but we never need parse cmd output. for what ?! if say we want list files/folders - we need do this yourself but not run <em>dir</em> command</p>
+
+<hr>
+
+<p><strong>ansi function usage</strong>. such as CreateProcess<strong>A</strong></p>
+
+<p>this is very bad. windows is unicode (utf-8) system. almost all api implemented as unicode. the ansi  (<strong>A</strong>) api - is shell over unicode (<strong>W</strong>) api. the <strong>A</strong> shell convert input ansi strings to unicode, call <strong>W</strong> api and finally convert out unicode strings to ansi. this is very not efficient. more bad that use ansi strings simply wrong by design. ansi code page is not invariant. it different on different systems. if you hardcode some ansi string in code, which use characters &gt; 0x80 - you got different unicode strings after convert, on different systems. finally not any unicode string can be converted to the current ansi code page.</p>
+
+<p>use ansi code page for <em>cmd</em> is wrong. <em>cmd</em> use for pipe input/output not <strong>ansi</strong> but <strong>oem</strong> code page. this is different code pages. when <em>cmd</em> read multi-byte string from <em>stdin file</em> - he convert it to unicode via <a href="https://msdn.microsoft.com/en-us/library/windows/desktop/dd319072(v=vs.85).aspx" rel="nofollow noreferrer"><code>MultiByteToWideChar</code></a> with <code>CP_OEMCP</code>. and when he output something to <em>stdout file</em> - he translate unicode string to multi-byte via <a href="https://msdn.microsoft.com/en-us/library/windows/desktop/dd374130(v=vs.85).aspx" rel="nofollow noreferrer"><code>WideCharToMultiByte</code></a> with <code>CP_OEMCP</code>. so until he output characters in range <code>[0, 0x80)</code> you not view different. but if will be say "not english" file name in output, or you pass some command with "not english" file name - will be error - because you and cmd use <strong>different</strong> code pages for translation. you pass him ansi but he wait oem. he pass to you oem strings, but you wait ansi.</p>
+
+<p>also note about inherited handles - begin from vista better use also <a href="https://msdn.microsoft.com/en-us/library/windows/desktop/ms686880(v=vs.85).aspx" rel="nofollow noreferrer"><code>UpdateProcThreadAttribute</code></a> with <code>PROC_THREAD_ATTRIBUTE_HANDLE_LIST</code> for restrict list of handles to be inherited by the child process - not all inheritable handles, but only <strong>one</strong> pipe handle. yes <strong>one</strong> but not <strong>two</strong> as you use.</p>
+
+<hr>
+
+<blockquote>
+  <p>Pipe creation and usage</p>
+</blockquote>
+
+<p>again bad and wrong. for what you create <strong>2</strong> pipe pairs ?? when <strong>1</strong> pipe pair only need. one pipe handle in you process and one connected pipe end in cmd. pipe must be duplex. what you write to this pipe end in self process - will be read in cmd. what cmd write to self handle - you read via handle in self process. so not need additional pipe pair. next - always need use asynchronous pipes and io here.  synchronous is not efficient and can deadlock.</p>
+
+<hr>
+
+<p>interface of course also must be absolute another. here faster need export class with virtual functions. class implement <em>cmd</em> exec and write commands to it. virtual callbacks with read data from cmd. you inherit own class from this base interface class, implement your own on read data handler and cmd exit (disconect). some basic implementation of class:</p>
+
+<pre><code>class CPacket
+{
+    ULONG _BufferSize, _DataSize;
+    LONG _dwRef;
+    LONG _pad;
+    char _buf[];
+
+    enum ST : ULONG {};
+
+    ~CPacket() {}
+
+    void* operator new(size_t ByteSize, ST BufferSize)
+    {
+        return ::operator new(ByteSize + BufferSize);
+    }
+
+    CPacket(ULONG BufferSize) : _dwRef(1), _BufferSize(BufferSize), _DataSize(0) { }
+
+public:
+
+    CPacket() { }
+
+    void* operator new(size_t , ULONG BufferSize)
+    {
+        return new(static_cast&lt;ST&gt;(BufferSize)) CPacket(BufferSize);
+    }
+
+    void AddRef()
+    {
+        InterlockedIncrement(&amp;_dwRef);
+    }
+
+    void Release()
+    {
+        if (!InterlockedDecrement(&amp;_dwRef)) delete this;
+    }
+
+    PSTR getFreeBuffer()
+    {
+        return _buf + _DataSize;
+    }
+
+    ULONG getFreeSize()
+    {
+        return _BufferSize - _DataSize;
+    }
+
+    PSTR getData()
+    {
+        return _buf;
+    }
+
+    ULONG getBufferSize()
+    {
+        return _BufferSize;
+    }
+
+    ULONG getDataSize()
+    {
+        return _DataSize;
+    }
+
+    ULONG setDataSize(ULONG DataSize)
+    {
+        return _DataSize = DataSize;
+    }
+};
+
+struct U_IRP;
+
+class __declspec(novtable) CCmd 
+{
+    friend U_IRP;
+
+    enum { read, write };
+
+    HANDLE _hFile;
+    CPacket* _packet;
+    LONG _dwRef, _handleLock;
+
+    ULONG Read();
+
+    static ULONG CreatePipeAnonymousPair(PHANDLE phServerPipe, PHANDLE phClientPipe);
+    static ULONG CreatePipeAnonymousPair7(PHANDLE phServerPipe, PHANDLE phClientPipe);
+
+    ULONG CreatePipePair(HANDLE* phClient);
+
+    void OnIoComplete(ULONG OpCode, ULONG dwErrorCode, ULONG_PTR dwNumberOfBytesTransfered, PSTR buf);
+
+    BOOL LockHandle();
+
+    void UnlockHandle();
+
+protected:
+
+    virtual ~CCmd()
+    {
+        Close();
+
+        if (_packet)
+        {
+            _packet-&gt;Release();
+        }
+    }
+
+    virtual BOOL OnRead(PSTR buf, ULONG cb) = 0;
+
+    virtual void OnWrite(ULONG /*dwErrorCode*/) { }
+
+public:
+
+    void Close();
+
+    ULONG Write(PCWSTR lpWideCharStr, int cchWideChar = -1);
+
+    ULONG Write(PCSTR szOem)
+    {
+        return Write(szOem, (ULONG)strlen(szOem));
+    }
+
+    ULONG Write(const void* pv, ULONG cb);
+
+    ULONG Write(CPacket* packet);
+
+    ULONG Exec(ULONG cbBuffer);
+
+    void AddRef()
+    {
+        InterlockedIncrement(&amp;_dwRef);
+    }
+
+    void Release()
+    {
+        if (!InterlockedDecrement(&amp;_dwRef))
+        {
+            delete this;
+        }
+    }
+
+    CCmd() : _hFile(0), _packet(0), _dwRef(1), _handleLock(0)
+    {
+    }
+};
+
+struct U_IRP : OVERLAPPED 
+{
+    CCmd* _pIoObject;
+    CPacket* _packet;
+    PSTR _pv;
+    ULONG _code;
+
+    ~U_IRP()
+    {
+        if (_packet)
+        {
+            _packet-&gt;Release();
+        }
+        _pIoObject-&gt;Release();
+    }
+
+    ULONG CheckIoResult(BOOL fOk)
+    {
+        if (fOk)
+        {
+            OnIoComplete(NOERROR, InternalHigh);
+        }
+        else
+        {
+            ULONG dwErrorCode = GetLastError();
+
+            if (dwErrorCode != ERROR_IO_PENDING)
+            {
+                OnIoComplete(dwErrorCode, 0);
+            }
+        }
+
+        return NOERROR;
+    }
+
+    VOID OnIoComplete(ULONG dwErrorCode, ULONG_PTR dwNumberOfBytesTransfered)
+    {
+        _pIoObject-&gt;OnIoComplete(_code, dwErrorCode, dwNumberOfBytesTransfered, _pv);
+        delete this;
+    }
+
+    static VOID WINAPI _onIoComplete(
+        ULONG dwErrorCode,
+        ULONG dwNumberOfBytesTransfered,
+        LPOVERLAPPED lpOverlapped
+        )
+    {
+        static_cast&lt;U_IRP*&gt;(lpOverlapped)-&gt;OnIoComplete(RtlNtStatusToDosError(dwErrorCode), dwNumberOfBytesTransfered);
+    }
+
+public:
+
+    U_IRP(CCmd* pIoObject, ULONG code = 0, CPacket* packet = 0, PSTR pv = 0) : _pIoObject(pIoObject), _code(code), _packet(packet), _pv(pv)
+    {
+        if (packet)
+        {
+            packet-&gt;AddRef();
+        }
+        pIoObject-&gt;AddRef();
+        RtlZeroMemory(static_cast&lt;OVERLAPPED*&gt;(this), sizeof(OVERLAPPED));
+    }
+
+    static ULONG Bind(HANDLE hFile)
+    {
+        return BindIoCompletionCallback(hFile, U_IRP::_onIoComplete, 0)  
+            &amp;&amp; SetFileCompletionNotificationModes(hFile, FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)
+
+        ? NOERROR : GetLastError();
+    }
+};
+
+ULONG CCmd::Read()
+{
+    ULONG err = ERROR_INVALID_HANDLE;
+
+    if (LockHandle())
+    {
+        err = ERROR_NO_SYSTEM_RESOURCES;
+
+        PSTR buf = _packet-&gt;getFreeBuffer();
+
+        if (U_IRP* Irp = new U_IRP(this, read, _packet, buf))
+        {
+            err = Irp-&gt;CheckIoResult(ReadFile(_hFile, buf, _packet-&gt;getFreeSize(), 0, Irp));
+        }
+
+        UnlockHandle();
+    }
+
+    return err;
+}
+
+ULONG CCmd::Write(const void* pv, ULONG cb)
+{
+    if (CPacket* packet = new(cb) CPacket)
+    {
+        memcpy(packet-&gt;getData(), pv, packet-&gt;setDataSize(cb));
+        ULONG err = Write(packet);
+        packet-&gt;Release();
+        return err;
+    }
+
+    return ERROR_NO_SYSTEM_RESOURCES;
+}
+
+ULONG CCmd::Write(PCWSTR lpWideCharStr, int cchWideChar)
+{
+    if (cchWideChar &lt; 0)
+    {
+        cchWideChar = (ULONG)wcslen(lpWideCharStr);
+    }
+
+    if (int cbMultiByte = WideCharToMultiByte(CP_OEMCP, 0, lpWideCharStr, cchWideChar, 0, 0, 0, 0))
+    {
+        if (CPacket* packet = new(cbMultiByte) CPacket)
+        {
+            ULONG err;
+            if (cbMultiByte = WideCharToMultiByte(CP_OEMCP, 0, lpWideCharStr, cchWideChar, packet-&gt;getData(), cbMultiByte, 0, 0))
+            {
+                packet-&gt;setDataSize(cbMultiByte);
+                err = Write(packet);
+            }
+            else
+            {
+                err = GetLastError();
+            }
+            packet-&gt;Release();
+
+            return err;
+        }
+
+        return ERROR_NO_SYSTEM_RESOURCES;
+    }
+
+    return GetLastError();
+}
+
+ULONG CCmd::Write(CPacket* packet)
+{
+    ULONG err = ERROR_INVALID_HANDLE;
+
+    if (LockHandle())
+    {
+        err = ERROR_NO_SYSTEM_RESOURCES;
+
+        if (U_IRP* Irp = new U_IRP(this, write, packet))
+        {
+            err = Irp-&gt;CheckIoResult(WriteFile(_hFile, packet-&gt;getData(), packet-&gt;getDataSize(), 0, Irp));
+        }
+
+        UnlockHandle();
+    }
+
+    return err;
+}
+
+ULONG CCmd::CreatePipeAnonymousPair(PHANDLE phServerPipe, PHANDLE phClientPipe)
+{
+    static char flag_supported = -1;
+
+    if (flag_supported &lt; 0)
+    {
+        ULONG dwMajorVersion, dwMinorVersion;
+        RtlGetNtVersionNumbers(&amp;dwMajorVersion, &amp;dwMinorVersion, 0);
+        flag_supported = _WIN32_WINNT_WIN7 &lt;= ((dwMajorVersion &lt;&lt; 8)| dwMinorVersion);
+    }
+
+    if (flag_supported)
+    {
+        return CreatePipeAnonymousPair7(phServerPipe, phClientPipe);
+    }
+
+    static LONG s;
+    if (!s)
+    {
+        ULONG seed = GetTickCount();
+        InterlockedCompareExchange(&amp;s, RtlRandomEx(&amp;seed), 0);
+    }
+
+    WCHAR name[64];
+
+    swprintf(name, L"\\\\?\\pipe\\Win32Pipes.%08x.%08x", GetCurrentProcessId(), InterlockedIncrement(&amp;s));
+
+    HANDLE hClient, hServer = CreateNamedPipeW(name, 
+        PIPE_ACCESS_DUPLEX|FILE_READ_DATA|FILE_WRITE_DATA|FILE_FLAG_OVERLAPPED, 
+        PIPE_TYPE_BYTE|PIPE_READMODE_BYTE, 1, 0, 0, NMPWAIT_USE_DEFAULT_WAIT, 0);
+
+    if (hServer != INVALID_HANDLE_VALUE)
+    {
+        static SECURITY_ATTRIBUTES sa = { sizeof(sa), 0, TRUE };
+
+        hClient = CreateFileW(name, FILE_GENERIC_READ|FILE_GENERIC_WRITE, 
+            FILE_SHARE_READ|FILE_SHARE_WRITE, &amp;sa, OPEN_EXISTING, 0, 0);
+
+        if (hClient != INVALID_HANDLE_VALUE)
+        {
+            *phServerPipe = hServer, *phClientPipe = hClient;
+            return NOERROR;
+        }
+
+        CloseHandle(hServer);
+    }
+
+    return GetLastError();
+}
+
+ULONG CCmd::CreatePipeAnonymousPair7(PHANDLE phServerPipe, PHANDLE phClientPipe)
+{
+    HANDLE hNamedPipe;
+
+    IO_STATUS_BLOCK iosb;
+
+    static UNICODE_STRING NamedPipe = RTL_CONSTANT_STRING(L"\\Device\\NamedPipe\\");
+
+    OBJECT_ATTRIBUTES oa = { sizeof(oa), 0, (PUNICODE_STRING)&amp;NamedPipe, OBJ_CASE_INSENSITIVE };
+
+    NTSTATUS status;
+
+    if (0 &lt;= (status = NtOpenFile(&amp;hNamedPipe, SYNCHRONIZE, &amp;oa, &amp;iosb, FILE_SHARE_VALID_FLAGS, 0)))
+    {
+        oa.RootDirectory = hNamedPipe;
+
+        static LARGE_INTEGER timeout = { 0, MINLONG };
+        static UNICODE_STRING empty = {};
+
+        oa.ObjectName = &amp;empty;
+
+        if (0 &lt;= (status = ZwCreateNamedPipeFile(phServerPipe,
+            FILE_READ_ATTRIBUTES|FILE_READ_DATA|
+            FILE_WRITE_ATTRIBUTES|FILE_WRITE_DATA|
+            FILE_CREATE_PIPE_INSTANCE, 
+            &amp;oa, &amp;iosb, FILE_SHARE_READ|FILE_SHARE_WRITE,
+            FILE_CREATE, 0, FILE_PIPE_BYTE_STREAM_TYPE, FILE_PIPE_BYTE_STREAM_MODE,
+            FILE_PIPE_QUEUE_OPERATION, 1, 0, 0, &amp;timeout)))
+        {
+            oa.RootDirectory = *phServerPipe;
+            oa.Attributes = OBJ_CASE_INSENSITIVE|OBJ_INHERIT;
+
+            if (0 &gt; (status = NtOpenFile(phClientPipe, SYNCHRONIZE|FILE_READ_ATTRIBUTES|FILE_READ_DATA|
+                FILE_WRITE_ATTRIBUTES|FILE_WRITE_DATA, &amp;oa, &amp;iosb, 
+                FILE_SHARE_VALID_FLAGS, FILE_SYNCHRONOUS_IO_NONALERT)))
+            {
+                NtClose(oa.RootDirectory);
+            }
+        }
+
+        NtClose(hNamedPipe);
+    }
+
+    return RtlNtStatusToDosError(status);
+}
+
+ULONG CCmd::CreatePipePair(HANDLE* phClient)
+{
+    HANDLE hServer, hClient;
+
+    ULONG err = CreatePipeAnonymousPair(&amp;hServer, &amp;hClient);
+
+    if (!err)
+    {
+        _hFile = hServer;
+        _handleLock = 0x80000000;
+
+        if (!(err = U_IRP::Bind(hServer)) &amp;&amp; !(err = Read()))
+        {
+            *phClient = hClient;
+            return NOERROR;
+        }
+
+        CloseHandle(hClient);
+    }
+    return err;
+}
+
+void CCmd::OnIoComplete(ULONG OpCode, ULONG dwErrorCode, ULONG_PTR dwNumberOfBytesTransfered, PSTR buf)
+{
+    switch (OpCode)
+    {
+    case read:
+        if (dwErrorCode == NOERROR)
+        {
+            if (OnRead(buf, (ULONG)dwNumberOfBytesTransfered))
+            {
+                Read();
+            }
+        }
+        break;
+    case write:
+        OnWrite(dwErrorCode);
+        break;
+    default:
+        __debugbreak();
+    }
+
+    if (dwErrorCode)
+    {
+        DbgPrint("[%u]: error=%u\n", OpCode, dwErrorCode);
+    }
+}
+
+void CCmd::UnlockHandle()
+{
+    if (!_InterlockedDecrement(&amp;_handleLock))
+    {
+        CloseHandle(_hFile), _hFile = 0;
+    }
+}
+
+BOOL CCmd::LockHandle()
+{
+    LONG Value, NewValue;
+
+    if (0 &gt; (Value = _handleLock))
+    {
+        do 
+        {
+            NewValue = _InterlockedCompareExchange(&amp;_handleLock, Value + 1, Value);
+
+            if (NewValue == Value) return TRUE;
+
+        } while (0 &gt; (Value = NewValue));
+    }
+
+    return FALSE;
+}
+
+void CCmd::Close()
+{
+    if (LockHandle())
+    {
+        _bittestandreset(&amp;_handleLock, 31);
+        UnlockHandle();
+    }
+}
+
+ULONG CCmd::Exec(ULONG cbBuffer)
+{
+    WCHAR ApplicationName[MAX_PATH];
+    if (!GetEnvironmentVariableW(L"ComSpec", ApplicationName, RTL_NUMBER_OF(ApplicationName)))
+    {
+        return GetLastError();
+    }
+
+    if (!(_packet = new(cbBuffer) CPacket))
+    {
+        return ERROR_NO_SYSTEM_RESOURCES;
+    }
+
+    STARTUPINFOEXW si = { { sizeof(si) } };
+    PROCESS_INFORMATION pi;
+    ULONG err = CreatePipePair(&amp;si.StartupInfo.hStdError);
+
+    if (err)
+    {
+        return err;
+    }
+
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = si.StartupInfo.hStdOutput = si.StartupInfo.hStdError;
+
+    ULONG dwCreationFlags = CREATE_NO_WINDOW;
+    BOOL fInit = FALSE;
+    SIZE_T Size;
+    if (!InitializeProcThreadAttributeList(0, 1, 0, &amp;Size) &amp;&amp;
+        GetLastError() == ERROR_INSUFFICIENT_BUFFER &amp;&amp;
+        InitializeProcThreadAttributeList(si.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)alloca(Size), 1, 0, &amp;Size))
+    {
+        fInit = TRUE;
+        if (UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, 
+            &amp;si.StartupInfo.hStdError, sizeof(HANDLE), 0, 0))
+        {
+            dwCreationFlags |= EXTENDED_STARTUPINFO_PRESENT;
+        }
+    }
+
+    if (CreateProcessW(ApplicationName, 0, 0, 0, TRUE, dwCreationFlags, 0, 0, &amp;si.StartupInfo, &amp;pi))
+    {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+    }
+    else
+    {
+        err = GetLastError();
+    }
+
+    if (fInit)
+    {
+        DeleteProcThreadAttributeList(si.lpAttributeList);
+    }
+
+    CloseHandle(si.StartupInfo.hStdError);
+
+    return err;
+}
+</code></pre>
+
+<p>and usage example</p>
+
+<pre><code>class CMyCmd : public CCmd
+{
+    ULONG _dwThreadId;
+
+    virtual ~CMyCmd()
+    {
+        PostThreadMessage(_dwThreadId, WM_QUIT, 0, 0);
+    }
+
+    static void PrintOem(PSTR buf, ULONG cb)
+    {
+        if (int cchWideChar = MultiByteToWideChar(CP_OEMCP, 0, buf, cb, 0, 0))
+        {
+            PWSTR wz = (PWSTR)alloca(cchWideChar * sizeof(WCHAR));
+
+            if (MultiByteToWideChar(CP_OEMCP, 0, buf, cb, wz, cchWideChar))
+            {
+                if (ULONG cbMultiByte = WideCharToMultiByte(CP_ACP, 0, wz, cchWideChar, 0, 0, 0, 0))
+                {
+                    PSTR sz = (PSTR)alloca(cbMultiByte);
+
+                    if (WideCharToMultiByte(CP_ACP, 0, wz, cchWideChar, sz, cbMultiByte, 0, 0))
+                    {
+                        DbgPrint("%.*s", cbMultiByte, sz);
+                    }
+                }
+            }
+        }
+    }
+    virtual BOOL OnRead(PSTR buf, ULONG cbTotal)
+    {
+        if (cbTotal)
+        {
+            ULONG cb;
+
+            do 
+            {
+                PrintOem(buf, cb= min(cbTotal, 256));
+
+            } while (buf += cb, cbTotal -= cb);
+        }
+        return TRUE;
+    }
+
+public:
+    CMyCmd() : _dwThreadId(GetCurrentThreadId()) {}
+};
+
+void CmdTest()
+{
+    if (CCmd* pCmd = new CMyCmd)
+    {
+        if (!pCmd-&gt;Exec(0x1000))
+        {
+            pCmd-&gt;Write("echo off\r\n");
+            pCmd-&gt;Write(L"echo ***\r\n");
+            pCmd-&gt;Write("cd /d d:\\\r\ndir\r\nexit\r\n");
+        }
+
+        pCmd-&gt;Release();
+    }
+    MessageBoxW(0,L"demo user interface",L"wait signal",0);
+}
+</code></pre>
+    </div>

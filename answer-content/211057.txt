@@ -1,0 +1,271 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>As a generic remark, note that your FIFO always satisfies the invariant:</p>
+
+<pre><code>write_idx == (read_idx + size) % FIFO_CAPACITY
+</code></pre>
+
+<p>Thus, if you wanted to save some space, you could get rid of the <code>write_idx</code> property entirely and rewrite your <code>push</code> method as:</p>
+
+<pre><code>pub fn push(&amp;mut self, item: u8) -&gt; Result&lt;(), &amp;'static str&gt; {
+    if self.buffer_full() {
+        Err("Buffer full.")
+    } else {
+        let write_idx = Fifo::wrap_around(self.read_idx + self.size);
+        self.buffer[write_idx] = item;
+
+        self.size = self.size + 1;
+
+        Ok(())
+    }
+}
+
+fn wrap_around(idx: usize) -&gt; usize {
+    idx % FIFO_CAPACITY
+}
+</code></pre>
+
+<p>Note that storing <em>only</em> <code>read_idx</code> and <code>write_idx</code> and getting rid of <code>size</code> instead would <em>not</em> work, since there are two different situations where <code>read_idx == write_idx</code>: when the buffer is empty, and when it is full.  Storing <code>size</code> explicitly lets you differentiate between those two cases, since an empty FIFO has <code>size == 0</code> while a full one has <code>size == FIFO_CAPACITY</code>.</p>
+
+<p>I would also replace the line</p>
+
+<pre><code>self.read_idx = Fifo::increment_index(self.read_idx);
+</code></pre>
+
+<p>in your <code>pop</code> method with</p>
+
+<pre><code>self.read_idx = Fifo::wrap_around(self.read_idx + 1);
+</code></pre>
+
+<p>and get rid of the <code>increment_index</code> method entirely, since it's kind of redundant with the more general-purpose <code>wrap_around</code> method above.</p>
+
+<hr>
+
+<p>One interesting side effect of the <code>push</code> rewrite I suggested above is that (as seen below) it allows the compiler omit the array bounds check, since it can tell that the index returned by the <code>wrap_around</code> method is always within the bounds of the array.  We can enable the same optimization for <code>pop</code> by moving the <code>wrap_around</code> call before the array access, e.g. like this:</p>
+
+<pre><code>pub fn pop(&amp;mut self) -&gt; Option&lt;u8&gt; {
+    if self.size == 0 {
+        None
+    } else {
+        self.read_idx = Fifo::wrap_around(self.read_idx); 
+        let result = self.buffer[self.read_idx];
+        self.read_idx = self.read_idx + 1;
+        self.size = self.size - 1;
+        Some(result)        
+    }
+}
+</code></pre>
+
+<p>Note that, with this change, it becomes possible for <code>self.read_idx</code> to be equal to <code>FIFO_CAPACITY</code> after a call to <code>pop</code>.  But that doesn't matter, since any values there will still be correctly wrapped before being used to access the buffer (but see the note at the end of the next section below!).</p>
+
+<hr>
+
+<p>Also, since you say this code is intended for a microcontroller, it's worth keeping in mind that division and remainder can be rather slow operations on low-end microcontrollers.</p>
+
+<p>If your FIFO capacity is always a power of two (like it is in your example code), and given that you're working with unsigned integers, it's likely that the compiler will be able to optimize the <code>idx % FIFO_CAPACITY</code> operation into a bitwise AND, in which case your current code is probably optimal.  Otherwise, however, you may want to consider manually replacing the remainder operation with a comparison, something like this:</p>
+
+<pre><code>fn wrap_around(idx: usize) -&gt; usize {
+    if idx &lt; FIFO_CAPACITY {
+        idx
+    } else {
+        idx - FIFO_CAPACITY
+    }
+}
+</code></pre>
+
+<p>The compiler will not be able to make this optimization automatically, since this function will behave differently than your original if <code>idx &gt;= 2 * FIFO_CAPACITY</code>.  We know that can never actually happen in this code, but the compiler (probably) isn't that smart.</p>
+
+<p>Unfortunately, this version of <code>wrap_around</code> is more efficient than the original for non-power-of-two buffer sizes, it's likely to be <em>less</em> efficient when the capacity <em>is</em> a power of two.  But with a bit of cleverness and trust in the compiler's optimization (specifically, constant folding and dead code elimination) skills, we can actually get optimal code for both cases, like this:</p>
+
+<pre><code>fn wrap_around(idx: usize) -&gt; usize {
+    if Fifo::is_power_of_2(FIFO_CAPACITY) {
+        idx &amp; (FIFO_CAPACITY - 1)  // faster when capacity is a power of 2
+    } else if idx &lt; FIFO_CAPACITY {
+        idx
+    } else {
+        idx - FIFO_CAPACITY
+    }
+}
+
+fn is_power_of_2(num: usize) -&gt; bool {
+    num &amp; (num - 1) == 0
+}
+</code></pre>
+
+<p>The expression <code>num &amp; (num - 1)</code> evaluates to zero <a href="https://stackoverflow.com/questions/108318/whats-the-simplest-way-to-test-whether-a-number-is-a-power-of-2-in-c">if and only if <code>num</code> is a power of two</a> (or zero, but that's not a valid capacity anyway).  Since <code>FIFO_CAPACITY</code> is a constant, the compiler will evaluate <code>Fifo::is_power_of_2(FIFO_CAPACITY)</code> at compile time, and optimize away the branch that isn't taken.  Thus, we get both highly efficient code for power-of-two sizes, and nearly as fast code for sizes that are <em>not</em> powers of two.</p>
+
+<p>Ps. The combination of all these optimizations does create a somewhat subtle edge case: with the optimized <code>pop</code> implementation, it's possible for both <code>self.read_idx</code> and <code>self.size</code> to equal <code>FIFO_CAPACITY</code> when the buffer is full, potentially causing <code>Fifo::wrap_around(self.read_idx + self.size)</code> <em>not</em> to be a valid index into the buffer if the buffer size is not a power of two.  (This can happen e.g. after pushing <code>FIFO_CAPACITY</code> items into a new FIFO, popping them all off and then pushing <code>FIFO_CAPACITY</code> more items again.)  Fortunately, this can <em>only</em> occur when the buffer is full, in which case pushing more items will fail anyway, so the invalid array access will never actually be attempted.  (And of course we're still using Rust, so the compiler does add bounds checks to make sure of that!)  But it's a case that should definitely be tested.</p>
+
+<hr>
+
+<p><strong>Addendum:</strong> It turns out that <a href="https://rust.godbolt.org/" rel="nofollow noreferrer">godbolt.org supports Rust</a>, so we can do some experiments to see how these changes affect the generated assembly.</p>
+
+<p>First, <a href="https://rust.godbolt.org/z/XLCZer" rel="nofollow noreferrer">let's take a look at your original code</a>, with <code>FIFO_CAPACITY</code> set to 32.  I'll compile it with the <code>-O</code> switch, which enables a moderate level of compiler optimization, and with <code>--target=arm-unknown-linux-gnueabi</code> to produce ARM instead of x86 assembly (<a href="https://codereview.stackexchange.com/posts/comments/408088">thanks, hellow</a>!).</p>
+
+<p>Here's what your <code>push</code> and <code>pop</code> methods looks like in ARM assembly, with some manual annotations for readers not so familiar with the syntax.  Note how the calls to <code>buffer_full</code> and <code>increment_index</code> have been inlined:</p>
+
+<pre class="lang-none prettyprint-override"><code>example::Fifo::push:
+        ldr     r2, [r0]        @ r2 = self.size
+        cmp     r2, #32         @ r2 == FIFO_CAPACITY?
+
+        ldreq   r0, .LCPI1_0    @ Err("Buffer full.")
+        moveq   r1, #12
+        addeq   r0, pc, r0
+        bxeq    lr
+
+        ldr     r2, [r0, #8]    @ r2 = self.write_idx
+        cmp     r2, #31         @ [array bounds check]
+
+        addls   r2, r0, r2      @ self.buffer[r2] = r1
+        strbls  r1, [r2, #12]
+
+        ldrls   r1, [r0]        @ r1 = self.size
+        ldrls   r2, [r0, #8]    @ r2 = self.write_idx
+        addls   r1, r1, #1      @ r1 = r1 + 1
+        strls   r1, [r0]        @ self.size = r1
+
+        addls   r1, r2, #1      @ r1 = r2 + 1
+        andls   r1, r1, #31     @ r1 = r1 &amp; (FIFO_CAPACITY-1)
+        strls   r1, [r0, #8]    @ self.write_idx = r1
+
+        movls   r1, #0          @ Ok(())
+        movls   r0, #0
+        bxls    lr
+
+        push    {r11, lr}       @ [array bounds check failed]
+        ldr     r0, .LCPI1_1
+        mov     r1, r2
+        mov     r2, #32
+        add     r0, pc, r0
+        bl      core::panicking::panic_bounds_check
+
+example::Fifo::pop:
+        ldr     r3, [r0]        @ r3 = self.size
+        cmp     r3, #0          @ if (r3 == 0) goto .LBB2_2 
+        beq     .LBB2_2
+
+        ldr     r2, [r0, #4]    @ r2 = self.read_idx
+        cmp     r2, #31         @ [array bounds check]
+
+        addls   r1, r0, r2      @ r1 = self.buffer[r2] (interleaved...)
+
+        addls   r2, r2, #1      @ r2 = r2 + 1
+        subls   r3, r3, #1      @ r3 = r3 - 1
+        andls   r2, r2, #31     @ r2 = r2 &amp; (FIFO_CAPACITY-1)
+
+        ldrbls  r1, [r1, #12]   @ r1 = self.buffer[r2] (...interleaved)
+
+        strls   r3, [r0]        @ self.size = r3
+        strls   r2, [r0, #4]    @ self.read_idx = r2
+
+        movls   r0, #1          @ Some(r1)
+        bxls    lr
+
+        push    {r11, lr}       @ [array bounds check failed]
+        ldr     r0, .LCPI2_0
+        mov     r1, r2
+        mov     r2, #32
+        add     r0, pc, r0
+        bl      core::panicking::panic_bounds_check
+
+.LBB2_2:
+        mov     r0, #0          @ None
+        bx      lr
+</code></pre>
+
+<p>In general, this doesn't look too bad.  For <code>push</code> there are four loads (one of which the compiler <em>could</em> have optimized out, but didn't), three stores and no branches (due to the use of conditional code instead), while <code>pop</code> has three loads, two stores and one branch (for the <code>self.size == 0</code> case) that the compiler for some reason didn't replace with conditional code.  There's no particularly slow arithmetic (since the <code>%</code> operation was optimized into a bitwise <code>&amp;</code>), and while the unnecessary array bounds checks bloat the code a little bit, their effect on execution time should be negligible.</p>
+
+<p>Now let's see how the same code would look <a href="https://rust.godbolt.org/z/908R4o" rel="nofollow noreferrer">with the modifications I suggested</a>:</p>
+
+<pre class="lang-none prettyprint-override"><code>example::Fifo::push:
+        ldr     r2, [r0]        @ r2 = self.size
+        cmp     r2, #32         @ r2 == FIFO_CAPACITY?
+
+        ldreq   r0, .LCPI1_0    @ Err("Buffer full.")
+        moveq   r1, #12
+        addeq   r0, pc, r0
+        bxeq    lr
+
+        ldr     r3, [r0, #4]    @ r3 = self.read_idx
+        add     r3, r3, r2      @ r3 = r3 + r2
+        and     r3, r3, #31     @ r3 = r3 &amp; (FIFO_CAPACITY-1)
+
+        add     r3, r0, r3      @ self.buffer[r3] = r1
+        strb    r1, [r3, #8]
+
+        add     r1, r2, #1      @ r1 = r2 + 1
+        str     r1, [r0]        @ self.size = r1
+
+        mov     r1, #0          @ Ok(())
+        mov     r0, #0
+        bx      lr
+
+example::Fifo::pop:
+        ldr     r2, [r0]        @ r2 = self.size
+        cmp     r2, #0          @ if (r2 == 0) goto .LBB2_2
+        beq     .LBB2_2
+
+        ldr     r1, [r0, #4]    @ r1 = self.read_idx
+        sub     r2, r2, #1      @ r2 = r2 - 1
+        and     r3, r1, #31     @ r3 = r1 &amp; (FIFO_CAPACITY-1)
+
+        add     r1, r0, r3      @ r1 = self.buffer[r3] (interleaved...)
+        add     r3, r3, #1      @ r3 = r3 + 1
+        ldrb    r1, [r1, #8]    @ r1 = self.buffer[r3] (...interleaved)
+
+        stm     r0, {r2, r3}    @ self.size = r2, self.read_idx = r3
+
+        mov     r0, #1          @ Some(r1)
+        bx      lr
+
+.LBB2_2:
+        mov     r0, #0          @ None
+        bx      lr
+</code></pre>
+
+<p>The first six instructions in <code>push</code> (which implement the buffer fullness check) are exactly the same.  The rest, however, looks a bit simpler: now we have only two loads and two stores, and the unnecessary array bounds check is also gone (because the compiler can now tell that the wrapped index can never overflow the array).</p>
+
+<p>In the <code>pop</code> method, the <code>self.size == 0</code> check is compiled into the exact same code as before (still with an explicit branch, for some reason), and we still have the same number of loads and stores (although this time the compiler managed to merge the two stores into a single <code>stm</code> instruction).  Here, as well, avoiding the array bounds check makes the code shorter and simpler.</p>
+
+<hr>
+
+<p>OK, but what about non-power-of-two buffer sizes?  Well, ideally, you'd probably want to avoid them entirely, if you want to maximize performance.  But what if you just <em>had to</em> use a buffer capacity that wasn't a power of two?</p>
+
+<p>Well, here's what the <code>increment_index</code> call in your <code>push</code> method compiles to <a href="https://rust.godbolt.org/z/F1H2LP" rel="nofollow noreferrer">with <code>FIFO_CAPACITY</code> set to 37</a>:</p>
+
+<pre class="lang-none prettyprint-override"><code>        addls   r1, r2, #1              @ r1 = self.write_idx + 1
+        ldrls   r2, .LCPI1_0            @ r2 = 3134165325 (!)
+        umullls r2, r3, r1, r2          @ r3 = (r1 * r2) &gt;&gt; 32 
+        subls   r2, r1, r3              @ r2 = r1 - r3
+        addls   r2, r3, r2, lsr #1      @ r2 = r3 + (r2 &gt;&gt; 1)
+        movls   r3, #37                 @ r3 = FIFO_CAPACITY
+        lsrls   r2, r2, #5              @ r2 = r2 &gt;&gt; 5
+        mulls   r2, r2, r3              @ r2 = r2 * r3
+        subls   r1, r1, r2              @ r1 = r1 - r2
+
+.LCPI1_0:
+        .long   3134165325
+</code></pre>
+
+<p>Wait, what the heck is going on here?</p>
+
+<p>Well, what's going on is <a href="https://homepage.divms.uiowa.edu/~jones/bcd/divide.html" rel="nofollow noreferrer">reciprocal multiplication</a>.  Basically, since division is one of the slowest arithmetic operations on any modern CPU, compilers use <a href="https://stackoverflow.com/questions/41183935/why-does-gcc-use-multiplication-by-a-strange-number-in-implementing-integer-divi">clever arithmetic tricks</a> to <a href="https://reverseengineering.stackexchange.com/questions/1397/how-can-i-reverse-optimized-integer-division-modulo-by-constant-operations">replace division (and modulo) by a constant</a> with a combination of multiplications and shifts.</p>
+
+<p>So, basically, instead of calculating <code>idx = idx % 37</code> directly, the assembly code generated by the compiler effectively calculates</p>
+
+<pre><code>tmp = (3134165325 * idx) &gt;&gt; 32;
+avg = tmp + ((idx - tmp) &gt;&gt; 1);
+idx = idx - (avg &gt;&gt; 5) * 37
+</code></pre>
+
+<p>using unsigned 32-bit arithmetic (except with the first multiplication calculated as a 64-bit result, the lower half of which is immediately discarded).  If you want, you can verify that this indeed produces the same results as the normal remainder calculation!</p>
+
+<p>(It may be illustrative to do the calculation step by step for <code>idx</code> = 37.  You'll find that <code>tmp</code> works out to 27, and their average <code>avg</code> to 32, which when shifted right by 5 bits yields 1.  If <code>idx</code> = 36, however, then <code>tmp</code> = 26 and <code>avg</code> = 31, which yields 0 when shifted right.  Clever!)</p>
+
+<p>Meanwhile, however, in <a href="https://rust.godbolt.org/z/COp6tZ" rel="nofollow noreferrer">my optimized version</a> the equivalent code (sans increment) compiles to just this:</p>
+
+<pre class="lang-none prettyprint-override"><code>        subs    r2, r3, #37     @ r2 = r3 - 37
+        movlo   r2, r3          @ if (r2 &lt; 0) r2 = r3
+</code></pre>
+
+<p>Not nearly as clever and enigmatic, perhaps, but a lot simpler and faster.</p>
+    </div>

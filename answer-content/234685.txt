@@ -1,0 +1,148 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3><em>Optimization and restructuring</em></h3>
+
+<p><em>Function's responsibility</em></p>
+
+<p>The initial approach makes the <code>read_page</code> function depend on both <code>requests</code> and <code>BeautifulSoup</code> modules (though <code>BeautifulSoup</code> functionality/features is not actually used there). Then, a <code>soup</code> instance is passed to <code>news_scraper(soup)</code> function.<br>To reduce dependencies let <code>read_page</code> function extract the remote webpage and just return its contents <code>r.content</code>. That will also uncouple <code>news_scraper</code> from <code>soup</code> instance arguments and allow to pass any markup content, making the function more unified.</p>
+
+<hr>
+
+<p><em>Namings</em></p>
+
+<p><code>BASE = "https://www.pravda.com.ua"</code> within <code>news_scraper</code> function is essentially acting like a local variable. But considering it as a constant - it should be moved out at top level and renamed to a meaningful <strong><code>BASE_URL = "https://www.pravda.com.ua"</code></strong>.</p>
+
+<p><code>i</code> is not a good variable name to reflect a document element in <code>for i in soup.select("div.news.news_all &gt; div")</code>. Good names are <code>node</code>, <code>el</code>, <code>atricle</code> ...</p>
+
+<p>The <code>main</code> function is better renamed to <strong><code>news_to_df</code></strong> to reflect the actual intention.<br><code>main(START_URL)</code> - don't give arguments uppercased names, it should be <code>start_url</code>.</p>
+
+<hr>
+
+<p><em>Parsing news items and composing <code>"date"</code> value</em></p>
+
+<p>As you parse webpages (html pages) - specifying <strong><code>html.parser</code></strong> or <strong><code>html5lib</code></strong> (not <code>lxml</code>) is preferable for creating <code>BeautifulSoup</code> instance.</p>
+
+<p>Extracting an <em>article publication time</em> with generic <code>i.div.text</code> would be wrong as a parent node <code>div.article</code> could potentially contain another child <code>div</code> nodes with text content. Therefore, the search query should be more exact: <strong><code>news_time = el.find(class_='article__time').text</code></strong>.<br>Instead of assigning, traversing and dropping <code>"time"</code> column and aggregating:</p>
+
+<pre><code>dataframe["date"] = (
+        dataframe["link"]
+        .str.extract("(\d{4}/\d{2}/\d{2})")[0]
+        .str.cat(dataframe["time"], sep=" ")
+    )
+</code></pre>
+
+<p>- that all can be eliminated and the <code>date</code> column can be calculated at once by combining the extracted <em>date</em> value (powered by precompiled regex pattern <strong><code>DATE_PAT = re.compile(r'\d{4}/\d{2}/\d{2}')</code></strong>) and <code>news_time</code> value.</p>
+
+<p>Instead of collecting a list of lists - a more robust way is to collect a list of dictionaries like <code>{'title': ..., 'subtitle': ..., 'date': ..., 'link': ...}</code> as that will prevent confusing the order of values for strict list of column names.</p>
+
+<p>Furthermore, instead of <code>append</code>ing to list, a sequence of needed dictionaries can be efficiently collected with <em>generator</em> function. See the full implementation below. </p>
+
+<hr>
+
+<p><em>The <code>main</code> function (new name: <code>news_to_df</code>)</em></p>
+
+<p>The <code>while next_page:</code> turned to <code>while True:</code>.</p>
+
+<p><code>except:</code> - do not use bare <code>except</code>, at least catch basic <code>Exception</code> class: <strong><code>except Exception:</code></strong>.</p>
+
+<p>The repeated blocks of <code>read_page</code>, <code>news_scraper</code> and <code>results.append(df)</code> statements can be reduced to a single block (see below).<br>One subtle nuance is that the ultimate "next" page will have <strong><code>'/archives/'</code></strong> in its <code>a.button.button_next.href</code> path, signaling the end of paging. It's worth to handle that situation explicitly:</p>
+
+<pre><code>if next_page == '/archives/':
+    break
+</code></pre>
+
+<hr>
+
+<p>The final optimized solution:</p>
+
+<pre><code>import requests
+import pandas as pd
+from bs4 import BeautifulSoup
+from time import sleep
+import re
+
+BASE_URL = "https://www.pravda.com.ua"
+DATE_PAT = re.compile(r'\d{4}/\d{2}/\d{2}')
+
+
+def read_page(url):
+    r = requests.get(url)
+    return r.content
+
+
+def _collect_newsitems_gen(articles):
+    for el in articles:
+        a_node = el.a
+        news_time = el.find(class_='article__time').text
+        yield {'title': a_node.text, 
+               'subtitle': el.find(class_="article__subtitle").text,
+               'date': f'{DATE_PAT.search(a_node["href"]).group()} {news_time}',
+               'link': f'{BASE_URL}{a_node["href"]}'}
+
+
+def news_scraper(news_content):
+    soup = BeautifulSoup(news_content, "html5lib")
+    articles = soup.select("div.news.news_all &gt; div")
+    next_page_url = soup.select_one("div.archive-navigation &gt; a.button.button_next")["href"]
+    df = pd.DataFrame(list(_collect_newsitems_gen(articles)),
+                      columns=["title", "subtitle", "date", "link"])
+
+    return df, f'{BASE_URL}{next_page_url}'
+
+
+def news_to_df(start_url):
+    next_page = start_url
+    results = []
+
+    while True:
+        print(next_page)
+        try:
+            content = read_page(next_page)
+            df, next_page = news_scraper(content)
+            results.append(df)
+            if next_page == '/archives/':
+                break
+        except Exception:
+            break
+
+        sleep(1)
+
+    return pd.concat([r for r in results], ignore_index=True)
+
+
+if __name__ == "__main__":
+    df = news_to_df("https://www.pravda.com.ua/archives/date_24122019/")        
+    assert df.shape == (120, 4)  # it's true as of today, 12.26.2019
+</code></pre>
+
+<p>If printing the final resulting <code>df</code> with <code>print(df.to_string())</code> - the output would look like below (with cutted the middle part to make it a bit shorter):</p>
+
+<pre><code>https://www.pravda.com.ua/archives/date_24122019/
+https://www.pravda.com.ua/archives/date_25122019/
+https://www.pravda.com.ua/archives/
+                                                 title                                           subtitle              date                                               link
+0    Голова Закарпаття не зрозумів, за що його звіл...  Голова Закарпатської обласної державної адміні...  2019/12/24 23:36  https://www.pravda.com.ua/news/2019/12/24/7235...
+1    Стало відомо коли відновлять будівництво об'єк...  На зустрічі представників керівництва ХК Київм...  2019/12/24 22:41  https://www.pravda.com.uahttps://www.epravda.c...
+2          ВАКС продовжив арешт Гримчаку до 14 лютого   Вищий антикорупційний продовжив арешт для коли...  2019/12/24 22:25  https://www.pravda.com.ua/news/2019/12/24/7235...
+3    Економічні новини 24 грудня: транзит газу, зни...  Про транзит газу, про зниження "платіжок", про...  2019/12/24 22:10  https://www.pravda.com.uahttps://www.epravda.c...
+4    Трамп: США готові до будь-якого "різдвяного по...  Президент США Дональд Трамп на тлі побоювань щ...  2019/12/24 22:00  https://www.pravda.com.uahttps://www.eurointeg...
+5    У податковій слідчі дії – електронні сервіси п...  Державна податкова служба попереджає, що елект...  2019/12/24 21:55  https://www.pravda.com.ua/news/2019/12/24/7235...
+6     Мінфін знизив ставки за держборгом до 11% річних  Міністерство фінансів знизило середньозважену ...  2019/12/24 21:31  https://www.pravda.com.uahttps://www.epravda.c...
+7    Україна викреслила зі списку на обмін ексберку...  Російський адвокат Валентин Рибін заявляє, що ...  2019/12/24 21:13  https://www.pravda.com.ua/news/2019/12/24/7235...
+8    Посол: іспанський клуб покарають за образи укр...  Посол України в Іспанії Анатолій Щерба заявив,...  2019/12/24 20:45  https://www.pravda.com.uahttps://www.eurointeg...
+9    Міністр енергетики: "Газпром" може "зістрибнут...  У Міністерстві енергетики не виключають, що "Г...  2019/12/24 20:03  https://www.pravda.com.uahttps://www.epravda.c...
+10   Зеленський призначив Арахамію секретарем Націн...  Президент Володимир Зеленський затвердив персо...  2019/12/24 20:00  https://www.pravda.com.ua/news/2019/12/24/7235...
+...
+110  Уряд придумав, як захистити українців від шкод...  Кабінет міністрів схвалив законопроєкт, який з...  2019/12/25 06:54  https://www.pravda.com.ua/news/2019/12/25/7235...
+111  Кіберполіція та YouControl домовилися про спів...  Кіберполіція та компанія YouControl підписали ...  2019/12/25 06:00  https://www.pravda.com.ua/news/2019/12/25/7235...
+112  В окупованому Криму продають прикарпатські яли...  У центрі Сімферополя, на новорічному ярмарку п...  2019/12/25 05:11  https://www.pravda.com.ua/news/2019/12/25/7235...
+113  У США схожий на Санту чоловік пограбував банк,...  У Сполучених Штатах чоловік з білою, як у Сант...  2019/12/25 04:00  https://www.pravda.com.ua/news/2019/12/25/7235...
+114  У Росії за "дитячу порнографію" посадили блоге...  Верховний суд російської Чувашії засудив до тр...  2019/12/25 03:26  https://www.pravda.com.ua/news/2019/12/25/7235...
+115  Уряд провів екстрене засідання через газові пе...  Кабінет міністрів у вівторок ввечері провів ек...  2019/12/25 02:31  https://www.pravda.com.ua/news/2019/12/25/7235...
+116  Нова стратегія Мінспорту: розвиток інфраструкт...  Стратегія розвитку спорту і фізичної активност...  2019/12/25 02:14  https://www.pravda.com.ua/news/2019/12/25/7235...
+117  Милованов розкритикував НБУ за курс гривні та ...  Міністр розвитку економіки Тимофій Милованов р...  2019/12/24 01:46  https://www.pravda.com.uahttps://www.epravda.c...
+118  Російські літаки розбомбили школу в Сирії: заг...  Щонайменше 10 людей, в тому числі шестеро – ді...  2019/12/25 01:04  https://www.pravda.com.ua/news/2019/12/25/7235...
+119  Ліквідація "майданчиків Яценка": Зеленський пі...  Президент Володимир Зеленський підписав закон,...  2019/12/25 00:27  https://www.pravda.com.ua/news/2019/12/25/7235...
+</code></pre>
+
+<h3><em>P.S. From Ukraine with love ...</em></h3>
+    </div>

@@ -1,0 +1,575 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><em>(self-answer)</em></p>
+<hr>
+<h3>v3</h3>
+<p>I wanted to use <code>v2</code> of this code (below) to upgrade my old <code>MimeType</code> that was very similar but it turned out I cannot because I need <code>string</code> values (like <code>application/json</code>) and not numerical ones (like <code>1</code>) (which are rarely useful anyway) so I've changed the whole thing to work with my <code>SoftString</code> and replaced binary operations with <code>HashSet</code>s. Alternatively this could use a generic value but currently I don't see any use for them.</p>
+<pre><code>[PublicAPI]
+public abstract class Option
+{
+    protected const string Unknown = nameof(Unknown);
+
+    public static readonly IImmutableList&lt;SoftString&gt; ReservedNames =
+        ImmutableList&lt;SoftString&gt;
+            .Empty
+            .Add(nameof(Option&lt;Option&gt;.None))
+            .Add(nameof(Option&lt;Option&gt;.Known));
+
+    // Disallow anyone else to use this class.
+    // This way we can guarantee that it is used only by the Option&lt;T&gt;.
+    private protected Option() { }
+
+    [NotNull]
+    public abstract SoftString Name { get; }
+
+    public abstract IImmutableSet&lt;SoftString&gt; Values { get; }
+
+    public abstract bool IsFlag { get; }
+}
+
+[PublicAPI]
+[DebuggerDisplay(DebuggerDisplayString.DefaultNoQuotes)]
+public abstract class Option&lt;T&gt; : Option, IEquatable&lt;Option&lt;T&gt;&gt;, IFormattable where T : Option
+{
+    // Values are what matters for equality.
+    private static readonly IEqualityComparer&lt;Option&lt;T&gt;&gt; Comparer = EqualityComparerFactory&lt;Option&lt;T&gt;&gt;.Create
+    (
+        equals: (left, right) =&gt; left.Values.SetEquals(right.Values),
+        getHashCode: (obj) =&gt; obj.Values.GetHashCode()
+    );
+
+    // ReSharper disable once StaticMemberInGenericType - this is correct
+    private static readonly ConstructorInfo Constructor;
+
+    static Option()
+    {
+        Constructor =
+            typeof(T).GetConstructor(new[] { typeof(SoftString), typeof(IImmutableSet&lt;SoftString&gt;) })
+            ?? throw DynamicException.Create
+            (
+                "ConstructorNotFound",
+                $"{typeof(T).ToPrettyString()} must provide a constructor with the following signature: " +
+                $"ctor({typeof(SoftString).ToPrettyString()}, {typeof(int).ToPrettyString()})"
+            );
+
+        // Always initialize "None".
+        var none = New(nameof(None), ImmutableHashSet&lt;SoftString&gt;.Empty.Add(nameof(None)));
+        Known = ImmutableHashSet&lt;T&gt;.Empty.Add(none);
+    }
+
+    protected Option(SoftString name, IImmutableSet&lt;SoftString&gt; values)
+    {
+        Name = name;
+        Values = values;
+    }
+
+    [NotNull]
+    public static T None =&gt; Known.Single(o =&gt; o.Name == nameof(None));
+
+    /// &lt;summary&gt;
+    /// Gets all known options ever created for this type.
+    /// &lt;/summary&gt;
+    [NotNull]
+    public static IImmutableSet&lt;T&gt; Known { get; private set; }
+
+    /// &lt;summary&gt;
+    /// Gets options that have only a single value.
+    /// &lt;/summary&gt;
+    [NotNull, ItemNotNull]
+    public static IEnumerable&lt;T&gt; Bits =&gt; Known.Where(o =&gt; o.IsFlag);
+
+    #region Option
+
+    public override SoftString Name { [DebuggerStepThrough] get; }
+
+    public override IImmutableSet&lt;SoftString&gt; Values { get; }
+
+    /// &lt;summary&gt;
+    /// Gets value indicating whether this option has only a single value.
+    /// &lt;/summary&gt;
+    public override bool IsFlag =&gt; Values.Count == 1;
+
+    #endregion
+
+    #region Factories
+
+    public static T Create(SoftString name, params SoftString[] values)
+    {
+        return Create(name, values.ToImmutableHashSet());
+    }
+
+    [NotNull]
+    public static T Create(SoftString name, IImmutableSet&lt;SoftString&gt; values)
+    {
+        if (name.In(ReservedNames))
+        {
+            throw DynamicException.Create("ReservedOption", $"The option '{name}' is reserved and must not be created by the user.");
+        }
+
+        if (name.In(Known.Select(o =&gt; o.Name)))
+        {
+            throw DynamicException.Create("DuplicateOption", $"The option '{name}' is already defined.");
+        }
+
+        var newOption = New(name, values);
+
+        if (name == Unknown)
+        {
+            return newOption;
+        }
+
+        Known = Known.Add(newOption);
+        return newOption;
+    }
+
+    private static T New(SoftString name, IImmutableSet&lt;SoftString&gt; values)
+    {
+        return (T)Constructor.Invoke(new object[]
+        {
+            name,
+            values.Any()
+                ? values
+                : ImmutableHashSet&lt;SoftString&gt;.Empty.Add(name)
+        });
+    }
+
+    [NotNull]
+    public static T CreateWithCallerName([CanBeNull] string value = default, [CallerMemberName] string name = default)
+    {
+        return Create(name, value ?? name);
+    }
+
+    [NotNull]
+    public static T FromName([NotNull] string name)
+    {
+        if (name == null) throw new ArgumentNullException(nameof(name));
+
+        return
+            Known.FirstOrDefault(o =&gt; o.Name == name)
+            ?? throw DynamicException.Create("OptionOutOfRange", $"There is no such option as '{name}'.");
+    }
+
+    private static bool TryGetKnownOption(IEnumerable&lt;SoftString&gt; values, out T option)
+    {
+        if (Known.SingleOrDefault(o =&gt; o.Values.SetEquals(values)) is var knownOption &amp;&amp; !(knownOption is null))
+        {
+            option = knownOption;
+            return true;
+        }
+        else
+        {
+            option = default;
+            return false;
+        }
+    }
+
+    #endregion
+
+    public T Set(Option&lt;T&gt; option) =&gt; this | option;
+
+    public T Reset(Option&lt;T&gt; option) =&gt; this ^ option;
+
+    [DebuggerStepThrough]
+    public string ToString(string format, IFormatProvider formatProvider)
+    {
+        if (format.In(new[] { "asc", null }, SoftString.Comparer))
+        {
+            return Values.OrderBy(x =&gt; x).Select(x =&gt; $"{x.ToString()}").Join(", ");
+        }
+
+        if (format.In(new[] { "desc" }, SoftString.Comparer))
+        {
+            return Values.OrderByDescending(x =&gt; x).Select(x =&gt; $"{x.ToString()}").Join(", ");
+        }
+
+        return ToString();
+    }
+
+    public override string ToString() =&gt; $"{this:asc}";
+
+    public bool Contains(T option) =&gt; Values.Overlaps(option.Values);
+
+    #region IEquatable
+
+    public bool Equals(Option&lt;T&gt; other) =&gt; Comparer.Equals(this, other);
+
+    public override bool Equals(object obj) =&gt; Equals(obj as Option&lt;T&gt;);
+
+    public override int GetHashCode() =&gt; Comparer.GetHashCode(this);
+
+    #endregion
+
+    #region Operators
+
+    public static implicit operator string(Option&lt;T&gt; option) =&gt; option?.ToString() ?? throw new ArgumentNullException(nameof(option));
+
+    public static bool operator ==(Option&lt;T&gt; left, Option&lt;T&gt; right) =&gt; Comparer.Equals(left, right);
+
+    public static bool operator !=(Option&lt;T&gt; left, Option&lt;T&gt; right) =&gt; !(left == right);
+
+    [NotNull]
+    public static T operator |(Option&lt;T&gt; left, Option&lt;T&gt; right)
+    {
+        var values = left.Values.Concat(right.Values).ToImmutableHashSet();
+        return GetKnownOrCreate(values);
+    }
+
+    [NotNull]
+    public static T operator ^(Option&lt;T&gt; left, Option&lt;T&gt; right)
+    {
+        var values = left.Values.Except(right.Values).ToImmutableHashSet();
+        return GetKnownOrCreate(values);
+    }
+
+    private static T GetKnownOrCreate(IImmutableSet&lt;SoftString&gt; values)
+    {
+        return
+            TryGetKnownOption(values, out var knownOption)
+                ? knownOption
+                : Create(Unknown, values);
+    }
+
+    #endregion
+}
+</code></pre>
+<hr>
+<h3>v2</h3>
+<p>I have made a <em>couple</em> of changes so here's the summary and the improved code:</p>
+<ul>
+<li>Using <code>CallerMemberName</code> for automatic option names, however, it's still possible to create custom options with anyname.</li>
+<li>Using generic <code>Option&lt;T&gt;</code> to remove the <code>Dictionary</code> and provide a few default properties such as <code>None</code>, <code>All</code> or <code>Max</code>, <code>Bits</code>.</li>
+<li>Cleaned-up naming; now <em>parsing</em> APIs are called <code>FromName</code> and <code>FromValue</code></li>
+<li>Added internal set of options so that I can check whether an option is already defined and use it for other properties like <code>All</code>, <code>Max</code> and <code>Bits</code>.</li>
+<li>Added multi-bit support.</li>
+<li>Not using <code>BitVector32</code> yet... maybe later.</li>
+<li>Added <code>IFormattable</code> interface and three formats: <code>names</code>, <code>flags</code> and <code>names+flags</code>.</li>
+<li>Encapsulated operators <code>|</code> and <code>^</code> respectively as <code>Set</code> and <code>Reset</code>.</li>
+<li>Added <code>Flags</code> property that enumerates all bits of an option.</li>
+</ul>
+
+<pre><code>[PublicAPI]
+public abstract class Option
+{
+    public static readonly IImmutableList&lt;SoftString&gt; ReservedNames =
+        ImmutableList&lt;SoftString&gt;
+            .Empty
+            .Add(nameof(Option&lt;Option&gt;.None))
+            .Add(nameof(Option&lt;Option&gt;.All))
+            .Add(nameof(Option&lt;Option&gt;.Max));
+
+    // Disallow anyone else to use this class.
+    // This way we can guarantee that it is used only by the Option&lt;T&gt;.
+    private protected Option() { }
+
+    [NotNull]
+    public abstract SoftString Name { get; }
+
+    public abstract int Flag { get; }
+
+    /// &lt;summary&gt;
+    /// Returns True if Option is power of two.
+    /// &lt;/summary&gt;
+    public abstract bool IsBit { get; }
+}
+
+[PublicAPI]
+[DebuggerDisplay(DebuggerDisplayString.DefaultNoQuotes)]
+public abstract class Option&lt;T&gt; : Option, IEquatable&lt;Option&lt;T&gt;&gt;, IComparable&lt;Option&lt;T&gt;&gt;, IComparable, IFormattable where T : Option
+{
+    protected const string Unknown = nameof(Unknown);
+
+    private static readonly OptionComparer Comparer = new OptionComparer();
+
+    private static IImmutableSet&lt;T&gt; Options;
+
+    static Option()
+    {
+        // Always initialize "None".
+        Options = ImmutableSortedSet&lt;T&gt;.Empty.Add(Create(nameof(None), 0));
+    }
+
+    protected Option(SoftString name, int flag)
+    {
+        if (GetType() != typeof(T)) throw DynamicException.Create("OptionTypeMismatch", "Option must be a type of itself.");
+
+        Name = name;
+        Flag = flag;
+    }
+
+    #region Default options
+
+    [NotNull]
+    public static T None =&gt; Options.First();
+
+    [NotNull]
+    public static T Max =&gt; Options.Last();
+
+    [NotNull]
+    public static IEnumerable&lt;T&gt; All =&gt; Options;
+
+    #endregion
+
+    [NotNull, ItemNotNull]
+    public static IEnumerable&lt;T&gt; Bits =&gt; Options.Where(o =&gt; o.IsBit);
+
+    #region Option
+
+    public override SoftString Name { [DebuggerStepThrough] get; }
+
+    [AutoEqualityProperty]
+    public override int Flag { [DebuggerStepThrough] get; }
+
+    public override bool IsBit =&gt; (Flag &amp; (Flag - 1)) == 0;
+
+    #endregion
+
+    [NotNull, ItemNotNull]
+    public IEnumerable&lt;T&gt; Flags =&gt; Bits.Where(f =&gt; (Flag &amp; f.Flag) &gt; 0);
+
+    #region Factories
+
+    [NotNull]
+    public static T Create(SoftString name, T option = default)
+    {
+        if (name.In(Options.Select(o =&gt; o.Name).Concat(ReservedNames)))
+        {
+            throw DynamicException.Create("DuplicateOption", $"The option '{name}' is defined more the once.");
+        }
+
+        var bitCount = Options.Count(o =&gt; o.IsBit);
+        var newOption = Create(name, bitCount == 1 ? 1 : (bitCount - 1) &lt;&lt; 1);
+        Options = Options.Add(newOption);
+
+        return newOption;
+    }
+
+    [NotNull]
+    public static T CreateWithCallerName(T option = default, [CallerMemberName] string name = default)
+    {
+        return Create(name, option);
+    }
+
+    private static T Create(SoftString name, IEnumerable&lt;int&gt; flags)
+    {
+        var flag = flags.Aggregate(0, (current, next) =&gt; current | next);
+        return (T)Activator.CreateInstance(typeof(T), name, flag);
+    }
+
+    public static T Create(SoftString name, params int[] flags)
+    {
+        return Create(name, flags.AsEnumerable());
+    }
+
+    [NotNull]
+    public static T FromName([NotNull] string value)
+    {
+        if (value == null) throw new ArgumentNullException(nameof(value));
+
+        return
+            Options.FirstOrDefault(o =&gt; o.Name == value)
+            ?? throw DynamicException.Create("OptionOutOfRange", $"There is no such option as '{value}'.");
+    }
+
+    [NotNull]
+    public static T FromValue(int value)
+    {
+        if (value &gt; Max.Flag)
+        {
+            throw new ArgumentOutOfRangeException(paramName: nameof(value), $"Value {value} is greater than the highest option.");
+        }
+
+        // Is this a known value?
+        if (TryGetKnownOption(value, out var knownOption))
+        {
+            return knownOption;
+        }
+
+        var newFlags = Bits.Where(o =&gt; (o.Flag &amp; value) == o.Flag).Select(o =&gt; o.Flag);
+        return Create(Unknown, newFlags);
+    }
+
+    private static bool TryGetKnownOption(int flag, out T option)
+    {
+        if (Options.SingleOrDefault(o =&gt; o.Flag == flag) is var knownOption &amp;&amp; !(knownOption is null))
+        {
+            option = knownOption;
+            return true;
+        }
+        else
+        {
+            option = default;
+            return false;
+        }
+    }
+
+    #endregion
+
+    public T Set(Option&lt;T&gt; option)
+    {
+        return this | option;
+    }
+
+    public T Reset(Option&lt;T&gt; option)
+    {
+        return this ^ option;
+    }
+
+    [DebuggerStepThrough]
+    public string ToString(string format, IFormatProvider formatProvider)
+    {
+        if (SoftString.Comparer.Equals(format, "names"))
+        {
+            return Flags.Select(o =&gt; $"{o.Name.ToString()}").Join(", ");
+        }
+
+        if (SoftString.Comparer.Equals(format, "flags"))
+        {
+            return Flags.Select(o =&gt; $"{o.Flag}").Join(", ");
+        }
+
+        if (SoftString.Comparer.Equals(format, "names+flags"))
+        {
+            return Flags.Select(o =&gt; $"{o.Name.ToString()}[{o.Flag}]").Join(", ");
+        }
+
+        return ToString();
+    }
+
+    public override string ToString() =&gt; $"{this:names}";
+
+    public bool Contains(T option) =&gt; Contains(option.Flag);
+
+    public bool Contains(int flags) =&gt; (Flag &amp; flags) == flags;
+
+    public int CompareTo(Option&lt;T&gt; other) =&gt; Comparer.Compare(this, other);
+
+    public int CompareTo(object other) =&gt; Comparer.Compare(this, other);
+
+    #region IEquatable
+
+    public bool Equals(Option&lt;T&gt; other) =&gt; AutoEquality&lt;Option&lt;T&gt;&gt;.Comparer.Equals(this, other);
+
+    public override bool Equals(object obj) =&gt; Equals(obj as Option&lt;T&gt;);
+
+    public override int GetHashCode() =&gt; AutoEquality&lt;Option&lt;T&gt;&gt;.Comparer.GetHashCode(this);
+
+    #endregion
+
+    #region Operators
+
+    public static implicit operator string(Option&lt;T&gt; option) =&gt; option?.ToString() ?? throw new ArgumentNullException(nameof(option));
+
+    public static implicit operator int(Option&lt;T&gt; option) =&gt; option?.Flag ?? throw new ArgumentNullException(nameof(option));
+
+    public static bool operator ==(Option&lt;T&gt; left, Option&lt;T&gt; right) =&gt; Comparer.Compare(left, right) == 0;
+
+    public static bool operator !=(Option&lt;T&gt; left, Option&lt;T&gt; right) =&gt; !(left == right);
+
+    public static bool operator &lt;(Option&lt;T&gt; left, Option&lt;T&gt; right) =&gt; Comparer.Compare(left, right) &lt; 0;
+
+    public static bool operator &lt;=(Option&lt;T&gt; left, Option&lt;T&gt; right) =&gt; Comparer.Compare(left, right) &lt;= 0;
+
+    public static bool operator &gt;(Option&lt;T&gt; left, Option&lt;T&gt; right) =&gt; Comparer.Compare(left, right) &gt; 0;
+
+    public static bool operator &gt;=(Option&lt;T&gt; left, Option&lt;T&gt; right) =&gt; Comparer.Compare(left, right) &gt;= 0;
+
+    [NotNull]
+    public static T operator |(Option&lt;T&gt; left, Option&lt;T&gt; right) =&gt; GetKnownOrCreate(left.Flag | right.Flag);
+
+    [NotNull]
+    public static T operator ^(Option&lt;T&gt; left, Option&lt;T&gt; right) =&gt; GetKnownOrCreate(left.Flag ^ right.Flag);
+
+    private static T GetKnownOrCreate(int flag)
+    {
+        return
+            TryGetKnownOption(flag, out var knownOption)
+                ? knownOption
+                : Create(Unknown, flag);
+    }
+
+    #endregion
+
+    private class OptionComparer : IComparer&lt;Option&lt;T&gt;&gt;, IComparer
+    {
+        public int Compare(Option&lt;T&gt; left, Option&lt;T&gt; right)
+        {
+            if (ReferenceEquals(left, right)) return 0;
+            if (ReferenceEquals(left, null)) return 1;
+            if (ReferenceEquals(right, null)) return -1;
+            return left.Flag - right.Flag;
+        }
+
+        public int Compare(object left, object right)
+        {
+            return Compare(left as Option&lt;T&gt;, right as Option&lt;T&gt;);
+        }
+    }
+}
+</code></pre>
+<p>A new option-set can now be defined by deriving it from <code>Option&lt;T&gt;</code> and adding <code>static</code> properties for the desired flags:</p>
+<pre><code>public class FeatureOption : Option&lt;FeatureOption&gt;
+{
+    public FeatureOption(SoftString name, int value) : base(name, value) { }
+
+    /// &lt;summary&gt;
+    /// When set a feature is enabled.
+    /// &lt;/summary&gt;
+    public static readonly FeatureOption Enable = CreateWithCallerName();
+
+    /// &lt;summary&gt;
+    /// When set a warning is logged when a feature is toggled.
+    /// &lt;/summary&gt;
+    public static readonly FeatureOption Warn = CreateWithCallerName();
+
+    /// &lt;summary&gt;
+    /// When set feature usage statistics are logged.
+    /// &lt;/summary&gt;
+    public static readonly FeatureOption Telemetry = CreateWithCallerName();
+
+    public static readonly FeatureOption Default = CreateWithCallerName(Enable | Warn);
+}
+</code></pre>
+<p>Since there is only one option-class now, tests have also become simpler.</p>
+<pre><code>public class OptionTest
+{
+    [Fact]
+    public void Examples()
+    {
+        Assert.Equal(new[] { 0, 1, 2, 4 }, new[]
+        {
+            FeatureOption.None,
+            FeatureOption.Enable,
+            FeatureOption.Warn,
+            FeatureOption.Telemetry
+        }.Select(o =&gt; o.Flag));
+
+        Assert.Equal(FeatureOption.Enable, FeatureOption.Enable);
+        Assert.NotEqual(FeatureOption.Enable, FeatureOption.Telemetry);
+
+        var fromName = FeatureOption.FromName("Warn");
+        Assert.Equal(FeatureOption.Warn, fromName);
+
+        var fromValue = FeatureOption.FromValue(3);
+        var enableWarn = FeatureOption.Enable | FeatureOption.Warn;
+        Assert.Equal(enableWarn, fromValue);
+
+        var names = $"{enableWarn:names}";
+        var flags = $"{enableWarn:flags}";
+        var namesAndFlags = $"{enableWarn:names+flags}";
+        var @default = $"{enableWarn}";
+
+        Assert.True(FeatureOption.None &lt; FeatureOption.Enable);
+        Assert.True(FeatureOption.Enable &lt; FeatureOption.Telemetry);
+
+        Assert.Throws&lt;ArgumentOutOfRangeException&gt;(() =&gt; FeatureOption.FromValue(1000));
+        //Assert.ThrowsAny&lt;DynamicException&gt;(() =&gt; FeatureOption.Create("All", 111111));
+    }
+}
+</code></pre>
+<hr>
+<p>The intended usage is:</p>
+<ul>
+<li>Logger layer where the user can define their custom log-levels</li>
+<li>FeatureService where the user can define their custom behaviours</li>
+<li>Other services that work with some default options and let the user customize it with their domain-specific flags.</li>
+</ul>
+    </div>

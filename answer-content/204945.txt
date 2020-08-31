@@ -1,0 +1,128 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I can only comment on the C++ code, as I've never used R nor Rcpp.</p>
+
+<p>For an ignorant reader such as myself, it would have helped to omit the <code>using namespace Rcpp;</code>, so that I could see which names come from that library (I did quite a bit of external reading to even understand the code).</p>
+
+<p>Assuming I'm right that <code>sample()</code> returns an array of length <code>k</code>, then we can use range-based <code>for</code> to iterate through its values (since <code>IntegerVector</code> has suitable <code>begin()</code> and <code>end()</code>):</p>
+
+<pre><code>// sample k values from x, without replacement
+const Rcpp::IntegerVector ind_index = Rcpp::RcppArmadillo::sample(x, k, false);
+
+// how many different values do they index in pop_ptr?
+std::set&lt;int&gt; distinct_container;
+for (int i: ind_index) {
+    distinct_container.insert(pop_ptr[i]);
+}
+</code></pre>
+
+<p>In <code>accumulate()</code> (which name I dislike, because it sounds like <code>std::accumulate()</code>), we can reduce the scope of <code>i</code>, <code>j</code>, <code>k</code> and <code>pop_ptr</code> quite simply:</p>
+
+<pre><code>for (int i = 0; i &lt; K; ++i) {
+    for (int k = 0;  k &lt; num_specs;  ++k) {
+        for (int j = 0;  j &lt; perms;  ++j) {
+            const int *const pop_ptr = &amp;(pop(sample_one(perms), 0, sample_one(K)));
+            res(j, k, i) = sample_n_distinct(specs_C, k + 1, pop_ptr);
+        }
+    }
+}
+</code></pre>
+
+<p>Also, I'd be inclined to show that the creation of <code>specs_C</code> is more than just a conversion from <code>specs - 1</code> - that's actually a constructor argument specifying the length of the new vector:</p>
+
+<pre><code>IntegerVector specs_C(specs - 1);
+</code></pre>
+
+<p>I don't see any code that ever modifies this vector; if it's supposed to remain full of zeros, then it can be declared <code>const</code>.</p>
+
+<hr>
+
+<p>With those changes, and an automated re-indent, we get something like this for those two functions (I've compiled, but not tested this):</p>
+
+<pre><code>int sample_one(int n)
+{
+    return n * R::unif_rand();
+}
+
+int sample_n_distinct(const Rcpp::IntegerVector&amp; x,
+                      int k,
+                      const int * pop_ptr)
+{
+    // sample k values from x, without replacement
+    const auto ind_index = Rcpp::RcppArmadillo::sample(x, k, false);
+
+    // how many different values do they index in pop_ptr?
+    std::set&lt;int&gt; distinct_container;
+    for (int i: ind_index) {
+        distinct_container.insert(pop_ptr[i]);
+    }
+
+    return distinct_container.size();
+}
+
+// [[Rcpp::export]]
+arma::Cube&lt;int&gt; accumulate(const arma::Cube&lt;int&gt;&amp; pop,
+                           const Rcpp::IntegerVector&amp; specs,
+                           int perms,
+                           int K)
+{
+    auto const num_specs = specs.size();
+    arma::Cube&lt;int&gt; res(perms, num_specs, K);
+
+    Rcpp::IntegerVector specs_C(specs - 1);
+
+    for (int i = 0;  i &lt; K;  ++i) {
+        for (int k = 0;  k &lt; num_specs; ++k) {
+            for (int j = 0;  j &lt; perms; ++j) {
+                const auto&amp; sampled = pop(sample_one(perms), 0, sample_one(K));
+                res(j, k, i) = sample_n_distinct(specs_C, k + 1, &amp;sampled);
+            }
+        }
+    }
+    return res;
+}
+</code></pre>
+
+<hr>
+
+<p>Sadly, I don't have the domain knowledge to suggest more meaningful improvements other than these fairly mechanical changes that improve readability.</p>
+
+<p>In particular, I don't understand why we have to pass <code>specs_C</code> to <code>accumulate()</code> instead of sampling directly from <code>pop_ptr</code>.</p>
+
+<p>I'm also very wary of taking the address of the element returned by <code>pop()</code> - that seems to assume a memory layout that could vary between platforms, for instance.  I'd expect to use one of the <a href="http://arma.sourceforge.net/docs.html#subcube" rel="nofollow noreferrer">subcube view</a> operations to construct the population:</p>
+
+<pre><code>int sample_n_distinct(const Rcpp::IntegerVector&amp; population, int k)
+{
+    // sample k values from population, without replacement
+    const auto sampled = Rcpp::RcppArmadillo::sample(population, k, false);
+
+    // how many different values do have?
+    std::set&lt;int&gt; distinct(sampled.begin(), sampled.end());
+
+    return distinct.size();
+}
+
+// [[Rcpp::export]]
+arma::Cube&lt;int&gt; accumulate(const arma::Cube&lt;int&gt;&amp; pop,
+                           const Rcpp::IntegerVector&amp; specs,
+                           int perms,
+                           int K)
+{
+    auto const num_specs = specs.size();
+    arma::Cube&lt;int&gt; res(perms, num_specs, K);
+
+    for (int i = 0;  i &lt; K;  ++i) {
+        for (int k = 0;  k &lt; num_specs; ++k) {
+            for (int j = 0;  j &lt; perms; ++j) {
+                const auto&amp; sampled = pop.tube(sample_one(perms), sample_one(K));
+                const auto sampled_vector
+                    = Rcpp::IntegerVector(sampled.begin(), sampled.end());
+                res(j, k, i) = sample_n_distinct(sampled_vector, k + 1);
+            }
+        }
+    }
+    return res;
+}
+</code></pre>
+
+<p>I may be wrong on exactly what subcube view is required, so <code>pop.tube()</code> may need to be a different call, but you get the idea.  See how much simpler life is when you can use iterators instead of grubbing around with pointers?</p>
+    </div>

@@ -1,0 +1,260 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Going in quite a different direction: let's see exactly how much AJ's improvements make a difference, and how and why to vectorize. I know you claim that</p>
+
+<blockquote>
+  <p>SciPy, NumPy, etc. (usually) aren't available to QGIS plugins</p>
+</blockquote>
+
+<p>but given these results, it would be worth doing a</p>
+
+<pre><code>try:
+    import numpy as np
+except ImportError:
+    # sad face
+    from .fallbacks import *
+</code></pre>
+
+<p>In other words, keep both vectorized and non-vectorized implementations, using the best one possible.</p>
+
+<p>This (somewhat hacky) profiling code:</p>
+
+<pre><code>#!/usr/bin/env python3
+
+from matplotlib import pyplot
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
+from numpy.random._generator import default_rng
+from seaborn import color_palette
+from timeit import timeit
+from typing import List, Sequence
+import numpy as np
+
+
+def original_curve(control_points, number_of_curve_points):
+    return [
+        original_point(control_points, t)
+        for t in (
+            i/(number_of_curve_points - 1) for i in range(number_of_curve_points)
+        )
+    ]
+
+
+def original_point(control_points, t):
+    if len(control_points) == 1:
+        result, = control_points
+        return result
+    control_linestring = zip(control_points[:-1], control_points[1:])
+    return original_point([(1 - t)*p1 + t*p2 for p1, p2 in control_linestring], t)
+
+
+def aj_curve(control_points, number_of_curve_points):
+    last_point = number_of_curve_points - 1
+    return [
+        aj_point(control_points, i / last_point)
+        for i in range(number_of_curve_points)
+    ]
+
+
+def aj_point(control_points, t):
+    while len(control_points) &gt; 1:
+        control_linestring = zip(control_points[:-1], control_points[1:])
+        control_points = [(1 - t) * p1 + t * p2 for p1, p2 in control_linestring]
+    return control_points[0]
+
+
+def vectorized_curve(control_points, number_of_curve_points: int):
+    last_point = number_of_curve_points - 1
+    result = np.empty((number_of_curve_points, control_points.shape[1]))
+    for i in range(number_of_curve_points):
+        result[i] = vectorized_point(control_points, i / last_point)
+    return result
+
+
+def vectorized_point(control_points, t: float):
+    while len(control_points) &gt; 1:
+        p1 = control_points[:-1]
+        p2 = control_points[1:]
+        control_points = (1 - t)*p1 + t*p2
+    return control_points[0]
+
+
+def test():
+    # degree 2, i.e. cubic Bézier with three control points per curve)
+    # for large outputs (large number_of_curve_points)
+
+    controls = np.random.default_rng().random((3, 2), dtype=np.float64)
+    n_points = 10_000
+
+    expected: List[complex] = original_curve(controls, n_points)
+
+    for alt in (aj_curve, vectorized_curve):
+        actual = alt(controls, n_points)
+        assert np.isclose(expected, actual).all()
+
+
+class Profiler:
+    MAX_CONTROLS = 10  # exclusive
+    DECADES = 3
+    PER_DECADE = 3
+    N_ITERS = 30
+
+    METHOD_NAMES = (
+        'original',
+        'aj',
+        'vectorized',
+    )
+    METHODS = {
+        name: globals()[f'{name}_curve']
+        for name in METHOD_NAMES
+    }
+
+    def __init__(self):
+        self.all_control_points = default_rng().random((self.MAX_CONTROLS, 2), dtype=np.float64)
+        self.control_counts = np.arange(2, self.MAX_CONTROLS, dtype=np.uint32)
+
+        self.point_counts = np.logspace(
+            0,
+            self.DECADES,
+            self.DECADES * self.PER_DECADE + 1,
+            dtype=np.uint32,
+        )
+
+        self.quantiles = None
+
+    def profile(self):
+        times = np.empty(
+            (
+                len(self.control_counts),
+                len(self.point_counts),
+                len(self.METHODS),
+                self.N_ITERS,
+            ),
+            dtype=np.float64,
+        )
+
+        times_vec = np.empty(self.N_ITERS, dtype=np.float64)
+
+        for i, n_control in np.ndenumerate(self.control_counts):
+            control_points = self.all_control_points[:n_control]
+            for j, n_points in np.ndenumerate(self.point_counts):
+                print(f'n_control={n_control} n_points={n_points})', end='\r')
+                for k, method_name in enumerate(self.METHOD_NAMES):
+                    method = lambda: self.METHODS[method_name](control_points, n_points)
+                    for l in range(self.N_ITERS):
+                        times_vec[l] = timeit(method, number=1)
+                    times[i,j,k,:] = times_vec
+        print()
+
+        # Shape:
+        #   Quantiles (3)
+        #   Control counts
+        #   Point counts
+        #   Methods
+        self.quantiles = np.quantile(times, (0.2, 0.5, 0.8), axis=3)
+
+    def control_figures(self, colours):
+        control_indices = (
+            0,
+            len(self.control_counts) // 2,
+            -1,
+        )
+
+        fig: Figure
+        axes: Sequence[Axes]
+        fig, axes = pyplot.subplots(1, len(control_indices), sharey='all')
+        fig.suptitle('Bézier curve calculation time, selected control counts')
+
+        for ax, i_control in zip(axes, control_indices):
+            n_control = self.control_counts[i_control]
+            ax.set_title(f'nc={n_control}')
+            if i_control == len(self.control_counts) // 2:
+                ax.set_xlabel('Curve points')
+            if i_control == 0:
+                ax.set_ylabel('Time (s)')
+
+            ax.set_xscale('log')
+            ax.set_yscale('log')
+            ax.grid(axis='both', b=True, which='major', color='dimgray')
+            ax.grid(axis='both', b=True, which='minor', color='whitesmoke')
+
+            for i_method, method_name in enumerate(self.METHOD_NAMES):
+                data = self.quantiles[:, i_control, :, i_method]
+                ax.plot(
+                    self.point_counts,
+                    data[1, :],
+                    label=method_name if i_control == 0 else '',
+                    c=colours[i_method],
+                )
+                ax.fill_between(
+                    self.point_counts,
+                    data[0, :],
+                    data[2, :],
+                    facecolor=colours[i_method],
+                    alpha=0.3,
+                )
+        fig.legend()
+
+    def point_figures(self, colours):
+        point_indices = (
+            0,
+            len(self.point_counts)//2,
+            -1,
+        )
+
+        fig: Figure
+        axes: Sequence[Axes]
+        fig, axes = pyplot.subplots(1, len(point_indices), sharey='all')
+        fig.suptitle('Bézier curve calculation time, selected point counts')
+
+        for ax, i_point in zip(axes, point_indices):
+            n_points = self.point_counts[i_point]
+            ax.set_title(f'np={n_points}')
+
+            if i_point == len(self.point_counts) // 2:
+                ax.set_xlabel('Control points')
+            if i_point == 0:
+                ax.set_ylabel('Time (s)')
+
+            ax.set_yscale('log')
+            ax.grid(axis='both', b=True, which='major', color='dimgray')
+            ax.grid(axis='both', b=True, which='minor', color='whitesmoke')
+
+            for i_method, method_name in enumerate(self.METHOD_NAMES):
+                data = self.quantiles[:, :, i_point, i_method]
+                ax.plot(
+                    self.control_counts,
+                    data[1, :],
+                    label=method_name if i_point == 0 else '',
+                    c=colours[i_method],
+                )
+                ax.fill_between(
+                    self.control_counts,
+                    data[0, :],
+                    data[2, :],
+                    facecolor=colours[i_method],
+                    alpha=0.3,
+                )
+        fig.legend()
+
+    def plot(self):
+        colours = color_palette('husl', len(self.METHODS))
+        self.control_figures(colours)
+        self.point_figures(colours)
+        pyplot.show()
+
+
+if __name__ == '__main__':
+    test()
+    p = Profiler()
+    p.profile()
+    p.plot()
+</code></pre>
+
+<p>produces these:</p>
+
+<p><a href="https://i.stack.imgur.com/VoGNi.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/VoGNi.png" alt="perf curves 1"></a></p>
+
+<p><a href="https://i.stack.imgur.com/UgtrB.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/UgtrB.png" alt="perf curves 2"></a></p>
+
+<p>I didn't give this profiling a lot of CPU time so the results are a little bumpy (inter-quantile shading shown between 0.2 and 0.8), but quite clear. Vectorization is definitely worth doing, even if it can't always be done. Some efficiencies might be found on top of what I have shown because I am not a Numpy expert.</p>
+    </div>

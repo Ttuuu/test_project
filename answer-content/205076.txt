@@ -1,0 +1,99 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Code</h2>
+
+<ul>
+<li>Missing a <code>#include &lt;memory&gt;</code> for <code>std::unique_ptr</code>, <code>#include &lt;algorithm&gt;</code> for <code>std::find_if</code>.</li>
+<li><p>Use <code>= default;</code> or <code>= delete;</code> for constructors, rather than declaring an empty function. This makes the intent clearer. Don't forget the copy constructor, move constructor, copy assignment, move assignment (again, use <code>= default</code> or <code>= delete</code> where appropriate). e.g.</p>
+
+<pre><code>WaitSentMap() = default;
+
+WaitSentMap(WaitSentMap&amp;&amp;) = delete;
+WaitSentMap(WaitSentMap const&amp;) = delete;
+
+WaitSentMap&amp; operator=(WaitSentMap&amp;&amp;) = delete;
+WaitSentMap&amp; operator=(WaitSentMap const&amp;) = delete;
+</code></pre>
+
+<p>(I'd personally leave out the destructor definition unless it's actually needed).</p></li>
+<li><p><code>addItem</code> does <code>std::forward&lt;T&gt;</code> when it should be doing <code>std::forward&lt;U&gt;</code>.</p></li>
+<li><p><code>addItem</code> forwards a single item to the <code>T</code> constructor, which restricts <code>T</code> to types with single argument constructors. Use a template parameter pack to allow <code>T</code>s with constructors with any number of arguments.</p></li>
+<li><p><code>getNextItem</code> throws if there are no waiting requests. However, there is no  way to check if there are requests waiting, forcing the user to track this externally!</p></li>
+<li><p><code>getNextItem</code> attempts to recover from an internal throw. However, combined with the above, this makes the class unusable after such a recovery.</p></li>
+<li><p><code>getNextItem</code>: <a href="https://en.cppreference.com/w/cpp/memory/unique_ptr/unique_ptr" rel="nofollow noreferrer">the only thing that</a> <a href="https://en.cppreference.com/w/cpp/container/deque/pop_front" rel="nofollow noreferrer">can really throw here is</a> <a href="https://en.cppreference.com/w/cpp/container/deque/push_back" rel="nofollow noreferrer"><code>push_back</code></a>, so we can change the order of things to make it safe without worrying about recovery:</p>
+
+<pre><code>m_sentRequests.emplace_back(std::move(m_waitingRequests.front()));
+m_waitingRequests.pop_front();
+
+return *m_sentRequests.back();
+</code></pre></li>
+<li><p><code>rescheduleItem</code>: has the same issues, and a similar solution:</p>
+
+<pre><code>m_waitingRequests.emplace_back(std::move(*it));
+m_sentRequests.erase(it);
+</code></pre></li>
+<li><p>Note that the <code>find_if</code> predicate can be simplified, and use a <code>const&amp;</code>, and be defined once per function:</p>
+
+<pre><code>auto pred = [&amp;] (std::unique_ptr&lt;T&gt; const&amp; p) { return *p == item; };
+</code></pre></li>
+<li><p>Both <code>rescheduleItem</code> and <code>removeItem</code> should take a <code>const&amp;</code>, not a <code>&amp;&amp;</code>. Also, these should probably both be <code>T</code>, rather than <code>U</code>.</p></li>
+<li><p><code>removeItem</code>: does not return any indication of success or failure (throw or return a boolean). Again, since the user can't check what's in the queues, this makes the class rather unhelpful.</p></li>
+</ul>
+
+<hr>
+
+<h2>Design</h2>
+
+<ul>
+<li>containers: It looks like a <a href="https://en.cppreference.com/w/cpp/container/queue" rel="nofollow noreferrer"><code>queue</code></a> would be more appropriate than a <code>deque</code> for <code>m_waitingRequests</code>, since items are pushed and processed in FIFO order.</li>
+<li><p>containers: A <code>vector</code> would probably be more appropriate for <code>m_sentRequests</code>, as we only need to push items onto one end.</p></li>
+<li><p>naming: Since all the functions manipulate items, there's not a lot of point in having the function names all end in <code>Item</code>.</p></li>
+<li><p>naming: <code>getNextItem</code> is a slightly misleading name since the function also moves the item from one queue to another.</p></li>
+<li><p>interface: As noted above, we need to be able to check if an item is present in each queue, or check if a queue is empty to use the class properly. I'd expect a more complete interface to look something like this:</p>
+
+<pre><code>void push(T&amp;&amp; item); // was addItem
+void remove(T const&amp; item); // was removeItem - note this should throw if the item isn't there (we now have ways to check if it's there before calling remove...)
+
+bool isWaitingEmpty() const; // waiting queue is empty
+bool isSentEmpty() const; // sent queue is empty
+bool isEmpty() const; // return isWaitingEmpty() &amp;&amp; isSentEmpty();
+
+void clearWaiting(); // clear waiting queue
+void clearSent(); // clear sent queue
+void clear(); // clear both queues
+
+bool isWaiting(T const&amp; item) const; // is this item in the waiting queue?
+bool isSent(T const&amp; item) const; // is this item in the sent queue?
+bool isWaitingOrSent(T const&amp; item) const; // is this item in either queue?
+
+T&amp; moveNextToSent(); // was getNextItem 
+void moveToWaiting(T const&amp; item); // was rescheduleItem
+</code></pre>
+
+<p>Perhaps <code>remove</code> functions could be added for each individual queue too.</p></li>
+</ul>
+
+<hr>
+
+<ul>
+<li><p>I think the main issue with this class is that "sending" (whatever that is) is done externally to the class itself. As such, if "sending" an item fails, the user has to then notify the container to move it back again, which is very awkward. This also seems to be the cause of using <code>std::unique_ptr</code> internally (because we give some external code a <code>&amp;</code> to the item from <code>getNextItem</code>.</p>
+
+<p>If messages are sent synchronously and immediately, it might be reasonable to replace <code>getNextItem</code> with a function that takes a lambda to do the actual sending. Something like:</p>
+
+<pre><code>bool send(std::function&lt;bool(T const&amp;)&gt; sendMessage)
+{
+    if (m_waitingRequests.empty())
+        return false;
+
+    if (!sendMessage(m_waitingRequests.front())) // if it can't fail, we don't need to check or return a bool from send
+        return false;
+
+    m_sentRequests.emplace_back(std::move(m_waitingRequests.front()));
+    m_waitingRequests.pop_front();
+
+    return true;
+}
+</code></pre>
+
+<p>Alternatively, it might be more appropriate to do something based on <a href="https://en.cppreference.com/w/cpp/thread/future" rel="nofollow noreferrer"><code>std::future</code></a>. It's hard to say without more context.</p></li>
+</ul>
+    </div>

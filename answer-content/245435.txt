@@ -1,0 +1,132 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Overview</h2>
+<p>Currently the code is broken as it does not implement the rule of three.</p>
+<p>You can make vast improvements to the efficiency by learning how to use placement new and manually calling the destructor for members of the container. This will remove the need to force initialization on all members.</p>
+<p>A nice addition would be support for move semantics. Both for the container itself but also for putting elements into the container.</p>
+<p>Your sizing algorithm makes you re-size after every four elements (or minAllocation size). But this basically means that you are forced to resize all the time (resizing is proportional to the number of elements). The standard container simply doubles the allocated space when it needs more (this makes allocations logarithmic compared to the number of elements). There is an argument for (<a href="https://lokiastari.com/blog/2016/03/25/resizemaths/index.html" rel="nofollow noreferrer">1.5 rather</a> than 2 as it allows for better memory re-use but the standard implementations have abandoned this in preference for 2 ).</p>
+<h2>Code Review</h2>
+<p>That's quite unique.</p>
+<pre><code>#ifndef DYN_ARR_H_INCLUDED
+#define DYN_ARR_H_INCLUDED
+</code></pre>
+<p>But I would still add a namespace to it.<br>
+I would also put your code in a namespace.</p>
+<hr>
+<p>Why the empty line?</p>
+<pre><code>template &lt;class T&gt;
+
+class DynArr
+</code></pre>
+<hr>
+<p>You have the basic constructors.</p>
+<pre><code>        DynArr(uint16_t startSize = 0);
+        ~DynArr();
+</code></pre>
+<p>But you have a RAW pointer but don't implement the rule of three/five.<br>
+The compiler generates a default copy constructor and copy assignment operators. These are not good for RAW pointers as they simply do a shallow copy.</p>
+<hr>
+<p>You have the copy additions operations.</p>
+<pre><code>        T&amp; append(const T&amp;);
+        T&amp; insert(const T&amp;, uint16_t);
+</code></pre>
+<p>But you want to add the move equivalents:</p>
+<pre><code>        T&amp; append(T&amp;&amp;);                     // Notice the &amp;&amp;
+        T&amp; insert(T&amp;&amp;, uint16_t);           // Binds R-Value references
+</code></pre>
+<hr>
+<p>No idea what this does:</p>
+<pre><code>        bool kickoutLast();
+</code></pre>
+<p>Maybe a more standard name would be better.</p>
+<hr>
+<p>If you separate the template methods into a different file they normally go into the *.tpp file (not *.cpp) file.</p>
+<pre><code>#include "dyn_arr.cpp"
+</code></pre>
+<p>Lots of build tools will try and automatically build all the *.cpp file so making it a *.tpp file helps to distinguish this is really part of the header file.</p>
+<p>Note: All the template methods defined outside the class needs to be declared "inline". This tells the compiler that it is likely to see multiple definitions of the functions.</p>
+<hr>
+<p>Is this really different for different types of T?</p>
+<pre><code>template &lt;class T&gt;
+const uint8_t DynArr&lt;T&gt;::minAllocate = 4;
+</code></pre>
+<hr>
+<p>This is overcomplex:</p>
+<pre><code>    do
+    {
+        allocated += minAllocate;
+    }while(allocated &lt; startSize);
+</code></pre>
+<p>I would simplify to:</p>
+<pre><code>    allocated = *(startSize / minAllocate) + 1) * minAllocate;
+</code></pre>
+<hr>
+<p>This is your biggest issue.</p>
+<pre><code>    elements = new T[allocated];
+</code></pre>
+<p>Here <code>allocated</code> means the amount of space I have available to use for type T. While <code>length</code> means the amount of space I have used up.</p>
+<p>This both allocates the space and initializes all the objects (calls their constructor). If the type T is expensive to create this could be an issue. Also Why are you paying to construct objects you may never use?</p>
+<p>There is also the problem that you now require T to have a default (no argument) constructor. Not all types have a zero argument constructor.</p>
+<p>You will need to learn about placement new and manually calling the destructor to make this work correctly.</p>
+<hr>
+<p>Don't bother with the check.</p>
+<pre><code>    if(length &gt; 0) delete [] elements;
+</code></pre>
+<p>Always delete the elements. If it is null then that is OK.</p>
+<hr>
+<p>Subtle here here:</p>
+<pre><code>    if(length + 1 &gt; allocated &amp;&amp; allocated + minAllocate &lt;= std::numeric_limits&lt;int16_t&gt;::max())
+</code></pre>
+<p>If <code>allocted + minAllocated</code> is greater than max then it will probably be truncated and therefore very small and thus not trigger this if statement.</p>
+<p>You should subtract allocated from max and see if there is enough room left to allocate what you need.</p>
+<pre><code> if(length + 1 &gt; allocated &amp;&amp; 
+    (std::numeric_limits&lt;int16_t&gt;::max() - allocated) &gt;= minAllocate)
+</code></pre>
+<hr>
+<p>This is a checked accesses.</p>
+<pre><code>template &lt;class T&gt;
+T&amp; DynArr&lt;T&gt;::operator[](uint16_t i)
+{
+    if(i &lt; length)
+        return elements[i];
+    else return elements[length - 1];
+}
+</code></pre>
+<p>Normally if you want a checked access you use <code>at()</code> method. That does this check. While the <code>operator[]</code> is normally unchecked accesses. The point is not to make an experienced developer pay a cost just because a beginner would need to.</p>
+<pre><code> for(int loop = 0; loop &lt; a.getLength(); ++loop)
+    a[loop] += 5;   // Why do I need a check here.
+                    // I have already guranteede that loop is smaller
+                    // than the length so that extra test is wasteful
+ }
+
+
+ a.at(13) += 15;    // Sure test needed here I have not checked
+                    // a3 is in the correct bounds.
+</code></pre>
+<hr>
+<p>Subtle error here:</p>
+<pre><code>template &lt;class T&gt;
+void DynArr&lt;T&gt;::transfer(T* newE)
+{
+    copyElements(newE, elements);
+
+    delete[] elements;   // If any T has a destructor that throws
+                         // (yes rare) then your object now
+                         // leaves element pointing at an invalid
+                         // pointer and you leaked `newE`.
+    elements = newE;
+}
+</code></pre>
+<p>Its simple to fix</p>
+<pre><code> {
+     copyElements(newE, elements);
+     std::swap(elements, newE);
+     delete newE;                    // Even if this throws
+                                     // Your object is still good.
+                                     // and you don't leak anything.
+ }
+</code></pre>
+<h2>Plug for my stuff</h2>
+<p>I wrote a series of articles on how to create a vector like class here.</p>
+<p><a href="https://lokiastari.com/series/" rel="nofollow noreferrer">https://lokiastari.com/series/</a></p>
+<p>look at the section on Vector.</p>
+    </div>

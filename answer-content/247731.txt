@@ -1,0 +1,73 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>No way to stop the cycle.</strong></p>
+<p>The standard with TPL is to use the CancellationToken.  Even if it is not need now, which I don't know why, it would be easier in the future if it supported it.  For example if it gets turned into a service can just cancel the Token Source or if stays a console app could trap Esc key and cancel token source.</p>
+<p><strong>Numbers for Task Delay.</strong></p>
+<p>It's easier to read/maintain</p>
+<pre><code>Task.Delay(TimeSpan.FromSeconds(1))
+</code></pre>
+<p>then</p>
+<pre><code>Task.Delay(1000)
+</code></pre>
+<p>For each Task instead of checking their time you can combine them with Task.Delay()</p>
+<p>For example</p>
+<pre><code>Task.WhenAll(lastNodeCheck, Task.Delay(TimeSpan.FromMinutes(1)));
+</code></pre>
+<p>Now we have one task that will only complete when either a minute has passed and the main task has completed.  We can make a helper method for this</p>
+<pre><code>    public static Task DelayedTask(Task task, TimeSpan delay, CancellationToken token)
+    {
+        return Task.WhenAll(task, Task.Delay(delay, token));
+    }
+</code></pre>
+<p>The downside to this is even if the task failed right away it will still wait the delay time before it gets logged that it failed. I don't think that's a big deal breaker but only you know that for sure.</p>
+<p><strong>Optional but you can make this into a queue</strong></p>
+<p>We can create a dictionary that waits for task to be complete then re-adds them if needed.   This will make the code a bit more complex but easier to add new task later on.</p>
+<p>Something like</p>
+<pre><code>    private static async Task TaskQueue(CancellationToken token, params Func&lt;Task&gt;[] tasks)
+    {
+        if (tasks.Length == 0)
+        {
+            return;
+        }
+        
+        var queue = new ConcurrentDictionary&lt;Task, Func&lt;Task&gt;&gt;();
+        foreach (var task in tasks)
+        {
+            queue.TryAdd(task(), task);
+        }
+
+        while (!token.IsCancellationRequested)
+        {
+            await Task.WhenAny(queue.Keys).ContinueWith(completedTask =&gt;
+            {
+                Func&lt;Task&gt; factory;
+                var mainTask = completedTask.Unwrap();
+                queue.TryRemove(mainTask, out factory);
+                if (!mainTask.IsCanceled)
+                {
+                    queue.GetOrAdd(factory(), factory);
+                }
+
+                if (mainTask.IsFaulted)
+                {
+                    foreach (var ex in mainTask.Exception.InnerExceptions)
+                    {
+                        LogException(ex);
+                    }
+                }
+            });
+        }
+    }
+</code></pre>
+<p>I haven't tested this with all options but with basic test seems to work.   We create a concurrent dictionary and load it with tasks that are in flight and factories to make the task.  As task complete we remove from the dictionary and re-add them.  Continue until we get told to cancel.</p>
+<p>Now in the main method can look something similar to this</p>
+<pre><code>        var cancellation = new CancellationTokenSource();
+        var cancelToken = cancellation.Token;
+        Func&lt;Task&gt; checkGateWayFactory = () =&gt; DelayedTask(CheckGateways.CheckAll(configuration), TimeSpan.FromMinutes(1), cancelToken);
+        Func&lt;Task&gt; checkNodeFactory = () =&gt; DelayedTask(CheckNodes.CheckAll(configuration), TimeSpan.FromMinutes(1), cancelToken);
+        Func&lt;Task&gt; checkAlertFactory = () =&gt; DelayedTask(CheckAlerts.CheckAll(configuration), TimeSpan.FromSeconds(1), cancelToken);
+        await TaskQueue(cancelToken, 
+            checkAlertFactory, 
+            checkGateWayFactory, 
+            checkNodeFactory);
+</code></pre>
+    </div>

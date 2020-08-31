@@ -1,0 +1,150 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Before starting to talk about threads in Python, let's compare to a sequential implementation. I’ll start by building a test file using the following code:</p>
+
+<pre><code>import string
+import random
+
+with open('test.txt', 'w') as f:
+    for _ in range(20000000):
+        line = ''.join(random.choice(string.printable) for _ in range(random.randint(0, 10000)))
+        print(line, file=f)
+</code></pre>
+
+<p>This is Python 3 syntax, and I could not recommend more to use it instead of the <a href="https://pythonclock.org/" rel="nofollow noreferrer">end-of-life Python 2.7</a>.</p>
+
+<p>Anyway, after a while, I have a 5.9G file of 64 or so million lines (yes, <code>string.printable</code> contains the newline character) so I stopped it. Let's read it and count the length of its lines.</p>
+
+<hr>
+
+<p>For starter (and you may have noticed in the snippet above), you should use the <code>with</code> statement to open files so you don't accidentally forget to close them. You can also iterate directly over the content of the file instead of using <code>next</code>; and if you want to know the line number (to spawn a thread each 200000 lines, for instance), you can always delegate the task to <code>enumerate</code>. This way, you’ll avoid using <code>range</code> instead of <code>xrange</code> and consume memory where you don't need to.</p>
+
+<p>Second, timing should be done using <a href="https://docs.python.org/2/library/timeit.html" rel="nofollow noreferrer"><code>timeit</code></a> for better precision and less boilerplate. Let's start by timing the reading of the file only to get a ballpark figure of how much time we can expect to gain. We’ll use part of the <a href="https://docs.python.org/2/library/itertools.html#recipes" rel="nofollow noreferrer"><code>consume</code> recipe from <code>itertools</code></a>:</p>
+
+<pre><code>from collections import deque
+
+
+def read_file(filename):
+    with open(filename) as f:
+        deque(f, maxlen=0)
+
+
+if __name__ == '__main__':
+    import timeit
+    time = timeit.timeit('read_file("test.txt")', 'from __main__ import read_file', number=1)
+    print('execution took {}s'.format(time))
+</code></pre>
+
+<p>Result is <code>execution took 41.8203251362s</code> on my machine. This is roughly as fast as I can expect the file to be read… without taking caching into account. If we change the timing part to <code>min(timeit.repeat('read_file("test.txt")', 'from __main__ import read_file', number=1, repeat=5))</code> we get somewhere around 3.5s.</p>
+
+<hr>
+
+<p>Now, on to counting characters. As I read it, you want to remove the newline character that is found at the end of each line. You can, as you do here, subtract 1 from each line length; or, alternatively, sum each line length and subtract the amount of lines afterwards. The second approach is easier as we can use <code>map</code> to produce a list of all line lengths and then, <code>sum</code> it before subtracting its <code>len</code>:</p>
+
+<pre><code>def count_characters(filename):
+    with open(filename) as f:
+        line_lengths = map(len, f)
+    return sum(line_lengths) - len(line_lengths)
+</code></pre>
+
+<p>Timings approaches the same 40s figure for a single execution, but is about 6.5s on repeated executions. This is only 3 seconds of counting characters in 64 million lines; that's somewhat acceptable, but <code>map</code> is building a list in memory which is 64 million items long, so maybe we could speed things up if we didn't:</p>
+
+<pre><code>def count_characters(filename):
+    count = 0
+    with open(filename) as f:
+        for line in f:
+            count += len(line) - 1
+    return count
+</code></pre>
+
+<p>Unfortunately, a <code>for</code> loop in Python is slower than a <code>for</code> loop in C (which is what <code>map</code> does) so this code is not faster (albeit being roughly as fast).</p>
+
+<hr>
+
+<p>Now, trying to speed things up. To parallelize tasks on chunk of data, we usually use <code>map</code> from <a href="https://docs.python.org/2/library/multiprocessing.html#module-multiprocessing.pool" rel="nofollow noreferrer"><code>multiprocessing.Pool</code></a>. But serializing this much data to feed other processes takes time and isn't worth it. So we are left trying to use <code>threading</code> as you did. However, due to the <a href="https://stackoverflow.com/q/1294382/5069029">GIL</a>, you will not be able to run more than one thread in parallel and will be either reading the file or summing the lines; exactly as it is done in sequential code, but you’ll have more overheads due to using threads and helper data structures to move data around. So all in all, for this kind of problem, you’re better off sticking to the sequential implementation.</p>
+
+<p>But let's analyze your code anyway:</p>
+
+<ul>
+<li>The <code>l</code> parameter is useless, since it's an integer, it is immutable and the local version on each thread won't interfere with others so passing it as a parameter with seemingly a value of 0 and then resetting it to 0 after the computation is useless;</li>
+<li><p>Contrarily, the <code>length</code> list as a global variable is more problematic, I’d rather pass it as a parameter, leading to the threaded functions being:</p>
+
+<pre><code>def count_characters_in_chunk(lines, accumulator):
+    length = sum(len(line) - 1 for line in lines)
+    accumulator.append(length)
+</code></pre></li>
+<li><p>As said previously, organizing lines into chunks without prior knowledge of its length can be done using <code>enumerate</code> but we need to account for the last chunk not being the full size, if any:</p>
+
+<pre><code>def count_characters_in_file(filename, chunk_size=200000):
+    threads = []
+    lengths = []
+
+    with open(filename) as f:
+        lines = []
+        for line_number, line in enumerate(f, start=1):
+            lines.append(line)
+            if line_number % chunk_size == 0:
+                t = threading.Thread(target=count_characters, args=(lines, lengths))
+                t.start()
+                threads.append(t)
+                lines = []
+
+        if lines:
+            t = threading.Thread(target=count_characters, args=(lines, lengths))
+            t.start()
+            threads.append(t)
+
+    for t in threads:
+        t.join()
+    return sum(lengths)
+</code></pre></li>
+</ul>
+
+<p>However, there is still two issues with this code:</p>
+
+<ol>
+<li>The repetition of thread management is ugly and error-prone, plus the manual handling of the <code>lines</code> list is unnecessarily verbose. You can use <a href="https://docs.python.org/2/library/itertools.html#itertools.islice" rel="nofollow noreferrer"><code>itertools.islice</code></a> to simplify all that;</li>
+<li>The use of a simple list to store resulting lengths is a bad habit to have as threaded code is prone to race-conditions (although highly unlikely in this case) that can lead to loss of data. You should use a <a href="https://docs.python.org/2/library/queue.html" rel="nofollow noreferrer"><code>Queue.Queue</code></a> instead.</li>
+</ol>
+
+<p>Final code being:</p>
+
+<pre><code>import itertools
+import threading
+import Queue
+
+
+def extract_from_queue(queue):
+    while not queue.empty():
+        yield queue.get()
+
+
+def count_characters(lines, accumulator):
+    length = sum(len(line) - 1 for line in lines)
+    accumulator.put(length)
+
+
+def count_characters_in_file(filename, chunk_size=200000):
+    threads = []
+    lengths = Queue.Queue()
+
+    with open(filename) as f:
+        while True:
+            lines = list(itertools.islice(f, chunk_size))
+            if not lines:
+                break
+            t = threading.Thread(target=count_characters, args=(lines, lengths))
+            t.start()
+            threads.append(t)
+
+    for t in threads:
+        t.join()
+    return sum(extract_from_queue(lengths))
+
+
+if __name__ == '__main__':
+    import sys
+    count_characters_in_file(sys.argv[1])
+</code></pre>
+
+<p>But timings using caching indicates 44 seconds on my machine, so not really worth it given the speed and simplicity of the sequential implementation.</p>
+    </div>

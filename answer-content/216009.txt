@@ -1,0 +1,83 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>My first recommendation would be to refactor this query so that it's friendlier to dynamic construction. Perhaps something like</p>
+
+<pre class="lang-sql prettyprint-override"><code>CREATE TEMPORARY TABLE RequestedIds (id INT);
+INSERT INTO RequestedIds (id)
+VALUES (@p0), (@p1), (@p2);
+
+SELECT requested.id
+FROM RequestedIds AS requested
+LEFT JOIN player AS item ON item.id = requested.id
+WHERE item.id IS NULL
+    OR item.update_at IS NULL
+    OR item.update_at &lt; DATE_SUB(CURRENT_DATE, INTERVAL 7 DAY);
+</code></pre>
+
+<p>Now the <em>only</em> indicator here that we're looking at players (and not seasons or teams) is the table name. Also, the use of a temp table means the generated list of parameters is isolated. <code>(@p0), (@p1), (@p2)</code> is more straightforward to build than <code>SELECT @first as id UNION ALL SELECT @p1 UNION ALL SELECT @p2</code>.</p>
+
+<p>Now the command text is buildable with something like this:</p>
+
+<pre class="lang-cs prettyprint-override"><code>private string BuildCommandText(IEnumerable&lt;MySqlParameter&gt; parameters, string tableName)
+{
+    var paramNames = parameters.Select(param =&gt; $"({param.ParameterName})");
+
+    return string.Join(Environment.NewLine,
+        "CREATE TEMPORARY TABLE RequestedIds (id INT);",
+        "INSERT INTO RequestedIds (id)",
+        $"VALUES {string.Join(", ", paramNames)};",
+        "",
+        "SELECT requested.id",
+        "FROM RequestedIds AS requested",
+        $"LEFT JOIN {tableName} AS item ON item.id = requested.id",
+        "WHERE item.id IS NULL",
+            "OR item.update_at IS NULL",
+            "OR item.update_at &lt; DATE_SUB(CURRENT_DATE, INTERVAL 7 DAY);");
+}
+</code></pre>
+
+<p>As a side note, I usually prefer <code>string.Join</code> over <code>StringBuilder</code>. The performance is comparable, and it feels more declarative: "Join these string with newlines" vs "Start with this string. Now add this string. Now add this string..."</p>
+
+<hr>
+
+<p>As for the parameters themselves, you can map a collection of IDs to a collection of parameters with a helper function like this:</p>
+
+<pre class="lang-cs prettyprint-override"><code>var parameters = players.Select(player =&gt; player.Id).Select(BuildIdParameter);
+
+// ...
+
+private MySqlParameter BuildIdParameter(int value, int index)
+{
+    return new MySqlParameter($"p{index}", MySqlDbType.Int32) { Value = value };
+}
+</code></pre>
+
+<p>This technique takes advantage of the handy automatic index parameter provided by <a href="https://docs.microsoft.com/en-us/dotnet/api/system.linq.enumerable.select?view=netframework-4.7.2#System_Linq_Enumerable_Select__2_System_Collections_Generic_IEnumerable___0__System_Func___0_System_Int32___1__" rel="nofollow noreferrer">this overload of Select</a>. I recommend doing this in conjunction with the generalization advice from Henrik's answer.</p>
+
+<hr>
+
+<p>My last piece of advice is for after you've done the query. If you hide the actual execution of the query in a function, like this (braces ommitted for brevity)</p>
+
+<pre class="lang-cs prettyprint-override"><code>private IEnumerable&lt;int&gt; GetIdsToAddOrUpdate(...)
+{
+    using (var connection...)
+        using (var command...)
+            using (var reader...)
+                while (reader.read())
+                    yield return Convert.ToInt32(reader["id"]);
+}
+</code></pre>
+
+<p>Then you can skip the <code>.FirstOrDefault</code> and the null check, and write</p>
+
+<pre class="lang-cs prettyprint-override"><code>public List&lt;TItem&gt; GetItemsToAddOrUpdate&lt;TItem&gt;(List&lt;TItem&gt; items) where TItem : IDHolder
+{
+    var ids = GetIdsToAddOrUpdate(...).ToHashSet();
+
+    return items.Where(item =&gt; ids.Contains(item.Id)).ToList();
+}
+</code></pre>
+
+<p>Now, this <em>is</em> more efficient for large numbers of players/teams/seasons: it is O(n), while calling <code>.FirstOrDefault</code> in a loop gives you O(n^2). However, you're unlikely to notice the difference unless <code>n</code> is large indeed.</p>
+
+<p>The real reason I like it isn't the efficiency, but because it's more declarative: "The players that need to be updated are all the players with IDs that need to be updated".</p>
+    </div>

@@ -1,0 +1,366 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Overall</h2>
+
+<p>Please put your code in your own namespace.<br>
+It is more than likely that other people have created a "Vector" type. But in general you need to keep all your code in your own namespace.</p>
+
+<p>Your main issue is that you construct all the elements in the vector even if you are not using them. This can be expensive if T is expensive or you never use most of the elements in the vector.</p>
+
+<p>Your secondary issue is that you check and allocate extra capacity i nearly all functions that add elements. You need to simplify this and move this code into its own function. Then call this function from each member that adds elements to the vector.</p>
+
+<pre><code>void checkForEnoughSpaceAndAllocateIfRequried(std::size_t totalSpaceRequired);
+</code></pre>
+
+<h3>My full explanation of how to build a vector</h3>
+
+<p><a href="https://lokiastari.com/blog/2016/02/27/vector/index.html" rel="nofollow noreferrer">Vector - Resource Management Allocation</a><br>
+<a href="https://lokiastari.com/blog/2016/02/29/vector-resource-management-ii-copy-assignment/index.html" rel="nofollow noreferrer">Vector - Resource Management Copy Swap</a><br>
+<a href="https://lokiastari.com/blog/2016/03/12/vector-resize/index.html" rel="nofollow noreferrer">Vector - Resize</a><br>
+<a href="https://lokiastari.com/blog/2016/03/19/vector-simple-optimizations/index.html" rel="nofollow noreferrer">Vector - Simple Optimizations</a><br>
+<a href="https://lokiastari.com/blog/2016/03/20/vector-the-other-stuff/index.html" rel="nofollow noreferrer">Vector - The Other Stuff</a>  </p>
+
+<h2>Code Review</h2>
+
+<p>When using move construction you can't pass by const reference.</p>
+
+<pre><code>    Vector(const Vector&amp;&amp;);
+</code></pre>
+
+<p>You are going to modify the input value if you remove its content.</p>
+
+<hr>
+
+<p>If T is non trivial and needs a destructor call then this will call the destructor for all elements in <code>values</code> (assuming it was correctly allocated).</p>
+
+<pre><code>    ~Vector()
+    {
+        delete [ ]  values;
+    }
+</code></pre>
+
+<p><strong>BUT</strong> you have <code>v_capacity</code> member. This means that not all members of <code>values</code> have been constructed (or potentially the elements have been removed and thus destructed). So this is probably wrong.</p>
+
+<p>Or you always construct all the members and keep them constructed. This is an issue if the type <code>T</code> is expensive to construct, there is some special property of T that counts the number of valid entities of T etc.</p>
+
+<p>i.e. you should not construct the members of the vector until they are placed in the vector and they should be destroyed (via destructor) when they are removed erased from the vetctor.</p>
+
+<hr>
+
+<pre><code>    T&amp; front(); // actually I don't see why would we need this function to be a reference, I think it should be only a const reference, any insight?
+    const T&amp; back() const;
+</code></pre>
+
+<p>You need this so you can modify the front element in the vector (you don't need "need" it but it is very useful).</p>
+
+<hr>
+
+<p>What about the const version of <code>back()</code> ?</p>
+
+<pre><code>    T&amp; back();
+</code></pre>
+
+<hr>
+
+<p>Not sure why you want this to be a friend rather than a member.</p>
+
+<pre><code>    // Non-Member Functions
+    template&lt;typename H&gt; friend bool operator==(const Vector&lt;H&gt;&amp; lhs, const Vector&lt;H&gt;&amp; rhs);
+</code></pre>
+
+<p>Normally the reason to use friend functions is to allow auto conversion of both the right and left hand sides if one side is not a vector. Since you don't really want auto conversion for a comparison I don't see the need.</p>
+
+<hr>
+
+<p>This is the basics actions needed for swap.</p>
+
+<pre><code>    friend void swap(Vector&amp; first, Vector&amp; second)
+    {
+        using std::swap;
+
+        swap(first.v_size, second.v_size);
+        swap(first.v_capacity, second.v_capacity);
+        swap(first.values, second.values);
+    }
+</code></pre>
+
+<p>But probably is not the best way to implement it. Some internal functions also need the ability to swap and calling an external function seems overkill. So I would implement it like this:</p>
+
+<pre><code>    // This is useful to provide as a public function.
+    // But provides a member function that allows other members to use swap.
+    void swap(Vector&amp; other) noexcept
+    {
+        using std::swap;
+
+        swap(v_size,     other.v_size);
+        swap(v_capacity, other.v_capacity);
+        swap(values,     other.values);
+    }
+
+
+// Now the implementation of the swap function (in the same namespace as Vector)
+// Becomes really simple.
+void swap(Vector&amp; lhs, Vector&amp; rhs)
+{
+    lhs.swap(rhs);
+}
+</code></pre>
+
+<hr>
+
+<p>Prefer to use the initializer list rather than construct members the body.</p>
+
+<pre><code>template&lt;typename T&gt;
+inline Vector&lt;T&gt;::Vector()
+{
+    v_size = 0;
+    v_capacity = 0;
+    values = nullptr;
+}
+</code></pre>
+
+<p>In this case it makes no difference. <strong>BUT</strong> if the types of the members has non trivial constructor or assignment then you are doing extra work. And one of the things about C++ is that we often come around and simply change the type of a member and expect the type to continue working the same. If you do this type of initialization suddenly your class becomes ineffecient.</p>
+
+<p>So it is better to do it like this:</p>
+
+<pre><code>template&lt;typename T&gt;
+Vector&lt;T&gt;::Vector()
+    : v_size(0)
+    , v_capacity(0)
+    , values(nullptr)
+{}
+</code></pre>
+
+<hr>
+
+<p>The problem here is that you are initializing every member of the array.</p>
+
+<pre><code>    values = new T[v_capacity];
+</code></pre>
+
+<p>This is not very efficient especially if <code>T</code> is expensive to initialize (or it is not appropriate to initialize members that the user has not created). TO mimik <code>std::vector</code> you should allocate the space but <strong>NOT</strong> call the constructors on the members.</p>
+
+<p>Members are not constructed until objects are added to the array.</p>
+
+<p>To add an object to memory that is allocated but not initialized you need to use placement new. This is a new where you tell new the memory location to use.</p>
+
+<pre><code> // Allocate Memory
+ values = static_cast&lt;T*&gt;(::operator new(sizeof(T) * v_capacity);
+
+
+ // Put an element into the memory space.
+ // that has not be initialized by calling constructor
+
+ new (&amp;values[i]) T(&lt;constructor parameters&gt;);
+</code></pre>
+
+<p>Notice the extra parameter to new here (a pointer to a memory location). This means new will not allocate memory but will use the pointer provided.</p>
+
+<p>Conversely when these locations are no longer used you must manually call the destructor.</p>
+
+<pre><code> values[i].~T();
+</code></pre>
+
+<hr>
+
+<p>Lets re-write this version using the guidelines above:</p>
+
+<pre><code>template&lt;typename T&gt;
+inline Vector&lt;T&gt;::Vector(size_t sz, const T&amp; v)
+    : v_size(sz)
+    , v_capacity(sz)
+    , values(static_cast&lt;T*&gt;(::operator new(sizeof(T) * v_capacity))
+    , ctor_initialized(true)
+{    
+    for(int i = 0; i &lt; sz; ++i) {
+        new (&amp;values[ i ]) T(v);
+    }
+}
+</code></pre>
+
+<hr>
+
+<p>Prefer to use the range based for:</p>
+
+<pre><code>    for(auto iter = i_list.begin(), i = 0; iter != i_list.end(); ++i, ++iter)
+        values[ i ] = *iter;
+</code></pre>
+
+<p>Simpler to write as:</p>
+
+<pre><code>    for(auto const&amp; val: i_list) {
+        push_back(val);
+    }
+</code></pre>
+
+<hr>
+
+<p>This constructor is making a copy of <code>mv</code> before swapping it!</p>
+
+<pre><code>template&lt;typename T&gt;
+inline Vector&lt;T&gt;::Vector(const Vector&lt;T&gt;&amp;&amp; mv)
+{
+    swap(*this, mv);
+}
+</code></pre>
+
+<p>This is correctly written like this:</p>
+
+<pre><code>template&lt;typename T&gt;
+inline Vector&lt;T&gt;::Vector(Vector&lt;T&gt;&amp;&amp; mv) noexcept
+{
+    swap(mv);
+}
+</code></pre>
+
+<p>Notes:</p>
+
+<ol>
+<li>This constructor should be <code>noexcept</code></li>
+<li>Use the internal version of swap()</li>
+</ol>
+
+<hr>
+
+<p>All these methods are correct and fine. But they are simple one liners.</p>
+
+<pre><code>template&lt;typename T&gt;
+inline typename Vector&lt;T&gt;::iterator Vector&lt;T&gt;::begin() noexcept
+{
+    return values;
+}
+</code></pre>
+
+<p>I would simply declare them in the class and make them one liners.</p>
+
+<pre><code>iterator               begin()   noexcept       {return values;}
+const_iterator         begin()   noexcept const {return values;}
+const_iterator         cbegin()  noexcept const {return values;}
+reverse_iterator       rbegin()  noexcept       {return reverse_iterator(end());}
+const_reverse_iterator crbegin() noexcept const {return rbegin();}
+iterator               end()     noexcept       {return values + v_size;}
+const_iterator         end()     noexcept const {return values + v_size;}
+const_iterator         cend()    const          {return values + v_size;}
+reverse_iterator       rend()    noexcept       {return reverse_iterator(begin());}
+const_reverse_iterator crend()   noexcept const {return rend();}
+</code></pre>
+
+<p>When I lined them up all nice (and moved const to the right of noexcept). I notices that <code>cend()</code> is different. It is not only one you have not declared <code>noexcept</code>. Why?????</p>
+
+<hr>
+
+<p>Why do you have the else here?</p>
+
+<pre><code>template&lt;typename T&gt;
+inline T&amp; Vector&lt;T&gt;::at (size_t i)
+{
+    if(i &gt;= v_size)
+        throw std::runtime_error("out of range exception");
+    else
+        return values[ i ];
+}
+</code></pre>
+
+<p>Normally when you check pre-conditions your code looks like this:</p>
+
+<pre><code>    if (precondition-fail) {
+        throw excpetion
+    }
+
+    Normal Code
+</code></pre>
+
+<p>You put the precondition check at the top then all your normal code can go at the normal indent level (not be indent an extra level.</p>
+
+<hr>
+
+<p>Every one of your functions that adds members checks to see if there is room and increases capacity!</p>
+
+<p>You don't think there should be a separate method that does this check and if there is not enough capacity allocates the appropriate amount of memory.</p>
+
+<pre><code>template&lt;typename T&gt;
+template&lt;typename... ARGS&gt;
+void Vector&lt;T&gt;::emplace_back(ARGS&amp;&amp;... args)
+{
+    if(v_size == v_capacity)
+    {
+        if(ctor_initialized)
+            v_capacity *= 2;
+        else
+        {
+            if (v_size == 0)
+                v_capacity = 1;
+            else if(v_size &lt; 8)
+                v_capacity++;
+            else if (v_size &gt;= 8)
+                v_capacity *= 2;
+        }
+
+        reallocate();
+    }
+
+    values[v_size++] = std::move(T(std::forward&lt;ARGS&gt;(args)...));
+}
+</code></pre>
+
+<hr>
+
+<p>You don't need <code>std::move here</code>:</p>
+
+<pre><code>    values[v_size++] = std::move(T(std::forward&lt;ARGS&gt;(args)...));
+</code></pre>
+
+<p>The expression <code>T(std::forward&lt;ARGS&gt;(args)...)</code> is already an r-value reference (its an unamed variable).</p>
+
+<hr>
+
+<p>You should definately want to use the destructor remove elements when they are removed. Unfortunately you can't because of the way you have created the constructors/destructor.</p>
+
+<p>Currently destroying the element would lead to the destructor re-destroying the element. </p>
+
+<pre><code>template&lt;typename T&gt;
+inline void Vector&lt;T&gt;::pop_back()
+{
+    --v_size;
+
+    // what if I use this below, what would be happening and what would be the difference??
+    /*   values[--v_size].~T(); */
+}
+</code></pre>
+
+<p>You do want to do this. But first you must change your code to use inpace new operator everywhere else.</p>
+
+<hr>
+
+<p>If T is expensive to create you may want to move objects from the original to the destination rather than copying them.</p>
+
+<pre><code>template&lt;typename T&gt;
+inline void Vector&lt;T&gt;::reallocate()
+{
+    T* temp = new T[ v_capacity ];
+
+    for(int i = 0; i &lt; v_size; ++i)
+        temp[ i ] = values[ i ];       // This is a copy of T
+
+    delete[ ] values;
+    values = temp;
+}
+</code></pre>
+
+<p>You have not considered what would happen if a copy failed! If a copy of T failed during your loop (and throws an exception). Then you leak the memory that was allocated and assigned to <code>temp</code>.</p>
+
+<p>A better technique is to create a new <code>Vector</code> object. If it works then swap the content out of the this new vector object into your own Vector.</p>
+
+<pre><code>template&lt;typename T&gt;
+inline void Vector&lt;T&gt;::reallocate()
+{
+    Vector&lt;T&gt;   temp;
+    temp.reserve(v_capacity);
+
+    for(int i = 0; i &lt; v_size; ++i) {
+        temp.emplace_back(values[ i ]);
+    }
+
+    swap(temp);    
+}
+</code></pre>
+    </div>

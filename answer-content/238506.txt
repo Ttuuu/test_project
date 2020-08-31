@@ -1,0 +1,123 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'm of the opinion that this is <strong>awesome</strong>, and I have a couple of suggestions to add. It's <strong>not</strong> "Service Locator" because you're explicitly constraining to the exact type that can be resolved---the explicit dependency is right up there in the constructor.</p>
+
+<p>(I wish they'd bake this into .Net Core.)</p>
+
+<ol>
+<li>Don't store the service-object
+
+<ul>
+<li>I think it would be better to replace <code>T Service</code> with <code>T GetRequiredService()</code>. If you're resolving a Transient service, it would be useful. Additionally, it makes for fewer changes when someone switches away from the built-in <code>IServiceScopeFactory</code>.</li>
+</ul></li>
+<li>Finish implementing IDispose
+
+<ul>
+<li>See <a href="https://stackoverflow.com/a/538238/530545">this answer on StackOverflow</a></li>
+</ul></li>
+<li>Go Singleton
+
+<ul>
+<li>I see no reason to register as Scoped, considering what this does. It's using a Singleton, so make it Singleton.</li>
+</ul></li>
+</ol>
+
+<h1>Here's my tweaked version</h1>
+
+<pre><code>public interface IServiceScopeFactory&lt;T&gt; where T : class
+{
+    IServiceScope&lt;T&gt; CreateScope();
+}
+
+public interface IServiceScope&lt;T&gt; : IDisposable where T : class
+{
+    T GetRequiredService();
+    T GetService();
+    IEnumerable&lt;T&gt; GetServices();
+}
+
+
+public class ServiceScopeFactory&lt;T&gt; : IServiceScopeFactory&lt;T&gt; where T : class
+{
+    private readonly IServiceScopeFactory _serviceScopeFactory;
+
+    public ServiceScopeFactory(IServiceScopeFactory serviceScopeFactory) =&gt; _serviceScopeFactory = serviceScopeFactory;
+
+    public IServiceScope&lt;T&gt; CreateScope() =&gt; new ServiceScope&lt;T&gt;(_serviceScopeFactory.CreateScope());
+}
+
+public class ServiceScope&lt;T&gt; : IServiceScope&lt;T&gt; where T : class
+{
+    readonly IServiceScope _scope;
+
+    public ServiceScope(IServiceScope scope) =&gt; _scope = scope;
+
+    public T GetRequiredService() =&gt; _scope.ServiceProvider.GetRequiredService&lt;T&gt;();
+
+    public T GetService() =&gt; _scope.ServiceProvider.GetService&lt;T&gt;();
+
+    public IEnumerable&lt;T&gt; GetServices() =&gt; _scope.ServiceProvider.GetServices&lt;T&gt;();
+
+
+    #region IDisposable/Dispose methods ( https://stackoverflow.com/a/538238/530545 )
+    bool _disposed = false;
+
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    protected virtual void Dispose(bool calledFromCodeNotTheGarbageCollector)
+    {
+        if (_disposed)
+            return;
+        if (calledFromCodeNotTheGarbageCollector)
+        {
+            // dispose of manged resources in here
+            _scope?.Dispose();
+        }
+        _disposed = true;
+    }
+
+    ~ServiceScope() { Dispose(false); }
+    #endregion
+
+}
+</code></pre>
+
+<p>You'd register this like so:</p>
+
+<pre><code>services.AddSingleton(typeof(IServiceScopeFactory&lt;&gt;), typeof(ServiceScopeFactory&lt;&gt;));
+</code></pre>
+
+<p>And to work with your example, you'd use it like so (assuming you registered your <code>ConmaniaDbContext</code>):</p>
+
+<pre><code>public class Foo
+{
+    readonly IServiceScopeFactory&lt;ConmaniaDbContext&gt; _dbCtxFactory;
+
+    public Foo(IServiceScopeFactory&lt;ConmaniaDbContext&gt; dbCtxFactory) =&gt; _dbCtxFactory = dbCtxFactory;
+
+    public void Bar()
+    {
+        using var scope = _dbCtxFactory.CreateScope();
+        var db = scope.GetRequiredService();
+        //use service
+    }
+}
+</code></pre>
+
+<h2>FYI/Backstory</h2>
+
+<p>FYI, I'm using this in a .Net Core 3.x app that's leveraging Gql.Net. This pattern makes it so I can actually use EFC. Gql.Net's field resolvers run in parallel, so if you don't do something like this, you cannot use your constructor-injected <code>DbContext</code> in more than one field, or you wind up getting this EFC exception (which is not unique to Gql.Net): </p>
+
+<blockquote>
+  <p>[InvalidOperationException] A second operation started on this context
+  before a previous operation completed. This is usually caused by
+  different threads using the same instance of DbContext. For more
+  information on how to avoid threading issues with DbContext, see
+  <a href="https://go.microsoft.com/fwlink/?linkid=2097913" rel="nofollow noreferrer">https://go.microsoft.com/fwlink/?linkid=2097913</a>.</p>
+</blockquote>
+
+<p>I've confirmed this solves that "parallel execution in the same Http request" issue for me. I can now run multiple, concurrent tasks against the database from the same instance of a scoped service class. It's because with this solution, instead of all threads using the same <code>DbContext</code> that was injected into the constructor, they now each resolve their own, scoped <code>DbContext</code> instance when they need it.</p>
+    </div>

@@ -1,0 +1,92 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Performance</h2>
+
+<p>I won't say much about the algorithm, but the profiler has pointed you in the right direction: what you need is a <a href="https://en.wikipedia.org/wiki/Priority_queue" rel="nofollow noreferrer">Priority Queue</a>.</p>
+
+<p>A Priority Queue will enable you to keep track of the 'open' nodes in such a way that you can determine the 'cheapest' in sub-linear time. Unfortunately, C#/.NET doesn't provide a priority Queue, so you'll have to find one. Blue Raja will probably show up at some point and point you at <a href="https://github.com/BlueRaja/High-Speed-Priority-Queue-for-C-Sharp" rel="nofollow noreferrer">this offering</a>, and you can see an outline of an A* implementation using it <a href="https://codereview.stackexchange.com/a/197204/39858">near the end of my answer</a> to another A* themed question.</p>
+
+<p>Get it working with this better data structure before worrying about anything else with regard to performance.</p>
+
+<p>I'll add that your 'closed/!closed' system needs rethinking. You explicitly set the start node open, but none of the others. It's much easier just to keep track of explored nodes by putting them in a <code>HashSet</code>.</p>
+
+<h2><code>BuildAStar(string, string)</code></h2>
+
+<p>This is a <em>biiiig</em> method. Consider breaking it down into smaller, more manageable, methods. I would try to pull the code which 'expands' the current node out, and I'd definitely move all the <code>pathStartToEnd</code> stuff into a different method. I'd also move the call to <code>GetDistanceFromLatLonInMeters</code> into its own method, since getting the cost between nodes is perfectly self-contained concept independent of using said cost for path-finding.</p>
+
+<p>The return type could be more general: there is no reason to expose the fact you are using a <code>List</code> internally (e.g. you could just as well use a <code>Stack</code> to accumulate the path). Consider changing the return type to <code>IEnumerable&lt;NodeRow&gt;</code> or <code>IReadOnlyList&lt;NodeRow&gt;</code> or <code>IList&lt;NodeRow&gt;</code>. This allows you to change the internal implementation without having to adhere to an unnecessarily strict API, and you can more easily change from an abstract type to a concrete type in the future, than to change from a concrete type to a more abstract type.</p>
+
+<p>More importantly, you return <code>new List&lt;NodeRow&gt;()</code> both when the route is zero-length and when there is no route. These results must absolutely be distinct. A quick-and-dirty solution would be to return <code>null</code> when there is no route, which will at least make unsuspecting code crash violently when it's assumptions are violated (which is good).</p>
+
+<p>I really don't like your <code>nodes</code> variable. It's explicitly an <code>ILookup</code>, and you spend the rest of the method working around the fact that you can't be sure whether nodes exists, and assuming that none of them have the same name. Your code depends on there being only one. You can resolve much of this weirdness by switching to <code>ToDictionary</code>, which enforces the rule that there can only be one element to each key, throwing if a duplicate appears (which is good). You're also inconsistent between <code>First()</code> and <code>FirstOrDefault()</code>. Since you are never checking for <code>null</code>s, these should all be <code>First()</code>, so that the program crashes as soon as possible. The other option is to actually check for the <code>null</code>s, and throw a meaningful error. For example:</p>
+
+<pre><code>IDictionary&lt;string, DijkstraNodeData&gt; nodes = AllNodes.ToLookup(n =&gt; n.Key, n =&gt; new DijkstraNodeData(n.FirstOrDefault()));
+
+// snip
+
+DijkstraNodeData startNode;
+if (!nodes.TryGetValue(start, out startNode))
+{
+    throw new ArgumentException("No node exists with the start key", nameof(start));
+}
+</code></pre>
+
+<p>Why do you record <code>smallestId = node.Key;</code> rather than <code>currentNode = node</code>? The only time you use <code>smallestId</code> is when you are looking up the node in the table, and that will just add overhead and makes the code more fragile.</p>
+
+<p>Finally, where did the number <code>10000</code> come from? This is a magic number: such important numbers deserve good names. Naming constants makes the code clear and easier to maintain (e.g. if the 'constant' changes, you need only change it in one place, which means you can't miss any instances, or accidently change any other magic numbers which happened to be the same values but are logically distinct.</p>
+
+<h2><code>FindNextCorridorNode(NodeRow)</code></h2>
+
+<p>The following loop returns nothing, so it's just doing work for the fun of it:</p>
+
+<pre><code>foreach (NodeEdgeRow edge in node.Edges)
+{
+    FindNextCorridorNode(edge.Node2);
+}
+</code></pre>
+
+<p>Not knowing the topology of your graph, it's not unthinkable that this could lead to an infinite loop.</p>
+
+<p>What is <code>"c"</code>? I'm guessing it stands for 'corridor', but it's not clear. Give it a meaningful name, or  change the type of <code>NodeRow.Type</code> to something with an <code>IsCorridor()</code> method. The <code>ToLower</code> calls do not inspire much confidence either.</p>
+
+<p>The only code provided which uses this method assumes that it returns non-null. This means that when it does return <code>null</code>, it will wait quietly until the calling code falls over this <code>null</code>, and whoever has to debug it will wonder where this <code>null</code> came from. The <code>return null</code> should probably be a <code>throw</code> with a helpful error message.</p>
+
+<h2><code>class DijkstraNodeData</code></h2>
+
+<p>I'd make <code>Node</code> readonly, since it makes no sense ever to change it.</p>
+
+<p>I don't like that <code>Link</code> is initialised to <code>""</code>. This looks like a valid value (on account of not being <code>null</code>), which means that (if you did any <code>null</code> checks) it could slip through, and cause problems far away from the source.</p>
+
+<p>Should <code>Closed</code> be initialised to <code>true</code>?</p>
+
+<h2>Style</h2>
+
+<p>It's a non-issue for a consumer, but I'd personally appreciate some more consistency with empty lines.</p>
+
+<p>This was a little surprising:</p>
+
+<pre><code>if(smallest == float.PositiveInfinity) { return new List&lt;NodeRow&gt;();
+</code></pre>
+
+<p>All on one line, no space after the <code>if</code>: rather out of place. And another one:</p>
+
+<pre><code>if (nextClosed == start) { done = true; }
+</code></pre>
+
+<p>I'd rewrite the <code>while</code> as:</p>
+
+<pre><code>while (nextClosed.Length &gt; 0)
+{
+    var thisNode = nodes[nextClosed].First();
+    thisNode.InPath = true;
+    pathStartToEnd.Add(thisNode.Node);
+    nextClosed = thisNode.Link;
+
+    if (nextClosed == start)
+    {
+        break;
+    }
+}
+</code></pre>
+
+<p>Your names are all formatted nicely, though some could be better and more consistent. The two that bother me most are <code>smallest</code> and <code>smallestId</code>, which from the rest of the code feel like they should be <code>smallestCost</code> and <code>smallest</code>.</p>
+    </div>

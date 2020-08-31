@@ -1,0 +1,76 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Abstractness</h2>
+
+<blockquote>
+  <p>To be precise, this class is meant to be inherited by multiple derived classes, which actually define the constants.</p>
+</blockquote>
+
+<p>Do you mean there will be many <em>classes</em> each of which contain a constant set of <code>bytes</code>, but are otherwise the same? If so, then there is no need to create a new class for each one. You could instead just provide <code>static readonly</code> instances for each constant, e.g.</p>
+
+<pre><code>public static class MagicNumbers
+{
+    public static readonly Bytes Example1 = new Bytes(new byte[] { 0xFF, 0xFF });
+    public static readonly Bytes Example2 = new Bytes(new byte[] { 0xFE, 0xFF });
+}
+</code></pre>
+
+<h2>Readonlyness</h2>
+
+<p>This certainly provides a read-only interface, which is good. The only way to violate the read-onlyness would be with reflection (which it is essentially always fine to ignore).</p>
+
+<p>You are right that the backing collection of a <code>ReadOnlyCollection&lt;T&gt;</code> can change; this is all part of the 'interface is gospel' approach of languages like C# (which personally I subscribe to whole-heartedly). Note that if you pass a <code>ReadOnlyCollection&lt;T&gt;</code> to someone else, however, that <em>they</em> can't modify it. This means it is up to whoever creates the backing collections for the <code>ReadOnlyCollection&lt;T&gt;</code> as to what can or cannot be done with it. <code>ReadOnlyCollection&lt;T&gt;</code>, however, is not a type I would use for anything, pretty much, because it unhelpfully implements <code>IList&lt;T&gt;</code> (among other things). It's also annoyingly named (in my opinion), because <code>IReadOnlyCollection&lt;T&gt;</code> doesn't expose indexed retrieval (that's <code>IReadOnlyList&lt;T&gt;</code> job).</p>
+
+<p>It's good that your constructor takes an <code>IEnumerable&lt;T&gt;</code>. You might consider implementing <code>IReadOnlyList&lt;T&gt;</code> (which 'includes' <code>IEnumerable&lt;T&gt;</code>) if you think it appropriate; this would expose an efficient implementation of <code>Count</code> and <code>T this[int]</code> (more discussion about this below).</p>
+
+<p>Inside your class you could also use a read-only collection instead of <code>List&lt;byte&gt;</code>, to enforce the contract internally, e.g. <code>IReadOnlyList&lt;T&gt;</code>.</p>
+
+<h2>Properties</h2>
+
+<p>Your <code>Count</code> and <code>Length</code> properties are, as you comment, redundant. Don't do this: it will only create confusion. <code>Length</code> is (in my experiance) pretty much exclusive to arrays: go with <code>Count</code> instead (it's the property exposed by <code>IReadOnlyList&lt;T&gt;</code>), and instead of storing the value, I'd suggest retrieving it from the actual list, which means the construtor has less to do (which means there is less to go wrong).</p>
+
+<pre><code> public int Count =&gt; bytesList.Count;
+</code></pre>
+
+<p>It's good that your external properties were <code>readonly</code> (this is preserved with the 'expression-bodied property' syntax above). You might also want to make <code>bytesList</code> <code>readonly</code> (the class is fine as it is, because it's public API is sound, but this again will enforce the contract inside the class, making it easier to maintain and understand).</p>
+
+<p>Concerning <code>readonly</code> vs getter-only, unless I have good reason (which basically never happens), I go with getter-only. While what <code>Rob</code> says in the linked thread is true, I personlly don't care what a class does so long as the API makes sense, and a public <code>readonly</code> field has two important disadvantages over getter-only properties: it can't implement an interface property (e.g. <code>int IReadOnlyList.Count</code>), and you can't quietly change it to be a property in future. For example, changing your <code>public int read-only Count</code> to <code>public int Count =&gt; byteList.Count</code> is a binary breaking change: any code that depends on the old field needs to be recompiled to work with the new property. If, however, you had made it <code>public int Count { get; }</code>, then you could make this change to the <em>implementation</em> without breaking any consuming code. One case where you might want this would be <code>AsString</code>: if you found that this was hardly ever being used, you might consider deferring the creation until it is needed: you <em>can't</em> do this with a <code>readonly</code> field, but you can easily replace a getter-only property with one which implements caching.</p>
+
+<p>In practical terms, as Henk Holterman points out in the linked thread, <code>readonly</code> fields are a nightmare when it comes to serialisation. A getter-only field, however, can become a <code>{ get; private set; }</code> field without issue if your serialisation scheme demands it. This is by no means ideal, but it doesn't change the external API, so the unpleasantness is contained within the class.</p>
+
+<h2>Indexer <code>this[int]</code></h2>
+
+<p>You might consider the <code>expression-bodied member</code> syntax again:</p>
+
+<pre><code>public byte this[int i] =&gt; this.bytesList[ i &gt;= 0 ? i : i + this.Count ];
+</code></pre>
+
+<p>Though it's just syntatic sugar we could live without, it is arguably a bit easier to read, and makes it immediately apprent that there is no <code>set</code> block.</p>
+
+<p>If you did decide to implement <code>IReadOnlyList</code>, you would need 2 versions of this methods; one with the negative-index support, and one without.</p>
+
+<pre><code>byte IReadOnlyList&lt;T&gt;.this[int i] =&gt; this.bytesList[i];
+public byte this[int i] =&gt; this.bytesList[ i &gt;= 0 ? i : i + this.Count ];
+</code></pre>
+
+<p>This means that code which misuses the <code>IReadOnlyList&lt;T&gt;</code> interface will still get an out-of-bounds error, but anyone who has an instance of your class by name of the class can use the negative-indexing.</p>
+
+<h2>Namespace qualifiers</h2>
+
+<p>It's been a while since I used Python for anything substancial, but my understanding is that *-imports pull methods as well as classes, so the issue is lesser in C# (only pulls types and other namespaces). As you say, it's pretty standard for C#ers to use *-imports, and because it is expected, APIs are designed in a manner which assumes it: e.g. there are many more namespaces in C# than C++. Most importantly, however, is that C# fails at compile-time if there are <em>observed</em> name-collisions (e.g. even if <code>Horse</code> could be interpreted as two things, the code is fine so long as you don't try to use <code>Horse</code> unqualified). This means two things have to change for library authors to break your code - the introduction of a 'duplicate' method or type in a dependency in Python will quietly create problems - and you can't break your own (because it won't compile). The only leak in all this, is that classes in their own namespace are preferred over classes in an imported namespace (but only the author of that namespace can change the behaviour of their code, not someone else).</p>
+
+<p><code>using CollectionsGen = System.Collections.Generic</code> would mostly horrifying me because <code>Gen</code> is truncated. Anothing think you'll find in C# is that we prefer long easy-to-remember-and-understand names over short quicker-to-type (if you can remember them) names. The time-to-type is minimised by auto-complete in the IDE/editor.</p>
+
+<h2>Documentation</h2>
+
+<p>It's good that your class has an inline-summary, but inline-documentation (<code>///</code>) on all public non-inherited members significantly improved usabily. The <code>Count == Length</code> thing, for example, would be confusing no end, which is why you have a comment in your code to remind you that it is correct: this same comment should be available to the people using your code. The negative-indexing support is another thing that should be documented externally. The constructor should also state that it takes a copy of the <code>IEnumerable</code>; while this is implied (by virtue of taking an <code>IEnumerable&lt;T&gt;</code> rather than, say, an <code>IReadOnlyList&lt;T&gt;</code>), as a consumer of your code I would appreciate knowing that this is the intended long-term behaviour and not just an implementation detail.</p>
+
+<p>Remember: code is <em>consumed</em> far more often than it is read or written (which people all too often seem to forget).</p>
+
+<h2>Misc</h2>
+
+<ul>
+<li><p>I wouldn't bother with the lining stuff up; it's just effort to maintain.</p></li>
+<li><p>I'd also avoid things like "x&gt;=2", and some IDEs will 'correct' it to <code>x &gt;= 2</code>, so you'll just end up fighting them. If expressions need grouping, then use parenthesis, which are unambiguous.</p></li>
+<li><p>If you are worried about space, consider using a <code>byte[]</code> rather than a list (you can use LINQ's <code>IEnumerable&lt;T&gt;.ToArray()</code> (guarantees copy) to keep the code short. (Note that <code>byte[]</code> implements <code>IReadOnlyList&lt;T&gt;</code>).</p></li>
+</ul>
+    </div>

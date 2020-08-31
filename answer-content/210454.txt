@@ -1,0 +1,278 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Welcome to Code Review!</p>
+
+<p>Thanks for sharing your code.</p>
+
+<p>As you observed the main problem is code duplication.</p>
+
+<p>We have basically two options to solve that problem. Both of them use the basic approach to separate the <em>common code</em> from the <em>different code</em> and "inject" the <em>differing code</em> into the <em>common code</em>.</p>
+
+<h1>prepare injecting differing code</h1>
+
+<p>When looking at your code the only difference between the <code>//Article Request</code> and the  <code>//Events Request</code> are these lines:</p>
+
+<pre><code>//Article Request
+articles = gson.fromJson(body.string(), new TypeToken&lt;List&lt;Article&gt;&gt;() {
+                                    }.getType());
+
+//Events Request 
+events = gson.fromJson(body.string(), new TypeToken&lt;List&lt;Event&gt;&gt;() {
+                                    }.getType());
+</code></pre>
+
+<p>One problem here is that you <em>change</em> the objects pointed to by the member variables <code>articles</code> and <code>events</code>. We could make is easier to change if the objects would be reused:</p>
+
+<pre><code>//Article Request
+articles.clear();
+articles.addAll(gson.fromJson(body.string(), new TypeToken&lt;List&lt;Article&gt;&gt;() {
+                                    }.getType()));
+
+//Events Request 
+events.clear();
+events.addAll(gson.fromJson(body.string(), new TypeToken&lt;List&lt;Event&gt;&gt;() {
+                                    }.getType()));
+</code></pre>
+
+<p>now we can extract one of that parts to a new Method using the IDEs <em>automated refactoring</em> "extract method":</p>
+
+<pre><code>private void deserializeJson(
+      List&lt;Event&gt; events,
+      Gson gson,
+      ResponseBody body
+){
+    events.clear();
+    events.addAll(gson.fromJson(body.string(), new TypeToken&lt;List&lt;Event&gt;&gt;() {
+                                        }.getType()));
+} 
+
+//Events Request 
+// ...
+} else {
+      deserializeJson((List&lt;Event&gt;)events,
+      Gson gson,
+      ResponseBody body);
+}
+</code></pre>
+
+<p>Next we have to mat this new private method "generic":</p>
+
+<pre><code>private &lt;L extends List&gt; void deserializeJson(
+      L events,
+      Gson gson,
+      ResponseBody body
+){
+    events.clear();
+    events.addAll(gson.fromJson(body.string(), new TypeToken&lt;L&gt;() {
+                                        }.getType()));
+} 
+</code></pre>
+
+<p>Now we can change toe other place too:</p>
+
+<pre><code>//Articles  Request
+// ...
+} else {
+      deserializeJson((List&lt;Article&gt;)articles);
+}
+</code></pre>
+
+<p>from here we have two options:</p>
+
+<ol>
+<li>consolidating the common code in a single generic typed method.</li>
+<li>puttig the difering code into an "specialized classes" providing the differing behavior via an common <em>interface</em>.</li>
+</ol>
+
+<h1>common code in a single generic typed method</h1>
+
+<p>We basically do he same as above: we extract the <code>//Events Request</code> section or the <code>//Articles  Request</code> into a new private method and make it "generic"</p>
+
+<pre><code>private &lt;L extends List&gt; void deserializeFromJson(
+    L theList, 
+    OkHttpClient client, 
+    Gson gson 
+){
+    client.newCall(articlesrequest).enqueue(new Callback() {
+        @Override
+        public void onFailure(Call call, IOException e) {
+            error.set(true);
+            latch.countDown();
+        }
+        @Override
+        public void onResponse(Call call, Response response) {
+            try {
+                ResponseBody body = response.body();
+                if (response.code() != 200 || body == null) {
+                    error.set(true);
+                } else {
+                     deserializeJson((L)theList, gson, body);
+                }
+            } catch (IOException | JsonSyntaxException e) {
+                error.set(true);
+            }
+            latch.countDown();
+        }
+    });
+}
+
+
+//Article Request
+deserializeFromJson(
+   (List&lt;Articles&gt;)articles,
+   client,
+   gson
+);
+
+//Events Request
+client.newCall(eventsrequest).enqueue(new Callback() {
+  // ...
+</code></pre>
+
+<p>and then also replace the other part:</p>
+
+<pre><code>//Article Request
+deserializeFromJson(
+   (List&lt;Articles&gt;)articles,
+   client,
+   gson
+);
+
+//Events Request
+deserializeFromJson(
+   (List&lt;Event&gt;)events,
+   client,
+   gson
+);
+</code></pre>
+
+<h1>creating specialized classes with interface</h1>
+
+<p>for this we have to move the private method created in the first section into a new <em>inner class</em></p>
+
+<pre><code>class your current class:
+
+  private static class JsonDeserializer&lt;T&gt; {
+
+     void deserialize(
+          List&lt;T&gt; theList,
+          Gson gson,
+          ResponseBody body
+     ){
+        theList.clear();
+        theList.addAll(gson.fromJson(body.string(), new TypeToken&lt;List&lt;T&gt;&gt;() {
+                                            }.getType()));
+
+     }
+  }
+  // ...
+
+    //Articles  Request
+    // ...
+    } else {
+          new JsonDeserializer&lt;Article&gt;().deserialize(articles, gson, body);
+    }
+    //...
+</code></pre>
+
+<p>Since <code>articles</code> and <code>events</code> are <em>member variables</em> I'd rather have them as <em>constructor parameters</em> in the new class: </p>
+
+<pre><code>class your current class:
+
+  private static class JsonDeserializer&lt;T&gt; {
+     private final List&lt;T&gt; theList;
+     JsonDeserializer( List&lt;T&gt; theList){
+       this.theList = theList;
+     }
+
+     void deserialize(
+          Gson gson,
+          ResponseBody body
+     ){
+        theList.clear();
+        theList.addAll(gson.fromJson(body.string(), new TypeToken&lt;List&lt;T&gt;&gt;() {
+                                            }.getType()));
+
+     }
+  }
+  // ...
+
+    //Articles  Request
+    // ...
+    } else {
+          new JsonDeserializer&lt;Article&gt;(articles).deserialize(gson, body);
+    }
+    //...
+    //Event  Request
+    // ...
+    } else {
+          new JsonDeserializer&lt;Event&gt;(eventss).deserialize(gson, body);
+    }
+    //...
+</code></pre>
+
+<p>Now we can create the <code>JsonDeserializer</code> instances at the top of the method:</p>
+
+<pre><code>private void loadRepository() {
+    JsonDeserializer&lt;Article&gt; articleDeserializer =  new JsonDeserializer&lt;&gt;(articles);
+    JsonDeserializer&lt;Event&gt; eventDeserializer =  new JsonDeserializer&lt;&gt;(event);
+    ExecutorService exService = Executors.newSingleThreadExecutor();
+    // ...
+    //Articles  Request
+    // ...
+    } else {
+          articleDeserializer.deserialize(gson, body);
+    }
+    //...
+    //Event  Request
+    // ...
+    } else {
+          eventDeserializer.deserialize(gson, body);
+    }
+    //...
+</code></pre>
+
+<p>Now the only difference left in <code>//Articles  Request</code> section and <code>//Event  Request</code> section is the <em>name</em> of the variable. So we can put the two <code>JsonDeserializer</code> instances into a <em>collection</em> and apply the *common code * as a loop:</p>
+
+<pre><code>private void loadRepository() {
+    JsonDeserializer&lt;?&gt; deserializers = Arrays.asList( 
+         new JsonDeserializer&lt;Article&gt;(articles),
+         new JsonDeserializer&lt;Event&gt;(event)
+    );
+    ExecutorService exService = Executors.newSingleThreadExecutor();
+// ...
+
+    Request eventsrequest = requestbuilder.url("https://apiurlevents").build();
+
+    //Article Request changed to loop
+    for(JsonDeserializer&lt;?&gt;  deserializer: deserializers){
+        client.newCall(articlesrequest).enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {
+                error.set(true);
+                latch.countDown();
+            }
+            @Override
+            public void onResponse(Call call, Response response) {
+                try {
+                    ResponseBody body = response.body();
+                    if (response.code() != 200 || body == null) {
+                        error.set(true);
+                    } else {
+                        deserializer.deserialize(gson, body);
+                    }
+                } catch (IOException | JsonSyntaxException e) {
+                    error.set(true);
+                }
+                latch.countDown();
+            }
+        });
+    }
+    try {
+        latch.await();
+    } catch (InterruptedException e) {
+        error.set(true);
+    }
+</code></pre>
+
+<p>New document types are just new instances in the <em>collection</em>.</p>
+    </div>

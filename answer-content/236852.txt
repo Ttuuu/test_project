@@ -1,0 +1,220 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I suspect you'd better off using a <code>DirectorySearcher</code>, but I don't know Active Directory services are supported by .NET Core.</p>
+
+<p>Here is how I did it in .NET Framework (4.7.2).</p>
+
+<p>Classes to hold the data I needed:</p>
+
+<pre><code>public class Account
+{
+    private Account(string name)
+    {
+        Name = name;
+    }
+
+    public Account(string name, List&lt;DataCombination&gt; groupData)
+        : this(name)
+    {
+        GroupData = groupData;
+    }
+
+    public string Name { get; }
+
+    public List&lt;DataCombination&gt; GroupData { get; }
+}
+</code></pre>
+
+<hr>
+
+<pre><code>public class DataCombination
+{
+    public string GroupName { get; set; }
+
+    public string Account { get; set; }
+}
+</code></pre>
+
+<hr>
+
+<p>The code that queries AD:</p>
+
+<pre><code>        var searchResults = new List&lt;SearchResult&gt;();
+
+        using (var directoryEntry = new DirectoryEntry(directoryEntryPath))
+        {
+            directoryEntry.RefreshCache();
+
+            using (var directorySearcher = new DirectorySearcher(directoryEntry))
+            {
+                directorySearcher.SearchRoot = directoryEntry;
+                directorySearcher.SearchScope = SearchScope.Subtree;
+                directorySearcher.PageSize = 1000;
+                directorySearcher.Filter = filter;
+
+                directorySearcher.PropertiesToLoad.Clear();
+                directorySearcher.PropertiesToLoad.Add(PropertyName.Name);
+                directorySearcher.PropertiesToLoad.Add(PropertyName.MemberOf);
+
+                searchResults.AddRange(directorySearcher.FindAll().Cast&lt;SearchResult&gt;());
+            }
+        }
+
+        var accounts = searchResults
+            .Select(searchResult =&gt; _accountFactory.Execute(searchResult.Properties))
+            .OrderBy(x =&gt; x.Name)
+            .ToList();
+
+        return accounts;
+</code></pre>
+
+<ul>
+<li><code>directoryEntryPath</code> is an LDAP URI, starts with "LDAP://".</li>
+<li><p><code>filter</code> is used to filter using a list of user names and is filled by this method:</p>
+
+<pre><code>public static string Execute(IEnumerable&lt;string&gt; userNames)
+{
+    var filter = new StringBuilder();
+    filter.Append("(&amp;(objectClass=user)(|");
+
+    foreach (var userName in userNames)
+    {
+        filter.Append($"(sAMAccountName={userName})");
+    }
+
+    filter.Append("))");
+
+    return filter.ToString();
+}
+</code></pre></li>
+<li><p><code>PropertyName</code> is a class containing <code>const string</code>s:</p>
+
+<pre><code>internal static class PropertyName
+{
+    // https://msdn.microsoft.com/en-us/library/windows/desktop/ms675090.aspx
+    public const string Name = "name";
+    public const string LockoutTime = "lockoutTime";
+    public const string UserAccountControl = "userAccountControl";
+    public const string MemberOf = "memberOf";
+    public const string DisplayName = "displayName";
+}
+</code></pre></li>
+</ul>
+
+<p>This is the <code>_accountFactory</code> which converts the data returned by the <code>DirectorySearcher</code> into my classes:</p>
+
+<pre><code>internal class GroupAccountFactory : BaseDirectorySearcher, IAccountFactory
+{
+    public Account Execute(ResultPropertyCollection properties)
+    {
+        var accountName = GetValue&lt;string&gt;(properties, PropertyName.Name);
+
+        var groupData = GetGroupData(properties, accountName);
+
+        return new Account(accountName, groupData);
+    }
+
+    private List&lt;DataCombination&gt; GetGroupData(ResultPropertyCollection properties, string accountName)
+    {
+        var groupNames = new List&lt;string&gt;();
+
+        foreach (var propertyValue in properties[PropertyName.MemberOf].Cast&lt;string&gt;())
+        {
+            groupNames.AddRange(propertyValue
+                .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(part =&gt; part.Split('='))
+                .Select(x =&gt; new
+                {
+                    Key = x[0],
+                    Value = x[1],
+                })
+                .Where(x =&gt; x.Key == LdapDirectory.CommonName)
+                .Select(x =&gt; x.Value));
+        }
+
+        return DataCombinationCollectionCreator.Execute(new HashSet&lt;string&gt;(groupNames), accountName);
+    }
+}
+</code></pre>
+
+<p>Its base class:</p>
+
+<pre><code>internal abstract class BaseDirectorySearcher
+{
+    protected T GetValue&lt;T&gt;(ResultPropertyCollection properties, string propertyName)
+    {
+        var value = PropertyValueRetriever.GetObject(properties, propertyName);
+        if (value == null)
+        {
+            return default(T);
+        }
+
+        return (T)value;
+    }
+}
+</code></pre>
+
+<p>And that one uses:</p>
+
+<pre><code>internal class PropertyValueRetriever
+{
+    public static string GetString(ResultPropertyCollection properties, string propertyName)
+    {
+        var value = GetObject(properties, propertyName);
+
+        return (string)value;
+    }
+
+    public static object GetObject(ResultPropertyCollection properties, string propertyName)
+    {
+        if (properties.Contains(propertyName)
+            &amp;&amp; properties[propertyName].Count &gt; 0)
+        {
+            return properties[propertyName][0];
+        }
+
+        return null;
+    }
+}
+</code></pre>
+
+<p>You might have noticed this class:</p>
+
+<pre><code>internal class LdapDirectory
+{
+    public const string CommonName = "CN";
+    public const string OrganizationalUnit = "OU";
+    public const string DomainComponent = "DC";
+}
+</code></pre>
+
+<p>And finally:</p>
+
+<pre><code>internal class DataCombinationCollectionCreator
+{
+    public static List&lt;DataCombination&gt; Execute(ICollection&lt;string&gt; groupNames, string accountName)
+    {
+        var groupData = new List&lt;DataCombination&gt;();
+
+        foreach (var groupName in groupNames)
+        {
+            groupData.Add(CreateDataCombination(groupName, accountName));
+        }
+
+        return groupData;
+    }
+
+    private static DataCombination CreateDataCombination(string groupName, string accountName)
+    {
+        return new DataCombination
+        {
+            GroupName = groupName,
+            Account = accountName
+        };
+    }
+}
+</code></pre>
+
+<p>(Note that I have stripped away some of the extra logic that is present in my code which only applies for my purposes; thus the whole use of <code>DataCombinationCollectionCreator</code> might be overkill for you.)</p>
+
+<p>It's all fairly self-explanatory. Whether it performs better than your code, I don't know: AD operations can be notoriously slow.</p>
+    </div>

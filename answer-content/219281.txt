@@ -1,0 +1,179 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>#include &lt;../cpp11-on-multicore/common/sema.h&gt;
+</code></pre>
+
+<p>You didn't show this file, so I cannot comment on it nor the use of the semaphore.</p>
+
+<pre><code>#if __cplusplus &lt; 201703l
+#error "Compile using c++17 or later"
+#endif
+</code></pre>
+
+<p>What's the point of this? If some feature isn't supported, the compiler will say so.</p>
+
+<pre><code>class worker_pool {
+private:
+</code></pre>
+
+<p>I would put the public interface on top, since that is what's relevant to the largest audience.</p>
+
+<pre><code>  class worker {
+</code></pre>
+
+<p>This can just be a lambda function. <code>id</code> is unused.</p>
+
+<pre><code>      // work until asked to stop
+      while (!wp-&gt;stop.load()) {
+        auto t = wp-&gt;fetch();
+        // when asked to stop workers will wake up
+        // and recieve a nullopt
+        if (t.has_value())
+          t.value()();
+      }
+</code></pre>
+
+<p>You check for the stop condition twice in each iteration. Accessing the atomic can be quite expensive when done frequently from multiple threads. Instead, you can simply write:</p>
+
+<pre><code>      // work until asked to stop
+      while (true) {
+        auto t = wp-&gt;fetch();
+        // when asked to stop workers will wake up
+        // and recieve a nullopt
+        if (!t.has_value())
+          break;
+        t.value()();
+      }
+</code></pre>
+
+<p>.</p>
+
+<pre><code>  // stop indicates that we were asked to stop but workers are not terminated
+  // yet
+  std::atomic&lt;bool&gt; stop;
+  // term means that workers are terminated
+  std::atomic&lt;bool&gt; term;
+</code></pre>
+
+<p>This allows for an invalid state (<code>term &amp;&amp; !stop</code>). You can represent this better with an <code>enum { Running, Stopping, Stopped }</code>.</p>
+
+<pre><code>  std::optional&lt;std::function&lt;void(void)&gt;&gt; fetch() {
+    queue_sem.wait();
+    std::unique_lock l(queue_mutex);
+    // return nothing if asked to stop
+    if (stop.load())
+      return std::nullopt;
+    auto res = std::move(job_queue.front());
+    // if we happen to have emptied the queue notify everyone who is waiting
+    job_queue.pop();
+    if (job_queue.empty())
+      cv_empty.notify_all();
+    return std::move(res);
+  };
+</code></pre>
+
+<p>There's no need to return an <code>optional</code> here. <code>function</code> can already be empty.</p>
+
+<p>You can check for the <code>stop</code> condition before locking the mutex. It's best to unlock the mutex as soon as possible; in this case, before notifying the CV.</p>
+
+<p>Finally, there shouldn't be a semicolon after a function body.</p>
+
+<pre><code>    for (long i = 0; i &lt; tcount; i++) {
+      workers.push_back(std::thread(worker(this, i)));
+    }
+</code></pre>
+
+<p>You can write <code>workers.emplace_back(worker(this, i));</code>.</p>
+
+<pre><code>  /**
+   * Terminate all workers before getting destroyed
+   */
+  ~worker_pool() { terminate(); }
+</code></pre>
+
+<p>When dealing with threads, "terminate" usually means killing a thread, which should almost always be avoided, as it leaves the program in an unpredictable (if not undefined) state. Better just use the term "stop" instead.
+Since the only way to start the threads in a worker pool is to instantiate one, it would make sense if the only way to stop them is by destroying that instance.</p>
+
+<pre><code>  worker_pool(worker_pool const &amp;) = delete;
+  worker_pool &amp;operator=(worker_pool const &amp;) = delete;
+  worker_pool(worker_pool &amp;&amp;) = delete;
+  worker_pool &amp;operator=(worker_pool &amp;&amp;) = delete;
+</code></pre>
+
+<p>There's no need to explicitly declare the move c'tor/assignment operator deleted here.</p>
+
+<pre><code>  template &lt;typename F, typename... Args&gt;
+  auto submit(F &amp;&amp;f, Args &amp;&amp;... args) -&gt; std::future&lt;decltype(f(args...))&gt; {
+    std::lock_guard l(queue_mutex);
+    // Wrapping callable with arguments into a packaged task
+    auto func = std::bind(std::forward&lt;F&gt;(f), std::forward&lt;Args&gt;(args)...);
+    auto task_ptr =
+        std::make_shared&lt;std::packaged_task&lt;decltype(f(args...))()&gt;&gt;(func);
+    // Wrapping packaged task into a simple lambda for convenience
+    job_queue.push([task_ptr] { (*task_ptr)(); });
+    queue_sem.signal();
+    return task_ptr-&gt;get_future();
+  }
+</code></pre>
+
+<p>Note that in the return value declaration you do not forward the arguments, which could yield a different overload resolution (and therefore a different return type) than when the function is actually called.</p>
+
+<p>I don't think the <code>bind</code> will work well here when you pass a temporary as an argument to this function, since it will not store a copy of the argument. When the function gets called on the worker thread, the argument has been destroyed.</p>
+
+<pre><code>  void terminate() {
+    // do nothing if already terminated
+    if (term.load())
+      return;
+    stop.store(true);
+    // wakeup all workers
+    queue_sem.signal(workers.size());
+    // wait for each worker to terminate
+    for (size_t i = 0; i &lt; workers.capacity(); i++) {
+      if (workers[i].joinable())
+        workers[i].join();
+    }
+    term.store(true);
+  }
+</code></pre>
+
+<p>You should compare the index to the size of <code>workers</code>, not its capacity.</p>
+
+<p>This function has a race condition. When it's called from two threads, the second call may begin before <code>term</code> has been updated. Then, the two threads may call <code>join</code> on the same thread instance.</p>
+
+<pre><code>  /**
+   * Check how many jobs remain in the queue
+   */
+  long jobs_remaining() {
+    std::lock_guard l(queue_mutex);
+    return job_queue.size();
+  }
+</code></pre>
+
+<p>I don't see any real use for this function.</p>
+
+<pre><code>  /**
+   * This function will block until all
+   * the jobs in the queue have been processed
+   */
+  void wait_until_empty() {
+    std::unique_lock l(queue_mutex);
+    while (!(job_queue.empty() || stop.load()))
+      cv_empty.wait(l, [&amp;] { return job_queue.empty() || stop.load(); });
+  }
+</code></pre>
+
+<p>The comment is wrong. This function only waits for all jobs to be taken off the queue. The function may return while the last jobs are still being processed. That makes the whole function pointless to begin with. I would remove it.</p>
+
+<pre><code>  /**
+   * Check if there was a demand to stop.
+   * Note: there may be still workers running.
+   */
+  bool stopped() { return stop.load(); }
+
+  /**
+   * Check if workers have been terminated
+   */
+  bool terminated() { return term.load(); }
+</code></pre>
+
+<p>These functions also seem useless.</p>
+    </div>

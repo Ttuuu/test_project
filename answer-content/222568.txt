@@ -1,0 +1,221 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>If you allow users to pass in arguments that are column names (for example array keys that you turn into column names). Then the keys could be modified to allow SQL Injection.  It's not clear in the question if you plan to do this.  If you just want to have dynamic arguments (with known columns) then preparing the query should suffice as all the user data can be parameterized without issue.</p>
+
+<p>As preparing the values is not an issue, I will assume you want to make the columns and/or tables dynamic.</p>
+
+<p><strong>Problem</strong></p>
+
+<p>Imagine you create a dynamic Select query like this, where the keys from the input args are used for column names and the table name is dynamic as well (fully dynamic):</p>
+
+<pre><code>class foo{
+  function Select($table, $args){
+    $query = "SELECT * FROM {$table}";
+    $where = [];
+    $params = [];
+
+    foreach($allowedArgs as $col =&gt; $arg){
+        $where[] = "{$col} = :{$col}";
+        $params[$col] = $arg;
+    }
+
+    if(!empty($where)) $query .= ' WHERE '.implode(' AND ', $where);
+
+    print_r($query);
+  }
+}
+</code></pre>
+
+<p>Output would be something like this:</p>
+
+<pre><code> //------- intended behaviour
+ $foo-&gt;Select('someTable', ['ID' =&gt; 32, 'user' =&gt; 'someUser']);
+ "SELECT * FROM someTable WHERE ID = :ID AND user = :user"
+ //after executing with parameters
+ "SELECT * FROM someTable WHERE ID = '32' AND user = 'someUser'"
+
+  //------- unintended behaviour
+ $foo-&gt;Select('someTable', ['ID' =&gt; 32, '1 OR 1 --' =&gt; null]);
+ "SELECT * FROM someTable WHERE ID = :ID AND 1 OR 1 -- = :1 OR 1 --"
+ //the DB would execute this:
+ "SELECT * FROM someTable WHERE ID = 32 AND 1 OR 1"
+</code></pre>
+
+<p>To explain the SQLInjection:</p>
+
+<ul>
+<li>The first <code>1</code> completes the <code>AND</code> </li>
+<li>Then the <code>OR 1</code> is always true. </li>
+<li>Everything after the SQL comment <code>--</code> is ignored.  </li>
+</ul>
+
+<p>So this would return all records in that table regardless of the other arguments.  This is how basic SQLInjection works.</p>
+
+<p>Here <code>$table</code> is also susceptible to SQLInjection, so if you did (this is a bad example but you get the point):</p>
+
+<pre><code> $foo-&gt;Select('admin WHERE 1 --', []);
+//"SELECT * FROM admin WHERE 1 --"
+</code></pre>
+
+<p><strong>Solution</strong> </p>
+
+<p>However, you can query the DB schema, by using <code>DESCRIBE {$table}</code> and <code>SHOW TABLES</code>, to build a whitelist of column names and tables. And than, store that data so you can filter out any bad "stuff" like this:</p>
+
+<pre><code>//eg. results of DESCRIBE 
+Field   Type               Null     Key     Default     Extra   
+  ID    int(10) unsigned    NO      PRI     NULL    auto_increment
+
+//eg. SHOW TABLES
+Tables_in_{database}
+   someTable
+</code></pre>
+
+<p>From this you can build something like:</p>
+
+<pre><code>class foo{
+  //get the schema
+  public static $fields;
+  public static $tables;
+
+  public function ckTable($table){
+     if(!self::$tables){
+        $smtp = $this-&gt;db-&gt;query("SHOW TABLES");
+        self::$tables = $stmt-&gt;fetchAll(PDO::FETCH_COLUMN); //['someTable', "admin", ...]
+     }
+     if(!in_array($table, self::$tables)) throw new UnknownTable($table);
+  }//end ckTable()
+
+  public function getFields($table){
+       $this-&gt;ckTable($table);
+
+      //only query this once per request
+      if(!self::$fields[$table]){
+
+         self::$fields[$table] = [];
+
+         $smtp = $this-&gt;db-&gt;query("DESCRIBE $table");
+
+         $fields = [];
+         while($row = $smtp-&gt;fetch(PDO::FETCH_ARRAY)){
+
+           //technically we only need the Keys or the "Field" for this
+           //but I felt like showing how you can parse the type too... 
+           preg_match('/^(?P&lt;type&gt;\w+)(?:\((?P&lt;size&gt;\d+)\))?/', $row['Type'], $match);
+
+           $fields[$table][$row['Field']] = [
+             'type' =&gt; $match['type'],
+             'size' =&gt; isset($match['size']) ? (int)$match['size'] : false,
+             'key' =&gt; $row['Key']
+           ];
+        }//end while
+      }//end if self::$fields
+
+      return self::$fields[$table];
+   }//end getFields()
+ }//end foo
+</code></pre>
+
+<p><a href="https://regex101.com/r/FaA5HD/1" rel="nofollow noreferrer">Regex Sandbox</a></p>
+
+<p>Which should give you something like this:</p>
+
+<pre><code>  //-note- we're returning only $fields['someTable'] in the example
+  $fields = [
+      'someTable' =&gt; [
+           'ID' =&gt; ['type' =&gt; 'int', 'size' =&gt; 10, 'key' =&gt; 'PRI']
+         ], [...]
+      ], [...]
+   ];
+</code></pre>
+
+<p>Then when you make your dynamic query:</p>
+
+<pre><code> class foo{
+     //eg inputs (with sql injection) 
+     //$table = 'someTable';
+     //$args = ['ID' =&gt; 1, '1 OR 1 --' =&gt; '']
+     public function Select($table, array $args){
+        $fields = $this-&gt;getFields($table); //retuns ['ID' =&gt; [...]]
+
+        $allowedArgs = array_intersect_key($args, $fields); //results in ['ID' =&gt; 1], removing key '1 OR 1 --'
+
+        //escaping with backtic ` is a good idea, it adds a tiny bit of security too.
+        //eg.  "SELECT * FROM `admin WHERE 1 --`"  this is a sql error
+        //that said it's mostly for reserved words and spaces in table names etc..
+        $query = "SELECT * FROM `{$table}`";
+
+        $where = [];
+        $params = [];
+
+        foreach($allowedArgs as $col =&gt; $arg){
+            //backtic column names too
+            $where[] = "`{$col}` = :{$col}";  // 'ID = :ID'
+            $params[$col] = $arg;
+        }
+
+        if(!empty($where)) $query .= ' WHERE '.implode(' AND ', $where);
+
+        $this-&gt;db-&gt;prepare($query);
+        return $this-&gt;db-&gt;execute($params);
+    } //end Select()
+ }//end foo
+</code></pre>
+
+<p>Output would be something like this:</p>
+
+<pre><code>$foo-&gt;Select('someTable', ['ID' =&gt; 1, '1 OR 1 --' =&gt; '']);
+//note the SQLInjection key is removed by array_intersect_key
+$query = "SELECT * FROM `someTable` WHERE `ID` = :ID"
+//in PDO the ':' for execute arguments are optional
+$params = ['ID' =&gt; 1];
+</code></pre>
+
+<blockquote>
+  <p><a href="https://www.php.net/manual/en/function.array-intersect-key.php" rel="nofollow noreferrer">array_intersect_key()</a> returns an array containing all the entries of array1 which have keys that are present in all the arguments.</p>
+</blockquote>
+
+<p>So by having the schema dynamically pulled from the DB we can filter out bad Keys that would become column names in the SQL.  Also because it's dynamic (you should store it once per request, so do the describe query once) if we modify the schema we don't have any issues with our code.  It just adapts based on the arguments and the schema.</p>
+
+<p>The only problem with this (the tables being dynamic) is they could potentially access other tables you don't want them too. But only if they are valid tables.  If that is a concern you can always create the table array manually or explicitly remove those tables you don't want end users having access to, with unset etc... </p>
+
+<p><strong>Additional Error checking</strong></p>
+
+<p>You can also throw an exception by comparing the count of <code>$args</code> and <code>$allowedArgs</code> Like this:</p>
+
+<pre><code>class foo{
+
+  //eg inputs (with sql injection) ['ID' =&gt; 1, '1 OR 1 --' =&gt; '']
+  public function Select($table, array $args){
+    $fields = $this-&gt;getFields($table);
+    $allowedArgs = array_intersect_key($args, $fields);
+
+    if(count($args) != count($allowedArgs)){
+       $diff = array_diff_key($args, $allowedArgs);
+       throw new UnknownColumn(implode(',', array_keys($diff)));
+    }
+    ....
+  }//end Select()
+}//end foo
+</code></pre>
+
+<p>The above would throw a <code>UnknownColumn</code> (assuming that exception exists) that says something like this:</p>
+
+<pre><code>//$foo-&gt;Select('someTable', ['ID' =&gt; 1, '1 OR 1 --' =&gt; '']);
+Exception UnknownColumn: "1 OR 1 --" IN somefile.php ON line 123
+</code></pre>
+
+<p>If you did some table that doesn't exist (as I showed above) you would get an exception from <code>ckTable()</code> which is chained through <code>getFields</code>:</p>
+
+<pre><code>//$foo-&gt;Select('1 OR 1', ['ID' =&gt; 1, '1 OR 1 --' =&gt; '']);
+Exception UnknownTable: "1 OR 1" IN somefile.php ON line 123
+</code></pre>
+
+<p>Obviously you can add more complexity such as if it's and <code>AND</code> or an <code>OR</code>.  Argument groups such as exclusive ORs.  Type checks, size checks etc.  Basically whatever you want as you will have all the schema data at your fingertips.</p>
+
+<p>I actually have a DB class that basically does this to build dynamic Insert and Update queries.  For example in the above I know that <code>ID</code> is the Pkey of the table so if its present in the arguments, I know that is an update of row with {x} ID.  If not then it's an insert etc...  Unfortunately my DB class has some dependencies and I can't share it without removing some of my employers requirements.  It does a lot of other things too, like handling multiple databases, different comparison operators, logical groups etc.  I should refactor it and put it on Git (one of these days).</p>
+
+<p>Anyway, I should re-iterate you can also do this with a simple array (instead of getting the schema) that you manually built. Essentially a whitelist the columns or tables.  But, if you edit the schema you will likely have to modify your code.</p>
+
+<p>Cheers!</p>
+
+<p>PS. I didn't test any of this, I like PDO so I used it for the code.  But it should be pretty close.</p>
+    </div>

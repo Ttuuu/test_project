@@ -1,0 +1,269 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Overall</h2>
+
+<p>Not sure I agree with the use of <code>std::unique_ptr</code> inside of <code>Node</code>. <strong>BUT</strong> I can't really argue against it. So I am not going to push the point.</p>
+
+<p>You need to concentrate on your const correctness.</p>
+
+<h2>Design</h2>
+
+<p>Using a linked list for a stack seems very inefficient way of doing this. Each object that you save required an additional pointer. In this case were your data is a <code>int</code> you are basically doubling the space requirements (that's not including any overhead for memory management imposed by the system libraries).</p>
+
+<p>The standard provides a <code>std::stack</code> class. This uses the <code>std::deque</code> underneath the hood (default) to store the data.</p>
+
+<p>You should think about what it would take to templatize your <code>Stack</code> class. Storing <code>int</code> is good as a test; but there is no reason you could not store any object. Once you have done that there are a couple of extra functions that would be nice:</p>
+
+<pre><code> void push_back(T const&amp; data);       // insert by copy.
+ void push_back(T&amp;&amp; data);            // insert by move
+ template&lt;typename... Args&gt;
+ void emplace_back(Args&amp;&amp; p...);      // construct in place at the back
+</code></pre>
+
+<h2>Code Review</h2>
+
+<p>I assume this has some meaning to you?</p>
+
+<pre><code>namespace sonsprl
+</code></pre>
+
+<hr>
+
+<p>Passing a <code>std::unqiue_ptr</code> by non-cost referece is a bit strange. I would normally expect that to be passed by r-value reference. When I was reading the <code>Stack</code> class below it confused me that you were passing a <code>std::unique_ptr</code> as a parameter without the <code>std::move</code>.</p>
+
+<pre><code>                    Node(int data, std::unique_ptr&lt;Node&gt;&amp; previous) {
+</code></pre>
+
+<p>You are affectively hiding the transfer of ownership that the C++ community has tried very hard to make explicit and visible.</p>
+
+<hr>
+
+<p>Both your destructors are us-less:</p>
+
+<pre><code>                    ~Node() { m_previous.reset(); }
+            ~Stack() { m_top.reset(); }
+</code></pre>
+
+<p>I would remove both.</p>
+
+<hr>
+
+<p>You could mark this function as <code>const</code>. I would not bother marking the <code>int</code> const (but it does not hurt). When you convert this into a template you should return by <code>const</code> reference.  <code>T const&amp;</code>.</p>
+
+<pre><code>                    const int data() { return m_data; }
+
+                    // I would have written like this:
+                    T const&amp; data() const { return m_data; }
+                    //^^^^^^        ^^^^^
+</code></pre>
+
+<hr>
+
+<p>As mentioned above. I don't like the passing of <code>m_top</code> as a parameter (and it being changed inside the <code>Node</code> constructor).</p>
+
+<pre><code>            void push_back(int data) {
+                m_top = std::unique_ptr&lt;Node&gt;(new Node(data, m_top));
+                ++m_size;
+            }
+</code></pre>
+
+<p>I would have written it like this:</p>
+
+<pre><code>            void push_back(int data) {
+                m_top = std::unique_ptr&lt;Node&gt;(new Node(data, std::move(m_top)));
+                ++m_size;
+            }
+</code></pre>
+
+<p>This way I can explicitly show that I am transferring ownership of <code>m_top</code> into the <code>Node</code> and that the newly created object is taking the place as the new value of <code>m_top</code>.</p>
+
+<hr>
+
+<p>There is an <code>empty()</code> function that allows users to check if the stack is empty before calling <code>pop_back()</code>. So also checking inside is a waste of time. If you really want to check then you should provide a checked and an unchecked version of <code>pop</code>.</p>
+
+<pre><code>            void pop_back() {
+                if(!m_top) {
+                    throw std::out_of_range("ERROR: Can not pop. Stack empty.");
+                }
+                else {
+                    m_top = std::move(m_top-&gt;previous());
+                    --m_size;
+                }
+            }
+</code></pre>
+
+<p>Note: the main use case is going to be something like this:</p>
+
+<pre><code>    while(!stack.empty()) {
+        stack.pop_back();     // I just checked its empty
+    }                         // are you going to check again?
+</code></pre>
+
+<p>If you look at functions in the standard library they tend not to throw (even if this would cause the object to be invalid). Instead the writters provide mechanisms to validate the pre-conditions of method so the user can do the check manually. Sometimes they also provide checked alternatives. That way a user of the functionality does not need to pay an extra cost (for the check) if they have already validate the pre-conditions.</p>
+
+<p>An example of this is:</p>
+
+<pre><code>std::vector::operator[]std::size_t index)    // unchecked access into the container.
+std::vector::afstd::size_t index)            // un-unchecked access into the container.
+</code></pre>
+
+<hr>
+
+<p>The <code>top()</code> function should be <code>const</code>. Your return value is <strong>inconsistent</strong> with the return type from <code>data()</code> (which returns a const). Consistency is king in programming.</p>
+
+<p>Talking about consistency. The <code>pop_back()</code> function checks the state of the container (and throws if it is not valid). To be consistent the <code>top()</code> method should perform  a similar check (or both of them should not perform a check).</p>
+
+<pre><code>            int top() {
+                return m_top.get()-&gt;data();
+            }
+</code></pre>
+
+<p>Do you need to call <code>get()</code> above?</p>
+
+<hr>
+
+<p>Another couple of function that should be marked <code>const</code></p>
+
+<pre><code>            int size() {
+            bool empty() {
+</code></pre>
+
+<hr>
+
+<p>Swap should be marked <code>noexcept</code>:</p>
+
+<pre><code>            void swap(Stack&amp; other_stack) {
+                m_top.swap(other_stack.m_top);
+                // Node* other_top = other_stack.m_top.release();
+                // other_stack.m_top = std::move(m_top);
+                // m_top = std::unique_ptr&lt;Node&gt;(new Node(other_top-&gt;data(), other_top-&gt;previous()));
+            }
+</code></pre>
+
+<p>I don't see you swapping the size!!!!!!<br>
+Every part of the swapped object should be exchanged.</p>
+
+<p>The normal pattern for this is to use <code>swap()</code> on each member.</p>
+
+<pre><code>     void swap(Stack&amp; other) noexcept {
+         using std::swap;
+         swap(m_top,  other.m_top);
+         swap(m_size, other.m_size);
+     }
+</code></pre>
+
+<p>It's also nice to add a friend function so others can do the swap naturally as well.</p>
+
+<pre><code>     friend void swap(Stack&amp; lhs, Stack&amp; rhs) {
+         lhs.swap(rhs);
+     }
+</code></pre>
+
+<hr>
+
+<p>When printing. The value being printed is normally marked <code>const</code> (because printing it should not change it).</p>
+
+<pre><code>            friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; os, Stack const&amp; stack) { 
+                                                                    ^^^^
+</code></pre>
+
+<p>Why are you building a string to output?</p>
+
+<pre><code>                std::string stack_string = "";
+                // STUFF
+                os &lt;&lt; stack_string;
+</code></pre>
+
+<p>Just print each value directly to the stream.</p>
+
+<pre><code>            Node* current = stack.m_top.get();
+            for(; current; current = current-&gt;previous().get()) {
+                os &lt;&lt;  '|' &lt;&lt; current-&gt;data() &lt;&lt; "|\n";
+            }
+</code></pre>
+
+<hr>
+
+<p>One late entry:</p>
+
+<pre><code> return (m_size == 0) ? true : false;
+</code></pre>
+
+<p>You are using a bool test to decide which bool to return. Simpler to simply return the result of the test.</p>
+
+<pre><code> return m_size == 0;
+</code></pre>
+
+<hr>
+
+<p>How I would have written it (apart from keeping the std::unique_ptr in Node).</p>
+
+<pre><code>namespace ThorsAnvil
+{
+    namespace Container
+    {
+        template&lt;typename T&gt;
+        class Stack
+        {
+                struct Node;
+                using Chain = std::unique_ptr&lt;Node&gt;;
+                struct Node
+                {
+                        T       data;
+                        Chain   prev;
+                        Node(Chain&amp;&amp; prev, T const&amp; data)
+                            : data(data)
+                            , prev(std::move(prev))
+                        {}
+                        Node(Chain&amp;&amp; prev, T&amp;&amp; data)
+                            : data(std::move(data))
+                            , prev(std::move(prev))
+                        {}
+                        template&lt;typename... Args&gt;
+                        Node(Chain&amp;&amp; prev, Args&amp;&amp;... p)
+                            : data(std::forward&lt;Args&gt;(p)...)
+                            , prev(std::move(prev))
+                        {}
+                };
+                int                     m_size{0};
+                std::unique_ptr&lt;Node&gt;   m_top;
+            public:
+                void push_back(T const&amp; data) {
+                    m_top = std::make_unique&lt;Node&gt;(std::move(m_top), data);
+                    ++m_size;
+                }
+                void push_back(T&amp;&amp; data) {
+                    m_top = std::make_unique&lt;Node&gt;(std::move(m_top), std::move(data));
+                    ++m_size;
+                }
+                template&lt;typename... Args&gt;
+                void push_back(Args&amp;&amp;... p) {
+                    m_top = std::make_unique&lt;Node&gt;(std::move(m_top), std::forward&lt;Args&gt;(p)...);
+                    ++m_size;
+                }
+                void pop_back() {
+                    m_top = std::move(m_top-&gt;prev);
+                    --m_size;
+                }
+                T const&amp; top()  const {return m_top-&gt;data;}
+                int size()      const {return m_size;}
+                bool empty()    const {return m_size == 0;}
+                void swap(Stack&amp; other) noexcept {
+                    using std::swap;
+                    swap(m_top,  other.m_top);
+                    swap(m_size, other.m_size);
+                }
+                friend void swap(Stack&amp; lhs, Stack&amp; rhs) {
+                    lhs.swap(rhs);
+                }
+                friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; os, Stack const&amp; stack) {
+                    Node* current = stack.m_top.get();
+                    for(; current; current = current-&gt;prev.get()) {
+                        os &lt;&lt; "|" &lt;&lt; current-&gt;data &lt;&lt; "|\n";
+                    }
+                    return os &lt;&lt; "---\n";
+                }
+        };
+    }
+}
+</code></pre>
+    </div>

@@ -1,0 +1,370 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This kind of function (a <em>pure</em> function, where the results depend only on the inputs) lends itself extremely well to automated testing.  So let's write some unit tests!  I'll use GoogleTest, as that's what I know best, but almost any unit testing framework will support you here.</p>
+<p>Let's start with our first test - we expect it to fail when passed a null pointer for the output:</p>
+<pre><code>#include &lt;stdint.h&gt;
+
+extern "C" {
+    void itoaBase10(int32_t num, char *string, int lengthOfString);
+}
+
+
+#include &lt;gtest/gtest.h&gt;
+
+TEST(itoa, null_string)
+{
+    EXPECT_FALSE(itoaBase10(0, nullptr, 9));
+}
+</code></pre>
+<p>Note that the tests are written in C++, though the code under test is C.  That's fine - we just need to compile each part with the correct compiler and declare the function with <code>extern "C"</code> so they can be linked to make the final test program.</p>
+<p>Here's our first problem - the function doesn't tell us whether or not we succeeded.  That's easy to fix:</p>
+<pre><code>#include &lt;stdbool.h&gt;
+
+bool itoaBase10(int32_t num, char *string, int lengthOfString)
+////
+{
+    if (!string || num &gt; 9999999999) { return false; }
+                                              /////
+    // ...
+    return true;
+    ////////////
+}
+</code></pre>
+<p>That one passes.</p>
+<hr>
+<p>Next, what about a zero-length buffer?</p>
+<pre><code>TEST(itoa, zero_space)
+{
+    char str[1];
+    EXPECT_FALSE(itoaBase10(0, str, 0));
+}
+</code></pre>
+<p>That one fails, so we need to add an extra check.  While we're doing that, we can remove the test that the compiler warns us will always be true:</p>
+<pre><code>/* output is at least one digit and a terminating NUL */
+if (!string || lengthOfString &lt;= 1) { return false; }
+</code></pre>
+<hr>
+<p>With that working, time to add a new test.  Let's make sure we succeed in printing 9 to a 2-char buffer, but fail when printing 10.</p>
+<pre><code>TEST(itoa, one_digit)
+{
+    char str[2];
+    EXPECT_TRUE(itoaBase10(9, str, 2));
+    EXPECT_STREQ(str, "9");
+}
+
+TEST(itoa, short_string)
+{
+    char str[2];
+    EXPECT_FALSE(itoaBase10(10, str, 2));
+}
+</code></pre>
+<p>This reveals some bugs.  Firstly <code>one_digit</code> fails because we print a leading space for positive values, which is unlike <code>%d</code> conversion - apparently, this is supposed to be more like <code>% d</code>.  Well, we can deal with that - we need to make the minimum buffer size be <em>three</em> characters, rather than two, and change our expectation:</p>
+<pre><code>/* output is at least sign char, one digit and a terminating NUL */
+if (!string || lengthOfString &lt;= 2) { return false; }
+</code></pre>
+
+<pre><code>TEST(itoa, zero_space)
+{
+    char str[1];
+    EXPECT_FALSE(itoaBase10(0, str, 0));
+}
+
+TEST(itoa, insufficient_space)
+{
+    char str[1];
+    EXPECT_FALSE(itoaBase10(0, str, 2));
+}
+
+TEST(itoa, one_digit)
+{
+    char str[3];
+    EXPECT_TRUE(itoaBase10(9, str, 3));
+    EXPECT_STREQ(str, " 9");
+}
+
+TEST(itoa, short_string)
+{
+    char str[3];
+    EXPECT_FALSE(itoaBase10(10, str, 3));
+}
+</code></pre>
+<p>Last bug first, <code>short_string</code> fails because we're not actually keeping count as we output.  That reveals that we're not actually tracking where we're writing to.  So fix that.</p>
+<pre><code>if (!string || lengthOfString &lt;= 2) { return false; }
+char const *const last_pos = string + lengthOfString - 1;
+// ...
+while (i--)  {
+    if (str &gt;= last_pos) { return false; }
+</code></pre>
+<hr>
+<p>Now we have five tests that succeed.  We can start working on negative numbers.  Let's make sure zero formats correctly, first:</p>
+<pre><code>TEST(itoa, zero)
+{
+    char str[3];
+    EXPECT_TRUE(itoaBase10(0, str, 3));
+    EXPECT_STREQ(str, " 0");
+}
+</code></pre>
+<p>Mmm, that one passed first time.  How do we know it really works?  Temporarily change <code>" 0"</code> to something else - say, <code>"-0"</code>, and it fails.  Good; the test works.  Change it back and continue.  (I won't show this procedure of testing the test on future passing tests, but be encouraged to do it anyway).</p>
+<hr>
+<p>Our first tests of a negative number:</p>
+<pre><code>TEST(itoa, negative_one_digit)
+{
+    char str[3];
+    EXPECT_TRUE(itoaBase10(-9, str, 3));
+    EXPECT_STREQ(str, "-9");
+}
+
+TEST(itoa, negative_short_string)
+{
+    char str[3];
+    EXPECT_FALSE(itoaBase10(-10, str, 3));
+}
+</code></pre>
+<p>Well, they were easy - no fixes required.</p>
+<hr>
+<p>What about the absolute limits of <code>int32_t</code>?  We could hard-code the string outputs, but I favour using <code>snprintf()</code> here to save us the hard work:</p>
+<pre><code>#include &lt;inttypes.h&gt;
+
+TEST(itoa, max_int32)
+{
+    char expected[12];
+    char str[12];
+    snprintf(expected, sizeof expected, "% " PRId32, INT32_MAX);
+    EXPECT_TRUE(itoaBase10(INT32_MAX, str, sizeof str));
+    EXPECT_STREQ(str, expected);
+}
+
+TEST(itoa, min_int32)
+{
+    char expected[12];
+    char str[12];
+    snprintf(expected, sizeof expected, "% " PRId32, INT32_MIN);
+    EXPECT_TRUE(itoaBase10(INT32_MIN, str, sizeof str));
+    EXPECT_STREQ(str, expected);
+}
+</code></pre>
+<p>We could reduce the duplication in these last two tests by creating a <em>data-driven</em> test.  That would certainly be useful if we want to add more of these specific values, but I'll leave that for now.</p>
+<hr>
+<p>Now that we have some confidence in the functionality, we can start on refactoring the function.</p>
+<p>One thing that's immediately strange is the use of <code>int</code> for the maximum length, when normal C code will use <code>size_t</code>.  That's easily fixed, and we can test it instantly.</p>
+<p>Next, do we really need that <code>memset()</code>?  It will touch memory we're about to write anyway, and we only need a single NUL at the end of our string, so let's ditch that, and write our NUL at the end:</p>
+<pre><code>*str = '\0';
+return true;
+</code></pre>
+<p>That change may make a very small performance improvement.</p>
+<p><code>sign</code> variable is only used once; let's just inline that use with a comment:</p>
+<pre><code>/* write sign character */
+*str++ = num &lt; 0 ? '-' : ' ';
+</code></pre>
+<p><code>n</code> can have a much smaller scope, so let's move it into the <code>i--</code> loop.  We don't use <code>string</code> after we've copied it to <code>str</code>, so let's combine them.  These three changes should make no difference to the generated (optimised) code, but simplify the logic for future maintainers (perhaps future-you in 6 months?).</p>
+<p>Instead of using index <code>i</code> to count entries in <code>subtractors</code>, just add a terminating zero entry to the list:</p>
+<pre><code>bool itoaBase10(int32_t num, char *str, size_t lengthOfString)
+{
+    /* output is at least sign char, one digit and a terminating NUL */
+    if (!str || lengthOfString &lt;= 2) { return false; }
+    char const *const last_pos = str + lengthOfString - 1;
+
+    static const uint32_t subtractors[] =
+        { 1000000000,
+          100000000,
+          10000000,
+          1000000,
+          100000,
+          10000,
+          1000,
+          100,
+          10,
+          1,
+          0
+        };
+
+    /* write sign character */
+    *str++ = num &lt; 0 ? '-' : ' ';
+
+    /* skip leading zeros */
+    uint32_t const *sub = subtractors;
+    uint32_t u = num &lt; 0 ? -(uint32_t)num : (uint32_t)num;
+    while (u &lt; *sub) {
+        sub++;
+    }
+
+    /* write the digits */
+    while (*sub)  {
+        if (str &gt;= last_pos) { return false; }
+        char n = '0';
+        while (u &gt;= *sub) {
+            u -= *sub;
+            n++;
+        }
+        *str++ = n;
+        sub++;
+    }
+
+    *str = '\0';
+    return true;
+}
+</code></pre>
+<p>That <em>almost</em> works, but it broke one of our tests:</p>
+<pre class="lang-none prettyprint-override"><code>[ RUN      ] itoa.zero
+204891-test.cpp:47: Failure
+      Expected: str
+      Which is: " "
+To be equal to: " 0"
+[  FAILED  ] itoa.zero (32 ms)
+</code></pre>
+<p>We can fix that.  The simplest, and probably best way is to special-case test <code>num==0</code> to just <code>strcpy(str, " 0")</code> (after the test that <code>str</code> and <code>lengthOfString</code> are valid).  Alternatively, we could skip all but the last zero by changing the loop condition from <code>(u &lt; *sub)</code> to <code>(u &lt; *sub &amp;&amp; *sub &gt; 1)</code>.</p>
+<hr>
+<h1>Modified code</h1>
+<pre><code>/*
+  Modified from:
+  https://gist.github.com/madex/c5cd5c6a23965a845d6e
+
+  This only works for up to 9 digits and only for base 10 numbers,
+  but no division is used and this method is very fast.
+*/
+
+#include &lt;stdbool.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;string.h&gt;
+
+bool itoaBase10(int32_t num, char *str, size_t length)
+{
+    /* output is at least sign char, one digit and a terminating NUL */
+    if (!str || length &lt;= 2) {
+        return false;
+    }
+
+    if (!num) {
+        /* special-case zero (which would be skipped as a leading 0) */
+        strcpy(str, " 0");
+        return true;
+    }
+
+    static const uint32_t subtractands[] =  {
+        1000000000,
+        100000000,
+        10000000,
+        1000000,
+        100000,
+        10000,
+        1000,
+        100,
+        10,
+        1,
+        0
+    };
+
+    /* last possible position for NUL */
+    char const *const last_pos = str + length - 1;
+    /* work with a positive version of num */
+    uint32_t u = num &lt; 0 ? -(uint32_t)num : (uint32_t)num;
+
+    /* write sign character */
+    *str++ = num &lt; 0 ? '-' : ' ';
+
+    /* skip leading zeros */
+    uint32_t const *sub = subtractands;
+    while (u &lt; *sub) {
+        ++sub;
+    }
+
+    /* write the digits */
+    while (*sub)  {
+        if (str &gt;= last_pos) {
+            /* no space for NUL */
+            return false;
+        }
+        char n = '0';
+        while (u &gt;= *sub) { u -= *sub; ++n; }
+        *str++ = n;
+        ++sub;
+    }
+
+    *str = '\0';
+    return true;
+}
+</code></pre>
+<h1>Unit tests</h1>
+<pre><code>#include &lt;inttypes.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;stdlib.h&gt;
+
+extern "C" {
+    bool itoaBase10(int32_t num, char *string, size_t lengthOfString);
+}
+
+
+#include &lt;gtest/gtest.h&gt;
+
+TEST(itoa, null_string)
+{
+    EXPECT_FALSE(itoaBase10(0, nullptr, 9));
+}
+
+TEST(itoa, zero_space)
+{
+    char str[1];
+    EXPECT_FALSE(itoaBase10(0, str, 0));
+}
+
+TEST(itoa, insufficient_space)
+{
+    char str[1];
+    EXPECT_FALSE(itoaBase10(0, str, 2));
+}
+
+TEST(itoa, one_digit)
+{
+    char str[3];
+    EXPECT_TRUE(itoaBase10(9, str, 3));
+    EXPECT_STREQ(str, " 9");
+}
+
+TEST(itoa, short_string)
+{
+    char str[3];
+    EXPECT_FALSE(itoaBase10(10, str, 3));
+}
+
+
+TEST(itoa, zero)
+{
+    char str[3];
+    EXPECT_TRUE(itoaBase10(0, str, 3));
+    EXPECT_STREQ(str, " 0");
+}
+
+
+TEST(itoa, negative_one_digit)
+{
+    char str[3];
+    EXPECT_TRUE(itoaBase10(-9, str, 3));
+    EXPECT_STREQ(str, "-9");
+}
+
+TEST(itoa, negative_short_string)
+{
+    char str[3];
+    EXPECT_FALSE(itoaBase10(-10, str, 3));
+}
+
+
+
+TEST(itoa, max_int32)
+{
+    char expected[12];
+    char str[12];
+    snprintf(expected, sizeof expected, "% " PRId32, INT32_MAX);
+    EXPECT_TRUE(itoaBase10(INT32_MAX, str, sizeof str));
+    EXPECT_STREQ(str, expected);
+}
+
+TEST(itoa, min_int32)
+{
+    char expected[12];
+    char str[12];
+    snprintf(expected, sizeof expected, "% " PRId32, INT32_MIN);
+    EXPECT_TRUE(itoaBase10(INT32_MIN, str, sizeof str));
+    EXPECT_STREQ(str, expected);
+}
+</code></pre>
+    </div>

@@ -1,0 +1,220 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Welcome to Code Review!  Let's go through your code and try to improve it.</p>
+
+<h1>Comments</h1>
+
+<p>The first thing I notice about your code is that all comments are written in ALL CAPS.  This not only makes the comments harder to read, but also distracts the reader of the code.  I suggest changing them to lower case.</p>
+
+<p>Some comments talk about aspects of the C++ language rather than the purpose of the code:</p>
+
+<pre><code>// DECLARES METHODS
+// PUBLIC VARIABLE FOR FILENAME
+</code></pre>
+
+<p>etc.  These comments are unnecessary to readers familiar with C++, so you can remove them once you feel comfortable with basic C++ constructs.</p>
+
+<h1><code>using namespace std;</code></h1>
+
+<p>Putting a <code>using namespace std;</code> at global level is considered bad practice.  It pulls in all names from the <code>std</code> namespace, potentially introducing name clashes.  See <a href="https://stackoverflow.com/q/1452721">Why is <code>using namespace std;</code> considered bad practice?</a> for more information.  For relatively small projects like yours, this is not a big problem, but I recommend that you remove this line and get used to qualifying names from the standard library with <code>std::</code> as soon as possible.</p>
+
+<h1>Declarations and definitions of functions</h1>
+
+<p>Instead of declaring functions first and put the definitions after, you can simply define functions after their dependencies.  That is, you can define <code>splitString</code> before <code>calculatePrognose</code> to eliminate the declaration.</p>
+
+<h1>Pass-by-value vs pass-by-reference</h1>
+
+<p>When you are reading data, passing by value requires copying the content of the argument.  This is very expensive for large types like <code>vector&lt;vector&lt;string&gt;&gt;</code>.  Pass by const reference (<code>const vector&lt;vector&lt;string&gt;&gt;&amp;</code>) instead.  See <a href="https://stackoverflow.com/a/2139254">How to pass objects to functions in C++?</a> for more information.</p>
+
+<h1>Data</h1>
+
+<p>Right now, the way you keep track of data is to maintain a <code>vector&lt;vector&lt;string&gt;&gt;</code> in each function and pass it around.  First, each record (the <code>vector&lt;string&gt;</code>) can be made a simple class:</p>
+
+<pre><code>using data_t = long;
+
+struct Record {
+    data_t day;
+    data_t infected;
+    data_t dead;
+};
+</code></pre>
+
+<p>We can overload <code>&gt;&gt;</code> to support input:</p>
+
+<pre><code>// simple manipulator
+// is &gt;&gt; eat_delim{':'} eats ':' delimiter
+struct eat_delim {
+    char delim;
+};
+
+std::istream&amp; operator&gt;&gt;(std::istream&amp; is, eat_delim manip)
+{
+    if (is.peek() == manip.delim) {
+        is.get();
+    } else {
+        is.setstate(is.failbit);
+    }
+    return is;
+}
+
+std::istream&amp; operator&gt;&gt;(std::istream&amp; is, Record&amp; rec)
+{
+    return is &gt;&gt; rec.day      &gt;&gt; eat_delim{':'}
+              &gt;&gt; rec.infected &gt;&gt; eat_delim{':'}
+              &gt;&gt; rec.dead     &gt;&gt; eat_delim{':'};
+}
+</code></pre>
+
+<p>Then, we can make a dedicated class to perform operations on the data:</p>
+
+<pre><code>class DataProcessor {
+    std::vector&lt;Record&gt; data;
+    std::string filename;
+public:
+    DataProcessor(std::string file)
+        : filename{std::move(file)}
+    {
+        std::ifstream in{filename};
+        for (Record rec; in &gt;&gt; rec;) {
+            data.push_back(rec);
+        }
+    }
+    // ...
+};
+</code></pre>
+
+<h1><code>splitString</code></h1>
+
+<p>Here's roughly how I would write the <code>splitString</code> method with string methods:</p>
+
+<pre><code>// a:b:c: =&gt; [a, b, c]
+auto split_string(std::string_view string, char delim)
+{
+    std::vector&lt;std::string&gt; result;
+    for (std::size_t index; (index = string.find(delim)) != string.npos) {
+        result.emplace_back(string, 0, index);
+        string.remove_prefix(index + 1);
+    }
+    return result;
+}
+</code></pre>
+
+<p>This <code>split_string</code> discards content after the last delimiter, just like your version does.  Note that <code>string_view</code> is used to <a href="https://stackoverflow.com/q/40127965">avoid copying</a> and <code>size_t</code> is used to index the string instead of <code>int</code>.</p>
+
+<h1><code>writeFile</code></h1>
+
+<p>This function can be simplified if you make use of RAII — automatic opening/closing:</p>
+
+<pre><code>std::ofstream file{file_name, std::ios_base::app};
+file &lt;&lt; content;
+</code></pre>
+
+<p>Note that <code>out</code> is always set for <code>ofstream</code>.</p>
+
+<p>Under our new design, this operation will be carried out when new data is added, so that the file syncs with our data.</p>
+
+<h1><code>getLongestLength</code></h1>
+
+<p>This function becomes much simpler with C++20 projections:</p>
+
+<pre><code>std::ranges::max(
+    vector_list | std::views::transform([&amp;](const auto&amp; record) {
+        return record[index].size();
+    })
+)
+</code></pre>
+
+<h1><code>calculatePrognose</code></h1>
+
+<p>The size of this function makes it hard to understand, so let's try to break it down.  We calculate the average factor first and determine the prognosis later:</p>
+
+<pre><code>// pointer to member of Record
+using column_t = data_t Record::*;
+
+class DataProcessor {
+    // ...
+public:
+    // ...
+    double average_factor(column_t column)
+    {
+        if (data.size() &lt;= 1) {
+            throw std::invalid_argument{"Insufficient samples"};
+        }
+        std::vector&lt;data_t&gt; past_data(data.size());
+        std::transform(data.begin(), data.end(), past_data, column);
+        std::adjacent_difference(past_data.begin(), past_data.end(),
+                                 past_data.begin(), std::divides{});
+        return std::accumulate(past_data.begin() + 1, past_data.end(), 0.0) / (past_data.size() - 1);
+    }
+    std::vector&lt;Record&gt; prognosis(data_t days)
+    {
+        auto infected_factor = average_factor(&amp;Record::infected);
+        auto dead_factor = average_factor(&amp;Record::dead);
+
+        std::vector&lt;Record&gt; result;
+        for (Record rec = data.back(); days--;) {
+            ++rec.day;
+            rec.infected *= infected_factor;
+            rec.dead *= dead_factor;
+            result.push_back(rec);
+        }
+        return result;
+    }
+    // ...
+};
+</code></pre>
+
+<h1><code>displayData</code></h1>
+
+<p>Again, the sheer length of the function makes it virtually incomprehensible (the last part is especially unreadable), so I'm just trying to rewrite it.  The printing of the data rows (as opposed to prognosis rows) can be extracted into a separate function:</p>
+
+<pre><code>class DataProcessor {
+    // ...
+public:
+    // ...
+    void print_data(std::ostream&amp; os) const
+    {
+        std::array&lt;int, 3&gt; widths {
+            // calculate widths
+        };
+
+        auto total_width = widths[0] + widths[1] + widths[2] + 4;
+        os &lt;&lt; std::string(total_width, '_');
+        print_data_rows(os, widths);
+        print_stats(os);
+    }
+    // print_prognosis is similar
+    // ...
+private:
+    void print_data_rows(std::ostream&amp; os, const std::array&lt;int, 3&gt;&amp; widths) const
+    {
+        for (const auto&amp; record : data) {
+            os &lt;&lt; '|'
+               &lt;&lt; std::setw(widths[0]) &lt;&lt; record.day
+               &lt;&lt; '|'
+               &lt;&lt; std::setw(widths[1]) &lt;&lt; record.infected
+               &lt;&lt; '|'
+               &lt;&lt; std::setw(widths[2]) &lt;&lt; record.dead
+               &lt;&lt; '|';
+        }
+    }
+    void print_prognosis_rows(std::ostream&amp; os, const std::array&lt;int, 3&gt;&amp; widths, data_t days) const
+    {
+        auto prog = prognosis(days);
+        for (const auto&amp; record : prog) {
+            os &lt;&lt; '|'
+               &lt;&lt; std::setw(widths[0]) &lt;&lt; (std::to_string(record.day) + " (P)")
+               &lt;&lt; '|'
+               &lt;&lt; std::setw(widths[1]) &lt;&lt; (std::to_string(record.day) + " (P)")
+               &lt;&lt; '|'
+               &lt;&lt; std::setw(widths[2]) &lt;&lt; (std::to_string(record.day) + " (P)")
+               &lt;&lt; '|';
+        }
+    }
+    void print_stats(std::ostream&amp; os)
+    {
+        // print Infections: 6339 etc.
+    }
+    // ...
+};
+</code></pre>
+    </div>

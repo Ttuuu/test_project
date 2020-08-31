@@ -1,0 +1,139 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>In no particular order:</p>
+
+<ul>
+<li>I have a hard time understanding why the <code>get_diff</code> function use vectorized operations sometimes and <code>apply</code> some other times. If the aim it to avoid <code>NaN</code>s in the dataframe, you can simply use <a href="https://pandas.pydata.org/pandas-docs/stable/generated/pandas.DataFrame.fillna.html" rel="nofollow noreferrer"><code>fillna</code></a> afterwards. If you want to avoid <code>inf</code> that would come from a division by 0, you could <a href="http://pandas.pydata.org/pandas-docs/version/0.13.1/generated/pandas.DataFrame.replace.html" rel="nofollow noreferrer"><code>replace</code></a> them with zeros or <code>NaN</code>s depending on your use-case. In any case, the <code>cal_xxx</code> functions are better replaced by vectorized operations.</li>
+<li>Your lack of whitespace and your usage of acronyms as variable names makes your code hard to read and understand.</li>
+<li>You open things that you never close, this includes files and database connections. The <a href="https://docs.python.org/3/reference/compound_stmts.html#with" rel="nofollow noreferrer"><code>with</code></a> statement and the <a href="https://docs.python.org/3/library/contextlib.html#contextlib.closing" rel="nofollow noreferrer"><code>closing</code></a> utility are your friends here.</li>
+<li><code>assert_frame_equal</code> can safely be replaced by <a href="https://pandas.pydata.org/pandas-docs/stable/generated/pandas.DataFrame.equals.html" rel="nofollow noreferrer"><code>equals</code></a> that behaves more nicely: it only returns <code>True</code> or <code>False</code>. The <code>changed</code> variable can then be safely eliminated.</li>
+<li>Your top-level code is better put into one or several functions to improve maintainability and testing. In the same vein, the <code>global</code> keyword is to be avoided and having functions (such as <code>optimize_val</code>) rely on the external initialisation of an object they need to use is prone to errors. Instead, pass the object as a parameter; and if you can't controll the calling point (such as using <code>apply</code> that will call the function with a single parameter), you can make use of <a href="https://docs.python.org/3/library/functools.html#functools.partial" rel="nofollow noreferrer"><code>functools.partial</code></a> to bind some parameters beforehand.</li>
+<li>You should avoid putting credentials into your script, pass them on the command line (and use <a href="https://docs.python.org/3/library/argparse.html" rel="nofollow noreferrer"><code>argparse</code></a> for instance to retrieve them).</li>
+<li>Don't fall into the habit of preparing SQL statement using <code>format</code>. Even though in this instance it sounds rather safe, you better train yourself to use <a href="https://www.python.org/dev/peps/pep-0249/#id15" rel="nofollow noreferrer">parametrized statements</a>.</li>
+</ul>
+
+<p>Proposed improvements:</p>
+
+<pre><code>import re
+import math
+import datetime
+import cPickle as pickle
+from functools import partial
+from contextlib import closing
+
+import redis
+import MySQLdb
+import pandas as pd
+
+
+READ_QUERY = """\
+SELECT group, url,
+       sum(lg) imps,
+       sum(acost)/1000000 cost,
+       sum(rpm-acost)/1000000 pft,
+       sum(rpm)/1000000/sum(lg)*1000 rpm,
+       sum(acost)/1000000/sum(lg)*1000 cpm,
+       sum(rpm-acost)/1000000/sum(lg)*1000 ppm
+FROM db_name.db
+WHERE dh = %s
+GROUP BY group, url HAVING pft &lt; 0
+ORDER BY sum(acost) DESC;"""
+
+
+def read_database(host, user, password, database, local_infile=True):
+    now = datetime.datetime.now() + datetime.timedelta(minutes=330)
+    minutes = 0 if now.minute &lt; 30 else 30
+    date = now.replace(minute=minutes, second=0, microsecond=0)
+
+    with closing(MySQLdb.connect(host=host, user=user, passwd=password, db=database, local_infile=int(local_infile))) as connection:
+        cursor = connection.cursor(MySQLdb.cursors.DictCursor)
+        cursor.execute("SET NAMES utf8")
+        cursor.execute(READ_QUERY, (date,))
+        return pd.DataFrame(list(cursor.fetchall()))
+
+
+def rename_x(col_name):
+    if re.match(r'.*\_(x)$', col_name):
+        return (col_name[:-2])
+    else:
+        return col_name
+
+
+def get_diff(new, old):
+    diff = pd.merge(new, old, how='outer', on=['group', 'url'])
+    diff.fillna(0, inplace=True)
+    diff['pft_diff'] = diff['pft_x'] - diff['pft_y']
+    diff['cost_diff'] = diff['cost_x'] - diff['cost_y']
+    diff['imps_diff'] = diff['imps_x'] - diff['imps_y']
+    diff['diff_rpm'] = (diff['pft_diff'] + diff['cost_diff']) / diff['imps_diff'] * 1000
+    diff['diff_cpm'] = diff['cost_diff'] / diff['imps_diff'] * 1000
+    diff['diff_ppm'] = diff['pft_diff'] / diff['imps_diff'] * 1000
+    diff = diff.rename(columns=rename_x)
+    diff.drop(list(diff.filter(regex='_y')), axis=1, inplace=True)
+    diff.replace(pd.np.inf, 0, inplace=True)
+    diff['optimized'] = 0
+    return diff
+
+
+def calc_bid_prob(lgpm, alpha=1, beta=0.01, infl=13, slope=1):
+    return int(100 * (beta + (alpha - beta) / (1 + math.pow((lgpm / infl), slope))))
+
+
+def optimize_val(rw, redis):
+    ppm = rw['diff_ppm']
+    lg = rw['imps_diff']
+    rpm = rw['diff_rpm']
+
+    redis_group_plcmnt = 'plcmnt:{}'.format(rw['group'])
+    redis_group_url = 'url:prob:{}'.format(rw['group'])
+    redis_url = rw['url']
+    bid = redis.hget(redis_group_plcmnt, redis_url)
+    try:
+        bid = int(bid)
+    except ValueError:
+        bid = 20
+
+    b_prob = redis.hget(redis_group_url, redis_url)
+    try:
+        if ppm &lt; 0:
+            if ppm &lt; -1:
+                if rpm &gt;= 2:
+                    new_bid = min((1-0.3)*rpm, bid)
+                else:
+                    new_bid = min((1-0.5)*rpm, bid)
+            else:
+                if rpm &lt; 2:
+                    new_bid = min((1-0.3)*rpm, bid)
+            new_bid_prob = min(calc_bid_prob(lg), b_prob)
+            redis.hset(redis_group_plcmnt, redis_url, new_bid)
+            redis.hset(redis_group_url, redis_url, new_bid_prob)
+        return 1
+    except Exception:
+        return 0
+
+
+def compare_and_optimize(cost_data, optimizer, filename='cost_data_old.p'):
+    with open(filename, 'rb') as pickled_file:
+        cost_data_old = pickle.load(pickled_file)
+
+    if cost_data.equals(cost_data_old):
+        # If not changed, proceed with old, optimize unoptimized top 100 and store as new pickle
+        cost_data_result = cost_data_old
+        cost_data_old.sort_values(by=['cost'], ascending=False, inplace=True)
+        optimize = cost_data_old[cost_data_old['optimized'] == 0].head(100)
+    else:
+        # Optimize diff_data
+        cost_data_result = get_diff(cost_data, cost_data_old[['group', 'url', 'cost', 'pft', 'imps', 'cpm', 'rpm', 'ppm']])
+        cost_data_result.sort_values(by=['cost_diff'], ascending=False, inplace=True)
+        optimize = cost_data_result.head(100)
+
+    optimize['optimized'] = optimize.apply(optimizer, axis=1)
+    with open(filename, 'wb') as pickle_file:
+        pickle.dump(cost_data_result, pickle_file)
+
+
+if __name__ == '__main__':
+    cost_data = read_database('AWS_HOST', 'root', 'password', 'db_name', True)
+    redis_db = redis.Redis(host='AWS2_HOST', port=PORT, db=0)
+    compare_and_optimize(cost_data, partial(optimize_val, redis=redis_db))
+</code></pre>
+    </div>

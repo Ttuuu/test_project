@@ -1,0 +1,161 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p>I challenged myself to implement the game with no loops</p>
+</blockquote>
+
+<p>However I like your set of mind, I wouldn't advise to renounce raw loops in this kind of program. There is no equivalent to <code>for (int i = 0; i &lt; n; ++i)</code> in the algorithm standard library if you only want the <code>i</code> (as opposed to as an offset in a container, or as a value to fill a container with, or anything related to a container), and you'll need it to efficiently compute the cell's neighbors for instance. What you could do though is to rely on Eric Niebler's range library, which will be partially  standardized in C++20; that would give something like <code>for (auto i : view::iota(0) | view::take(n)) // do something with i)</code></p>
+
+<blockquote>
+  <p></p>
+</blockquote>
+
+<p>The thing I don't like about your program is that it is too complex. The whole program could fit into two core functions and a display function: one function would compute the number of alive neighbors for each cell of the grid (so the return value would be a grid of the same size as the input), and one function would compute the grid's next state from the grid of alive neighbors by cell. You don't even have to create a <code>Grid</code> class, as a <code>std::vector</code> or yet better a <code>std::array</code> has every functionality you need and more (such as compile-time size and bounds for a <code>std::array</code>).</p>
+
+<pre><code>#include &lt;unordered_set&gt;
+#include &lt;iostream&gt;
+#include &lt;vector&gt;
+#include &lt;functional&gt;
+#include &lt;array&gt;
+#include &lt;iterator&gt;
+#include &lt;cstddef&gt;
+#include &lt;algorithm&gt;
+#include &lt;utility&gt;
+</code></pre>
+
+<p>There is I think a bit too many headers here: for instance, is <code>&lt;functional&gt;</code> really used?</p>
+
+<pre><code>using Cell = std::pair&lt;int, int&gt;;
+
+namespace std {
+  template&lt;&gt;
+  struct hash&lt;Cell&gt; {
+    std::size_t operator()(const Cell&amp; cell) const {
+      const std::hash&lt;int&gt; hasher;
+      return hasher(cell.first) &amp; hasher(cell.second);
+    }
+  };
+}
+</code></pre>
+
+<p>As @AlexReinking said, a hash map isn't more efficient here, or rather: a simple 2d array is the most efficient hash map you could devise.</p>
+
+<pre><code>std::ostream&amp; operator&lt;&lt;(std::ostream&amp; out, const Cell&amp; cell) {
+  out &lt;&lt; '(' &lt;&lt; cell.first &lt;&lt; ',' &lt;&lt; cell.second &lt;&lt; ')';
+  return out;
+}
+
+class Life {
+public:
+  template&lt;typename InputIt&gt;
+  Life(InputIt begin, InputIt end);
+
+  void tick();
+  friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; out, const Life&amp; life);
+
+private:
+  std::unordered_set&lt;Cell&gt; grid;
+  std::array&lt;Cell, 8&gt; neighbors_of(const Cell&amp; cell) const;
+  int n_alive_neighbors(const std::array&lt;Cell, 8&gt;&amp; neighbors) const;
+};
+
+template&lt;typename InputIt&gt;
+Life::Life(InputIt begin, InputIt end)
+  : grid(begin, end) {}
+
+void Life::tick() {
+  std::vector&lt;Cell&gt; to_die;
+  std::vector&lt;Cell&gt; to_create;
+  std::vector&lt;Cell&gt; all_neighbors;
+</code></pre>
+
+<p>That looks like a lot of intermediary vectors.</p>
+
+<pre><code>  // find cells that will die
+  std::copy_if(grid.begin(), grid.end(), std::back_inserter(to_die),
+               [&amp;](const auto&amp; cell){
+</code></pre>
+
+<p>It is a bad idea to capture the whole context, and even worse when you do it by reference, because it's a source of silent bugs: one or two wrong keystrokes and you can refer to a variable outside of the lambda while thinking you refer to a variable inside</p>
+
+<pre><code>                 const auto neighbors = neighbors_of(cell);
+                 const auto alive_neighbors = n_alive_neighbors(neighbors);
+                 return alive_neighbors &lt; 2 || alive_neighbors &gt; 3;
+               });
+
+  // collect neighbors of all cells
+  std::for_each(grid.begin(), grid.end(),
+</code></pre>
+
+<p>No raw loops is a nice goal, but <code>for_each</code> shouldn't be used instead of <code>for (const auto&amp; elem : container)</code>: it's more convoluted, less readable, etc.</p>
+
+<pre><code>                [&amp;](const auto&amp; cell){
+                  const auto neighbors = neighbors_of(cell);
+                  std::copy(neighbors.begin(), neighbors.end(), std::back_inserter(all_neighbors));
+</code></pre>
+
+<p>I don't understand why you have the <code>neighbors</code> intermediary array, if the only thing you do with it is copy it into <code>all_neighbors</code>. It's just a waste.</p>
+
+<pre><code>                });
+
+  // find cells that will be created
+  std::copy_if(all_neighbors.begin(), all_neighbors.end(), std::back_inserter(to_create),
+               [&amp;](const auto&amp; cell) {
+                 if (grid.find(cell) != grid.end()) return false;
+                 const auto neighbors = neighbors_of(cell);
+                 const auto alive_neighbors = n_alive_neighbors(neighbors);
+                 return alive_neighbors == 3;
+               });
+
+  // kill cells
+  std::for_each(to_die.begin(), to_die.end(), [&amp;](const auto&amp; cell){ grid.erase(cell); });
+  // reproduce cells
+  grid.insert(to_create.begin(), to_create.end());
+}
+
+std::array&lt;Cell, 8&gt; Life::neighbors_of(const Cell&amp; cell) const {
+  return { Cell(cell.first - 1, cell.second + 1),
+           Cell(cell.first, cell.second + 1),
+           Cell(cell.first + 1, cell.second + 1),
+           Cell(cell.first + 1, cell.second),
+           Cell(cell.first + 1, cell.second - 1),
+           Cell(cell.first, cell.second - 1),
+           Cell(cell.first - 1, cell.second - 1),
+           Cell(cell.first - 1, cell.second) };
+}
+</code></pre>
+
+<p>This doesn't take into account the fact that some cells are at the border of the grid: those don't have 8 neighbors, but between 3 (angles) and 7. </p>
+
+<pre><code>int Life::n_alive_neighbors(const std::array&lt;Cell, 8&gt;&amp; neighbors) const {
+  return std::count_if(neighbors.begin(), neighbors.end(),
+                       [&amp;](const auto&amp; cell){ return grid.find(cell) != grid.end(); });
+}
+
+std::ostream&amp; operator&lt;&lt;(std::ostream&amp; out, const Life&amp; life) {
+  if (life.grid.empty()) return out;
+  out &lt;&lt; *life.grid.begin();
+  std::for_each(std::next(life.grid.begin()), life.grid.end(),
+                [&amp;](const auto&amp; cell){
+                  out &lt;&lt; '\n' &lt;&lt; cell;
+                });
+  return out;
+}
+</code></pre>
+
+<p>You don't have to master GUIs in order to do better than that: just output your grid as a grid, not as a list of cells (for instance <code>for (int i = 0; i &lt; m; ++i) { for (int j = 0; j &lt; n; ++j) { if (grid.find(cell(i, j)) != grid.end()) std::cout &lt;&lt; 'O' else std::cout ' '; } std::cout &lt;&lt; std::endl; }</code>).</p>
+
+<pre><code>int main() {
+  std::array&lt;Cell, 3&gt; blinker {Cell(-1, 0), Cell(0, 0), Cell(1, 0)};
+  std::array&lt;Cell, 6&gt; toad {Cell(0, 0), Cell(1, 0), Cell(2, 0),
+                            Cell(1, 1), Cell(2, 1), Cell(3, 1)};
+
+  Life life(toad.begin(), toad.end());
+
+  std::cout &lt;&lt; life &lt;&lt; '\n';
+  for (int i = 0; i &lt; 6; ++i) {
+    life.tick();
+    std::cout &lt;&lt; '\n' &lt;&lt; life &lt;&lt; '\n';
+  }
+}
+</code></pre>
+    </div>

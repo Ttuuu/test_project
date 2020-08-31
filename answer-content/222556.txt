@@ -1,0 +1,140 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Using a <code>set()</code> is your bottleneck, memory-wise.</p>
+
+<pre><code>&gt;&gt;&gt; numbers = set(range(3, 10**8, 2))
+&gt;&gt;&gt; sys.getsizeof(numbers)
+2147483872
+&gt;&gt;&gt; sys.getsizeof(numbers) + sum(map(sys.getsizeof, numbers))
+3547483844
+</code></pre>
+
+<p>A <code>set</code> of odd numbers up to 100 million is consuming <strike>2GB</strike> 3.5GB (thank-you @ShadowRanger) of memory.  When you do an operation like <code>numbers = numbers - num_set</code>, you'll need to have 3 sets in memory at once.  One for the original set, one for the set of numbers you are removing, and one for the resulting set.  This will be greater than <strike>4GB</strike> 7GB of memory, since some of the numbers you are removing aren't in the original set.</p>
+
+<p>You don't need to realize the entire set of numbers you are removing in memory.  You could simply remove the numbers from the set one at a time:</p>
+
+<pre><code>for c in range(3, num // 2, 2):
+    numbers.remove(i * c)
+</code></pre>
+
+<p>This is modifying the set in place, so the memory requirement will not exceed the initial 2GB of memory for the set.</p>
+
+<hr>
+
+<p>Why are you looping <code>c</code> over <code>range(3, num // 2, 2)</code>?  This is doing way too much work.  The maximum value <code>c</code> should obtain should satisfy <code>i*c &lt; num</code>, since no product <code>i*c</code> larger than <code>num</code> will be in the original set.</p>
+
+<p>You should instead loop over <code>range(3, num // i + 1, 2)</code>.  This will decrease the size of the set of numbers you are removing as the prime numbers you find increase.</p>
+
+<hr>
+
+<p>Why start removing primes at <code>3*i</code>?  When <code>i</code> is 97, you've already removed multiples of 3, 5, 7, 11, 13, 17, ... up to 89. The first multiple you need to remove is <code>97*97</code>.  You would then continue with <code>99*97</code>, <code>101*97</code>, and so on, up to <code>num</code>.  So the <code>range</code> should begin with <code>i</code>, not <code>3</code>. </p>
+
+<pre><code>for c in range(i, num // i + 1, 2):
+    numbers.remove(i * c)
+</code></pre>
+
+<p>Actually, this is still too complicated.  Let's get rid of the multiplication.  This also greatly simplifies the upper limit of the range.</p>
+
+<pre><code>for multiple in range(i*i, num, 2*i):
+    numbers.remove(multiple)
+</code></pre>
+
+<p>Or equivalently, passing a generator to <code>difference_update</code> to remove items in bulk, but without realizing the set of numbers to be removed in memory simultaneously.</p>
+
+<pre><code>numbers.difference_update(multiple for multiple in range(i*i, num, 2*i))
+</code></pre>
+
+<hr>
+
+<p>Even with all of the above changes, you still require 2GB of memory to compute the primes up to 100 million.  And since a <code>set</code> is unordered, you still have to <code>sort</code> the surviving numbers afterwards to get your ordered list of primes.</p>
+
+<p>A better way is to maintain an array of flags, one per candidate number.  With 100 million candidate numbers, if each flag used only a single byte, you'd only require 100 MB of memory, a savings of a factor of 20.  And since the array of flags is ordered, no sorting of the array would be required.</p>
+
+<p>The <a href="https://docs.python.org/3.7/library/stdtypes.html?highlight=bytearray#bytearray" rel="nofollow noreferrer"><code>bytearray</code></a> is one such structure.  It is an array of bytes.  You can store your candidates in the array as a <code>1</code>, and any non-primes (multiples of other primes) as <code>0</code>.</p>
+
+<pre><code>def sieve(num):
+    flags = bytearray(num)      # Initially, all bytes are zero
+
+    flags[2] = 1                # Two is prime
+    for i in range(3, num, 2):
+        flags[i] = 1            # Odd numbers are prime candidates
+
+    # Find primes and eliminate multiples of those primes
+    for i in range(3, int(num ** 0.5) + 1, 2):
+        if flags[i]:
+            for multiple in range(i * i, num, 2 * i):
+                flags[multiple] = 0
+
+    return [ i for i, flag in enumerate(flags) if flag ]
+</code></pre>
+
+<hr>
+
+<p>Conserving a little bit more memory, you can store your list of primes in an <a href="https://docs.python.org/3.7/library/array.html" rel="nofollow noreferrer"><code>array</code></a></p>
+
+<pre><code>import array
+
+def sieve(num):
+    flags = bytearray(num)      # Initially, all bytes are zero
+
+    flags[2] = 1                # Two is prime
+    for i in range(3, num, 2):
+        flags[i] = 1            # Odd numbers are prime candidates
+
+    # Find primes and eliminate multiples of those primes
+    for i in range(3, int(num ** 0.5) + 1, 2):
+        if flags[i]:
+            for multiple in range(i * i, num, 2 * i):
+                flags[multiple] = 0
+
+    return array.array('I', (i for i, flag in enumerate(flags) if flag))
+</code></pre>
+
+<p>For primes up to <span class="math-container">\$10^8\$</span>, the <code>array.array('I', ...)</code> stores the 5.7 million primes in a mere 23MB of memory.  The list version takes a whopping 212MB.</p>
+
+<p><strong>Note</strong>: If you are using a 32-bit version of Python, you may need the type-code <code>'L'</code> instead of <code>'I'</code> to get storage for 4-byte integers in the array.</p>
+
+<hr>
+
+<p>For the truly memory conscious, install the <code>bitarray</code> module.</p>
+
+<pre><code>pip3 install bitarray
+</code></pre>
+
+<p>In addition to using only a single bit per flag, for 1/8th the memory usage in the sieve, it allows some truly fantastic slice assignments from a single boolean scalar, which makes clearing all multiples of a prime number into a simple single statement.</p>
+
+<pre><code>import array
+from bitarray import bitarray
+
+def sieve(num):
+
+    flags = bitarray(num)
+    flags.setall(False)
+    flags[2] = True                      # Two is prime
+    flags[3::2] = True                   # Odd numbers are prime candidates
+
+    for i in range(3, int(num ** 0.5) + 1, 2):
+        if flags[i]:
+            flags[i*i:num:2*i] = False   # Eliminate multiples of this prime
+
+    primes = array.array('I', (i for i, flag in enumerate(flags) if flag))
+
+    return primes
+</code></pre>
+
+<p>Timings:</p>
+
+<pre><code>10^3:  0.000
+10^4:  0.000
+10^5:  0.004
+10^6:  0.051
+10^7:  0.428
+10^8:  4.506
+</code></pre>
+
+<p><strong>Note</strong>: Updated timing info.  I just noticed I had <code>for i in range(3, num + 1, 2)</code> in the last implementation instead of <code>for i in range(3, int(num ** 0.5) + 1, 2)</code>, resulting in a lot of wasted time doing nothing.</p>
+
+<p><strong>Python 3.8 Update</strong>: Using <a href="https://docs.python.org/3/library/math.html?highlight=isqrt#math.isqrt" rel="nofollow noreferrer"><code>math.isqrt(num)</code></a> is better than <code>int(num ** 0.5)</code>:</p>
+
+<pre><code>    for i in range(3, math.isqrt(num) + 1, 2):
+</code></pre>
+    </div>

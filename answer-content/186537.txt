@@ -1,0 +1,156 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I wrote a simple <code>main()</code> function to test this:</p>
+<pre><code>int main()
+{
+    show_progress_bar(100, "progress", '#');
+}
+</code></pre>
+<hr>
+<p>I immediately noticed that I only saw a couple of updates.  This is because the output is not flushed after each update.  Whether you see the same effect depends greatly on your output device (I was using Emacs compilation-mode, which might have more buffering than traditional terminals or terminal emulators). This is easily fixed for all users, by using the <code>std::flush</code> stream manipulator:</p>
+<pre><code>    std::cout &lt;&lt; "\r [" &lt;&lt; std::ceil(percentage) &lt;&lt; '%' &lt;&lt; "] "
+              &lt;&lt; progress_bar &lt;&lt; std::flush;
+</code></pre>
+<p>I fixed a small typo there - you had <code>ceil</code> instead of <code>std::ceil</code>.  Adrian McCarthy advises that <a href="http://www.adrianmccarthy.com/blog/?p=62" rel="noreferrer">rounding up progress</a> is annoying to users, so it may be better to round down or simply cast to an integer:</p>
+<pre><code>    std::cout &lt;&lt; "\r [" &lt;&lt; static_cast&lt;int&gt;(percentage) &lt;&lt; '%' &lt;&lt; "] "
+              &lt;&lt; progress_bar &lt;&lt; std::flush;
+</code></pre>
+<hr>
+<p>It's probably a good idea to use a manipulator to set a field width for <code>percentage</code>, so that the <code>]</code> doesn't jump position when we reach 10%.</p>
+<p>Also the <code>message</code> is overwritten immediately, and I don't get to see it - perhaps emit a newline after it?</p>
+<hr>
+<p>It's not obvious why <code>progress_level</code> has the value it does - it looks like it's an attempt to fit a particular line length.  I would prefer to see this calculated:</p>
+<pre><code>static const auto line_length = 70;
+static const auto progress_level = 100.0 / line_length;
+</code></pre>
+<p>A really sophisticated version would attempt to find the available width (probably using termcap or curses libraries).</p>
+<hr>
+<p>Appending progress characters to the string is usually more efficient than prepending:</p>
+<pre><code>    progress_bar += symbol;
+</code></pre>
+<p>It's probably better to create a full-length string and just print a substring of it each time - you'll want to use the <code>write()</code> function prior to C++17 (which introduces <code>string_view</code> to give substrings without copying).</p>
+<hr>
+<p>I'd prefer to be able to pass the output stream as a parameter; most of the time, the standard log stream is more appropriate than the standard output stream.</p>
+<hr>
+<h1>Improved code</h1>
+<p>I've made changes to put the message on the same line if it fits (I pass by value, and re-use as the progress bar; this may sometimes save a copy).</p>
+<pre><code>#include &lt;chrono&gt;
+#include &lt;cmath&gt;
+#include &lt;iomanip&gt;
+#include &lt;iostream&gt;
+#include &lt;string&gt;
+#include &lt;thread&gt;
+    
+void show_progress_bar(std::ostream&amp; os, int time,
+                       std::string message, char symbol = '*')
+{
+    static const auto bar_length = 70;
+    // not including the percentage figure and spaces
+
+    if (message.length() &gt;= bar_length) {
+        os &lt;&lt; message &lt;&lt; '\n';
+        message.clear();
+    } else {
+        message += " ";
+    }
+
+    const auto progress_level = 100.0 / (bar_length - message.length());
+
+    std::cout &lt;&lt; message;
+
+    for (double percentage = 0; percentage &lt;= 100; percentage += progress_level) {
+        message += symbol;
+        os &lt;&lt; "\r [" &lt;&lt; std::setw(3) &lt;&lt; static_cast&lt;int&gt;(percentage) &lt;&lt; "%] "
+           &lt;&lt; message &lt;&lt; std::flush;
+        std::this_thread::sleep_for(std::chrono::milliseconds(time));
+    }
+    os &lt;&lt; "\n\n";
+}
+
+
+int main()
+{
+    show_progress_bar(std::clog, 100, "progress", '#');
+}
+</code></pre>
+<hr>
+<h1>An alternative approach</h1>
+<p>Usually, when you need a progress bar, the work you are doing isn't as convenient as a regular sleep.  For these tasks, it's convenient to have an object you can either pass (by reference) to the task, or just update between sub-tasks.  I knocked one up to show what that looks like:</p>
+<pre><code>#include &lt;cmath&gt;
+#include &lt;iomanip&gt;
+#include &lt;ostream&gt;
+#include &lt;string&gt;
+
+class progress_bar
+{
+    static const auto overhead = sizeof " [100%]";
+
+    std::ostream&amp; os;
+    const std::size_t bar_width;
+    std::string message;
+    const std::string full_bar;
+
+ public:
+    progress_bar(std::ostream&amp; os, std::size_t line_width,
+                 std::string message_, const char symbol = '.')
+        : os{os},
+          bar_width{line_width - overhead},
+          message{std::move(message_)},
+          full_bar{std::string(bar_width, symbol) + std::string(bar_width, ' ')}
+    {
+        if (message.size()+1 &gt;= bar_width || message.find('\n') != message.npos) {
+            os &lt;&lt; message &lt;&lt; '\n';
+            message.clear();
+        } else {
+            message += ' ';
+        }
+        write(0.0);
+    }
+
+    // not copyable
+    progress_bar(const progress_bar&amp;) = delete;
+    progress_bar&amp; operator=(const progress_bar&amp;) = delete;
+
+    ~progress_bar()
+    {
+        write(1.0);
+        os &lt;&lt; '\n';
+    }
+
+    void write(double fraction);
+};
+
+void progress_bar::write(double fraction)
+{
+    // clamp fraction to valid range [0,1]
+    if (fraction &lt; 0)
+        fraction = 0;
+    else if (fraction &gt; 1)
+        fraction = 1;
+
+    auto width = bar_width - message.size();
+    auto offset = bar_width - static_cast&lt;unsigned&gt;(width * fraction);
+
+    os &lt;&lt; '\r' &lt;&lt; message;
+    os.write(full_bar.data() + offset, width);
+    os &lt;&lt; " [" &lt;&lt; std::setw(3) &lt;&lt; static_cast&lt;int&gt;(100*fraction) &lt;&lt; "%] " &lt;&lt; std::flush;
+}
+</code></pre>
+
+<pre><code>// Test program
+
+#include &lt;chrono&gt;
+#include &lt;iostream&gt;
+#include &lt;thread&gt;
+int main()
+{
+    progress_bar progress{std::clog, 70u, "Working"};
+
+    for (auto i = 0.0;  i &lt;= 100;  i += 3.65) {
+        progress.write(i/100.0);
+        // simulate some work
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+</code></pre>
+<p>If you want to develop this further, you can make it more elaborate (e.g. configurable start and end values, or sub-bars that forward scaled values to their parent bars).  I'll leave that as an exercise for the interested reader.</p>
+    </div>

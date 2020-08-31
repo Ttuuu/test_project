@@ -1,0 +1,118 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>    /// &lt;summary&gt;
+    /// Identifiers the generation.
+    /// &lt;/summary&gt;
+    /// &lt;returns&gt;A Unique ID&lt;/returns&gt;
+    private string generateUniqueID(int _characterLength = 11)
+</code></pre>
+
+<p>A good summary should describe what the method does. This summary doesn't really tell me anything. Keep it simple: the method generates IDs, so write the summary as such.</p>
+
+<p><code>generateUniqueID</code> does not follow C# method naming conventions. Call it <code>GenerateUniqueID</code>. Note the <code>PascalCase</code>.</p>
+
+<p>A character always has a length of 1, so <code>_characterLength</code> is a bit of a confusing name for me. What it describes is actually the length of the ID, so call it <code>idLength</code>, or just <code>length</code> since the thing it's describing is obvious from the method name anyway.</p>
+
+<p>You got the <code>camelCasing</code> right for parameter and local identifiers, but it's not conventional to use underscores. Get rid of those.</p>
+
+<p>It's not clear why you'd give such a method a default value, but in any case that <code>11</code> should be defined as a constant somewhere. Avoid magic numbers. By giving that number a name, you give it a meaning that's obvious to the next person who reads your code.</p>
+
+<pre><code>private const int DefaultIDLength = 11;
+
+private string GenerateUniqueID(int length = DefaultIDLength)
+...
+</code></pre>
+
+<hr>
+
+<pre><code>StringBuilder _builder = new StringBuilder();
+</code></pre>
+
+<p>It's common to use <code>var</code> when the expression type is obvious.</p>
+
+<p>Your ID will always be <code>length</code> characters long, so use the <code>StringBuilder</code> constructor that takes an initial capacity:</p>
+
+<pre><code>var builder = new StringBuilder(length);
+</code></pre>
+
+<hr>
+
+<pre><code>Enumerable
+            .Range(65, 26)
+            .Select(e =&gt; ((char)e).ToString())
+            .Concat(Enumerable.Range(97, 26).Select(e =&gt; ((char)e).ToString()))
+            .Concat(Enumerable.Range(0, 10).Select(e =&gt; e.ToString()))
+            .OrderBy(e =&gt; Guid.NewGuid())
+            .Take(_characterLength)
+            .ToList().ForEach(e =&gt; _builder.Append(e));
+</code></pre>
+
+<p>This is the crux of your implementation, and there's a lot to unpack here, so let's go step by step.</p>
+
+<pre><code>Enumerable
+            .Range(65, 26)
+            .Select(e =&gt; ((char)e).ToString())
+            .Concat(Enumerable.Range(97, 26).Select(e =&gt; ((char)e).ToString()))
+            .Concat(Enumerable.Range(0, 10).Select(e =&gt; e.ToString()))
+</code></pre>
+
+<p>This produces the same sequence every time you run it. It's painful to read. Why not just specify it as a constant? This gets the point across far easier:</p>
+
+<pre><code>private const string AllowableIDCharacters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+</code></pre>
+
+<p>But we'll see later that none of this is necessary.</p>
+
+<p>You don't need all those <code>ToString</code>s everywhere. You gain nothing by using <code>string</code> as an intermediate representation instead of <code>char</code>. Keep them as <code>char</code>s during the shuffle: <code>StringBuilder.Append()</code> has an overload that accepts <code>char</code>.</p>
+
+<p>I try to avoid writing lambdas with side effects. This would be more conventionally written as a <code>foreach</code> loop, which also avoids the need to convert the thing to a list:</p>
+
+<pre><code>foreach (char c in AllowableIDCharacters
+            .OrderBy(e =&gt; Guid.NewGuid())
+            .Take(length))
+{
+    builder.Append(c);
+}
+</code></pre>
+
+<p>But by far the biggest problem here is your source of entropy, as Turksarama pointed out in the comments. By shuffling the alphabet, you are not allowing any repeated characters! This cuts down the number of unique IDs you can generate by more than half. Drop the shuffling idea entirely, it's not the best tool for this job.</p>
+
+<hr>
+
+<p>You cannot generate unique IDs without keeping some kind of state. GUIDs work by generating sequences that, while not unique in a pure sense, are so astronomically unlikely to be repeated that they are "unique" for all practical intents and purposes.</p>
+
+<p>If you embrace the non-determinism approach of generating unique IDs that GUID takes, then the question is no longer "how to generate a unique ID with as few characters as possible". It is now "what is an acceptable trade-off between ID length and probability of collision".</p>
+
+<p>Because your method is just a mechanism for generating IDs <em>given a length</em>, then half of your problem reduces to something much simpler:</p>
+
+<ol>
+<li>Given an ID length <code>n</code>, how do I minimize the probability of a collision?</li>
+<li>How do I maximize the amount of information contained within a string of length <code>n</code>?</li>
+</ol>
+
+<p>Both of these are straightforward problems. To minimize collisions you need a source of entropy that is both uniformly distributed and unpredictable. There are a lot of ways to do this, with varying degrees of uniformity and unpredictability, but do note that GUIDs are <em>not</em> uniformly distributed, are <em>somewhat</em> predictable, and are therefore not a great choice here. There is plenty of literature on how to generate such entropy so I won't go into detail for now. A common choice in .NET is to use <code>RNGCryptoServiceProvider</code>.</p>
+
+<p>Maximizing the information contained in the ID means trying to squeeze as many bits of data as possible into that string. You chose an encoding that can represent 62 different things per character, or about 5.95 bits of data per character -- but because of the shuffling issue we talked about earlier, the actual number will be much smaller. For IDs of length 11 it's less than half.</p>
+
+<p>I assume you're limited to ID strings of 8-bit ASCII-ish characters. But the alphabet you came up with is <em>really</em> close to Base 64, so why not just use Base 64? That'll give you an even 6 bits of information per character. By selecting a standard encoding as such, you'll avail to yourself a suite of standard tools for converting to and from that encoding.</p>
+
+<hr>
+
+<p>Here's an example of how you could do it:</p>
+
+<pre><code>private static readonly RNGCryptoServiceProvider random = new RNGCryptoServiceProvider();
+
+private string GenerateUniqueID(int length)
+{
+    // We chose an encoding that fits 6 bits into every character,
+    // so we can fit length*6 bits in total.
+    // Each byte is 8 bits, so...
+    int sufficientBufferSizeInBytes = (length * 6 + 7) / 8;
+
+    var buffer = new byte[sufficientBufferSizeInBytes];
+    random.GetBytes(buffer);
+    return Convert.ToBase64String(buffer).Substring(0, length);
+}
+</code></pre>
+
+<p>This gives you 6 bits of entropy per character. It's up to you and the constraints of your business domain to pick an appropriate length. By the "birthday problem" rule of thumb, the probability of two random IDs of <code>n</code> bits to conflict with each other is about one in <code>2^(n/2)</code>; so an ID length of 11 gives you 66 bits, with a one in <code>2^33</code> chance of two IDs conflicting.</p>
+    </div>

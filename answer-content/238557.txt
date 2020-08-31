@@ -1,0 +1,58 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I think the type of <code>apidefTokenRef</code> unnecessarily exposes internal details. Perhaps it would better to parameterize <code>APIDefaults</code> with a monad and hide the code that gets the token behind a monadic action, like this:</p>
+
+<pre><code>data APIDefaults m = APIDefaults
+  { apidefManager :: Manager
+  , apidefPool :: ConnectionPool
+  , apidefTokenAction :: m APIToken 
+  }
+</code></pre>
+
+<p>I'm also making it return the <code>APIToken</code> type instead of <code>Text</code>. It's good to have a more precise type for it than <code>Text</code>, let's not fall prey to <a href="https://refactoring.guru/smells/primitive-obsession" rel="nofollow noreferrer">primitive obsession</a>!</p>
+
+<p>Now <code>APIEnv</code> seems a bit redundant. Instead of reading the token from <code>APIEnv</code>, functions in need of it can simply execute the token action each time. Or perhaps we could define a function like</p>
+
+<pre><code>sequenceToken :: Monad m =&gt; APIDefaults m -&gt; m (APIDefaults Identity)
+sequenceToken r = do
+    token &lt;- apidefTokenAction r
+    pure (r { apidefTokenAction = Identity token })
+</code></pre>
+
+<hr>
+
+<p>But how to define the token action itself? Here I will indulge in a bit of over-abstraction and define this typeclass:</p>
+
+<pre><code>class Perishable p where
+    lifetime :: p -&gt; NominalDiffTime
+</code></pre>
+
+<p>for values which have a certain <a href="http://hackage.haskell.org/package/time-1.9.3/docs/Data-Time-Clock.html#t:NominalDiffTime" rel="nofollow noreferrer">lifetime</a> during which they are valid. Of course, <code>APIToken</code> will have an instance.</p>
+
+<p>What type should the function which creates the token action have? It will be something like </p>
+
+<pre><code>makeRefresher :: Perishable p =&gt; IO p -&gt; IO (IO p)
+</code></pre>
+
+<p>(Working in <code>IO</code> for simplicity, the real function would likely work in <code>MonadUnliftIO</code>.)</p>
+
+<p>The argument is an action that obtains the perishable value. But why the outer <code>IO</code> in the result? because <code>makeRefresher</code> will have to set up some reference—like an <code>MVar</code>—that will be used across successive invocations of the resulting action:</p>
+
+<pre><code>makeRefresher obtain = do
+    ref &lt;- newMVar _initialValueHole
+    return $ _actualTokenActionHole
+</code></pre>
+
+<p>What should be on the <code>MVar</code>? Perhaps a <code>Maybe (UTCTime, p)</code>. It would be <code>Nothing</code> initially to signify that no perishable value has been obtained yet, and later it would become <code>Just (someTime,somePerishable)</code>. We have the time of creation and the expected lifetime of the <code>Perishable</code>, so we can decide whether to return the current value or invoke <code>obtain</code> again.</p>
+
+<p>Instead of <code>Maybe</code>, I would perhaps use my own type, for clarity:</p>
+
+<pre><code>data PerishableState p = NoPerishableYet
+                       | PerishableObtainedAt UTCTime p
+</code></pre>
+
+<p>Also, I would try to manipulate the <code>MVar</code> with functions like <a href="http://hackage.haskell.org/package/base-4.12.0.0/docs/Control-Concurrent-MVar.html" rel="nofollow noreferrer"><code>modifyMVar_</code></a> to avoid deadlocks if there's an exception while obtaining the token.</p>
+
+<hr>
+
+<p>One potential disadvantage of this solution is that the token "state" becomes harder to inspect because it's hidden behind an opaque action. Perhaps some logging effect should be added.</p>
+    </div>

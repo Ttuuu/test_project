@@ -1,0 +1,177 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Putting multiple enum values into one <code>enum_strings</code> data structure means this one piece of code will depend on every single enum definition in the code-base where conversion to a string is required. It's also easy to forget to add a value.</p>
+
+<p>Having a separate <code>enum_strings</code>-type structure for each enum would mean that the strings can be defined near the enum, and one is less likely to forget to add things to one central point. Headers containing unrelated enums from other places also won't be included accidentally.</p>
+
+<hr>
+
+<p><code>enum_binary_search::execute_impl</code> converts to <code>std::string</code> to do comparisons. This is likely to be very slow (it allocates memory and copys over all the data in the array). It also does the comparison multiple times.</p>
+
+<p><a href="https://en.cppreference.com/w/cpp/string/byte/strcmp" rel="nofollow noreferrer"><code>std::strcmp</code> can be used to do the comparison once, with no copying</a>.</p>
+
+<hr>
+
+<p>It's complicated and unreadable! This isn't your fault, it's just how template metaprogramming is in C++. Generally, <code>constexpr</code>-based solutions are simpler, and promise to get much easier with future versions of the language.</p>
+
+<p>For example, here's a version that does a linear search, based on <a href="https://stackoverflow.com/a/26079954/673679">this stackoverflow answer</a>.</p>
+
+<pre><code>#include &lt;stdexcept&gt;
+
+class CExprStr // use std::string_view in C++17
+{
+public:
+
+    template&lt;std::size_t N&gt;
+    constexpr CExprStr(char const (&amp;s)[N]): m_size(N), m_data(s) { }
+
+    constexpr char operator[](std::size_t index) const
+    {
+        return
+            (index &gt;= m_size) ? throw std::out_of_range("Invalid index.") :
+            m_data[index];
+    }
+
+    constexpr char const* data() const
+    {
+        return m_data;
+    }
+
+private:
+
+    std::size_t m_size;
+    char const* m_data;
+};
+
+namespace 
+{
+
+    constexpr bool EqualsImpl(CExprStr const&amp; a, char const* b, std::size_t i)
+    {
+        return
+            (a[i] != b[i]) ? false :
+            (a[i] == 0 || b[i] == 0) ? true :
+            EqualsImpl(a, b, i + 1);
+    }
+
+} // unnamed
+
+constexpr bool operator==(CExprStr const&amp; a, char const* b)
+{
+    return EqualsImpl(a, b, 0);
+}
+
+
+#include &lt;tuple&gt;
+#include &lt;stdexcept&gt;
+
+template&lt;class EnumT&gt;
+using EnumStringT = std::tuple&lt;EnumT, CExprStr&gt;;
+
+template&lt;class EnumT, std::size_t N&gt;
+using EnumMapT = std::array&lt;EnumStringT&lt;EnumT&gt;, N&gt;;
+
+template&lt;class EnumT, std::size_t N&gt;
+constexpr char const* EnumGetValue(EnumMapT&lt;EnumT, N&gt; const&amp; map, EnumT key, std::size_t i = 0)
+{
+    return
+        (i == map.size()) ? throw std::invalid_argument("Enum key not present in map.") : // (will also fail to compile, as it's not a constant expression).
+        (std::get&lt;0&gt;(map[i]) == key) ? std::get&lt;1&gt;(map[i]).data() : 
+        EnumGetValue(map, key, i + 1);
+}
+
+template&lt;class EnumT, std::size_t N&gt;
+constexpr EnumT EnumGetKey(EnumMapT&lt;EnumT, N&gt; const&amp; map, char const* value, std::size_t i = 0)
+{
+    return
+        (i == map.size()) ? throw std::invalid_argument("Enum value not present in map.") : // (will also fail to compile, as it's not a constant expression).
+        (std::get&lt;1&gt;(map[i]) == value) ? std::get&lt;0&gt;(map[i]) :
+        EnumGetKey(map, value, i + 1);
+}
+
+
+#include &lt;array&gt;
+#include &lt;iostream&gt;
+#include &lt;string&gt;
+
+enum class Color { Red, Green, Blue };
+
+namespace
+{
+    using E = EnumStringT&lt;Color&gt;;
+
+    constexpr EnumMapT&lt;Color, 3&gt; ColorStringMap =
+    {{
+        E{ Color::Red, "red" },
+        E{ Color::Green, "green" },
+        E{ Color::Blue, "blue" },
+    }};
+
+} // unnamed 
+
+constexpr char const* ColorToString(Color value)
+{
+    return EnumGetValue(ColorStringMap, value);
+}
+
+std::ostream&amp; operator&lt;&lt;(std::ostream&amp; stream, Color value)
+{
+    stream &lt;&lt; ColorToString(value);
+    return stream;
+}
+
+constexpr Color StringToColor(char const* value)
+{
+    return EnumGetKey(ColorStringMap, value);
+}
+
+std::istream&amp; operator&gt;&gt;(std::istream&amp; stream, Color&amp; value)
+{
+    auto buffer = std::string();
+    stream &gt;&gt; buffer;
+
+    value = StringToColor(buffer.c_str());
+
+    return stream;
+}
+
+
+#include &lt;iostream&gt;
+#include &lt;sstream&gt;
+
+int main()
+{
+    {
+        constexpr auto red = ColorToString(Color::Red);
+        //constexpr auto invalid = ColorToString((Color)-1); // won't compile
+        //auto invalid = ColorToString((Color)-1); // throws std::invalid_argument
+        std::cout &lt;&lt; red &lt;&lt; std::endl;
+    }
+
+    {
+        std::cout &lt;&lt; Color::Green &lt;&lt; std::endl;
+    }
+
+    {
+        constexpr auto red = StringToColor("red");
+        //constexpr auto invalid = StringToColor("sdlfkj"); // won't compile
+        std::cout &lt;&lt; red &lt;&lt; std::endl;
+    }
+
+    {
+        std::stringstream stream("green");
+        //std::stringstream stream("grsdfkl"); // throws std::invalid_argument when parsed
+
+        auto c = Color::Blue;
+        stream &gt;&gt; c;
+
+        std::cout &lt;&lt; c &lt;&lt; std::endl;
+    }
+}
+</code></pre>
+
+<p><code>CExprStr</code> exists purely to do string comparison between <code>const char*</code>s, since <code>std::strcmp</code> isn't a <code>constexpr</code> function. In C++17, we can delete the whole class and use <code>std::string_view</code> instead.</p>
+
+<p>Similarly, in C++20, a whole bunch of <code>std</code> algorithms become <code>constexpr</code>, including <code>std::find_if</code>, <code>std::binary_search</code>, <code>std::lexicographical_compare</code>, which makes a <code>constexpr</code> based solution more appealing.</p>
+
+<p>It should be fairly simple to add binary lookup to <code>EnumGetValue</code> and <code>EnumGetKey</code> above. Sorting the array in a constexpr function will still be <a href="https://stackoverflow.com/a/40030044/673679">tricky in C++14, but slightly easier in C++17</a>.</p>
+    </div>

@@ -1,0 +1,103 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You could use the <a href="https://docs.microsoft.com/en-us/dotnet/api/system.linq.expressions.expressionvisitor?view=netframework-4.8" rel="noreferrer">ExpressionVisitor</a> class to give yourself some more flexibility and not have to handle all the conditions yourself.  </p>
+
+<pre><code>public class ExpressionConverter&lt;TFrom, TTo&gt; : ExpressionVisitor
+    where TFrom : class, new() 
+    where TTo : class, new()
+{
+    private readonly MappedConverter&lt;TFrom, TTo&gt; _converter;
+    private ParameterExpression _fromParameter;
+    private ParameterExpression _toParameter;
+
+    public ExpressionConverter(MappedConverter&lt;TFrom, TTo&gt; converter)
+    {
+        _converter = converter;
+    }
+
+    public override Expression Visit(Expression node)
+    {
+        if (_fromParameter == null)
+        {
+            if (node.NodeType != ExpressionType.Lambda)
+            {
+                throw new ArgumentException("Expression must be a lambda");
+            }
+
+            var lambda = (LambdaExpression)node;
+            if (lambda.ReturnType != typeof(bool) || lambda.Parameters.Count != 1 ||
+                lambda.Parameters[0].Type != typeof(TFrom))
+            {
+                throw new ArgumentException("Expression must be a Func&lt;TFrom, bool&gt;");
+            }
+
+            _fromParameter = lambda.Parameters[0];
+            _toParameter = Expression.Parameter(typeof(TTo), _fromParameter.Name);
+        }
+        return base.Visit(node);
+    }
+</code></pre>
+
+<p>We going to have the ExpressionConverter inherit from the ExpressionVisitor and the first call to Visit make sure it's a Func lambda (Visit gets called a lot from recursion in the ExpressionTree) . If so we save the parameter expression we are converting from and making a new one for the one we are converting to.</p>
+
+<p>Then override VisitParameter and swap out the parameters</p>
+
+<pre><code>protected override Expression VisitParameter(ParameterExpression node)
+{
+    if (_fromParameter == node)
+    {
+        return  _toParameter;
+    }
+    return base.VisitParameter(node);
+}
+</code></pre>
+
+<p>Then we also need to override the VisitMembers to swap out member assignments</p>
+
+<pre><code>protected override Expression VisitMember(MemberExpression node)
+{
+    if (node.Expression == _fromParameter)
+    {
+        var member = _converter.GetMappingFromMemberName&lt;TFrom&gt;(node.Member.Name);
+        return Expression.Property(_toParameter, member);
+    }
+
+    return base.VisitMember(node);
+}
+</code></pre>
+
+<p>I did have to change the GetMappingFromMemberName to return the correct PropertyInfo instead of the mapping to make it work easier.  </p>
+
+<pre><code>public PropertyInfo GetMappingFromMemberName&lt;T&gt;(string name)
+{
+    if (typeof(T) == typeof(Dto))
+    {
+        return this.Mappings.SingleOrDefault(x =&gt; x.DtoProperty.Name == name).EntityProperty;
+    }
+    else if (typeof(T) == typeof(Entity))
+    {
+        return this.Mappings.SingleOrDefault(x =&gt; x.EntityProperty.Name == name).DtoProperty;
+    }
+    throw new Exception($"Cannot get mapping for {typeof(T).Name} from MappedConverter&lt;{typeof(Dto).Name}, {typeof(Entity).Name}&gt;");
+}
+</code></pre>
+
+<p>Last thing we need to do is create a new <code>Expression&lt;Func&lt;TFrom, bool&gt;&gt;</code></p>
+
+<pre><code>protected override Expression VisitLambda&lt;T&gt;(Expression&lt;T&gt; node)
+{
+    if (typeof(T) == typeof(Func&lt;TFrom, bool&gt;))
+    {
+        return Expression.Lambda&lt;Func&lt;TTo, bool&gt;&gt;(Visit(node.Body), new[] { _toParameter }); 
+    }
+    return base.VisitLambda(node);
+}
+</code></pre>
+
+<p>You can call it like so</p>
+
+<pre><code>Expression&lt;Func&lt;Model, bool&gt;&gt; lambda = x =&gt; x.LastName == x.FirstName  &amp;&amp; x.FirstName == "John";
+var newLambda = expressionConverter.Visit(lambda);
+</code></pre>
+
+<p>If you don't like the Visit call you can always make it an private class inside another class to give it a different method signature.  But now you don't have to create the constants or operators.  Just update the parameter and properties that are getting used.  I didn't do CallMethod but if you need that you can just <code>override Expression VisitMethodCall(MethodCallExpression node)</code> using the same techniques as above. </p>
+    </div>

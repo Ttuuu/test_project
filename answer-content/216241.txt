@@ -1,0 +1,112 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'm going to reuse some parts of the <a href="https://codereview.stackexchange.com/a/216197/92478">answer</a> I recently posted here on Code Review.</p>
+
+<h1>Losing your Loops</h1>
+
+<blockquote>
+  <p><strong>(Most) loops are damn slow in Python. Especially multiple nested loops.</strong></p>
+  
+  <p>NumPy can help to <em>vectorize</em> your code, i.e. in this case that more
+  of the looping is done in the C backend instead of in the Python
+  interpreter. I  would highly recommend to have a listen to the talk
+  <a href="https://codereview.stackexchange.com/a/216197/92478">Losing your Loops: Fast Numerical Computing with NumPy</a> by Jake
+  VanderPlas.</p>
+</blockquote>
+
+<p>All those loops used to generate the complex grid followed by the nested loops used to iterate over the grid and the image are slow when left to the Python interpreter. Fortunately, NumPy can take quite a lot of this burden off of you.</p>
+
+<p>For example</p>
+
+<pre class="lang-py prettyprint-override"><code>real_axis = np.linspace(-2, 1, num=3000)
+imaginary_axis = np.linspace(1, -1, num=2000)
+complex_grid = [[complex(np.float64(a),np.float64(b)) for a in real_axis] for b in imaginary_axis]
+</code></pre>
+
+<p>could become</p>
+
+<pre class="lang-py prettyprint-override"><code>n_rows, n_cols = 2000, 3000
+complex_grid_np = np.zeros((n_rows, n_cols), dtype=np.complex)
+real, imag = np.meshgrid(real_axis, imaginary_axis)
+complex_grid_np.real = real
+complex_grid_np.imag = imag
+</code></pre>
+
+<p>No loops, just plain simple NumPy.</p>
+
+<p>Same goes for</p>
+
+<pre class="lang-py prettyprint-override"><code>for complex_list in complex_grid:
+    for complex_number in complex_list:
+        for iteration in range(255):
+            z = z**2 + complex_number
+            if (z.real**2+z.imag**2)**0.5 &gt; 2:
+                pixel_grid[complex_grid.index(complex_list),complex_list.index(complex_number)]=[iteration,iteration,iteration]
+                break
+            else:
+                continue
+        z = 0
+</code></pre>
+
+<p>can be transformed to</p>
+
+<pre class="lang-py prettyprint-override"><code>z_grid_np = np.zeros_like(complex_grid_np)
+elements_todo = np.ones((n_rows, n_cols), dtype=bool)
+for iteration in range(255):
+    z_grid_np[elements_todo] = \
+        z_grid_np[elements_todo]**2 + complex_grid_np[elements_todo]
+    mask = np.logical_and(np.absolute(z_grid_np) &gt; 2, elements_todo)
+    pixel_grid_np[mask, :] = (iteration, iteration, iteration)
+    elements_todo = np.logical_and(elements_todo, np.logical_not(mask))
+</code></pre>
+
+<p>which is just a single loop instead of three nested ones. Here, a little more trickery was needed to treat the <code>break</code> case the same way as you did. <code>elements_todo</code> is used to only compute updates on the <code>z</code> value if it has not been marked as done. There might also be a better solution without this.</p>
+
+<p>I added the following lines</p>
+
+<pre class="lang-py prettyprint-override"><code>complex_grid_close = np.allclose(np.array(complex_grid), complex_grid_np)
+pixel_grid_close = np.allclose(pixel_grid, pixel_grid_np)
+print("Results were similar: {}".format(all((complex_grid_close, pixel_grid_close))))
+</code></pre>
+
+<p>to validate my results against your reference implementation.</p>
+
+<p>The vectorized code is about 9-10x faster on my machine for several <code>n_rows/n_cols</code> combinations I tested. E.g. for <code>n_rows, n_cols = 1000, 1500</code>:</p>
+
+<pre class="lang-none prettyprint-override"><code>Looped generation took 61.989842s
+Vectorized generation took 6.656926s
+Results were similar: True
+</code></pre>
+
+<h2>Lose a dimension</h2>
+
+<p>An aspect I somehow slightly ignored while looking at your code was that you're essentially creating a grayscale image since all of your color channel values are the same. Accounting for this, you can easily reduce the size of data the program has handle to from, in your case, <code>3000x2000x3</code> to <code>3000x2000</code>. This will likely help your program to be more cache efficient, although I'm not an expert in this field.</p>
+
+<hr>
+
+<h2>Edit/Appendix: Further timings</h2>
+
+<p>Including the "no square root" optimization as suggested by trichoplax in his <a href="https://codereview.stackexchange.com/a/216298/92478">answer</a> and Peter Cordes in the <a href="https://codereview.stackexchange.com/questions/216235/increase-performance-creating-mandelbrot-set-in-python/216241#comment418534_216241">comments</a> like so</p>
+
+<pre class="lang-py prettyprint-override"><code>mask = np.logical_and((z_grid_np.real**2+z_grid_np.imag**2) &gt; 4, elements_todo)
+</code></pre>
+
+<p>will give you about another second and a half for <code>n_rows, n_cols = 1000, 1500</code>, i.e. about 12x the speed of the original solution</p>
+
+<pre class="lang-none prettyprint-override"><code>10 loops, best of 5: 4.98 s per loop
+10 loops, best of 5: 4.28 s per loop (in grayscale, 14x)
+</code></pre>
+
+<p>A quick implementation of <a href="https://codereview.stackexchange.com/a/216240/92478">Reinderien's hint</a> towards the symmetry of the Mandelbrot set will again add a factor of about two to that.</p>
+
+<pre class="lang-none prettyprint-override"><code>10 loops, best of 5: 2.54 s per loop (~24x)
+10 loops, best of 5: 2.07 s per loop (in grayscale, ~30x)
+</code></pre>
+
+<p>However, my quick hacking approach did not lead to an output that was completely within the tolerance of <code>np.allclose</code> compared to the original one. Funnily, it seems to be off by one at a single pixel, but visually still the same. Since this post is already quite long, I will leave the reimplementation as an exercise to the reader.</p>
+
+<p>Depending on your needs, you might also go down with the floating point precision from 64bit to 32bit on addition to all the previously mentioned optimizations.</p>
+
+<pre class="lang-none prettyprint-override"><code>10 loops, best of 5: 1.49 s per loop (~41x)
+10 loops, best of 5: 1.14 s per loop (in grayscale, ~54x)
+</code></pre>
+    </div>

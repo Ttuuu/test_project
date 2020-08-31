@@ -1,0 +1,143 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>(kind of nitpicking here, it looks quite solid to me)</p>
+
+<p><strong>Code</strong>:</p>
+
+<pre><code>    /* Discard up until the last `0xFF`, then that is the marker type. */
+    do { if(fread(f, 1, 1, fp) != 1) return 0; } while(f[0] != 0xFF);
+    do { if(fread(f, 1, 1, fp) != 1) return 0; } while(f[0] == 0xFF);
+</code></pre>
+
+<p>While we might have extra <code>0xff</code> fill to read, I'm not sure we should be reading and discarding non-<code>0xff</code> bytes. If the data in the file doesn't follow the expected format our assumptions about the marker / chunk structure might be wrong too, which could lead to invalid results.</p>
+
+<p>Outputting the wrong size could cause more problems than returning an error, so I'd be inclined to pick the latter instead.</p>
+
+<hr>
+
+<pre><code>        if((skip = (f[0] &lt;&lt; 8) | f[1]) != 8u + 3 * f[7])
+            return errno = EDOM, 0;
+</code></pre>
+
+<p>No need to set <code>skip</code> here, since we return in both branches.</p>
+
+<p>We're checking the SOF chunk length matches with the number of image components? It might be nice to have a comment or something to mention this.</p>
+
+<hr>
+
+<p>Using <code>errno</code> seems unnecessary if we return success / failure in the return value (and the only error code used  <code>EDOM</code>).</p>
+
+<hr>
+
+<p><strong>Style:</strong></p>
+
+<p>Some of the compound statements seem a bit forced. e.g.</p>
+
+<p>e.g.:</p>
+
+<pre><code>if(argc != 2 || !(fp = fopen(argv[1], "rb"))
+    || !jpeg_dim(fp, &amp;width, &amp;height)) goto catch;
+</code></pre>
+
+<p>If we split this up, the flow becomes much simpler, we can introduce local variables later, and we don't need multiple branches in the error handling:</p>
+
+<pre><code>int main(int argc, char **argv) {
+
+    if (argc != 2) {
+        fprintf(stderr, "Use with jpeg filename to see the size.\n");
+        return EXIT_FAILURE;
+    }
+
+    FILE* fp = fopen(argv[1], "rb"); // note: we only need this if argc was correct
+    if (!fp) {
+        perror("jpeg size"); // note: fopen() may not set errno on non-POSIX platforms
+        return EXIT_FAILURE;
+    }
+
+    unsigned width, height; // note: we only need these if fopen worked
+    if (!jpeg_dim(fp, &amp;width, &amp;height))
+    {
+        perror("jpeg size"); // note: errno isn't very helpful here... we could return an error code instead
+        return EXIT_FAILURE;
+    }
+
+    printf("Jpeg width: %u, height: %u.\n", width, height);
+
+    fclose(fp);
+
+    return EXIT_SUCCESS;
+}
+</code></pre>
+
+<p>There are quite a few repeated statements in <code>jpeg_dim</code> (<code>fread</code> and stuff like <code>((f[5] &lt;&lt; 8) | f[6]</code>). These are quite concise, but should probably still be factored into separate functions.</p>
+
+<p>I'd suggest something like a <code>jpeg_read_u8</code>, <code>jpeg_read_u16</code> and <code>jpeg_skip</code>:</p>
+
+<pre><code>static int jpeg_read_u8(FILE *const fp, unsigned char *const u8) {
+    assert(u8);
+
+    unsigned char b;
+    if (fread(&amp;b, 1, 1, fp) != 1)
+        return 0;
+
+    *u8 = b;
+    return 1;
+}
+
+static int jpeg_read_u16(FILE *const fp, unsigned short *const u16) {
+    assert(u16);
+
+    unsigned char b[2];
+    if (fread(&amp;b, 1, 2, fp) != 2)
+        return 0;
+
+    *u16 = (b[0] &lt;&lt; 8) | b[1];
+    return 1;
+}
+
+static int jpeg_skip(FILE *const fp, unsigned bytes) {
+    return fseek(fp, bytes, SEEK_CUR) == 0;
+}
+
+static int jpeg_dim(FILE *const fp, unsigned *const width, unsigned *const height) {
+    assert(fp);
+    assert(width &amp;&amp; height);
+
+    /* The start of the file has to be an `SOI`. */
+    unsigned char soi0; if (!jpeg_read_u8(fp, &amp;soi0) || soi0 != 0xff) return 0;
+    unsigned char soi1; if (!jpeg_read_u8(fp, &amp;soi1) || soi1 != 0xd8) return 0;
+
+    for (; ; ) {
+        /* Read first byte of next marker */
+        unsigned char m0; if (!jpeg_read_u8(fp, &amp;m0) || m0 != 0xff) return 0;
+        /* Discard fill characters */
+        unsigned char m1; do { if (!jpeg_read_u8(fp, &amp;m1)) return 0; } while (m1 == 0xff);
+
+        switch (m1) {
+        case 0xC0: case 0xC1: case 0xC2: case 0xC3: case 0xC5: /* _sic_ */
+        case 0xC6: case 0xC7: case 0xC9: /* _sic_ */ case 0xCA: case 0xCB:
+        case 0xCD: /* _sic_ */ case 0xCE: case 0xCF: {
+            /* `SOF` markers. */
+            unsigned short Lf; if (!jpeg_read_u16(fp, &amp;Lf)) return 0;
+            if (!jpeg_skip(fp, 1)) return 0; /* skip Precision */
+            unsigned short Y;  if (!jpeg_read_u16(fp, &amp;Y)) return 0;
+            unsigned short X;  if (!jpeg_read_u16(fp, &amp;X)) return 0;
+            unsigned char Nf;  if (!jpeg_read_u8(fp, &amp;Nf)) return 0;
+            /* Check that the chunk length (Lf) matches the number of image components (Nf) */
+            if (Lf != 8u + 3 * Nf) return 0;
+            *width = X; *height = Y;
+            return 1;
+        }
+        case 0xD8: case 0xD9:
+            /* Image data `SOS, EOI` without image size. */
+            return 0;
+        default: {
+            /* Skip the rest by reading it's size. */
+            unsigned short Lf;
+            if (!jpeg_read_u16(fp, &amp;Lf) || Lf &lt; 2) return 0;
+            if (!jpeg_skip(fp, Lf - 2)) return 0;
+        }
+        }
+    }
+}
+</code></pre>
+    </div>

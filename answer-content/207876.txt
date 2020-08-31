@@ -1,0 +1,204 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Try to think about this in a more generic way, you basically have:</p>
+
+<ol>
+<li>Select data from DB</li>
+<li>Put that data in a CSV (will you in the future want to use other formats like XLSX, etc? If so, we should abstract this step too, but I wont do this right now)</li>
+<li>Return that CSV file (doesn't matter to who you're returning)</li>
+</ol>
+
+<p>So we can create a few classes from those steps</p>
+
+<ol>
+<li>Any class that can query the DB, your app probably has a bunch of them</li>
+<li>AbstractWriter - this class is an abstraction/interface to write anywhere, you'll need to implement it for specific formats, like Writer/Csv, Writer/Xlsx, Writer/JSON, etc.</li>
+<li>AbstractFileReturner - this class is an abstraction/interface to return it to anyone, you'll need to implement it for specific cases, AbstractFileReturner/like Sftp, AbstractFileReturner/HttpResponse, etc.</li>
+</ol>
+
+<p>Any time you need more File formats or Returner, you just implement the AbstractWriter or FileReturner respectively one more time.</p>
+
+<p>Doing all these, you'll be using <strong>Single Responsability Principle</strong> (each class do only one thing) and <strong>Open/Closed</strong> (the abstractions/interfaces are closed for modification, but open for extension).</p>
+
+<hr>
+
+<h2>Real code</h2>
+
+<p>Ok so I came up with a little bit of code having SOLID in mind and to make it easy to add more file formats and and <code>way outs</code> (Sftp, Response, etc).</p>
+
+<p>This is a photo of the layers I tried to create, it might make the code more understandable.
+<a href="https://i.stack.imgur.com/eBvd0.jpg" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/eBvd0.jpg" alt="enter image description here"></a></p>
+
+<p>Now embrace yourself for there are coming a few classes.</p>
+
+<p>I didn't test this code and doens't know much of Laravel, so there might be a few bugs, but you'll get the big picture.</p>
+
+<p>First, a sample controller and model which I thought was your <code>Line</code>.</p>
+
+<pre><code>class SomeModel
+{
+    // the chunk does not go here, it will go inside who's putting the data into the csv
+    public static function someQuery()
+    {
+        return Line::with(['invoice', 'invoice.customer', 'item'])
+            -&gt;whereHas('invoice', function ($query) {
+                $query-&gt;where('is_exportable', 1);
+            });
+    }
+
+    public static function lineMapping(Line $line)
+    {
+        return [
+            'Invoice number'            =&gt; $line-&gt;invoice-&gt;id,
+            'Document type'             =&gt; self::DOCUMENT_TYPE,
+            'Date'                      =&gt; $line-&gt;invoice-&gt;date,
+        ];
+    }
+}
+
+class SomeController
+{
+    public function exportCsvSftpAction()
+    {
+        $dataCollection = SomeModel::someQuery();
+        $filename       = 'output.csv';
+
+        $exporter = new SftpCsvExporter($dataCollection, $filename);
+        $exporter-&gt;export();
+    }
+
+    public function exportCsvResponseAction()
+    {
+        $dataCollection = SomeModel::someQuery();
+        $filename       = 'output2.csv';
+
+        $exporter = new ResponseCsvExporter($dataCollection, $filename);
+        $exporter-&gt;export();
+    }
+}
+</code></pre>
+
+<p>Than there's the first layer: <strong>Export</strong>, I created an interface to say <code>what</code> it should do (don't mind about <code>how</code> now) and a abstract class that implements some parts of it.</p>
+
+<pre><code>interface Exportable
+{
+    protected function createFile();
+
+    protected function write($line);
+
+    protected function deliver($filename);
+}
+
+abstract class Export implements Exportable
+{
+    protected $fileHandle = null;
+    private   $dataCollection;
+    private   $filename;
+
+    public function __construct($dataCollection, $filename)
+    {
+        $this-&gt;createFile();
+
+        // @TODO You should add validation for $dataCollection like
+        // checking if it has data, if it really is a Collection so we can call chunk, etc
+        // And check $filename for invalid characters   
+        $this-&gt;dataCollection = $dataCollection;
+        $this-&gt;filename       = $filename;
+    }
+
+    protected abstract function createFile();
+
+    protected abstract function write($line);
+
+    protected abstract function deliver($filename);
+
+    // this method is who makes it all work together 
+    // and let the controller be so simple 
+    public function export()
+    {
+        $this-&gt;dataCollection-&gt;chunk(200, function ($lines) {
+            foreach ($lines as $line) {
+                $this-&gt;write($line);
+            }
+        });
+
+        $this-&gt;deliver($this-&gt;filename);
+    }
+}
+</code></pre>
+
+<p>Now there's the second layer: <strong>Csv</strong>, in this layer you will be able to add more file formats in the future if needed.<br>
+This layer knows how to write, but doesn't know how to open nor deliver the file.</p>
+
+<pre><code>abstract class CsvExporter extends Export
+{
+    const DELIMITER = ';';
+
+    private $headerWritten = false;
+
+    protected function write($line)
+    {
+        if (!$this-&gt;headerWritten) {
+            fputcsv(
+                $this-&gt;fileHandle,
+                array_keys(SomeModel::lineMapping(SomeModel::first())),
+                self::DELIMITER
+            );
+
+            $this-&gt;headerWritten = true;
+        }
+
+        fputcsv(
+            $this-&gt;fileHandle,
+            SomeModel::lineMapping($line),
+            self::DELIMITER
+        );
+    }
+}
+</code></pre>
+
+<p>And finally the third and last layer: this is responsible for opening and delivering the file. So we have Sftp and Response in this layer.</p>
+
+<pre><code>class SftpCsvExporter extends CsvExporter
+{
+    protected function createFile()
+    {
+        if ($this-&gt;fileHandle !== null) {
+            throw new LogicException('Handle already initilized');
+        }
+
+        $this-&gt;fileHandle = fopen('php://temp', 'w');
+    }
+
+    protected function deliver($filename)
+    {
+        return Storage::disk('sftp')-&gt;put($filename, $this-&gt;fileHandle);
+    }
+}
+
+class ResponseCsvExporter extends CsvExporter
+{
+    protected function createFile()
+    {
+        if ($this-&gt;fileHandle !== null) {
+            throw new LogicException('Handle already initilized');
+        }
+
+        $this-&gt;fileHandle = fopen('php://output', 'w');
+    }
+
+    protected function deliver($filename)
+    {
+        $handle = $this-&gt;fileHandle;
+
+        return new StreamedResponse(function () use ($handle, $filename) {
+            // I don't know this StreamedResponse so you might want to correct this
+            // the only thing left is to close the handle before send the file
+            fclose($handle);
+        }, 200, [
+            'Content-Type'        =&gt; 'text/csv',
+            'Content-Disposition' =&gt; 'attachment; filename="' . $filename . '"',
+        ]);
+    }
+}
+</code></pre>
+    </div>

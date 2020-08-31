@@ -1,0 +1,54 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This won't be comprehensive review/ramble, because I'm hungry; however, it is nice to see fairly comprehensive inline documentation on the public API!</p>
+
+<h2>General Networking Commentary</h2>
+
+<p>Because you asked if there are better ways of doing this, here is some high-level discussion that doesn't relate so much to your precise code. I've written code like this dozens of times, but I'm no expert by any stretch.</p>
+
+<h3>Threading</h3>
+
+<p>You've done what we all do when we start doing networking: give each client a thread, and tell it to get on with it! This is often a lot of work (maintenance wise) and (fortunately?) not the most efficient way of writing a server. You're much better off using asynchronous callbacks (which are efficiently pinged off by the networking stack, rather than having each thread constantly polling).</p>
+
+<p>If you want an event based system (which as far as I'm concerned is fine, but it may present difficulties with threading (e.g. if an event fires while you are in the middle of updating the game-state), which is partly why a lot of software doesn't do this) then the old <a href="https://msdn.microsoft.com/en-us/library/system.net.sockets.networkstream.beginread%28v=vs.110%29.aspx" rel="noreferrer"><code>NetworkStream.BeginRead(byte[], int, int)</code></a> method could be the cleanest way of writing this, but you could also just refit your code which currents runs in its own thread with <code>async</code> calls to <a href="https://msdn.microsoft.com/en-us/library/system.net.sockets.networkstream.readasync(v=vs.110).aspx" rel="noreferrer"><code>NetworkStream.ReadAsync(byte[], int, int)</code></a>. Both will be efficient and save you running dozens of threads, all competing for CPU time during which they will usually do nothing useful. Both, however, require that you switch from trying to read the stream one byte at a time, and instead process it in blocks...</p>
+
+<h3>Messages</h3>
+
+<p>I would <em>strongly</em> suggest prefixing messages with a length, rather than using start/end codes. Code like this in <code>SendMessage(object)</code> is never good enough (it should at least escape the forbidden content!):</p>
+
+<pre><code>var outContent = content.ToString()
+    .Replace(TcpOptions.EndConnectionCode.ToString(), "")
+    .Replace(TcpOptions.EndMessageCode.ToString(), "");
+</code></pre>
+
+<p>Since you are sending strings, you need only first send an integer length, and then the string; very simple. There are numerous benefits to this: you don't have code like the above (which is slow and dodgy), it significantly simplifies the listening code (just read a number, then read lots of bytes, none of that checking every byte in-case it is special business), and sets you up for adding more metadata (e.g. send the type of message, then the length, then the payload). The big downside is that you can't interrogate your stream with telnet anymore.</p>
+
+<p>In terms of efficiency, a length-prefixed scheme enables you to dependably use the <code>Read(byte[], int, int)</code> method on your <code>NetworkStream</code> to read (up to) as many bytes as you need. Most of my networking code starts with an <code>async ReadBytes(int count)</code> method which does nothing but wait until <code>count</code> many bytes have been read so that I can process them in one go (e.g. read a message by reading 4 bytes for the length, then the right number of bytes for the payload). It's <em>so</em> much cleaner than scanning a byte stream, and saves you worrying about calling <code>ReadByte()</code> thousands of times, which is a performance concern which can only be solved by making block reads with <code>Read(byte[], int, int)</code> (and you can do a lot worse than reading each message as a block) or the other various asynchronous equivalents.</p>
+
+<p>Personally I think it's also a bit untidy that you are taking an <code>object</code> and calling <code>ToString()</code> on it. If you are sending and deserialising strings, then I would make that clear in your API (i.e. take a <code>string</code>, not an <code>object</code>): the caller can call <code>ToString()</code> if it makes sense.</p>
+
+<p><em>Edit:</em> I forgot to mention Unicode: your current code strips out characters from a string, but you are delimitating messages based on bytes. Assuming you want to use more than ASCII (I'm assuming <code>GetString()</code> and <code>GetBytes()</code> use UTF-8 or UTF-16 (UTF-8 is the networking standard of sorts)), this is potentially problematic, depending on your choice of symbols and encoding (e.g. a multi-byte character might contain the single byte you are using to delimitate messages). If you do length-prefix strings, be sure to send the length in bytes (not chars) so that it is encoding independent, and that would solve the problem.</p>
+
+<h3>Responses</h3>
+
+<p>It's a neat idea, but looking for strings within arbitrary strings is always a bad idea: your 'special' strings can always appear in unexpected places. It is much better to have a formal protocol for recognised responses. Instead of sending a message as "just a string, it might contain fancy things", define it as a MessageType/Payload combination, and handle them separately.</p>
+
+<p>If you have length-prefixed packets, and you can agree magic numbers between the server and client, you can give each important event a specific id (or set of tags), and transmit these before the payload. Though your current system is quite flexible, it is inherently dodgy and expensive: you have to query the message against every response type. If instead you gave the responses unique IDs, you could look up the appropriate event(s) in a Dictionary.</p>
+
+<h2>Server</h2>
+
+<p>It's a bit odd that you start listening for clients as soon as you construct the Server. This means it might receive messages before you've configured it with any responses. It also feels like most of what is in <code>StartClientListening()</code> should be the constructor (except the starting listening bit).</p>
+
+<p>Relatedly, <code>foreach (var response in Responses)</code> is liable to crash if you try to modify the set of responses on a different thread. You can get around this by using a dedicated concurrent collection such as <a href="https://msdn.microsoft.com/en-us/library/dd381779%28v=vs.110%29.aspx?f=255&amp;MSPPError=-2147217396" rel="noreferrer"><code>ConcurrentBag&lt;T&gt;</code></a> which has a <a href="https://msdn.microsoft.com/en-us/library/dd381960(v=vs.110).aspx" rel="noreferrer">thread-safe enumerator</a>.</p>
+
+<h2>Client</h2>
+
+<p>Again, you try to connect in the constructor of the client: this is just a bit unexpected, and the inline documentation for the constructors is not very helpful.</p>
+
+<p><code>SendMessage(object content, bool a)</code> has a second parameter, but is never used. You'd be better off giving this method a different name (or purging it, if you switch to length-prefixed messages).</p>
+
+<p>The line <code>MessageReceived?.Invoke(sender, e);</code> looks like it should be outside the <code>foreach</code> loop. Currently, you are checking the message against each type of response, and firing <code>MessageReceived</code> for each one that does not trigger.</p>
+
+<h3>Other</h3>
+
+<p><code>ResponseEvent</code> could be immutable: since everything else is so nicely encapsulated, I'm assuming though that you have a good reason for this design.</p>
+    </div>

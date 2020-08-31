@@ -1,0 +1,66 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>16bit fixed-point SIMD</h1>
+<p>Here is a version adjusted to use 16bit fixed-point arithmetic, this changes the type (and interpretation) of the result, so the code that uses it needs to be adjusted too.</p>
+<p>There are some advantages to this:</p>
+<ul>
+<li>low latency addition, for floating point addition you need multiple accumulators to be able to handle a loop-carried dependency well. So the code ends up being simpler.</li>
+<li>SIMD is fixed width, so using narrower elements means there are more lanes. For example there are 8 <code>uint16_t</code>s in an <code>__m128i</code> but only 2 doubles.</li>
+<li>lower memory usage, often a lot of time can be saved just by touching less memory.</li>
+</ul>
+<p>SSE2 has decent support for 16bit fixed-point arithmetic, better than C++ itself, so it's generally not that hard to use. It does take a bit more care to ensure that values are used with the right interpretation, which is usually not a concern for floating point code, where the floats are mostly just interpreted "as themselves".</p>
+<p>If we have these pre-calculated values</p>
+<pre><code>double value = bp0 * ((blockStartAmp + (blockStep * blockDeltaAmp)) + bp1;
+double delta = bp0 * rate * blockDeltaAmp;
+</code></pre>
+<p>Then the 16bit fixed-point equivalents calculated from that would be</p>
+<pre><code>uint16_t value16 = value * 65536.0;
+uint16_t delta16 = delta * 65536.0;
+</code></pre>
+<p>But these turn out not to be super useful, since they end up being multiplied again and it is more accurate to keep that value a <code>double</code> as long as possible. Obviously creating <code>delta16</code> and <em>then</em> multiplying it by 8 (there are 8 samples per <code>__m128i</code>) would create a value that for sure has its 3 lowest bits zeroed out, but doing that calculation in double precision all the way until the moment it is converted to 16bit fixed-point enables those bits to be non-zero as well if appropriate. These would be useful in scalar code though.</p>
+<p>Then for SIMD we need a starting vector,</p>
+<pre><code>uint16_t temp[8];
+for (size_t i = 0; i &lt; 8; i++)
+    temp[i] = round((value + i * delta) * 65536.0);
+__m128i vvalue = _mm_loadu_si128((__m128i*)&amp;temp[0]);
+</code></pre>
+<p>And a vector of deltas,</p>
+<pre><code>// calculate from delta for extra precision
+__m128i vdelta = _mm_set1_epi16(round(delta * 65536.0 * 8));
+</code></pre>
+<p>Then start filling the output:</p>
+<pre><code>for (size_t sampleIndex = mblockStart; sampleIndex &lt; mblockEnd; sampleIndex += 8) {
+    _mm_storeu_si128((__m128i*)&amp;values[sampleIndex], vvalue);
+    vvalue = _mm_add_epi16(vvalue, vdelta);
+}
+</code></pre>
+<p>The parameters should not be updated with an <code>if</code> inside this loop, that would evaluate that branch every iteration and no scalar <code>blockStep</code> is available. But it can be done by putting that basic output-filling loop inside an other loop that updates the parameters and then calculates how long the inner loop can run for before the parameters must be updated again.</p>
+<p>Ideally the mini-block size (the number of samples between parameter updates) would be a multiple of 8 for obvious reasons, but it does not have to be, as long as there is some padding at the end of the buffer to accommodate the "past-the-end" write of the last mini-block. For mini-blocks other than the last one, writing a little bit of extra data does not matter, the next mini-block will just overwrite it anyway.</p>
+<hr>
+<h1>Floating point but a bit faster</h1>
+<p>If that all turns out to be too difficult to work with or too imprecise, here is a basic trick to improve the performance of dependent floating point additions:</p>
+<pre><code>double value0 = bp0 * ((blockStartAmp + (blockStep * blockDeltaAmp)) + bp1;
+double delta = bp0 * rate * blockDeltaAmp;
+double value1 = value0 + delta;
+double value2 = value0 + delta * 2;
+double value3 = value0 + delta * 3;
+double delta4 = delta * 4;
+size_t sampleIndex;
+for (sampleIndex = 0; sampleIndex + 3 &lt; blockSize; sampleIndex += 4) {
+    values[sampleIndex + 0] = value0;
+    values[sampleIndex + 1] = value1;
+    values[sampleIndex + 2] = value2;
+    values[sampleIndex + 3] = value3;
+    value0 += delta4;
+    value1 += delta4;
+    value2 += delta4;
+    value3 += delta4;
+}
+// in case blockSize is not always a multiple of 4
+for (; sampleIndex &lt; blockSize; sampleIndex++) {
+    values[sampleIndex] = value0;
+    value0 += delta;
+}
+</code></pre>
+<p>Except on super old CPUs, the main problem with floating point addition is not that it cannot be done often enough, the problem is that it takes a fair amount of time from start to finish. Even a fairly old CPU can <em>start</em> a floating point addition every cycle (some modern CPUs can do two), but the time from start-to-completion of a particular addition is around 3-4 cycles. So in order to not get stuck waiting for the previous addition to complete, the next addition needs to be independent of it.</p>
+<p>Since there are 4 independent sums, as long as the latency of FP-add is 4 or less, the example above would be able to complete a value every cycle in the best case (other concerns may slow it down a little), whereas in a simpler loop with only one <code>value</code>-variable the additions queue up and execute one-by-one, head-to-tail, without overlapping each other.</p>
+    </div>

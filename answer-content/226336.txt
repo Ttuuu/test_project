@@ -1,0 +1,258 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Since I couldn't choose a single answer as <em>the answer</em>, I decided to compilte all the suggestions and comments made and show how the final class(es) looks. It still doesn't use <a href="https://docs.microsoft.com/en-us/dotnet/api/system.threading.readerwriterlockslim?view=netcore-2.2" rel="nofollow noreferrer">ReaderWriterLockSlim</a>, but the code is far cleaner and contains one or two less bugs.
+Maybe the final results can be used by others :) thanks to everyone for the feedback, I love this community.</p>
+
+<p><a href="https://stackoverflow.com/questions/754233/is-it-there-any-lru-implementation-of-idictionary/3719378#3719378">Initial implementation</a> by <a href="https://stackoverflow.com/users/448597/martin">Martin</a>, from StackOverflow.</p>
+
+<p>Notable changes, in no specific order:</p>
+
+<ul>
+<li>Exposed SyncRoot [dfhwze]</li>
+<li>Add AddOrCreate method [dfhwze]</li>
+<li>Fixed issue in method `Add(...) [VisualMelon]</li>
+<li>Improved naming of typ-parameters (T -&gt; TKey, V -&gt; TValue) [VisualMelon]</li>
+<li>Added safety measures / documentation code in private methods, e.g. <code>Debug.Assert(Monitor.IsEntered(_lock))</code> [VisualMelon]</li>
+<li>Added <code>else</code> to <code>if</code> statements [VisualMelon]</li>
+<li>Improved documentation and fixed typos [VisualMelon]</li>
+<li>Created NullCache class and ICache interface [Henrik Hansen]</li>
+<li>Moved "should remove item logic" to method <code>RemoveLeastRecentlyUsedIfNecessary</code> method [3chb0t]</li>
+<li>Sexified of the code by removing generic arguments from LruCacheEntry [3chb0t]</li>
+</ul>
+
+<p>Final results, LruCache.cs:</p>
+
+<pre><code>namespace Minotaur.Collections {
+    using System;
+    using System.Collections.Generic;
+    using System.Diagnostics;
+    using System.Threading;
+
+    /// &lt;summary&gt;
+    /// This class is in-memory, thread-safe cache.
+    /// The evicition policy is the Least Recently Used (LRU),
+    /// see https://en.wikipedia.org/wiki/Cache_replacement_policies#Least_recently_used_(LRU).
+    /// &lt;/summary&gt;
+    /// &lt;remarks&gt;
+    /// This class is based on the following implementation https://stackoverflow.com/a/3719378/1642116
+    /// &lt;/remarks&gt;
+    public sealed class LruCache&lt;TKey, TValue&gt;: ICache&lt;TKey, TValue&gt; {
+        private readonly int _capacity;
+        private readonly Dictionary&lt;TKey, LinkedListNode&lt;LruCacheEntry&gt;&gt; _cacheMap;
+        private readonly LinkedList&lt;LruCacheEntry&gt; _lruList = new LinkedList&lt;LruCacheEntry&gt;();
+        public readonly object SyncRoot = new object();
+
+        /// &lt;summary&gt;
+        /// The constructor of the class.
+        /// &lt;paramref name="capacity"/&gt; must be &gt;= 0.
+        /// If you want to disable the caching of the system,
+        /// consindering using the NullCache class.
+        /// &lt;/summary&gt;
+        public LruCache(int capacity) {
+            if (capacity &lt;= 0)
+                throw new ArgumentOutOfRangeException(nameof(capacity) + " must be &gt; 0");
+
+            this._capacity = capacity;
+            this._cacheMap = new Dictionary&lt;TKey, LinkedListNode&lt;LruCacheEntry&gt;&gt;(capacity: capacity);
+        }
+
+        /// &lt;summary&gt;
+        /// Adds the pair (&lt;paramref name="key"/&gt;, &lt;paramref name="value"/&gt;)
+        /// to the cache.
+        /// If the key is already in the cache, an exception is thrown.
+        /// &lt;remarks&gt;
+        /// This method is thread-safe.
+        /// &lt;/remarks&gt;
+        public void Add(TKey key, TValue value) {
+            if (key == null)
+                throw new ArgumentNullException(nameof(key));
+
+            // We are doing as much work as we can outside of the lock
+            var cacheItem = new LruCacheEntry(key, value);
+            var lruNode = new LinkedListNode&lt;LruCacheEntry&gt;(cacheItem);
+
+            lock (SyncRoot) {
+                if (!_cacheMap.ContainsKey(key)) {
+                    _cacheMap.Add(key: key, value: lruNode);
+                    RemoveLeastRecentlyUsedIfNecessary();
+                } else {
+                    throw new InvalidOperationException("The value is already in the cache.");
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Tries to get the value associated with &lt;paramref name="key"/&gt;.
+        /// 
+        /// If the key is stored in the cache,
+        /// &lt;paramref name="value"/&gt; is set to the value associated with it,
+        /// the key's "least recently used" data is updated,
+        /// and the method returns true.
+        /// 
+        /// If the key is not stored in the cache,
+        /// &lt;paramref name="value"/&gt; is set to default
+        /// and the method returns false.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This method is thread-safe.
+        /// &lt;/remarks&gt;
+        public bool TryGet(TKey key, out TValue value) {
+            if (key == null)
+                throw new ArgumentNullException(nameof(key));
+
+            lock (SyncRoot) {
+                var isCached = _cacheMap.TryGetValue(key, out var lruNode);
+
+                if (!isCached) {
+                    value = default;
+                    return false;
+                } else {
+                    UpdateUsage(lruNode);
+                    value = lruNode.Value.Value;
+                    return true;
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Tries to get the value associated with &lt;paramref name="key"/&gt;.
+        /// If the value is not stored in the cache,
+        /// the function &lt;paramref name="valueCreator"/&gt; 
+        /// is called and the result is stored in the cache.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// This method is thread-safe.
+        /// &lt;/remarks&gt;
+        public TValue GetOrCreate(TKey key, Func&lt;TValue&gt; valueCreator) {
+            if (key == null)
+                throw new ArgumentNullException(nameof(key));
+            if (valueCreator is null)
+                throw new ArgumentNullException(nameof(valueCreator));
+
+            // We take the lock for a long time,
+            // but we must ensure that the entire operation is atomic.
+            // Maybe using System.Threading.ReaderWriterLockSlim and some
+            // black magic we could reduce contention, but aint that 
+            // high level of a wizard
+
+            lock (SyncRoot) {
+                var isCached = _cacheMap.TryGetValue(key: key, value: out var lruNode);
+                if (isCached) {
+                    UpdateUsage(lruNode);
+                    return lruNode.Value.Value;
+                }
+
+                // I wish this could be called outside the lock :(
+                var value = valueCreator();
+
+                var cacheEntry = new LruCacheEntry(
+                    key: key,
+                    valeu: value);
+
+                lruNode = new LinkedListNode&lt;LruCacheEntry&gt;(cacheEntry);
+
+                _cacheMap.Add(key: key, value: lruNode);
+                RemoveLeastRecentlyUsedIfNecessary();
+
+                return value;
+            }
+        }
+
+        private void UpdateUsage(LinkedListNode&lt;LruCacheEntry&gt; node) {
+            Debug.Assert(Monitor.IsEntered(SyncRoot));
+
+            _lruList.Remove(node);
+            _lruList.AddLast(node);
+        }
+
+        private void RemoveLeastRecentlyUsedIfNecessary() {
+            Debug.Assert(Monitor.IsEntered(SyncRoot));
+
+            if (_cacheMap.Count &lt; _capacity)
+                return;
+
+            var node = _lruList.First;
+            _lruList.RemoveFirst();
+            _cacheMap.Remove(node.Value.Key);
+        }
+
+        private sealed class LruCacheEntry {
+            public readonly TKey Key;
+            public readonly TValue Value;
+
+            public LruCacheEntry(TKey key, TValue valeu) {
+                Key = key;
+                Value = valeu;
+            }
+        }
+    }
+}
+</code></pre>
+
+<p>NullCache.cs</p>
+
+<pre><code>namespace Minotaur.Collections {
+    using System;
+
+    /// &lt;summary&gt;
+    /// This class is used to effectively disable caching
+    /// in place where a ICache can be used.
+    /// &lt;/summary&gt;
+    public sealed class NullCache&lt;TKey, TValue&gt;: ICache&lt;TKey, TValue&gt; {
+
+        /// &lt;summary&gt;
+        /// Does nothing.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// &lt;paramref name="key"/&gt; still can't be null.
+        /// &lt;/remarks&gt;
+        public void Add(TKey key, TValue value) {
+            if (key == null)
+                throw new ArgumentNullException(nameof(key));
+        }
+
+        /// &lt;summary&gt;
+        /// Always assigns default do &lt;paramref name="value"/&gt; and returns false.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// &lt;paramref name="key"/&gt; still can't be null.
+        /// &lt;/remarks&gt;
+        public bool TryGet(TKey key, out TValue value) {
+            if (key == null)
+                throw new ArgumentNullException(nameof(key));
+
+            value = default;
+            return false;
+        }
+
+        /// &lt;summary&gt;
+        /// Invokes &lt;paramref name="valueCreator"/&gt; and returns its output.
+        /// &lt;/summary&gt;
+        /// &lt;remarks&gt;
+        /// Neither &lt;paramref name="key"/&gt; nor &lt;paramref name="valueCreator"/&gt; can be
+        /// null.
+        /// &lt;/remarks&gt;
+        public TValue GetOrCreate(TKey key, Func&lt;TValue&gt; valueCreator) {
+            if (key == null)
+                throw new ArgumentNullException(nameof(key));
+            if (valueCreator is null)
+                throw new ArgumentNullException(nameof(valueCreator));
+
+            return valueCreator();
+        }
+    }
+}
+</code></pre>
+
+<p>ICache.cs</p>
+
+<pre><code>namespace Minotaur.Collections {
+    using System;
+
+    public interface ICache&lt;TKey, TValue&gt; {
+        void Add(TKey key, TValue value);
+        bool TryGet(TKey key, out TValue value);
+        TValue GetOrCreate(TKey key, Func&lt;TValue&gt; valueCreator);
+    }
+}
+</code></pre>
+    </div>

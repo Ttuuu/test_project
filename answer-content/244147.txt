@@ -1,0 +1,110 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>As others pointed out you are iterating over the source a lot.  Once ToList and every loop in the step.  Your grouping method is tied to repository and GetAll method.  It would be better to pass that into the method instead of having how to access data as part of the grouping.  I would also recommend removing the mapping from this method as well and use the standard Select afterwards.   Every method should just have one responsibility and right now your method gets data, groups data and projects the data.   This would make it hard to unit test and maintain down the road.</p>
+<p>Typically when dealing with IEnumerable we want to try to avoid multiple iterations. We can do this here but does make the code more complicated.  It's always a fine line between complex code and maintenance.</p>
+<p>Can see in this method signature it takes in the source, rangeSize and how we determine the grouping value.</p>
+<pre><code>public static class IEnumerableExtensions
+{
+    public static ILookup&lt;(int start, int end), TSource&gt; GroupByRange&lt;TSource&gt;(this IEnumerable&lt;TSource&gt; source, int rangeSize, Func&lt;TSource, decimal&gt; valueFunc)
+    {
+</code></pre>
+<p>You could just update your method to be that signature and fix it but you would still have the issue of multiple iterations, but at least it would be testable and responsible for one thing only.</p>
+<p>Like I said before we want to just iterate over the source once it does get more complex but we can go step by step into it and only you will know if it's worth it.</p>
+<p>Starters I'm return an <a href="https://docs.microsoft.com/en-us/dotnet/api/system.linq.ilookup-2?view=netcore-3.1" rel="nofollow noreferrer">ILookup</a> as that will act like across between a dictionary and grouping and it's readonly.   I'm also using the ValueTuple and if using a version of .net that doesn't have that I would recommend creating a struct that would hold the range.</p>
+<pre><code>public static ILookup&lt;(int start, int end), TSource&gt; GroupByRange&lt;TSource&gt;(this IEnumerable&lt;TSource&gt; source, int rangeSize, Func&lt;TSource, decimal&gt; valueFunc)
+{
+    var grouping = new Dictionary&lt;(int start, int end), List&lt;TSource&gt;&gt;();
+    var maxValue = 0m;
+    foreach (var item in source)
+    {
+        var value = valueFunc(item);
+        CheckIfNeedToResize(value, maxValue, rangeSize, grouping, valueFunc);
+        foreach (var group in grouping.Where(grp =&gt; grp.Key.start &lt;= value &amp;&amp; grp.Key.end &gt;= value))
+        {
+            group.Value.Add(item);
+        }
+    }
+
+    // not in love with iterating over the dictionary to convert to lookup
+    //   if don't want to do this could return IReadOnlyDictionary
+    //    also because of SelectMany this will exclude key ranges that don't have values
+    //   if we do return readonly dictionary it will include "empty" key ranges
+    //   if return readonly dictionary should make it value IEnumerable or and array as well
+    return grouping.SelectMany(x =&gt; x.Value.Select(v =&gt; new { x.Key, Value = v }))
+        .ToLookup(x =&gt; x.Key, x =&gt; x.Value);
+}
+</code></pre>
+<p>As you can see this part of the code isn't that complicated. For the return value if you need the "empty" result sets then I would return a ReadOnlyDictionary instead of LookUp.  Again only you know if that's a requirement or not.</p>
+<p>Now for the complicated code.  We can storing the maxValue so we can see if we need to add more slots when we hit the next value.  We are going to calculate the slots as we move through the collection instead of up front.</p>
+<pre><code>private static void CheckIfNeedToResize&lt;TSource&gt;(decimal currentValue, decimal maxValue, int rangeSize, IDictionary&lt;(int, int), List&lt;TSource&gt;&gt; grouping, Func&lt;TSource, decimal&gt; valueFunc)
+{
+    if (currentValue &gt; maxValue)
+    {
+        maxValue = currentValue;
+        // check if we need to add ranges
+        var groupCount = grouping.Count;
+        var steps = Math.Ceiling(currentValue / rangeSize);
+        if (steps &gt; int.MaxValue)
+        {
+            throw new IndexOutOfRangeException();
+        }
+        if (steps &gt; groupCount)
+        {
+            // add in extra "rows" into dictionary
+            foreach (var key in Enumerable.Range(groupCount, (int)steps - groupCount)
+                .Select(x =&gt; (x * rangeSize, (x + 1) * rangeSize)))
+            {
+                grouping.Add(key, new List&lt;TSource&gt;());
+            }
+
+            // have an edge case if previous end group had the ending range values in it we need
+            //  to add it into the next range that we added
+            if (groupCount &gt; 0)
+            {
+                var endRange = groupCount * rangeSize;
+                var lastList = grouping[((groupCount - 1) * rangeSize, endRange)];
+                var items = lastList.Where(x =&gt; valueFunc(x) == endRange);
+                grouping[(endRange, (groupCount + 1) * rangeSize)].AddRange(items);
+            }
+        }
+    }
+}
+</code></pre>
+<p>This could be merged up in the main method but because there is a lot going on I moved it to its own.  That is personal choice but I feel its easier to read and understand this way.  We first check if the current value greater than the max value if so we calculate if we need to add another slot or multiple slots. For each slot we calculate we need to add it to the dictionary and initialize the list of values.   There is an edge case where we need to iterate of the last value list to see if we need to add any to the new slot.  While if each slot did contain one value each time in theory we would end up iterating over the source twice, I would guess in practice this wouldn't be as much as twice the collection but still that's worst case of n*3.</p>
+<p>Now for testing I just used a console app but you could see how easy it would be to convert to unit test.</p>
+<pre><code>static void Main(string[] args)
+{
+    var testData = new[] { new { Value = 14 }, new { Value = 30 }, new { Value = 11 }};
+    var lookup = testData.GroupByRange(5, x =&gt; x.Value);
+    foreach (var items in lookup)
+    {
+        Console.WriteLine($"Start: {items.Key.start} End: {items.Key.end}");
+        foreach (var data in items)
+        {
+            Console.Write($"     Value {data.Value} ");
+        }
+        Console.WriteLine();
+    }
+
+    Console.WriteLine("---------------");
+
+    testData = new[] { new { Value = 9 }, new { Value = 10 }, new { Value = 11 } };
+    lookup = testData.GroupByRange(10, x =&gt; x.Value);
+    foreach (var items in lookup)
+    {
+        Console.WriteLine($"Start: {items.Key.start} End: {items.Key.end}");
+        foreach (var data in items)
+        {
+            Console.Write($"     Value {data.Value} ");
+        }
+        Console.WriteLine();
+    }
+
+
+    Console.WriteLine("done" );
+    
+    Console.ReadLine();
+}
+</code></pre>
+<p>The first one I wanted to show how it will skip "empty" ranges and the second one was just showing the same results you posted with yours.</p>
+<p>Again this doesn't do the projection and I would just do <code>_itemRepository.GetAll().GroupByRange(10, x =&gt; x.Value).Select(_mapper.Map&lt;DTO.Item&gt;)</code> as I don't think adding a projection parameter gains much.  With this way now you have a method that is unit testable and can be reused.</p>
+    </div>

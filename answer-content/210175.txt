@@ -1,0 +1,123 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1><code>fourBitsToString</code> and <code>charToHex</code></h1>
+<p>Both of these functions are basically reimplementations of existing features of the <code>&lt;iostream&gt;</code> and <code>&lt;iomanip&gt;</code> headers.</p>
+<p>The whole call to <code>charToHex</code> could simply be replaced by <code>std::cout &lt;&lt; std::uppercase &lt;&lt; std::hex &lt;&lt; std::setfill('0') &lt;&lt; std::setw(2) &lt;&lt; static_cast&lt;int&gt;(c);</code>.</p>
+<blockquote>
+<p>Note the <code>static_cast&lt;int&gt;</code>: We want to print the numerical value, not the ASCII character glyph!</p>
+</blockquote>
+<p>However, setting <code>std::uppercase</code>, <code>std::hex</code> and <code>std::setfill('0')</code> for every byte to be printed would be wasteful, plus it would overwrite any previously set flags on <code>std::cout</code>.</p>
+<p>A better approach would be using a intermediary <code>std::ostringstream</code> instead, setting the flags once and retrieving (and resetting) its contents when sufficiently filled.</p>
+<blockquote>
+<p>More on that in the section below.</p>
+</blockquote>
+<p>Also, both functions end with <code>return move(s);</code>. This seems like misguided premature optimization ("Hey, we can move here! No need for a copy!"), but it likely is actually a pessimization instead!</p>
+<p>Compilers actually know that the returned value is a temporary and can optimize for this case (usually called NRVO - "Named return value optimization"). But: They can only do this if the variable is returned directly, and the call to <code>std::move</code> prevents that.</p>
+<p>Prefer <code>return s;</code>, unless you have good reasons (e.g. measurements/bad compiler) indicating otherwise.</p>
+<h1><code>PrintMBR</code></h1>
+<p>This function is a big pile of unnecessarily complicated code with poorly documented/enfored preconditions.</p>
+<p>First off, let's take a look at the function signature:</p>
+<pre><code>static void PrintMBR(char buffer[MBR_SIZE])
+</code></pre>
+<p>The flaw is really subtle: <code>buffer</code> isn't actually restricted to arrays of size <code>MBR_SIZE</code> at all! It's basically just a slightly fancier markup of <code>static void PrintMBR(char *buffer)</code>, and the compiler will actually treat it as such.</p>
+<p>This allows <code>PrintMBR</code> to be called with <code>char</code> arrays of all possible sizes, including smaller than <code>MBR_SIZE</code>, or even just <code>nullptr</code>.</p>
+<blockquote>
+<p>How to fix this?</p>
+<p>Well, the first inclination might be to just limit the size of <code>buffer</code> by explicitly making it keep track of the size information, e.g. by using a reference to a C-style array <code>char (&amp;buffer)[MBR_SIZE]</code> or a fancier <code>std::array</code> reference <code>const std::array&lt;char, MBR_SIZE&gt; &amp;buffer</code>.</p>
+<p>And that is a valid option if the only purpose was to print MBR contents.</p>
+<p>But looking at it's actually implementation, it seems like the intention was to print the hex values in one big column next to a column containing to the ASCII characters (if printable) nicely aligned. This could be generalized for printing arbitrary <code>char</code> arrays by amending some of the assumptions made further down in the implementation.</p>
+</blockquote>
+<p>Next, let's have a look at the function body:</p>
+<pre><code>size_t byteIndex = 0;
+string lineSeparator;
+string columnSeparator;
+
+for (size_t i = 0; i &lt; NUMBER_OF_LINES; i++) {
+    cout &lt;&lt; lineSeparator;
+    lineSeparator = '\n';
+    columnSeparator = "";
+
+    for (size_t j = 0; j &lt; BYTES_PER_LINE; j++) {
+        string ch = charToHex(buffer[byteIndex++]);
+        cout &lt;&lt; columnSeparator &lt;&lt; ch;
+        columnSeparator = " ";
+    }
+
+    cout &lt;&lt; ' ';
+
+    for (size_t j = 0; j &lt; BYTES_PER_LINE; j++) {
+        char c = buffer[byteIndex - BYTES_PER_LINE + j];
+        cout &lt;&lt; (isprint((unsigned int) c) ? c : '.');
+    }
+}
+</code></pre>
+<p>If I understand correctly, the intention is to print the MBR in a <code>XX XX XX XX xxxx</code> line format (where <code>X</code> is a hex digit and <code>x</code> is an ASCII character).</p>
+<p>First off, it's hard to keep track of "constants" if their values are constantly changing. With one more check and a tiny bit of reordering, we can fix this:</p>
+<pre><code>size_t byteIndex = 0;
+static const string lineSeparator = "\n";
+static const string columnSeparator = " ";
+
+for (size_t i = 0; i &lt; NUMBER_OF_LINES; i++) {
+    if(i != 0) cout &lt;&lt; lineSeparator;
+
+    for (size_t j = 0; j &lt; BYTES_PER_LINE; j++) {
+        string ch = charToHex(buffer[byteIndex++]);
+        cout &lt;&lt; ch &lt;&lt; columnSeparator;
+    }
+
+    for (size_t j = 0; j &lt; BYTES_PER_LINE; j++) {
+        char c = buffer[byteIndex - BYTES_PER_LINE + j];
+        cout &lt;&lt; (isprint((unsigned int) c) ? c : '.');
+    }
+}
+</code></pre>
+<p>A bit more readable, and I don't have to keep track of all the possible states (and weird reassignments).</p>
+<p>I mentioned above that instead of using <code>charToHex</code>, one could use <code>std::ostringstream</code> and <code>&lt;iomanip&gt;</code> facilities instead:</p>
+<pre><code>void PrintMBR(char (&amp;buffer)[MBR_SIZE]) {
+    static constexpr auto bytes_per_line = 4;
+    static const auto column_delimiter = " "s;
+    static const auto line_delimiter = "\n"s;
+
+    auto hex_part = std::ostringstream{};
+    auto ascii_part = std::ostringstream{};
+    auto counter = 0;
+
+    hex_part &lt;&lt; std::uppercase &lt;&lt; std::hex &lt;&lt; std::setfill('0');
+
+    for(auto c : buffer)
+    {
+        hex_part &lt;&lt; std::setw(2) &lt;&lt; static_cast&lt;int&gt;(c) &lt;&lt; column_delimiter;
+        ascii_part &lt;&lt; (isprint(static_cast&lt;unsigned int&gt;(c)) ? c : '.');
+
+        ++counter;
+
+        if(counter % bytes_per_line == 0)
+        {
+            std::cout &lt;&lt; hex_part.str() &lt;&lt; ascii_part.str() &lt;&lt; line_delimiter;
+            hex_part.str("");
+            ascii_part.str("");
+        }
+    }
+}
+</code></pre>
+<blockquote>
+<p>This could easily be made more generic to allow printing any byte buffer in this format.</p>
+</blockquote>
+<h1><code>ReadMBR</code></h1>
+<ul>
+<li><p>Memory leak: <code>buffer</code> doesn't ever get used after being allocated, including being deleted.</p>
+</li>
+<li><p>I don't like the <code>return GetLastError();</code> bit. I guess it's fine in pure C, but in C++ there is a more common way to communicate error conditions: exceptions.</p>
+<p>I get this is kind of a glue layer between C WinAPI and C++, but that doesn't mean you have to port idioms from one side into the other, especially if there are more idiomatic alternatives.</p>
+<blockquote>
+<p>I see this as problematic in this case, as likely nobody checks return codes unless they have to. Case in point: <code>main()</code>.</p>
+</blockquote>
+</li>
+<li><p>To be more generic, I would really like for this method to accept an <code>OutputIterator</code>. But sadly, the C WinAPI doesn't know those, so that would require another copy of the data (using an intermediary buffer). That's one of the design trade-offs: Performance vs. Usability.</p>
+</li>
+</ul>
+<h1><code>main</code></h1>
+<ul>
+<li>No check on the return code of <code>ReadMBR</code>.</li>
+<li><code>return 3;</code> - What does this <code>3</code> represent?</li>
+</ul>
+    </div>

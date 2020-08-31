@@ -1,0 +1,200 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>General Observations</h2>
+
+<hr>
+
+<p><strong>Indentation</strong></p>
+
+<p>The first thing that I did when I loaded your code up in the VBE was to run an indenter on it.  Without consistent indentation of logical blocks of code (<code>If</code> statements, <code>For Each</code> bodies, etc.), it is incredibly difficult to get a handle on what the code is doing.  Especially if your <code>Sub</code> is 201 lines long.</p>
+
+<hr>
+
+<p><strong>Case Syntax</strong></p>
+
+<p>Using <code>Case Is = "whatever"</code> is completely redundant. <code>Case "whatever"</code> is equivalent, easier to read, and saves a boolean expression evaluation. Also, having an empty <code>Case Else</code> is not necessary - it doesn't execute any code, so it simply constitutes noise while reading the <code>Select</code> block.</p>
+
+<hr>
+
+<p><strong>Variable Declarations</strong></p>
+
+<p>Put these immediately before thier usage. Having to continually scroll up to the top of the <code>Sub</code> to see how they are defined is tedious. They'll operate exactly the same way and will be much more readable.</p>
+
+<p>Also, the line <code>Dim p, s, poste, x As Variant</code> isn't doing what you think it is doing. Only <code>x</code> is explicitly declared as <code>Variant</code>. The others are implicitly <code>Variant</code>.  But there isn't any <em>reason</em> for any of these not to be strongly typed. While it isn't a major performance implication, it does require run-time coercion in most of the places where you use them.</p>
+
+<p>Finally, give your variables meaningful names. If I'm staring at a 201 line procedure and the only information I have (after scrolling all the way to the top) about <code>p</code> is that it's a <code>Variant</code>, that's not at lot. Don't make me try to determine what everything is simply by context.</p>
+
+<hr>
+
+<p><strong>Organization</strong></p>
+
+<p>This definiately needs to be split up into smaller sections.  You are repeating a <em>ton</em> of code in blocks like this:</p>
+
+<blockquote>
+<pre><code>Set x = ActiveSheet.Range(PosteWeekDayRange).Find(What:="Après-midi", Lookat:=xlWhole)
+If Not x Is Nothing Then
+    Do
+        If ActiveSheet.Range(Col &amp; x.Row) = "" Then
+            ActiveSheet.Range(Col &amp; x.Row) = Worksheets("Cycle").Range("A" &amp; poste.Row).Value
+            ActiveSheet.Range(Col &amp; x.Row).Font.Italic = True
+        End If
+        Set x = ActiveSheet.Range(PosteWeekDayRange).FindNext(x)
+    Loop While Not x Is Nothing
+End If
+</code></pre>
+</blockquote>
+
+<p>Extract the common functionality into another procedure, and then call that. Consider what would happen if you decide to change the formatting - you'd need to make changes in 11 different places. If you extract that out into its own procedure, you have to change it in exactly one place.</p>
+
+<hr>
+
+<p><strong>Miscellanea</strong></p>
+
+<ul>
+<li><p>The first line of code in <code>DraftFromCycle</code> is basically a guard clause.  If it evaluates to <code>False</code>, nothing executes. I'd invert the condition to make it clear that's what it is:</p>
+
+<pre><code>If Application.WorksheetFunction.CountA(Range(PlanningAgentEmptyRange)) &lt;&gt; 0 Then
+    Exit Sub
+End If
+</code></pre></li>
+<li><p>Use the built in VBA constant <code>vbNullString</code> instead of the literal <code>""</code>.  It's easier to read, easier to search for, and doesn't require a memory allocation.</p></li>
+<li><p>I consider <code>Dim Cycle_lastrow As Integer</code> to be an error. If you're using a variable to store a row number, then it should be a <code>Long</code>. You can overflow an <code>Integer</code> with a call to <code>.Row</code>. These are basically treated as <code>Long</code> internally, so there's generally not much reason to use <code>Integer</code> unless you're building a <code>Type</code> that needs to be memory aligned.</p></li>
+<li><p>Don't use column letters. Excel treats them as numbers internally, so what happens is that you convert (or ask Excel to convert) them to a letter. Then you build a range out of the letter in A1 format (string concatenation isn't free either), then pass it to Excel, which has to <strong><em>convert it back into a number</em></strong>. This is simply wasted CPU cycles.</p></li>
+<li><p>You aren't changing the <code>ActiveSheet</code> anywhere in this code. If this is intended to run on a the active worksheet, grab a reference at the start and use that. You shouldn't risk the wheels coming off it it somehow changes while your code is running.</p></li>
+</ul>
+
+<hr>
+
+<h2>Performance</h2>
+
+<p>Repeatedly calculating things that are guaranteed to have the same result is simply wasted CPU time.  For example, in this block of code...</p>
+
+<blockquote>
+<pre><code>Do
+    If ActiveSheet.Range(Col &amp; x.Row) = "" Then
+        ActiveSheet.Range(Col &amp; x.Row) = Worksheets("Cycle").Range("A" &amp; poste.Row).Value
+        ActiveSheet.Range(Col &amp; x.Row).Font.Italic = True
+    End If
+    Set x = ActiveSheet.Range(PosteWeekDayRange).FindNext(x)
+Loop While Not x Is Nothing
+</code></pre>
+</blockquote>
+
+<p>... <code>ActiveSheet.Range(Col &amp; x.Row)</code> is going to be exactly the same each of the <strong><em>3 times</em></strong> you call it. Either cache the result in a variable and use that or wrap it in a <code>With</code> block:</p>
+
+<pre><code>With ActiveSheet.Range(Col &amp; x.Row)
+    If .Value = vbNullString Then
+        .Value = Worksheets("Cycle").Cells(poste.Row, 1).Value
+        .Font.Italic = True
+    End If
+    Set x = ActiveSheet.Range(PosteWeekDayRange).FindNext(x)
+End With
+</code></pre>
+
+<hr>
+
+<p>The <code>Range.Find</code> and <code>Range.FindNext</code> functions are ridiculously slow given the tiny ranges that you're searching in. On top of that, they <em>never change</em>. Using a cached lookup will destroy this in performance. You would build the lookup with a function something like this...</p>
+
+<pre><code>'Add a reference to Microsoft Scripting Runtime.
+'Build a lookup keyed by a string identifier, with values containing a Collection of cells
+Private Function GetLookupForRange(source As Range) As Scripting.Dictionary
+    Dim lookup As Scripting.Dictionary
+    Set lookup = New Scripting.Dictionary
+
+    Dim currentCell As Range
+    For Each currentCell In source
+        Dim identifier As String
+        identifier = currentCell.Value
+        Dim results As Collection
+        If Not lookup.Exists(identifier) Then
+            Set results = New Collection
+            lookup.Add identifier, results
+        Else
+            Set results = lookup.Item(identifier)
+        End If
+        results.Add currentCell
+    Next
+
+    Set GetLookupForRange = lookup
+End Function
+</code></pre>
+
+<p>...and initialize it at the start of the procedure...</p>
+
+<pre><code>Dim targetSheet As Worksheet
+Set targetSheet = ActiveSheet
+
+Dim weekdayLookup As Scripting.Dictionary
+Set weekdayLookup = GetLookupForRange(targetSheet.Range(PosteWeekDayRange))
+</code></pre>
+
+<p>...then use that to replace your <code>.Find</code> with a simple iteration of the cached results for that identifier. This code...</p>
+
+<blockquote>
+<pre><code>Set x = ActiveSheet.Range(PosteWeekDayRange).Find(What:="Après-midi", Lookat:=xlWhole)
+If Not x Is Nothing Then
+    Do
+        With ActiveSheet.Range(Col &amp; x.Row)
+            If .Value = vbNullString Then
+                .Value = Worksheets("Cycle").Cells(poste.Row, 1).Value
+                .Font.Italic = True
+            End If
+            Set x = ActiveSheet.Range(PosteWeekDayRange).FindNext(x)
+        End With
+    Loop While Not x Is Nothing
+End If
+</code></pre>
+</blockquote>
+
+<p>...becomes this:</p>
+
+<pre><code>'I should be extracted as a function!
+If weekdayLookup.Exists("Après-midi") Then
+    'The first "found" item is the first Collection member.
+    Dim results As Collection
+    Set results = weekdayLookup.Item("Après-midi")
+    Dim currentResult As Range
+    'You can now simply loop through the cached results.
+    For Each currentResult In results
+        Dim targetCell As Range
+        'Col should be a number, remember?
+        Set targetCell = targetSheet.Cells(currentResult.Row, Col)
+        With targetCell
+            If .Value = vbNullString Then
+                .Value = Worksheets("Cycle").Cells(poste.Row, 1).Value
+                .Font.Italic = True
+            End If
+        End With
+    Next
+End If
+</code></pre>
+
+<hr>
+
+<p>Given the number of cells that you're accessing, the next thing I would do would be to collect all of the formatting changes into a single union of ranges - then set all of the formatting in one operation.  This prevents one of the two redraws every time you set a cell to italic.</p>
+
+<pre><code>'At the top.
+Dim italicized As Range
+</code></pre>
+
+<p>Then when you identify a cell that needs to be formatted, you can do this...</p>
+
+<pre><code>If .Value = vbNullString Then
+    .Value = Worksheets("Cycle").Cells(poste.Row, 1).Value
+    If italicized Is Nothing Then
+        Set italicized = targetCell
+    Else
+        Application.Union italicized, targetCell
+    End If
+End If    
+</code></pre>
+
+<p>...and format the whole mess in one shot:</p>
+
+<pre><code>'At the very bottom.
+italicized.Font.Italic = True
+</code></pre>
+
+<hr>
+
+<p>Finally, now that you've converted your A1 addressing to Row\Column, it becomes fairly trivial to switch to array processing as opposed to setting values of individual cells.  Give the current length of the answer, I'll leave that as an exercise for the reader (or another reviewer).  Even <em>without</em> array processing, the suggestions noted above should be a huge performance win - that would just be icing on the cake...</p>
+    </div>

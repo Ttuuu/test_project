@@ -1,0 +1,118 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The co-occurrence of <code>Value</code> and <code>value</code> in the same methods is irritating and likely to lead to bugs: I would rename <code>value</code> to <code>query</code> or something like that (and shall call <code>value</code> by <code>query</code> for the rest of this answer in the interests of not making any mistakes myself).</p>
+
+<hr>
+
+<p>I was initially dubious of Flater's suggestion that creating the <code>SwitchCase</code> objects would be a problem given all the predicates flying around, so I looked at the memory characteristics of his example loop (only with a few more zeros on the end), and saw that I was completely wrong:</p>
+
+<p><a href="https://i.stack.imgur.com/gjlDt.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/gjlDt.png" alt="enter image description here"></a></p>
+
+<p>Note all the predicates and boxed <code>int</code>s (always a bad sign). All those predicates are not the ones the caller wrote: those are predicates created by the <code>Case(T, ...)</code> methods, and all the <code>Int32</code>s are integers being boxed so they can be cast as <code>IEquatable&lt;int&gt;</code>. If you change Flater's code to one which only uses the <code>Case(Predicate&lt;T&gt;, ...)</code> overload, everything disappears with the exception of the <code>SwitchCase</code>s (the caller's predicates are reused), and as Flater says, you can remove those too by caching and improve the method memory characteristics dramatically.</p>
+
+<hr>
+
+<p>Now to diverge from the code itself... there may be little point in your <code>if (Value is IEquatable&lt;T&gt;)</code> condition, since the <code>EqualityComparer</code> will do that for you. The only thing it gives you, is that it will use <code>T</code>'s implementation of <code>IEquatable&lt;T&gt;</code> by default rather than <code>query</code>'s: this sort of thing needs to carefully documented, because it could cause someone down the line no-end of confusion when they try to 'override' the comparison by implementing <code>IEquatable&lt;T&gt;</code> in a super-class of <code>T</code>, only to have it ignored. This feels the wrong way round to me; however, personally I wouldn't do the check for either, and would solely depend on the <code>EqualityComparer</code> (and maybe a comparer passed to the constructor). If I did want to use <code>query</code>'s implementation, then I probably ought to know either that it has an implementation to use (and when it will be used), in which case the caller can decide if they want to use it or not. I'd rather provide a performant version with statically determinable behaviour:</p>
+
+
+
+<pre class="lang-cs prettyprint-override"><code>public ISwitchCase&lt;T&gt; Case&lt;S&gt;(S query, Action action) where S : IEquatable&lt;T&gt;
+{
+    if (query.Equals(Value))
+    {
+        action();
+        return EmptySwitchCase&lt;T&gt;.Instance;
+    }
+
+    return this;
+}
+</code></pre>
+
+<p>Such a method also has the advantage of being efficient when handling <code>structs</code>, as it doesn't involve any boxing. I've also in-lined the conditional logic, because it avoids the allocation of the <code>Predicate&lt;T&gt;</code> and its body (which can't be reused).</p>
+
+<p>This doesn't solve the boxing <code>int</code> problem in Flater's example, because the <code>Case(T, etc.)</code> overloads are better, but if you replace those with these, you can prevent any repetitive allocations occurring when these methods are called.</p>
+
+<pre class="lang-cs prettyprint-override"><code>/// &lt;summary&gt;
+/// Compares the query and internal value using the DefaultEqualityComparer, and invokes the given action if they match
+/// &lt;/summary&gt;
+public ISwitchCase&lt;T&gt; Case(T query, Action action)
+{
+    return Case(query, EqualityComparer&lt;T&gt;.Default, action);
+}
+
+/// &lt;summary&gt;
+/// Compares the query and internal value using the given comparer, and invokes the given action if they match
+/// &lt;/summary&gt;
+public ISwitchCase&lt;T&gt; Case(T query, IEqualityComparer&lt;T&gt; comparer, Action action)
+{
+    if (comparer.Equals(Value, query))
+    {
+        action();
+        return EmptySwitchCase&lt;T&gt;.Instance;
+    }
+
+    return this;
+}
+</code></pre>
+
+<p>Obviously it's your decision what your API does, and it is important to stress that the behaviour is different like this, but that the behaviour was unclear before. With the added inline documentation, the new behaviour is clear and completely transparent at compile time. The difference is that that a value which provides an alternative implementation of <code>IEquatable&lt;T&gt;</code> will only be compared using this implementation if it is not a <code>T</code> and it can be determined at compile time that it is <code>IEquatable&lt;T&gt;</code>. I'd make a case for this behaviour being more 'intuitive', because it become equivalent to using a predicate of the form <code>v =&gt; query.Equals(v)</code> when <code>query</code> is not of type <code>T</code>. Without a <code>: T</code> constraint, this means that stuff which is comparable to <code>T</code> without necessarily being a <code>T</code> can also be used, which may or may nor be desirable.</p>
+
+<hr>
+
+<p>Naturally, it is not nice having many methods implementing the <code>if (predicate(Value))</code> logic, so I'd be inclined to put this login in a simple <code>private ISwitchCase&lt;T&gt; Case(bool condition, Action action)</code>, essentially replacing your current <code>Case(Predicate&lt;T&gt;, etc.)</code> in this role. If you want to keep the dynamic <code>IEquatable&lt;T&gt;</code> behaviour, then you can still rid yourself of all the anonymous methods by using such a method instead of deferring everything to <code>Case(Predicate&lt;T&gt;, etc.)</code>. For example:</p>
+
+<pre class="lang-cs prettyprint-override"><code>/// &lt;summary&gt;
+/// Compares the query with the internal value, first trying to use implementation of `IEquatable&amp;lt;t&amp;gt;` provided by the internal value, then that provided by the query, falling back to the DefaultComparer otherwise
+/// &lt;/summary&gt;
+public ISwitchCase&lt;T&gt; Case(T query, Action action)
+{
+    if (Value is IEquatable&lt;T&gt;)
+        return Case(((IEquatable&lt;T&gt;)Value).Equals(query), action);
+
+    if (query is IEquatable&lt;T&gt;)
+        return Case(((IEquatable&lt;T&gt;)query).Equals(Value), action);
+
+    return Case(query, EqualityComparer&lt;T&gt;.Default, action);
+}
+
+/// &lt;summary&gt;
+/// Compares the query and internal value using the given comparer, and calls the given action if they match
+/// &lt;/summary&gt;
+public ISwitchCase&lt;T&gt; Case(T query, IEqualityComparer&lt;T&gt; comparer, Action action)
+{
+        return Case(comparer.Equals(Value, query), action);
+}
+
+/// &lt;summary&gt;
+/// Invokes the given action if the condition is true
+/// &lt;/summary&gt;
+private ISwitchCase&lt;T&gt; Case(bool condition, Action action)
+{
+    if (condition)
+    {
+        action();
+        return EmptySwitchCase&lt;T&gt;.Instance;
+    }
+
+    return this;
+}
+</code></pre>
+
+<p>Or, more tidily (using pattern matching):</p>
+
+<pre class="lang-cs prettyprint-override"><code>/// &lt;summary&gt;
+/// Compares the query with the internal value, first trying to use implementation of `IEquatable&amp;lt;t&amp;gt;` provided by the internal value, then that provided by the query, falling back to the DefaultComparer otherwise
+/// &lt;/summary&gt;
+public ISwitchCase&lt;T&gt; Case(T query, Action action)
+{
+    if (Value is IEquatable&lt;T&gt; v)
+        return Case(v.Equals(query), action);
+
+    if (query is IEquatable&lt;T&gt; q)
+        return Case(q.Equals(Value), action);
+
+    return Case(query, EqualityComparer&lt;T&gt;.Default, action);
+}
+</code></pre>
+
+<p>Note the inline documentation, which should appear on the <code>interface</code>.</p>
+    </div>

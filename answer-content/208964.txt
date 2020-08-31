@@ -1,0 +1,218 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Memory management</h1>
+
+<p>There are no leaks, which is great!</p>
+
+<p>However, there is an unnecessary copy being made:</p>
+
+<pre><code>//I think keeping the assignment and declaration of addend in 
+// multiple lines prevents copy constructors, right?
+std::string addend;
+addend = a.size() &gt; b.size() ? b:a;
+</code></pre>
+
+<p>Well, the comment is correct in that the copy constructor doesn't get called, but the copy assignment operator - and that one not only creates a copy of the right hand side operand, but also needs to clean up the original state.</p>
+
+<p>A better way would be to use a reference instead:</p>
+
+<pre><code>const std::string &amp;addend = a.size() &gt; b.size() ? b : a;
+</code></pre>
+
+<p>Now, no copy is being made, but you can still easily access the smaller operand.</p>
+
+<h1>Performance</h1>
+
+<p>The simplest way to improve performance would be to chose better data structures/data representations.</p>
+
+<p>The current implementation with <code>std::string</code> has one slight advantage (it is a string, i.e. directly human readable), and some disadvantages:</p>
+
+<ul>
+<li>It wastes a lot of memory (1 byte per decimal digit = 25.6x more memory usage than necessary).</li>
+<li>It operates in really small steps (1 byte at a time).</li>
+<li>There are some unnecessarily complicated repeated checks.</li>
+<li>Inserting a new leading digit (because of carryover) requires all digits to be moved in memory, plus a likely reallocation.</li>
+</ul>
+
+<p>For better performance, these issues should be addressed.</p>
+
+<blockquote>
+  <p>NOTE: For the best performance, you need to have a look at how the target processor works and understand how you can apply that knowledge to your advantage. That will likely include having to use embedded assembly (e.g. for x86 platforms, having access to the CPU carry flag can be really helpful) and similar tricks.</p>
+  
+  <p>But this question is targeting C++, so I'll try to give an example that can be portably done within C++ with not too much overhead.</p>
+</blockquote>
+
+<p>So, we need to address the issues mentioned above. Let's go through them one at a time:</p>
+
+<ul>
+<li><blockquote>
+  <p>Inserting a new leading digit (because of carryover) requires all digits to be moved in memory, plus a likely reallocation.</p>
+</blockquote>
+
+<p>This can be amended by storing the digits in reverse order (new digit gets inserted at the back instead of the front) and by switching to a <code>std::vector</code> for storage (with maybe some extra capacity to prevent the reallocation).</p>
+
+<pre><code>std::vector&lt;char&gt; BigInt::add(const std::vector&lt;char&gt; &amp;a, const std::vector&lt;char&gt; &amp;b) const
+{
+    // Some helper variables
+    auto min_size = std::min(a.size(), b.size());
+    auto max_size = std::max(a.size(), b.size());
+
+    std::vector&lt;char&gt; result(a.size() &gt; b.size() ? a:b);
+    const std::vector&lt;char&gt; &amp;addend = a.size() &gt; b.size() ? b : a;
+
+    char carry = 0;
+    char adder = 0;
+
+    for(int cnt = 0; cnt &lt; max_size; ++cnt)
+    {
+        adder = result[cnt] - '0' + carry;
+
+        if(cnt &lt; min_size)
+        {
+            adder += addend[cnt] - '0';
+        }
+
+        result[cnt] = adder%10 + '0';
+        carry = adder/10;
+    }
+
+    if(carry)
+    {
+        result.push_back(carry + '0');
+    }
+
+    return result;
+}
+</code></pre>
+
+<p>Already looks a lot cleaner, doesn't it?</p></li>
+<li><blockquote>
+  <p>There are some unnecessarily complicated repeated checks.</p>
+</blockquote>
+
+<p>Some of the complicated length calculations already got taken care of, but there is one part that is needlessly repeated:</p>
+
+<pre><code>        if(cnt &lt; min_size)
+        {
+            adder += addend[cnt] - '0';
+        }
+</code></pre>
+
+<p>Why needlessly? Well, actually we know that this condition will be <code>true</code> for the first <code>min_size</code> iterations of the <code>for</code> loop, and <code>false</code> afterwards. With that knowledge, we can move that check one level higher, and replace the <code>for</code> loop with:</p>
+
+<pre><code>    for(int cnt = 0; cnt &lt; min_size; ++cnt)
+    {
+        adder = (result[cnt] - '0') + carry + (addend[cnt] - '0');
+        result[cnt] = adder%10 + '0';
+        carry = adder/10;
+    }
+
+    for(int cnt = min_size; carry &amp;&amp; cnt &lt; max_size; ++cnt)
+    {
+        adder = result[cnt] - '0' + carry;
+        result[cnt] = adder%10 + '0';
+        carry = adder/10;
+    }
+</code></pre>
+
+<p>Of course, now the loop bodies are nearly identical, but that can easily be fixed with some refactoring. Full code:</p>
+
+<pre><code>std::vector&lt;char&gt; BigInt::add(const std::vector&lt;char&gt; &amp;a, const std::vector&lt;char&gt; &amp;b) const
+{
+    // Some helper variables
+    auto min_size = std::min(a.size(), b.size());
+    auto max_size = std::max(a.size(), b.size());
+
+    std::vector&lt;char&gt; result(a.size() &gt; b.size() ? a:b);
+    const std::vector&lt;char&gt; &amp;addend = a.size() &gt; b.size() ? b : a;
+
+    char carry = 0;
+
+    auto add_digits = [&amp;](char lhs, char rhs)
+    {
+        auto adder = lhs + rhs + carry;
+        carry = adder / 10;
+        return adder % 10;
+    };
+
+    for(int cnt = 0; cnt &lt; min_size; ++cnt)
+    {
+        result[cnt] = add_digits(result[cnt] - '0', addend[cnt] - '0') + '0';
+    }
+
+    for(int cnt = min_size; carry &amp;&amp; cnt &lt; max_size; ++cnt)
+    {
+        result[cnt] = add_digits(result[cnt] - '0', 0) + '0';
+    }
+
+    if(carry)
+    {
+        result.push_back(carry + '0');
+    }
+
+    return result;
+}
+</code></pre></li>
+<li><blockquote>
+  <p>It wastes a lot of memory (1 byte per decimal digit = 25.6x more memory usage than necessary).</p>
+  
+  <p>It operates in really small steps (1 byte at a time).</p>
+</blockquote>
+
+<p>Fixing this requires an increase in the digit "size": Before, we were using base-10 digits stored in <code>char</code>s. This can easily be improved to base-256 digits stored in chars (assuming 8 bit <code>char</code>, could be larger!).</p>
+
+<p>But that's basically just calculating on the <code>char</code>s themselves. Most processors can work directly with bigger numbers, like <code>int</code>s (which are usually the largest integer type the target CPU can handle natively). So, why not use <code>int</code>s as "digits"?</p>
+
+<blockquote>
+  <p>Sadly, <code>int</code>s aren't exactly portable themselves; signed integers can be handled very differently on different processors (e.g. one's complement or two's complement). But: Unsigned intergers are thoroughly specified by the C++ standard, so we can use those.</p>
+</blockquote>
+
+<p>Also, we can instruct the <code>result</code> vector to preallocate space in case we need space for a new leading digit.</p>
+
+<p>This can easily be added upon the code above for this:</p>
+
+<pre><code>bool check_overflow(unsigned int lhs, unsigned int rhs)
+{
+    return lhs &gt; std::numeric_limits&lt;unsigned int&gt;::max() - rhs;
+}
+
+std::vector&lt;unsigned int&gt; BigInt::add(const std::vector&lt;unsigned int&gt;&amp; a, const std::vector&lt;unsigned int&gt;&amp; b) const
+{
+    auto min_size = std::min(a.size(), b.size());
+    auto max_size = std::max(a.size(), b.size());
+
+    auto result = std::vector&lt;unsigned int&gt;();
+    result.reserve(max_size + 1);
+
+    const auto&amp; larger = (a.size() &gt; b.size() ? a : b);
+    const auto&amp; smaller = (a.size() &gt; b.size() ? b : a);
+
+    auto carry = 0u;
+
+    auto add_digit = [&amp;](unsigned int lhs, unsigned int rhs)
+    {
+        auto sum = lhs + rhs + carry;
+        carry = (check_overflow(lhs, rhs) || (sum == 0 &amp;&amp; carry)) ? 1 : 0;
+        return sum;
+    };
+
+    for(auto i = 0; i &lt; min_size; ++i)
+    {
+        result.push_back(add_digit(larger[i], smaller[i]));
+    }
+
+    for(auto i = min_size; i &lt; max_size; ++i)
+    {
+        result.push_back(add_digit(larger[i], 0));
+    }
+
+    if(carry) result.push_back(carry);
+
+    return result;
+}
+</code></pre></li>
+</ul>
+
+<blockquote>
+  <p>Of course, this isn't perfect performance yet, much can be improved by using knowledge about the target architecture, e.g. by using SSE instructions or similar. Still, this should be quite a lot faster than the original approach, and should be fully portable between different platforms.</p>
+</blockquote>
+    </div>

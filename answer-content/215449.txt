@@ -1,0 +1,251 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Full code</h2>
+
+<pre class="lang-golang prettyprint-override"><code>import (...)
+</code></pre>
+
+<p>Please include your full code next time. This should instead be:</p>
+
+<pre><code>import (
+    "database/sql"
+    "errors"
+    "fmt"
+    "io/ioutil"
+    "log"
+    "net/http"
+    "os"
+    "path/filepath"
+    "sync"
+    "time"
+)
+</code></pre>
+
+<p>You also have <code>item.toString()</code>, but this is nowhere defined. I changed it to:</p>
+
+<pre><code>fmt.Println(item)
+</code></pre>
+
+<h2>Scope</h2>
+
+<p><code>connectionString</code> doesn't need to be in the global scope, whether it's <code>const</code> or not. The same could be argued about <code>wg</code>, <code>ch</code>, and <code>errItems</code> -- but moving those to a lower scope would involve adding more function arguments, which is a choice you can make.</p>
+
+<p>In terms of security, I recommend against hard-coding the connection string in the source code. Instead, as one of many options, you can have the connection credentials as a separate file that you read.</p>
+
+<h2>Simplify query</h2>
+
+<p>You use named arguments in your query. But here, the query is so short that it's clear from the context. You can split the query across multiple lines to make it easier to read. You also have some keywords in all uppercase and some in all lowercase.</p>
+
+<pre><code>q := `
+SELECT [ImageID],
+       [AccommodationlID],
+       [Link],
+       [FileName]
+FROM [dbo]. [AccomodationImage]
+WHERE AccommodationlID BETWEEN ? AND ?
+      AND FileName NOT LIKE '%NoHotel.png%'`
+
+rows, err := db.Query(q, from, to)
+</code></pre>
+
+<p>(Notice that you also have a misspelling in <code>AccomodationImage</code>.)</p>
+
+<p>This kind of formatting for query strings is also how the Go documentation does it.</p>
+
+<h2>Vertical spacing</h2>
+
+<p>All of the code is compressed together and has no room to breathe. I recommend adding the occasional empty lines, such as between <code>if</code>-statements, <code>for</code> loops, goroutines, etc.</p>
+
+<h2>Validate <code>os.Args</code></h2>
+
+<p>Your code assumes the program will always have three arguments. While this makes sense if only you plan to use it, it's generally not good practice.</p>
+
+<p>Without bounds checking, you will get a runtime panic "index out of range" -- no a particularly useful message for those running the program.</p>
+
+<pre><code>if len(os.Args) &lt; 4 {
+    log.Fatal("missing arguments")
+}
+</code></pre>
+
+<p>You can also use <a href="https://golang.org/ref/spec#Short_variable_declarations" rel="nofollow noreferrer">short variable declaration</a> when declaring <code>basePath</code>, <code>from,</code> and <code>to</code>.</p>
+
+<pre><code>basePath := os.Args[1]
+from, to := os.Args[2], os.Args[3]
+</code></pre>
+
+<h2>Default values</h2>
+
+<pre><code>var item = item{}
+</code></pre>
+
+<p>This is redundant. You should be able to simply use <code>var item</code> -- please correct my if I'm wrong here and <code>Rows.Scan()</code> produces an error if <code>item</code> is <code>nil</code>. Since we do not need to initialize <code>item</code>, we can combine our declarations. Notice I rename the variable <code>item</code> to avoid confusion with the type <code>item</code>.</p>
+
+<pre><code>var (
+    i     item
+    accID string
+    name  string
+)
+</code></pre>
+
+<h2>Conclusion</h2>
+
+<p>Here's the code I ended up with:</p>
+
+<pre><code>package main
+
+import (
+    "database/sql"
+    "errors"
+    "fmt"
+    "io/ioutil"
+    "log"
+    "net/http"
+    "os"
+    "path/filepath"
+    "sync"
+    "time"
+)
+
+type item struct {
+    id      int
+    url     string
+    path    string
+    content []byte
+    err     error
+}
+
+var wg sync.WaitGroup
+var ch = make(chan *item)       // For success items
+var errItems = make(chan *item) // For error items
+
+func main() {
+    const connectionString = "connectionString"
+
+    if len(os.Args) &lt; 4 {
+        log.Fatal("missing arguments")
+    }
+
+    start := time.Now()
+
+    basePath := os.Args[1]
+    from, to := os.Args[2], os.Args[3]
+
+    db, err := sql.Open("sqlserver", connectionString)
+
+    if err != nil {
+        log.Fatal(err.Error())
+    }
+
+    q := `
+SELECT [ImageID],
+       [AccommodationlID],
+       [Link],
+       [FileName]
+FROM [dbo]. [AccomodationImage]
+WHERE AccommodationlID BETWEEN ? AND ?
+      AND FileName NOT LIKE '%NoHotel.png%'`
+
+    rows, err := db.Query(q, from, to)
+
+    if err != nil {
+        log.Fatal(err.Error())
+    }
+
+    defer db.Close()
+
+    for rows.Next() {
+        var (
+            i     item
+            accID string
+            name  string
+        )
+
+        _ = rows.Scan(&amp;i.id, &amp;accID, &amp;i.url, &amp;name)
+
+        i.path = fmt.Sprintf("%s\\%s\\%s", basePath, accID, name)
+
+        wg.Add(1)
+
+        go downloadFile(&amp;i)
+
+        go func() {
+            select {
+            case done := &lt;-ch:
+                wg.Add(1)
+                go saveAndUpdateFile(db, done)
+            case errorItem := &lt;-errItems:
+                wg.Add(1)
+                go printResult(errorItem)
+            }
+        }()
+    }
+
+    wg.Wait()
+
+    fmt.Printf("%.2fs elapsed\n", time.Since(start).Seconds())
+}
+
+func downloadFile(i *item) {
+    defer wg.Done()
+
+    resp, err := http.Get(i.url)
+
+    if err != nil {
+        i.content, i.err = nil, err
+    } else if resp.StatusCode != http.StatusOK {
+        i.content, i.err = nil, errors.New(resp.Status)
+    } else {
+        i.content, i.err = ioutil.ReadAll(resp.Body)
+    }
+
+    if i.err != nil {
+        errItems &lt;- i
+    } else {
+        ch &lt;- i
+    }
+}
+
+func saveAndUpdateFile(db *sql.DB, i *item) {
+    defer wg.Done()
+
+    if i.content == nil {
+        i.err = errors.New("Content is empty.")
+    } else {
+        dir := filepath.Dir(i.path)
+        err := os.MkdirAll(dir, os.ModePerm)
+
+        if err != nil {
+            i.err = err
+        } else {
+            i.err = ioutil.WriteFile(i.path, i.content, 0644)
+        }
+    }
+
+    q := `
+UPDATE [dbo].[AccomodationImage]
+SET    IsRead = 1
+WHERE  ImageID = ?`
+
+    if i.err == nil {
+        result, err := db.Exec(q, i.id)
+
+        if rows, _ := result.RowsAffected(); rows &lt;= 0 || err != nil {
+            i.err = errors.New("Update status failed.")
+        }
+    }
+
+    if i.err != nil {
+        errItems &lt;- i
+    }
+}
+
+func printResult(i *item) {
+    defer wg.Done()
+
+    fmt.Println(i)
+}
+</code></pre>
+
+<p>Unfortunately I cannot test this code and suggest algorithmic or more in-depth changes.</p>
+
+<p>Hope this helps!</p>
+    </div>

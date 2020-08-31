@@ -1,0 +1,50 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>Overall Organization</h3>
+<p>It seems to me, that <code>haystack_search</code> is really at least three fundamentally different kinds of things, all rolled into one.</p>
+<p>One is the logic for doing the search. That probably should be in this class.
+The second is a thread pool manager. That should be separate.
+The third is at least one (and maybe a couple) of thread-safe collections.</p>
+<h3>Thread safe collection</h3>
+<p>I would start by separating "requests" into a separate thread-safe queue (or stack--I didn't check how you use it). A really simple version might look something like this:</p>
+<pre><code>namespace sync {
+    template &lt;class T&gt;
+    class stack {
+       std::list&lt;T&gt; items;
+       std::mutex mtx;
+    public:
+        push(T const &amp;t) { 
+            std::lock_guard&lt;T&gt; L(mtx);
+            items.push_back(t); 
+        }
+
+        bool pop(T &amp;t) { 
+            std::lock_guard&lt;T&gt; L(mtx);
+            if (items.empty())
+                return false; 
+            t = items.pop(); 
+            items.pop_back(); 
+            return true;
+        }
+    };
+}
+</code></pre>
+<p>Then the searching code doesn't need to mess with locking to access the queue/stack.</p>
+<p>Side note: chances are that with some testing, you'll find that <code>std::list</code> is a poor choice here. For a queue you usually want <code>std::deque</code>. For a stack, either <code>std::deque</code> or <code>std::vector</code> usually works quite nicely.</p>
+<h3>Thread Pool</h3>
+<p>The thread pool class should normally be (mostly) agnostic to the kind of task the threads are being asked to execute. In fact, it should normally be possible (and easy) to push several different kind of tasks into the thread pool simultaneously. A thread then basically just grabs a task from its input, executes the task, and repeats (along with a few bits and pieces like exiting at the right times and such). The thread pool manager is responsible for things like starting up threads, shutting down threads, and so on.</p>
+<h3>Unlocking</h3>
+<p>Anytime I see a lock_guard/unique_lock <em>and</em> an explicit unlock, I start to get worried. Unlocking should <em>normally</em> be handled automatically via RAII. That's the whole point of using a lock_guard/unique_lock in the first place. Sometimes you add a scope just for this, so something like this:</p>
+<pre><code>        std::unique_lock&lt;std::mutex&gt; req_lock(requests_mutex);
+            requests.push_back({hay,index});
+        req_lock.unlock();
+</code></pre>
+<p>...becomes more like this instead:</p>
+<pre><code>{
+    std::unique_lock&lt;std::mutex&gt; req_lock(requests_mutex);
+    requests.push_back({hay, index});
+}
+</code></pre>
+<p>This <em>particular</em> one is handled by the previous suggestion to create a thread safe queue/stack, but there are still some that can be cleaned up this way.</p>
+<h3>Killing Threads</h3>
+<p>In my experience, when you want to kill threads, it's often easier and cleaner to just push some "tasks" that basically tell each thread to kill itself. In most cases, individual tasks should be small enough that it's all right to let a thread just finish a task once it's started it. In most cases this improves speed quite a bit--once it starts executing a task, the thread doesn't have to do any locking, access atomic variables, etc. It just executes the task until it's done.</p>
+    </div>

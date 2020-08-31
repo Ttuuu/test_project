@@ -1,0 +1,61 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I would first start by saying that such a class is <a href="https://devblogs.microsoft.com/pfxteam/should-i-expose-asynchronous-wrappers-for-synchronous-methods/" rel="nofollow noreferrer">generally regarded as a bad practice</a> because it doesn't achieve what's supposed to do, or simply there are better ways of doing it.</p>
+
+<p>But let's go to the actual code, in the <code>ConnectAsync</code> method.</p>
+
+<blockquote>
+<pre><code>var connectionTask = Task.Run(() =&gt;
+{
+    try
+    {
+        var _loader = new DatabaseDriverLoader();
+        DatabaseDriver _driver = _loader.Connect(connectionString, login, password);
+    }
+    catch (Exception e) { }
+});
+</code></pre>
+</blockquote>
+
+<p>Here you delegate the connection to the main class and initialize the <code>_driver</code> field. The first problem is that, since it's wrapped in a <code>Task</code>, it uses a separate thread and that new thread is the blocked one instead of the calling one. In a desktop program, it can be  a good thing (since it keeps the UI thread free to handle the UI), but in a web site you free the original thread and stall another one, which is what you want to avoid with an async method.</p>
+
+<p>Even worse, the empty <code>catch</code> block will swallow any exceptions, so you won't get any clue why a connection fails if that happens.</p>
+
+<p>The next part also has its problems:</p>
+
+<blockquote>
+<pre><code>await Task.Run(async () =&gt;
+{
+    while(!connectionTask.IsCompleted &amp;&amp; !cancellationToken.IsCancellationRequested)
+    {
+        await Task.Delay(100);
+    }
+});
+</code></pre>
+</blockquote>
+
+<p>This employs a second thread and loops until the first one finishes or the cancellation is requested. While it sounds neat in principle, it actually ends up using double the resources it should for the ability to "cancel" the connection (more on that latter), which is far suboptimal. Callers expect NO threads consumed when you see an async DB connection, but instead this code stalls 2 of them.</p>
+
+<h2>What to do instead?</h2>
+
+<p>In short, leave the decision to the caller! This class introduced some side effects that callers normally don't expect. In web pages, it consumes far more resources than necesary, and in desktop programs it can be simply invoked via <code>Task.Run</code> method directly, instead of wrapping in a class, if keeping the UI responsive is desired. This removes the need for this class, using the provided driver directly.</p>
+
+<h2>About your other points</h2>
+
+<blockquote>
+  <p>Be able to connect asynchronously (not waiting for actual connection)</p>
+</blockquote>
+
+<p>It clearly does that, but I would simply use the first chunk of code (awaiting for it) directly, and remove the need for this, because of unwanted side effects.</p>
+
+<blockquote>
+  <p>Be able to cancel the connection if I need to</p>
+</blockquote>
+
+<p>Here is the bigger catch. It does <strong>NOT</strong> cancel the connection at all!  When the cancellation token is triggered, the loop is interrupted, but the first thread is left running, and its result is ignored. This means that if the connection succeeds, you have a floating connection that won't be disposed of properly, and the involved resources will still be consumed. The only practical effect of cancellation is the early return.</p>
+
+<blockquote>
+  <p>Maybe Connect method should return successful Task when connection occurs?</p>
+</blockquote>
+
+<p>Yes, that's a good practice. I don't see a particular use for an event here (not that it's a bad thing to have one, but it serves little purpose). Most important, in its current form, the code <em>does</em> return a task and completes it on sucessful connection, and that's what you use in your "demo" code in fact. That's a good thing.</p>
+    </div>

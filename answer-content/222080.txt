@@ -1,0 +1,139 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I think, I would change <code>AccountState</code> to the following:</p>
+
+<pre><code>type AccountStatus =
+    | Uninitialized
+    | Opened
+    | Closed
+</code></pre>
+
+<p>In this way you have the full life cycle of an account and you then can avoid <code>Some/None</code> for the account status</p>
+
+<hr>
+
+<p>The <code>AccountState</code> could then be changed to:</p>
+
+<pre><code>type AccountState = {
+    Id: Guid
+    Status: AccountStatus
+    AuditInvalidations: string list
+    Contact: Contact
+    Balance: decimal
+    Created: DateTimeOffset option
+    Updated: DateTimeOffset option
+    NewAddressRequested: Address option
+    NewPhoneNumberRequested: PhoneNumber option
+    NewEmailRequested: string option
+   }
+</code></pre>
+
+<p>Where <code>option</code> is removed from fields that IMO shouldn't be optional: An Account without an <code>Id</code> or a <code>Contact</code> seems rather scary to me and the <code>Balance</code> has always a value (that may be <code>0.0m</code>), and with the <code>AccountStatus.Uninitialized</code>, <code>Status</code> can also always have a value.</p>
+
+<hr>
+
+<p>In <code>updateAccountState</code> you can consider to evaluate the <code>Id</code> at the first match level in order to get rid of repetitive checks of it. Below is the first two matches as examples:</p>
+
+<pre><code>let updateAccountState (state : AccountState) (event : Event)=
+    match event with
+    | AccountOpened account -&gt;
+        match account.AccountId with
+        | id when id = state.Id -&gt;
+            match state.Status with
+            | AccountStatus.Opened -&gt;
+                let message = "The account cannot be opened cause it is already opened."
+                { state with AuditInvalidations = message :: state.AuditInvalidations }
+            | AccountStatus.Closed -&gt;
+                let message = "The account cannot be opened cause it is closed."
+                { state with AuditInvalidations = message :: state.AuditInvalidations }
+            | AccountStatus.Uninitialized -&gt;
+                { state with
+                    Contact = account.Contact
+                    Status = AccountStatus.Opened
+                    Balance = 0m
+                    Created = Some account.Timestamp
+                    Updated = Some account.Timestamp
+                    Id = account.AccountId
+                }
+        | _ -&gt; 
+            let message = "The account cannot be opened cause the account id does not match this account."
+            { state with AuditInvalidations = message :: state.AuditInvalidations }
+    | AccountClosed account -&gt;
+        match account.AccountId with
+        | id when id = state.Id -&gt;
+            match state.Status with
+            | AccountStatus.Opened -&gt;
+                { state with
+                    Status = AccountStatus.Closed
+                    Updated = Some account.Timestamp
+                }
+            | AccountStatus.Closed -&gt;
+                let message = "The account cannot be closed cause it is already closed."
+                { state with AuditInvalidations = message :: state.AuditInvalidations }
+            | AccountStatus.Uninitialized -&gt;
+                let message = "The account cannot be closed cause it is not yet created."
+                { state with AuditInvalidations = message :: state.AuditInvalidations }
+        | _ -&gt;
+            let message = "The account cannot be closed cause the account id does not match this account."
+            { state with AuditInvalidations = message :: state.AuditInvalidations }
+</code></pre>
+
+<p>This is IMO more clear and easy to follow.</p>
+
+<hr>
+
+<p><strong>Update</strong></p>
+
+<p>All your <code>AccountXXXEvent</code> events have <code>AccountId</code> and <code>Timestamp</code> in common, so these properties could be placed on <code>Event</code> and then <code>AccountXXXEvent</code> could be discriminated unions as well:</p>
+
+<pre><code>type AccountEvent =
+    | AccountOpenedEvent of Contact: Contact
+    | AccountClosedEvent of Reason: string
+    | AccountCreditEvent of Amount:decimal * Description:string
+    | etc...
+</code></pre>
+
+<p><code>Event</code> could then look like:</p>
+
+<pre><code>type Event = Event of Id:Guid * Timestamp:DateTimeOffset * AccountEvent:AccountEvent
+</code></pre>
+
+<p>and finally <code>updateAccountState</code> as:</p>
+
+<pre><code>let updateAccountState (state : AccountState) (event : Event) =
+    match event with
+    | Event(id, timestamp, accountEvent) -&gt;
+        match id with
+        | stateId when stateId = state.Id -&gt;
+            match accountEvent with
+            | AccountOpenedEvent contact -&gt;
+                match state.Status with
+                | AccountStatus.Opened -&gt; invalidate state "The account cannot be opened cause it is already opened."
+                | AccountStatus.Closed -&gt; invalidate state "The account cannot be opened cause it is closed."
+                | AccountStatus.Uninitialized -&gt;
+                    { state with
+                        Contact = contact
+                        Status = AccountStatus.Opened
+                        Balance = 0m
+                        Created = Some timestamp
+                        Updated = Some timestamp
+                        Id = id
+                    }
+            | AccountClosedEvent reason -&gt; 
+                match state.Status with
+                | AccountStatus.Opened -&gt;
+                    { state with
+                        Status = AccountStatus.Closed
+                        Updated = Some timestamp
+                    }
+                | AccountStatus.Closed -&gt; invalidate state "The account cannot be closed cause it is already closed."
+                | AccountStatus.Uninitialized -&gt; invalidate state "The account cannot be closed cause it is not yet created."
+            | // TODO all the other events
+        | _ -&gt; 
+            invalidate state "The transaction can not be fulfilled because the ids don't match." 
+</code></pre>
+
+<p>where <code>invalidate</code> is defined as:</p>
+
+<pre><code>let invalidate state message = { state with AuditInvalidations = message :: state.AuditInvalidations }
+</code></pre>
+    </div>

@@ -1,0 +1,271 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>When approaching object oriented programming, I always try to adhere to a few best practices:</p>
+
+<ol>
+<li>Do one thing, and do it well</li>
+<li>Don't Repeat Yourself (DRY)</li>
+<li>Favor composition over inheritance</li>
+</ol>
+
+<p>There are many more, but I've found these three practices to be the most useful in creating modular code. That being said, let's explore how your class compares.</p>
+
+<h2>Do one thing and do it well</h2>
+
+<p>Your User class is doing many things:</p>
+
+<ol>
+<li>It is the <a href="http://en.wikipedia.org/wiki/Domain_model" rel="noreferrer">Domain Model</a> representing a User in the database along with some business logic (hashing the password)</li>
+<li>It is getting data from the <code>$_POST</code>, coupling this class to the HTTP request layer of your application.</li>
+<li>It is <code>echo</code>-ing a success flag, coupling this call to the standard output in PHP. Furthermore, if something goes wrong on insert, you can't handle that error. You should be throwing exceptions here instead. See <a href="https://codereview.stackexchange.com/questions/63049/returning-status-codes-from-business-layer/63052#63052">Returning status codes from business layer</a> for additional info</li>
+<li>It is inserting data into the database.
+
+<ol>
+<li>Worse yet, you appear to have a SQL injection vulnerability since you are using double quotes and variable interpretation in PHP (see <a href="http://xkcd.com/327/" rel="noreferrer">Little Bobby Tables</a> for a humorous explanation). You want <a href="http://php.net/manual/en/mysqli.quickstart.prepared-statements.php" rel="noreferrer">MYSQL Prepared Statements</a>.</li>
+</ol></li>
+</ol>
+
+<h2>Don't Repeat Yourself</h2>
+
+<p>While no code is repeated inside this class, because it is doing multiple jobs it becomes difficult to reuse the code, which could lead to repetitive code later on.</p>
+
+<h2>Favor Composition over Inheritance</h2>
+
+<p>Your class doesn't inherit from anything, which is good. It doesn't really need to inherit from a super class. Composition (e.g. holding references to other objects specializing in a different but related task) won't help you here either because about 4 layers of an application have been mashed together into one class.</p>
+
+<h2>Splitting your class up into multiple classes</h2>
+
+<p>While this will seem like overkill at first, the following code will lay the ground work for a modular and testable application.</p>
+
+<h3>user.php</h3>
+
+<p>This is your domain model representing the database data. This will also contain methods that implement business logic, for instance, hashing the password. It is both data <em>and</em> behavior.</p>
+
+<pre><code>&lt;?php
+
+class User
+{
+    private const PASSWORD_BCRYPT = "...";
+
+    private $username;
+    private $email;
+    private $password;
+
+    public User()
+    {
+    }
+
+    public User($username, $email, $password)
+    {
+        $this-&gt;set_username($username);
+        $this-&gt;set_email($email);
+        $this-&gt;set_password($password);
+    }
+
+    public function get_username()
+    {
+        return $this-&gt;username;
+    }
+
+    public function set_username($value)
+    {
+        $this-&gt;username = $value;
+    }
+
+    public function get_email()
+    {
+        return $this-&gt;email;
+    }
+
+    public function set_email($value)
+    {
+        $this-&gt;email = $value;
+    }
+
+    public function get_password()
+    {
+        return $this-&gt;password;
+    }
+
+    public function set_password($value)
+    {
+        $this-&gt;password = password_hash($value, User::PASSWORD_BCRYPT);
+    }
+}
+</code></pre>
+
+<h3>users_repository.php</h3>
+
+<p>The "Users Repository" is a class whose sole purpose is to perform CRUD operations on the users table (Create, Read, Update and Delete). It implements an interface that you can use later on as a test harness.</p>
+
+<pre><code>&lt;?php
+
+interface IUsersRepository
+{
+    public function add(User $user);
+}
+
+class UsersRepository implements IUsersRepository
+{
+    private static $connection_string;
+
+    public static function set_connection_string($value)
+    {
+        UsersRepository::$connection_string = $value;
+    }
+
+    private $connection;
+
+    public UsersRepository()
+    {
+        // $connection = new mysqli(...);
+    }
+
+    public function add(User $user)
+    {
+        $statement = $this-&gt;connection-&gt;prepare('INSERT INTO "users" ("id", "username", "email", "password") VALUES (?, ?, ?, ?)');
+        $statement-&gt;bind_param("id", NULL);
+        $statement-&gt;bind_param("username", $user-&gt;get_username());
+        $statement-&gt;bind_param("email", $user-&gt;get_email());
+        $statement-&gt;bind_param("password", $user-&gt;get_password());
+
+        if (!$statement-&gt;execute())
+            throw new Exception("Execute failed: ({$stmt-&gt;errno}) {$stmt-&gt;error}");
+    }
+}
+</code></pre>
+
+<p>If the INSERT into the database fails, an Exception gets thrown. Failing to save data to the database is a hard stop. You really can't go any further, so an exception is the ideal way to communicate this catastrophic error (yes, failed database operations <em>are</em> catastrophic and your application <em>should</em> blow up in your face).</p>
+
+<h3>users_controller.php</h3>
+
+<p>This begins the Poor Man's MVC. The UsersController handles the HTTP request.</p>
+
+<p>Notice that it has two constructors. The first one, which takes no arguments, instantiates <code>UsersRepository</code> as the object responsible for database operations. The second constructor accepts any object implementing the <code>IUsersRepository</code> interface, which is the interface implemented by <code>UsersRepository</code>. We'll use this later on as a test harness so we can write unit tests for this class without a database.</p>
+
+<pre><code>&lt;?php
+
+class UsersController
+{
+    private $repository;
+
+    public UsersController()
+    {
+        $this-&gt;repository = new UsersRepository();
+    }
+
+    public UsersController(IUsersRepository $repository)
+    {
+        $this-&gt;repository = $repository;
+    }
+
+    public function register()
+    {
+        return new User();
+    }
+
+    public function register($params)
+    {
+        if (isset($params['username'])) {
+            $user = new User($params['username'], $params['email'], $params['password']);
+            $this-&gt;repository-&gt;add($user);
+
+            return '/users/index.php';
+        }
+    }
+}
+</code></pre>
+
+<h3>users/create.php</h3>
+
+<p>Lastly, this file, which technically does too much here, is the actual "Create new User" page:</p>
+
+<pre><code>&lt;?php
+
+$controller = new UsersController();
+
+if (isset($_POST))
+{
+    $redirect = $controller-&gt;create($_POST);
+    header($redirect);
+}
+else
+{
+    $user = $controller-&gt;create(); ?&gt;
+
+&lt;!DOCTYPE HTML&gt;
+&lt;html&gt;
+    ...
+    &lt;body&gt;
+        &lt;form method="post" action="./create.php"&gt;
+            &lt;input name="username" type="text" value="&lt;?= $user-&gt;get_username() ?&gt;"&gt;
+            &lt;input name="email" type="text" value="&lt;?= $user-&gt;get_username() ?&gt;"&gt;
+            &lt;input name="password" type="password" value="&lt;?= $user-&gt;get_username() ?&gt;"&gt;
+            &lt;button type="submit"&gt;Submit&lt;/button&gt;
+        &lt;/form&gt;
+    &lt;/body&gt;
+&lt;/html&gt;
+
+&lt;?php } ?&gt;
+</code></pre>
+
+<p>It instantiates a new UsersController. If the <code>$_POST</code> is set, then it passes that array into the <code>$controller-&gt;create</code> method, which performs the actual logic for extracting the user information from the HTTP request and inserting it into the database. Furthermore, it directs the application flow, for instance redirecting the user to another page upon successful insert (which prevents a double-POST of the same information as well).</p>
+
+<p>The UsersController also has a method just called <code>create()</code> which takes no parameters and returns a <code>User</code> object, which gets displayed in the HTML form when the <code>$_POST</code> is not set.</p>
+
+<p>Really, you'd want to take advantage of one of the many fantastic MVC frameworks out there for PHP for the users_controller.php and create.php files, because the MVC application should be responsible for routing an HTTP request to a controller, and then a specific PHP file for the view should provide the web page.</p>
+
+<p>By splitting up your code into layers, you create a modular and testable application:</p>
+
+<ul>
+<li>User - Business logic</li>
+<li>UsersRepository - Data storage and retrieval</li>
+<li>UsersController - Handle application flow</li>
+<li>create.php - a not-so-perfect view</li>
+</ul>
+
+<h3>Testing your code</h3>
+
+<p>Notice that the <code>UsersController</code> has a constructor which accepts an instance of <code>IUsersRepository</code>. This is the interface implemented by <code>UsersRepository</code>. This allows you to write test code that uses a mock or stub user repository instead of going out to a database.</p>
+
+<p>First, create the "mock users repository" class, which implements <code>IUsersRepository</code></p>
+
+<pre><code>&lt;?php
+
+class MockUserRepository implements IUsersRepository
+{
+    public $added_users = array();
+
+    public function add(User $user)
+    {
+        $this-&gt;added_users[] = $user;
+    }
+}
+</code></pre>
+
+<p>Next, create your unit test. In this case, I'm using <a href="https://phpunit.de/" rel="noreferrer">PHPUnit</a>:</p>
+
+<pre><code>&lt;?php
+
+class UsersControllerTest extends PHPUnit_Framework_TestCase
+{
+    public function addsANewUser()
+    {
+        $repository = new MockUserRepository();
+        $controller = new UsersController($repository);
+        $params = array(
+            'username' =&gt; 'testable',
+            'email' =&gt; 'test@example.com',
+            'password' =&gt; 'abc123'
+        );
+
+        $redirect = $controller-&gt;create($params);
+
+        $this-&gt;assertFalse(empty($repository-&gt;added_users)));
+        $this-&gt;assertEquals('testable', $repository-&gt;added_users[0].get_username());
+        $this-&gt;assertEquals('/users/index.php', $redirect);
+    }
+}
+</code></pre>
+
+<p>Now you can verify the behavior of your application in an automated and repetitive way. Covering your with unit tests allows you to refactor code or change business rules later on with confidence that you won't introduce bugs.</p>
+    </div>

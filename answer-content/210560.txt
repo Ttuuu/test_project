@@ -1,0 +1,116 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'll hit the red flags first, and then review the details.</p>
+
+<pre><code>template&lt;typename T&gt;                                                                                                    
+const shr&lt;T&gt; make_shr(T * obj) { return shr&lt;T&gt;(obj); }
+</code></pre>
+
+<p>"Returning by <code>const</code> value" is a red flag. It doesn't do anything except occasionally disable move semantics. So at least we remove the <code>const</code>. But also, where there's one bug there's two. So we probably compare your <code>make_shr&lt;T&gt;(...)</code> to the Standard Library's <code>make_shared&lt;T&gt;(...)</code> and find out that your code does something <em>vastly</em> different. Consider</p>
+
+<pre><code>std::shared_ptr&lt;int&gt; sp = std::make_shared&lt;int&gt;(0);
+assert(sp != nullptr);
+ptr::shr&lt;int&gt; ps = ptr::make_shr&lt;int&gt;(0);
+assert(ps == nullptr);
+</code></pre>
+
+<hr>
+
+<p>Well, actually I don't think <code>ps == nullptr</code> even compiles with your version, because your comparison operators only ever take <code>base&lt;T&gt;</code>, and the implicit conversion from <code>nullptr_t</code> to <code>base&lt;T&gt;</code> is <code>protected</code> so normal code can't use it. You should have a public conversion from <code>std::nullptr_t</code>, and it should express the idea that you don't <em>take ownership of</em> "null"; it's a special state without an owned object.</p>
+
+<hr>
+
+<pre><code>base(T * obj) : obj(obj) {}   
+</code></pre>
+
+<p>Each constructor should be <code>explicit</code> unless your goal is specifically to add an implicit conversion. Make this one <code>explicit</code>.</p>
+
+<hr>
+
+<pre><code>std::ostream &amp; operator &lt;&lt; (std::ostream &amp; stream) { return (std::cout &lt;&lt; obj); }
+</code></pre>
+
+<p>The red flag here is that this operator is completely backwards and broken. What you meant was</p>
+
+<pre><code>friend std::ostream&amp; operator&lt;&lt; (std::ostream&amp; stream, const base&lt;T&gt;&amp; p) {
+    stream &lt;&lt; p.get();
+    return stream;
+}
+</code></pre>
+
+<p>Always use ADL friend functions to implement your operators (except for the few that have to be member functions, such as <code>operator++</code>).</p>
+
+<p>Where there's one bug there's two (or more).</p>
+
+<ul>
+<li>Your version was streaming to <code>std::cout</code> regardless of which <code>stream</code> was passed in.</li>
+<li>"If it's not tested, it doesn't work." Even the very simplest test case would have shown that the version you wrote wasn't functional. If you don't plan to write tests for (or: don't plan to use) a feature, such as <code>operator&lt;&lt;</code>, then you might as well save time and just not write the feature!</li>
+<li><p>Iostreams sucks: Even my new version is broken for <code>ptr::shr&lt;char&gt;</code>. I mean, <code>std::cout &lt;&lt; my_shr_ptr_to_char</code> will end up calling <code>operator&lt;&lt;(ostream&amp;, char*)</code>, which will <em>not</em> print the pointer — it'll print the <em>thing it points to</em>, treated as a C string, which it almost certainly isn't. So it'll segfault and die. The simplest way to work around <em>that</em> is to make sure our code controls the exact overload of <code>operator&lt;&lt;</code> that we call: don't let it be template-dependent. So:</p>
+
+<pre><code>friend std::ostream&amp; operator&lt;&lt; (std::ostream&amp; stream, const base&lt;T&gt;&amp; p) {
+    stream &lt;&lt; static_cast&lt;void*&gt;(p.get());
+    return stream;
+}
+</code></pre></li>
+</ul>
+
+<hr>
+
+<pre><code>operator bool const () { return (obj != nullptr) ? true : false; }
+</code></pre>
+
+<p>This is a sneaky one I'd never seen before! You put the <code>const</code> in front of the <code>()</code> instead of behind it; so, this is another example of "returning by <code>const</code> value." What you meant to type was</p>
+
+<pre><code>operator bool () const { return (obj != nullptr) ? true : false; }
+</code></pre>
+
+<p>that is, a <code>const</code> member function (which promises not to modify the <code>this</code> object), that returns (non-const-qualified) <code>bool</code>.</p>
+
+<p>Stylistically, there's no sense in writing <code>condition ? true : false</code> — that's like saying <code>if condition is true, return true; if condition is false, return false</code>. So:</p>
+
+<pre><code>operator bool () const { return (obj != nullptr); }
+</code></pre>
+
+<hr>
+
+<pre><code>inline T * get() { return obj; }
+</code></pre>
+
+<p>Any time a function promises not to modify one of its reference parameters, you should make sure to <code>const</code>-qualify that parameter's referent. So, <code>void f(int *p)</code> is saying it might modify <code>*p</code>; <code>void f(const int *p)</code> is saying it promises <em>not</em> to modify <code>*p</code>. Similarly for any member function that promises not to modify its <code>*this</code> parameter: <code>void mf()</code> is saying it <em>might</em> modify <code>*this</code>; <code>void mf() const</code> is saying it promises <em>not</em> to modify <code>*this</code>.</p>
+
+<pre><code>T *get() const { return obj; }
+</code></pre>
+
+<p>I also removed the <code>inline</code> keyword because it wasn't doing anything. Functions defined in the body of a class, like this, Java/Python-style, are already inline by default. The only time you need <code>inline</code> is when you want to define a function <em>in</em> a header file but <em>outside</em> the body of a class.</p>
+
+<hr>
+
+<p>That's enough red flags. Let me mention one super bug and then I'll call it a night.</p>
+
+<pre><code>class weak : public base&lt;T&gt; {
+[...]
+    mutable std::atomic&lt;int32_t&gt; * refs;
+[...]
+    [no destructor declared]
+};
+</code></pre>
+
+<p>Having an RAII type like <code>weak</code> without a destructor is an oxymoron. <code>weak</code> <em>must</em> have a destructor to clean up its <code>refs</code> member, or else you'll have a leak.
+(Also, <code>refs</code> doesn't need to be <code>mutable</code>.)</p>
+
+<p>But wait, does <code>weak</code> even own its <code>refs</code> at all? Its constructor doesn't call <code>new</code>, so maybe it's okay that its destructor doesn't call <code>delete</code>?... Right. <code>weak::refs</code> is always initialized to point the same place as some <code>shr</code>'s <code>refs</code> pointer. <code>weak::refs</code> is just an observer; <code>shr::refs</code> is the owner of the <code>atomic&lt;int32_t&gt;</code>.</p>
+
+<p>But any time we have a non-owning observer, we should think about <em>dangling</em>. Can <code>weak::refs</code> dangle? Yes, it certainly can!</p>
+
+<pre><code>ptr::shr&lt;int&gt; p(new int(42));
+ptr::weak&lt;int&gt; w(p);
+p.reset();
+w.expired();  // segfault
+ptr::shr&lt;int&gt; q(w.lock());
+assert(q != ptr::shr&lt;int&gt;(nullptr));
+*q;  // segfault
+</code></pre>
+
+<p>But your <code>weak</code> is all screwed up. Since it's unusable, you should just remove it. Bring it back if you ever run into a case where you need to use something like <code>weak_ptr</code>, so that you have some idea of what the requirements are. (For example, "locking an expired <code>weak_ptr</code> should return null," or "locking an unexpired <code>weak_ptr</code> should increment the original refcount, not create a new refcount competing with the first," or "it is nonsensical to create a <code>weak_ptr</code> from a raw <code>T*</code>."</p>
+
+<p>Write some test cases for your <code>ptr::unq</code> and <code>ptr::shr</code>. You'll find bugs. Think about how to fix those bugs, and then (only then!) fix them. As you improve your understanding of <em>what</em> the code needs to do, you'll improve your coding style as well.</p>
+    </div>

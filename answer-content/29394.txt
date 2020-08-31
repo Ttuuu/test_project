@@ -1,0 +1,130 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Personally, I must say that close to all PDO derived/based classes I've seen so far suffer from the same problem: They are, essentially, completely pointless.<br>
+Let me be clear: <code>PDO</code> offers a clear, easy to maintain and neat interface on its own, wrapping it in a custom class to better suit the needs of a particular project is essentially taking a decent OO tool, and altering it so that you <em>can't</em> reuse it as easily in other projects. If you were to write a wrapper around MySQLi, I could understand the reasoning, but PDO? No, I'm really struggeling to understand the logic behind that <strong>unless</strong>:</p>
+<p>You were to write a table mapper class to go with it, that establishes a connection between the tables you query, and the data models into which you store the data. Not unlike how <code>Zend\Db</code> works.<br>
+MySQL is, as you well know, not as flexible as PHP is in terms of data-types. If you are going to write a DB abstraction layer, common sense dictates that layer reflects that: it should use casts, constants, filters <em>as well as prepared statements</em> to reflect that.<br>
+Most mature code out there also offerst an API that doesn't require you to write your own queries:</p>
+<pre><code>$query = $db-&gt;select('table')
+            -&gt;fields(array('user', 'role', 'last_active')
+            -&gt;where('hash = ?', $pwdHash);
+</code></pre>
+<p>These abstraction layers often (if not always) offer another benefit, they build the queries for you, based on <em>what DB you're connection to</em>. If you're using <code>mysql</code>, they'll build a MySQL query, if you happen to switch to PostgreSQL, they'll churn out pg queries, without the need to rewrite thousands of queries. If you want to persist and write your own abstraction layer, make sure you offer something similar, too. If you don't, you're back to square one: embarking on a labour intensive, pointless adventure that <em>won't</em> be worth it.</p>
+<p>An alternative approach is to <em>extend</em> the PDO class. Again, this has been done before and is, in theory, perfectly OK. Although, again this might be personal, it does violate one principle which is upheld by many devs I know: Don't extend, or attempt to change an object <em>you don't own</em>. PDO is a core object,so it's pretty clear you don't own it.<br>
+Suppose you were to write something like:</p>
+<pre><code>class MyDO extends PDO
+{
+    public function createProcedure(array $arguments, $body)
+    {
+        //create SP on MySQL server, and return
+    }
+}
+</code></pre>
+<p>And lets assume that, after some serious debugging, and testing, you actually got this working. Great! But then what if, some time in the future, <code>PDO</code> got its own <code>createProcedure</code> method? it'll probably outperform yours, and might be more powerful. That, in itself isn't a problem, but suppose it's signature were different, too:</p>
+<pre><code>public function createProcedure (stdClass $arguments)
+{
+}
+</code></pre>
+<p>That would mean you <em>either</em> have to ditch your method, and refactor your entire code-base to sing to the tune of <code>PDO</code>'s latest and greatest hit, or you'd have to alter your method to:</p>
+<pre><code>public function createProcedure(array $arguments, $body)
+{
+    $arguments = (object) $arguments;//create stdClass
+    //parse $body and:
+    $arguments-&gt;declare = $body[0];
+    $arguments-&gt;loops = (object) array('loop1' =&gt; $body[1], 'loop2' =&gt; $body[2]);
+    $arguments-&gt;body = (object) array(
+        'main' =&gt; $body[3],
+        'loop1_body' =&gt; $body[4],
+        'loop2_body' =&gt; $body[5]
+    );
+    return parent::createProcedure($arguments);
+}
+</code></pre>
+<p>That would mean that, for all code you wrote, you're actually having to call 2 methods, turning your once so clever <code>createProcedure</code> method into dead weight. So what, you might say? Well, don't think you're out of the woods just yet, because <em><strong>This alternative method above is illegal</strong></em>, it can't be written, it can't work, it shouldn't work, it's just all shades of wrong, here's why:</p>
+<p>The Liskov principle states that a child (the class extending <code>PDO</code>) may not alter the signature of inherited methods if those alterations constitute a breach of contract, meaning the expected types (type-hints) may not be stricter than or different to the types defined in the parent (ie: <code>array</code> vs <code>stdClass</code> is not allowed). Additional arguments are allowed, provided they're <em>optional</em>.<br>
+If the <code>PDO</code> method itself takes but a single argument of the type <code>stdClass</code>, then your child class may only add optional arguments, and should either drop the type-hint, or uphold it (ie: hint at <code>stdClass</code>, which would break all existing code), or don't hint at all (which is as error-prone as it gets).</p>
+<p>What's more, after a couple of months, people might use third party code (frameworks), that rely on the <code>createProcedure</code> method, and pass it an instance of <code>stdClass</code>. You'll have to change your method again, to the vague, and error prone signature:</p>
+<pre><code>public function createProcedure($arrOrObject, $body = null)
+{
+    if ($arrOrObject instanceof stdClass)
+    {
+        return parent::createProcedure($arrOrObject);
+    }
+    if ($body === null)
+    {
+        //What now??
+    }
+    //parse body
+}
+</code></pre>
+<p>If <code>$body</code> is null, and <code>$arrOrObject</code> is an array, the user might have structured the <code>$arrOrObject</code> array in the same way as <code>PDO</code> would like to see the object structured, in which case <code>json_decode(json_encode($arrOrObject));</code> would do the trick (not casting, because a cast doesn't cast recursive), but it's just as likely that the code calling your method contains a bug. What to do? convert to an object, and <code>try-catch</code>, with the extra overhead that might cause?</p>
+<p>This leads me to the last, and for now biggest omission:<br>
+When using a wrapper object, it's generally a good idea to implement a (slow) magic <code>__call</code> method, that checks if a method call was meant for the wrapper object, or if it was meant for the wrapped object.<br>
+Using your object, I might want to set another attribute on the PDO extension, but since you failed to implement the <code>setAttribute</code> method, I can't change the charset, nor can I change how <code>PDO</code> deals with <code>NULL</code> values. Which can only be considered to be a glaring omission. Especially since you expect the user to pass bare PDO constants to the constructor. Basically, the least you <em>should</em> do is add:</p>
+<pre><code>public function __call($method, array $arguments )
+{
+    return call_user_func_array($this-&gt;datab, $arguments);
+}
+</code></pre>
+<p>This way, you semi-expose the actual wrapped object to the user, in the sense that, methods you haven't implemented can still be used. New methods that might be implemented in the future will automatically be accessible, too.<br>
+What's more, you'll be able to validate/check the arguments and log which methods are used by the users, so that you could fine-tune your class to better reflect the way it is being used.</p>
+<h2>Recap:</h2>
+<ul>
+<li>Building an abstraction class on a user-friendly raw-API like <code>PDO</code> is, IMHO, like a broken pencil: Pointless</li>
+<li>Extending PDO means you don't have to create <em>pass-through</em> methods that call the wrapped API (like creating a <code>prepare</code> method), but it does mean there is a chance you'll have to refactor your code whenever PDO changes</li>
+<li>If you still feel like using a wrapper object, either consider wrapping it around something less well known, but in some respects better (<code>mysqli_*</code> is what I'm hinting at), but <em>implement the magic <code>__call</code> and, if required <code>__callStatic</code> methods.</em></li>
+<li>Again, if you're going to procede: work on an entire abstraction layer, that allows for users to map tables to data models, and take it from there. Ensure that those data-models can be used easily to build HTML forms, for example in order for those forms to be linked to the DB in the blink of an eye, bot don't forget about sanitizing your data, of course.</li>
+</ul>
+<h2>On the code itself:</h2>
+<p>There is one thing you <em>have</em> to fix about your code, above all else, and that's your constructor:<br>
+I might choose to construct an object like so:</p>
+<pre><code>$database = new db("user", "pwd", "host", "mydb",
+             array(PDO::ATTR_DEFAULT_FETCH_MODE =&gt; PDO::FETCH_OBJ));
+</code></pre>
+<p>Setting the default fetch-mode to fetch objects, and the new instance of <code>PDO</code> will be passed the correct attribute array. Sadly, right after constructing that PDO object, you're deciding that the default fetch-mode should've been <code>PDO::FETCH_ASSOC</code>, because 2 lines further down:</p>
+<pre><code>$this-&gt;datab-&gt;setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+</code></pre>
+<p>I'd hate to use that code. Also, this just doesn't add up:</p>
+<pre><code>try
+{ 
+    $this-&gt;datab = new PDO("mysql:host={$host};dbname={$dbname};charset=utf8", $username, $password, $options); 
+    $this-&gt;datab-&gt;setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION); 
+    $this-&gt;datab-&gt;setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+} 
+catch(PDOException $e)
+{ 
+    $this-&gt;isConnected = false;
+    throw new Exception($e-&gt;getMessage());
+}
+</code></pre>
+<p>Try-catch-throw? Why? The connection failed, the <code>PDOException</code> tells me why, that's what I want to know, why catch that exception, and throw a new, more general one? What if I passed <code>PDO::ATTR_ERRMODE =&gt; PDO::ERRMODE_SILENT</code> to the constructor, and the connection failed? You're probably better of replacing it with this:</p>
+<pre><code>$this-&gt;datab = new PDO($connString, array(
+    PDO::ATTR_ERRMODE            =&gt; PDO::ERRMODE_EXCEPTION,
+    PDO::ATTR_DEFAULT_FETCH_MODE =&gt; PDO::FETCH_ASSOC,
+    PDO::MYSQL_ATTR_INIT_COMMAND =&gt; 'SET NAMES utf8'//careful with this one, though
+));
+foreach($options as $attr =&gt; $value)
+{
+    $this-&gt;datab-&gt;setAttribute($attr, $value);
+}
+</code></pre>
+<p>And <em>let the exception go</em>. If the connection to the DB fails, the script can't do what it's supposed to do anyway. The <code>PDOExceptions</code> are usefull in a scenario where you're using transactions. If 999 queries succeeded, but the 1000th query failed, rather than inserting partial data, catching the exception, and rolling back the transaction is what you do, but catching an exception to rethrow it again is just silly.</p>
+<p>But, again, I'm not going to stop you from doing what you want, perhaps you can prove me wrong and actually make something great. But in order to do that, you must know what's out there already:</p>
+<ul>
+<li>As always start with the theory, wiki's a great place to start
+<ol>
+<li>the <a href="http://en.wikipedia.org/wiki/Object-relational_mapping" rel="noreferrer">ORM wiki</a></li>
+<li>The <a href="http://en.wikipedia.org/wiki/Active_record_pattern" rel="noreferrer">ActiveRecord Pattern wiki</a></li>
+</ol>
+</li>
+<li><a href="http://www.doctrine-project.org/" rel="noreferrer">doctrine</a>
+<ol>
+<li>And all of its <a href="http://www.doctrine-project.org/projects.html" rel="noreferrer">projects</a></li>
+<li>Not in the least, its <a href="http://www.doctrine-project.org/projects/orm.html" rel="noreferrer">ORM</a></li>
+</ol>
+</li>
+<li><a href="http://propelorm.org/" rel="noreferrer">Propel</a>, haven't used it, but N.B. recommended it</li>
+<li><a href="http://www.phpactiverecord.org/" rel="noreferrer">PHPActiveRecord</a></li>
+<li><a href="http://framework.zend.com/manual/2.0/en/modules/zend.db.adapter.html" rel="noreferrer">Zend\Db\Adapter</a> and all of the components in the <code>Zend\Db</code> namespace</li>
+<li>Even the old <a href="http://framework.zend.com/manual/1.12/en/zend.db.html" rel="noreferrer">Zend_Db</a> has something going for it, still</li>
+</ul>
+    </div>

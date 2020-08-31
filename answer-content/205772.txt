@@ -1,0 +1,140 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I think there is a problem in that you only compare objects of same type (Tx and Tx or Ty and Ty) by reference, but compare by selected properties for objects of different types (Tx and Ty). I wonder if that can lead to unexpected behavior?</p>
+
+<p>If you have the following objects and compare by <code>FirstName</code> and <code>LastName</code>:</p>
+
+<pre><code>  var p0 = new PersonLib1 { Id = 0, FirstName = "John", LastName = "Doe" };
+  var p1 = new PersonLib1 { Id = 1, FirstName = "John", LastName = "Doe" };
+  var p2 = new PersonLib2 { Id = 2, FirstName = "JOHN", LastName = "Doe" };
+  var p3 = new PersonLib2 { Id = 3, FirstName = "Joh", LastName = "Doe" };
+</code></pre>
+
+<p>then <code>p0 != p1</code> but <code>p0 == p2</code> and <code>p1 == p2</code> because <code>p0</code> and <code>p1</code> is of same type where as <code>p2</code> is the other type. In other words: you have two different objects of the same type, that are both equal to the same object of another type!</p>
+
+<p><code>p0</code> and <code>p1</code> produces the same hash code, so <code>DuckEqualityComparer&lt;&gt;.Equals()</code> is called for these objects:</p>
+
+<blockquote>
+<pre><code>public override bool Equals(object x, object y)
+{
+    if (ReferenceEquals(x, y)) return true;
+    if (ReferenceEquals(x, null)) return false;
+    if (ReferenceEquals(y, null)) return false;
+
+    ValidateType(x);
+    ValidateType(y);
+
+    if (Equals((x, y))) return true;
+    if (Equals((y, x))) return true;
+
+    return false;
+}
+
+private bool Equals((object x, object y) t)
+{
+    return t.x is TX x &amp;&amp; t.y is TY y &amp;&amp; _equals(x, y);
+}
+</code></pre>
+</blockquote>
+
+<p>but unless they are equal by reference, they fall through the other tests, because they all handle objects of different types.</p>
+
+<p>To get it work properly, you'll have to ensure <code>one-to-one</code> relationship between objects of <code>Tx</code> and <code>Ty</code>:</p>
+
+<pre><code>  var p0 = new PersonLib1 { Id = 0, FirstName = "John", LastName = "Doe" };
+  var p1 = new PersonLib1 { Id = 1, FirstName = "John", LastName = "Doe" };
+  var p2 = new PersonLib2 { Id = 1, FirstName = "JOHN", LastName = "Doe" };
+  var p3 = new PersonLib2 { Id = 3, FirstName = "Joh", LastName = "Doe" };
+</code></pre>
+
+<p>If you compare by just <code>Id</code>, or <code>Id</code>, <code>FirstName</code> and <code>LastName</code> in the above <code>p0</code> and <code>p2</code> are unequal where <code>p1</code> and <code>p2</code> are equal.</p>
+
+<hr>
+
+<p>A simple "Expression" solution without the Builder could be:</p>
+
+<pre><code>  public class MixedEqualityComparer&lt;Tx, Ty&gt; : IEqualityComparer&lt;object&gt;
+  {
+    List&lt;Func&lt;Tx, Ty, bool&gt;&gt; m_xyEquals = new List&lt;Func&lt;Tx, Ty, bool&gt;&gt;();
+
+    Func&lt;Tx, int&gt; m_getHashCodeX;
+    Func&lt;Ty, int&gt; m_getHashCodeY;
+
+
+    public MixedEqualityComparer(Func&lt;Tx, int&gt; getHashCodeX, Func&lt;Ty, int&gt; getHashCodeY)
+    {
+      m_getHashCodeX = getHashCodeX;
+      m_getHashCodeY = getHashCodeY;
+    }
+
+    public MixedEqualityComparer&lt;Tx, Ty&gt; Compare&lt;TProperty&gt;(Expression&lt;Func&lt;Tx, TProperty&gt;&gt; xMemberExpression, Expression&lt;Func&lt;Ty, TProperty&gt;&gt; yMemberExpression, IComparer&lt;TProperty&gt; comparer = null)
+    {
+      var xmemFunc = xMemberExpression.Compile();
+      var ymemFunc = yMemberExpression.Compile();
+
+     comparer = comparer ?? Comparer&lt;TProperty&gt;.Default;
+
+     if (comparer != null)
+       m_xyEquals.Add((x, y) =&gt; comparer.Compare(xmemFunc(x), ymemFunc(y)) == 0);
+     else
+     {
+       m_xyEquals.Add((x, y) =&gt;
+       {
+         TProperty xmem = xmemFunc(x);
+         TProperty ymem = ymemFunc(y);
+         if (xmem != null &amp;&amp; ymem != null) return xmem.Equals(ymem);
+         return xmem == null &amp;&amp; ymem == null;
+       });
+     }
+
+     return this;
+    }
+
+    public new bool Equals(object x, object y)
+    {
+      if (x is null || y is null) return false;
+      if (ReferenceEquals(x, y)) return true;
+
+      return IsEqual(x, y) || IsEqual(y, x);
+    }
+
+    private bool IsEqual(object x, object y)
+    {
+      return x is Tx tx &amp;&amp; y is Ty ty &amp;&amp; m_xyEquals.All(eq =&gt; eq(tx, ty));
+    }
+
+    public int GetHashCode(object obj)
+    {
+      switch (obj)
+      {
+        case Tx x: return m_getHashCodeX(x);
+        case Ty y: return m_getHashCodeY(y);
+        default: return 0;
+      }
+    }
+  }
+</code></pre>
+
+<p><strong>Use Case</strong></p>
+
+<pre><code>  var p0 = new PersonLib1 { Id = 0, FirstName = "John", LastName = "Doe" };
+  var p1 = new PersonLib1 { Id = 1, FirstName = "John", LastName = "Doe" };
+  var p2 = new PersonLib2 { Id = 2, FirstName = "JOHN", LastName = "Doe" };
+  var p3 = new PersonLib2 { Id = 3, FirstName = "Joh", LastName = "Doe" };
+
+  var stringComparer = StringComparer.InvariantCultureIgnoreCase;
+  Func&lt;PersonLib1, int&gt; getXHashCode = x =&gt; stringComparer.GetHashCode(x.FirstName) + stringComparer.GetHashCode(x.LastName);
+  Func&lt;PersonLib2, int&gt; getYHashCode = x =&gt; stringComparer.GetHashCode(x.FirstName) + stringComparer.GetHashCode(x.LastName);
+
+  MixedEqualityComparer&lt;PersonLib1, PersonLib2&gt; personComparer = new MixedEqualityComparer&lt;PersonLib1, PersonLib2&gt;(getXHashCode, getYHashCode)
+    .Compare(x =&gt; x.FirstName, y =&gt; y.FirstName, stringComparer)
+    .Compare(x =&gt; x.LastName, y =&gt; y.LastName, stringComparer);
+
+  Dictionary&lt;object, string&gt; dict = new Dictionary&lt;object, string&gt;(personComparer);
+  dict[p0] = "AAA";
+  dict[p1] = "BBB";
+  dict[p2] = "CCC";
+  dict[p3] = "DDD";
+
+  Console.WriteLine(dict.Count); // == 3
+</code></pre>
+    </div>

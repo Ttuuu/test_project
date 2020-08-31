@@ -1,0 +1,197 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Review</h1>
+<p>This code looks pretty good.  I know very little about the <code>docker-compose</code> command being executed, but I can look at the script style.</p>
+<p>Shellcheck spots no issues, which is always a good start.</p>
+<p>I see nothing in here that really demands Bash rather than standard (POSIX) shell - all those <code>[[</code> can be easily converted to <code>[</code>.</p>
+<p>I recommend setting <code>-u</code> and probably <code>-e</code>.  In any case, consider what the effects of any individual command failing should be.  Within the loop, I recommend continuing to the next iteration, but remember whether any iteration failed.  One way I do that is</p>
+<pre><code>status=true   # until a failure
+for i in ....
+do
+    some_command  || status=false
+done
+
+# terminate with appropriate exit code    
+exec $status
+</code></pre>
+<p>Instead of using many <code>echo</code> commands in <code>usage()</code>, it's easier to copy a single here-document:</p>
+<pre><code>usage() {
+    cat &lt;&lt;'EOF'
+batch_users.sh
+SYNOPSIS
+...
+EOF
+}
+</code></pre>
+<blockquote>
+<pre><code>if [[ ! -e $1 ]]
+then
+  die "Couldn't find file ${1}."
+  exit 1
+fi
+</code></pre>
+</blockquote>
+<p>Braces not required here for <code>$1</code>, and <code>exit 1</code> is unreachable.  Mere existence of the file is insufficient: we need it to be readable.  Here's my version:</p>
+<pre><code>[ -r "$1" ] || die "Couldn't find file $1."
+</code></pre>
+<p>We need to be very careful when composing strings to be interpreted by other commands, especially shells:</p>
+<blockquote>
+<pre><code>    sh -c "docker-compose exec -T --env OC_PASS=${password} --user www-data app php occ \
+      user:add --password-from-env --display-name=\"${f2}\" --group=\"${f3}\" \"$f1\" " &lt; /dev/null
+</code></pre>
+</blockquote>
+<p><code>$password</code> in particular could contain almost anything (including quote characters), so that's really not safe in the inner <code>sh</code> instance.  Do we really need that shell, or can we simply invoke <code>docker-compose</code> directly?  The latter is much easier to get right.  If we really need the <code>sh</code>, then we'll need to be a lot more careful about constructing that command (I think we need to use a <code>printf</code> that supports <code>%q</code> conversion).</p>
+<p>We can avoid the repetition by using <code>${var+}</code> to conditionally include the optional arguments:</p>
+<pre><code>if [ "$f1" ]
+then
+    docker-compose exec -T --env OC_PASS="$password" \
+                   --user www-data app php occ \
+                   user:add --password-from-env \
+                   ${f2:+"--display-name=$f2"} \
+                   ${f3:+"--group=$f3"} \
+                   "$f1" \
+                   &lt;/dev/null \
+         || status=false
+else
+    #error
+    echo "Expected at least one field, but none were supplied." &gt;&amp;2
+    status=false
+    continue
+fi
+</code></pre>
+<p>I think we have an unnecessary password exposure,. <code>--password-from-env</code> allows passing the password in environment, so that it doesn't appear in command-line arguments.  But we've immediately lost that advantage when we wrote <code>--env OC_PASS="${password}"</code>.  I think the correct thing to do is to put the password into environment before the loop:</p>
+<pre><code>OC_PASS=$password
+export OC_PASS
+</code></pre>
+<p>And then specify to copy it without giving a new value: <code>--env OC_PASS</code>.  We could also ditch <code>$password</code> and assign directly to <code>OC_PASS</code>.  It would be worth not setting a default, so that users can use the same environment variable to avoid exposing the password using when invoking the script.</p>
+<hr>
+<h1>Modified code</h1>
+<pre><code>#!/bin/sh
+
+set -eu
+
+# Handle printing errors
+die () {
+    printf '%s\n' "$1" &gt;&amp;2
+    exit 1
+}
+
+usage () {
+    cat &lt;&lt;'EOF'
+batch_users.sh       
+SYNOPSIS
+batch_users [-p] [file]
+DESCRIPTION
+The batch_users script adds a batch of users to an instance of NextCloud
+running inside of a docker container by reading a list from a csv file.
+
+-p, --password    Set user password. If no option is passed, the password
+                  should be passed in the OC_PASS environment variable.
+
+csv file should be formatted in one of the following configurations:
+username,Display Name,group,email@address.domain,
+username,Display Name,group,
+username,Display Name,
+username,
+
+EXAMPLES
+The command:
+    batch_users.sh -p 123password321 foobar.csv
+will add the users from foobar.csv and assign them the password 123password321
+The command:
+    batch_users.sh foobar.csv
+will add the users from foobar.csv and assign them the default password.
+
+batch_users will return 0 on success and a positive number on failure.
+EOF
+}
+
+
+# flags
+while true
+do
+    case $1 in
+        -h|-\?|--help)
+            usage # Display a usage synopsis.
+            exit
+            ;;
+        -p|--password)
+            if [ "$2" ]; then
+                OC_PASS=$2
+                export OC_PASS
+                shift
+            else
+                die 'Error: "--password" requires a non-empty option argument.'
+            fi
+            ;;
+        --password=?*)
+            OC_PASS=${1#*=} # Delete everything up to = and assign the remainder.
+            export OC_PASS
+            ;;
+        --password=) # Handle the case of empty --password=
+            die 'Error: "--password" requires a non-empty option argument.'
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -?*)
+            printf 'WARN: Unknown option (ignored): %s\n' "$1" &gt;&amp;2
+            ;;
+        *) # Default case. No more options, so break out of the loop
+            break
+    esac
+    shift
+done
+
+
+# Was exactly one filename argument passed?
+[ $# -eq 1 ] || die "$0: Expected a filename argument"
+
+# Is the file readable?
+[ -r "$1" ] || die "$1: missing or not readable"
+
+[ "$OC_PASS" ] || die "$0: No password specified. Run with --help for more info."
+
+
+
+
+status=true                     # until a command fails
+
+while IFS=, read -r f1 f2 f3 f4
+do
+    if [ "$f1" ]
+    then
+        docker-compose exec -T --user www-data --env OC_PASS \
+                       app php occ \
+                       user:add --password-from-env \
+                       ${f2:+"--display-name=$f2"} \
+                       ${f3:+"--group=$f3"} \
+                       "$f1" \
+                       &lt;/dev/null \
+            || status=false
+    else
+        echo "Expected at least one field, but none were supplied." &gt;&amp;2
+        status=false
+        continue
+    fi
+
+    # If there is a fourth value in the csv, use it to set the user email.
+    if [ "$f4" ]
+    then
+        docker-compose exec -T \
+                       --user www-data app php occ \
+                       user:setting "$f1" settings email "$f4" \
+                       &lt;/dev/null \
+            || status=false
+    fi
+done &lt;"$1"
+
+exec $status
+</code></pre>
+<hr>
+<h1>Further suggestions</h1>
+<ul>
+<li>Perhaps it would be useful to add a <code>--verbose</code> option that shows what is to be done for each input line.</li>
+<li>Does the input really need to come from a file?  It would be useful to be able to provide it on standard input (so we could filter a list using <code>grep</code>, for example).</li>
+</ul>
+    </div>

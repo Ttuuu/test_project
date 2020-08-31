@@ -1,0 +1,220 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Since you already knew the headers as used in your <code>for</code> loop, then a delegate would reduce the number of loops needed to do the repeated task of creating the POCO.</p>
+
+<pre><code>string[] headers = parser.ReadFields();
+Func&lt;string[], MassUploadUser&gt; factory = (string[] fields) =&gt; 
+    new MassUploadUser {
+        email  = fields[headers.IndexOf("email")],
+        firstName  = fields[headers.IndexOf("First Name")],
+        lastName = fields[headers.IndexOf("Last Name")],
+        role = fields[headers.IndexOf("Role")]
+    };
+
+//...
+</code></pre>
+
+<p>Which in itself is rather simple for this example. But for more complex data, can become really complicated really fast.</p>
+
+<p>I am very partial to building expressions and delegates to handle generic repeated tasks that lend themselves well to LINQ. This scenario would fall into that category.</p>
+
+<p>Building upon the already provided suggestions, which provide some good suggestions, a lambda expression can be built using reflection and naming conventions to simplify the creation of your objects from the CSV file.</p>
+
+<p>The following utilities were constructed to satisfy that. Hopefully the code and accompanying documentation speaks for itself.</p>
+
+<pre><code>public static class ExpressionManager {
+
+    /// &lt;summary&gt;
+    /// Builds an expression that creates a new object and initializes properties from a string array
+    /// &lt;/summary&gt;
+    public static Expression&lt;Func&lt;string[], T&gt;&gt; BuildFactoryExpressionFor&lt;T&gt;(string[] headers) where T : new() {
+        var type = typeof(T);
+        var properties = type.GetCachedProperties();
+        var columns = MapColumnIndexes(headers);
+        //Desired delegate
+        //Func&lt;string[], T&gt; factory = (string[] fields) =&gt; new T() { X = fields[0], Y = fields[1] };
+
+        // (string[] fields) =&gt; ...
+        var parameter = Expression.Parameter(headers.GetType(), "fields");
+        // new T()
+        var newOfType = Expression.New(type);
+        // { PropertyA = fields[0], PropertyB = (int)fields[1] }
+        var memberBindings = getMemberBindings(columns, properties, parameter);
+        // new T() { PropertyA = fields[0], PropertyB = (int)fields[1] }; 
+        var body = Expression.MemberInit(newOfType, memberBindings);
+        // (string[] fields) =&gt; new T() { PropertyA = fields[0], PropertyB = (int)fields[1] }; 
+        var lambda = Expression.Lambda&lt;Func&lt;string[], T&gt;&gt;(body, parameter);
+        return lambda;
+    }
+    /// &lt;summary&gt;
+    /// Get the bindings used to populate the provided properties
+    /// &lt;/summary&gt;
+    private static IEnumerable&lt;MemberAssignment&gt; getMemberBindings(IDictionary&lt;string, int&gt; columns, PropertyInfo[] properties, ParameterExpression parameter) {
+        using (var e = columns.Keys.GetEnumerator()) {
+            while (e.MoveNext()) {
+                var headerName = e.Current;
+                var propertyName = headerName.Replace(" ", "");//&lt;-- simple naming convention
+                var propertyInfo = properties.FirstOrDefault(_ =&gt; string.Equals(_.Name, propertyName, StringComparison.InvariantCultureIgnoreCase));
+                if (propertyInfo != null) {
+                    var setMthd = propertyInfo.GetSetMethod(true);
+                    if (propertyInfo.CanWrite &amp;&amp; setMthd != null &amp;&amp; setMthd.IsPublic) {
+                        var propertyType = propertyInfo.PropertyType;
+                        // index
+                        var headerIndex = Expression.Constant(columns[headerName]);
+                        // fields[index]
+                        Expression value = Expression.ArrayAccess(parameter, headerIndex);
+                        if (propertyType != typeof(string)) {
+                            // (int)Coerce(fields[index], typeof(int))
+                            value = Expression.Convert(Expression.Call(getConverter(), value, Expression.Constant(propertyType)), propertyType);
+                        }
+                        // Property = value                            
+                        var setter = Expression.Bind(propertyInfo, value);
+                        yield return setter;
+                    }
+                }
+            }
+        }
+    }
+
+    static MethodInfo coerce;
+    static MethodInfo getConverter() {
+        if (coerce == null) {
+            var flags = BindingFlags.Static | BindingFlags.NonPublic;
+            coerce = typeof(ExpressionManager).GetMethod("CoerceValue", flags);
+        }
+        return coerce;
+    }
+
+    static object CoerceValue(object value, Type conversionType) {
+        if (value == null || (value is string &amp;&amp; string.IsNullOrWhiteSpace(value as string))) {
+            return conversionType.GetDefaultValueForType();
+        }
+        //TODO: room for improvement here for other types. consider automapper.
+        try {
+            return Convert.ChangeType(value, conversionType,
+                System.Globalization.CultureInfo.InvariantCulture);
+        } catch { }
+        if (isNullable(conversionType)) {
+            try {
+                var underlyingType = Nullable.GetUnderlyingType(conversionType);
+                return Convert.ChangeType(value, underlyingType,
+                    System.Globalization.CultureInfo.InvariantCulture);
+            } catch { }
+        }
+        return conversionType.GetDefaultValueForType();
+    }
+
+    static bool isNullable(Type conversionType) {
+        return conversionType.IsGenericType &amp;&amp;
+               conversionType.GetGenericTypeDefinition().IsAssignableFrom(typeof(Nullable&lt;&gt;));
+    }
+
+    static Dictionary&lt;Type, object&gt; defaultValueTypes = new Dictionary&lt;Type, object&gt;();
+    /// &lt;summary&gt;
+    /// Gets the default value for a type.
+    /// &lt;/summary&gt;
+    /// &lt;param name="type"&gt;The type.&lt;/param&gt;
+    /// &lt;returns&gt;The default value.&lt;/returns&gt;
+    static object GetDefaultValueForType(this Type type) {
+        if (!type.IsValueType) return null;
+
+        object defaultValue;
+
+        if (defaultValueTypes.TryGetValue(type, out defaultValue)) return defaultValue;
+
+        defaultValue = type.CreateInstance();
+
+        defaultValueTypes[type] = defaultValue;
+
+        return defaultValue;
+    }
+
+    public static IDictionary&lt;string, int&gt; MapColumnIndexes(this string[] headers) {
+        return headers
+            .Select((header, index) =&gt; new { header, index })
+            .ToDictionary(o =&gt; o.header, o =&gt; o.index);
+    }
+
+    private static readonly IDictionary&lt;Type, PropertyInfo[]&gt; propertyCache = new Dictionary&lt;Type, PropertyInfo[]&gt;();
+    /// &lt;summary&gt;
+    /// Returns all the public properties of the current &lt;seealso cref="System.Type"/&gt;.
+    /// &lt;/summary&gt;
+    /// &lt;param name="type"&gt;The type to get the properties from&lt;/param&gt;
+    /// &lt;returns&gt;&lt;/returns&gt;
+    public static PropertyInfo[] GetCachedProperties(this Type type) {
+        PropertyInfo[] properties = new PropertyInfo[0];
+        if (!propertyCache.TryGetValue(type, out properties)) {
+            lock (propertyCache) {
+                if (!propertyCache.TryGetValue(type, out properties)) {
+                    var flags = BindingFlags.Public | BindingFlags.Instance;
+                    properties = type.GetProperties(flags);
+                    propertyCache[type] = properties;
+                }
+            }
+        }
+        return properties;
+    }
+}
+</code></pre>
+
+<p>My initial issue was with allowing for a more flexible factory delegate that would try to convert the provided string values when mapping to non-string properties. </p>
+
+<pre><code>//...
+
+if (propertyType != typeof(string)) {
+    // (int)Coerce(fields[index], typeof(int))
+    value = Expression.Convert(Expression.Call(getConverter(), value, Expression.Constant(propertyType)), propertyType);
+}
+
+//...
+</code></pre>
+
+<p>This would allow a property like</p>
+
+<pre><code>public DateTime BirthDate { get; set; }
+</code></pre>
+
+<p>to map to a CSV column like</p>
+
+<pre><code>"2018-03-21"
+</code></pre>
+
+<p>and a proper <code>DateTime</code> would be passed to the mapped property.</p>
+
+<p>For now, the simplified <code>CoerceValue</code> method should be able to handle simple type conversions between value types and also nullables. There is room for improvements here as a library like <em>Automapper</em> could come in handy.</p>
+
+<p>Using a simple naming convention like removing spaces from CSV header names to compare against target property names, simplifies a one to one mapping of CSV header names to property names. Again this could be improved to use metadata from attributes if so desired as suggested in another answer.</p>
+
+<p>for example</p>
+
+<pre><code>"First Name" =&gt; firstName
+"Last Name" =&gt; lastName
+...etc
+</code></pre>
+
+<p>While the provided utilities may look like a lot under the hood, it will allow for a more simplified method when refactored</p>
+
+<pre><code>using (var parser = new TextFieldParser(Program.file)) {
+    parser.SetDelimiters(",");
+
+    string[] headers = parser.ReadFields();
+    //delegate to build desired objects
+    var factory = ExpressionManager.BuildFactoryExpressionFor&lt;MassUploadUser&gt;(headers).Compile();
+    //Need this to access Password as it is not included in POCO
+    var passwordColumn = headers.IndexOf("Password");
+
+    while (!parser.EndOfData){
+        string[] fields = parser.ReadFields();
+        MassUploadUser massUploadUser = factory(fields);
+        string password = fields[passwordColumn];
+
+        // After the for loop, I have some additional logic
+        // to serialize the newly-created object to JSON
+        // and then POST it to a RESTful API
+        DoPostToWebService(massUploadUser, password);
+
+        // At this point, we created the new user on the server, so no need
+        // to keep the current instance of massUploadUser around
+    }
+}
+</code></pre>
+    </div>

@@ -1,0 +1,297 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>There are several problems with the answers here, most notably that the original question doesn't seem to be answered, namely, that we want to create a clone a class with <strong>ONLY</strong> the fields that are set to default/NULL. But lets put a pin in that for a moment.</p>
+
+<p>Lets break this problem down into three parts:</p>
+
+<ol>
+<li>We need a way to specify which properties we want to validate (and we should be able to overlap that with multiple business requirements)</li>
+<li>We need a way to generically walk the class recursively to find all fields that are either NULL or set to their default value for all types.</li>
+<li>We need to construct some class as a return type that reflects all of those fields that are NULL/default.</li>
+</ol>
+
+<p><strong>Fields to be Validated</strong></p>
+
+<p>The first requirement is fairly straight forward, as .NET has been offering this for quite some time. We can use property decorators, which will allow use to use reflection to walk the properties when we move on to step (2). We achieve this using the following code (for this example, I am choosing to use the decorator name 'Validate', but you can really use anything you  like):</p>
+
+<pre><code>[AttributeUsage(AttributeTargets.Property)]
+public class ValidateAttribute : Attribute
+{
+    /// &lt;summary&gt;
+    /// Name
+    /// &lt;/summary&gt;
+    public string Validate
+    { get; set; }
+}
+</code></pre>
+
+<p>The beauty of decorators and reflection is that they are both self commenting, and can be mixed and matched. Supposed you want to validate one set of properties for new records, but another set only for update. You could create two decorators as follows:</p>
+
+<pre><code>[AttributeUsage(AttributeTargets.Property)]
+public class NewValidateAttribute : Attribute
+{
+    /// &lt;summary&gt;
+    /// Name
+    /// &lt;/summary&gt;
+    public string Validate
+    { get; set; }
+}
+
+[AttributeUsage(AttributeTargets.Property)]
+public class UpdateValidateAttribute : Attribute
+{
+    /// &lt;summary&gt;
+    /// Name
+    /// &lt;/summary&gt;
+    public string Validate
+    { get; set; }
+}
+</code></pre>
+
+<p>Your class could then be implemented as follows:</p>
+
+<pre><code>public class Foo
+{
+    [NewValidate]
+    public string Name { get; set; }
+
+    [NewValidate]
+    [UpdateValidate]
+    public string Age { get; set; }
+
+    [UpdateValidate]
+    public bool LikesIceCream { get; set; }
+}
+</code></pre>
+
+<p><strong>Validation</strong></p>
+
+<p>The next task is the actual validation. Here is where things should be done in a way that should support the following idioms:</p>
+
+<ul>
+<li>Should be able to handle POD (plain old data) types (both value and reference types)</li>
+<li>Should be able to handle user types</li>
+<li>Should be able to handle Generic (e.g. ICollection, etc.)</li>
+<li>Should be able to handle nested classes to n-levels</li>
+<li>Should be able to handle any decorator type 'T'</li>
+<li>Should follow separation of concerns pattern to support unit testing</li>
+</ul>
+
+<p>If we separate out these requirements, we can conclude that this really boils down to:</p>
+
+<ul>
+<li>Walk the target object looking for all public properties with a decorator of type 'T'</li>
+<li>Find the value of that property and decide if we need to recurs (go back to step 1)</li>
+<li>If its a reference type, do the check, make a note and move on</li>
+<li>If its a value type, create an instance to get its default, compare, do the check, make a note, and move on</li>
+<li>If its a generic, same this, etc.</li>
+</ul>
+
+<p>Let's first walk the object:</p>
+
+<pre><code>    /// &lt;summary&gt;
+    /// Iterates through all properties in the object 'obj' with the attribute 'T' and compiles a list of property
+    /// names whose value is the default value (i.e. the value assigned when the property is fixed created).
+    /// &lt;/summary&gt;
+    /// &lt;param name="obj"&gt;The object whose properties we will iterate&lt;/param&gt;
+    /// &lt;returns&gt;a list of property names as strings&lt;/returns&gt;
+    /// &lt;remarks&gt;
+    /// This method works on the assumption that default values for properties are never valid values. For example, an
+    /// integer property cannot contain '0' as a valid value.
+    /// &lt;/remarks&gt;
+    public static List&lt;string&gt; FindAllPropertiesWithDefaultValues&lt;T&gt;(object obj)
+    {
+        // collection of properties that contain default values
+        var defaultProps = new List&lt;string&gt;();
+
+        // Find all properties (using reflection) that contain an attribute of type 'type'
+        var props = obj.GetType().GetProperties().Where(prop =&gt; Attribute.IsDefined(prop, typeof(T)));
+        props.ToList().ForEach(prop =&gt;
+        {
+            // get the value and default value of 'prop'
+            var val = prop.GetValue(obj);
+            var defVal = Factory.GetDefaultValueForType(prop.PropertyType);
+
+            // If the property contains a default value (such as what happens when an object is first created without setting any
+            // values), is null or is an empty generic collection, add it to the defaultProps collection.
+            // In the case of generic values, this test will fail which is not an issue since we cant test generic properties anyways.
+            if (val == null || val.Equals(defVal) || IsEmptyGenericCollection(prop, obj))
+            {
+                var thisType = prop.DeclaringType?.Name ?? "&lt;Unknown&gt;";
+                defaultProps.Add($"{thisType}:{prop.Name}");
+            }
+
+            // Don't step into user type if the type itself is null
+            if (prop.GetValue(obj) != null)
+            {
+                // Make recursive call to this function
+                defaultProps.AddRange(FindAllPropertiesWithDefaultValues&lt;T&gt;(prop.GetValue(obj)));
+            }
+        });
+
+        // Check if all of the validators returned success and return the result of that check
+        return defaultProps;
+    }
+</code></pre>
+
+<p>This method returns a collection of 'classname':'property' strings for all properties that are found to be either NULL or default.</p>
+
+<p>Lets talk about two methods here for a moment. The <code>IsEmptyGenericCollection</code> method checks to see if the object has the <code>IsGenericType</code> property set, or if the object is a descendant of <code>IEnumerable</code>. In any case, this is where the special tests are then made to determine if the collection object is empty, since the presence of a fully constructed container is not enough evidence of a 'default' object -- we need to know the presence/absence of elements to make that determination.</p>
+
+<pre><code>    /// &lt;summary&gt;
+    /// Test to see if the property of the object 'obj' is a generic collection, and if so, test to see if that collection
+    /// has any elements.Is
+    /// &lt;/summary&gt;
+    /// &lt;param name="prop"&gt;The property of 'obj' that we are testing&lt;/param&gt;
+    /// &lt;param name="obj"&gt;The object that owns the property 'prop'&lt;/param&gt;
+    /// &lt;returns&gt;true is the property is a generic collection with no elements, false otherwise&lt;/returns&gt;
+    private static bool IsEmptyGenericCollection(PropertyInfo prop, object obj)
+    {
+        // sanity
+        if (prop == null)
+        {
+            throw new ArgumentNullException(nameof(prop));
+        }
+
+        // Check to see if this is a generic collection. All generic collections are derived from IEnumerable as well
+        // as IEnumerable&lt;T&gt;.
+        if (!prop.PropertyType.IsGenericType || !(prop.GetValue(obj) is System.Collections.IEnumerable))
+        {
+            return false;
+        }
+
+        // retrieve the enumerator and check to see if there is an element to advance to... if not, then we
+        // are in the default state
+        var enumerable = prop.GetValue(obj) as System.Collections.IEnumerable;
+        if (enumerable == null)
+        {
+            return false;
+        }
+        var enumerator = enumerable.GetEnumerator();
+        var isEmptyGenericCollection = !enumerator.MoveNext();
+
+        return isEmptyGenericCollection;
+    }
+</code></pre>
+
+<p>The second method needed is the instance creator for value types. I chose to move that off to a separate class because thats how I partitioned things for testing in my projects.</p>
+
+<pre><code>public static class Factory
+{
+    /// &lt;summary&gt;
+    /// Create a default object of a given type
+    /// &lt;/summary&gt;
+    /// &lt;param name="type"&gt;The type to create&lt;/param&gt;
+    /// &lt;returns&gt;The type in its default state&lt;/returns&gt;
+    public static object GetDefaultValueForType(Type type)
+    {
+        return type.IsValueType ? Activator.CreateInstance(type) : null;
+    }
+}
+</code></pre>
+
+<p><strong>Constructing a Class</strong></p>
+
+<p>Before we tackle this last point, and to my mind was what the questioner was asking in the first place, lets create a test case.</p>
+
+<p>Lets first make some test classes as follows:</p>
+
+<pre><code>public class ExampleClassB
+{
+    [Validate]
+    public double SomeDouble { get; set; }
+
+    [Validate]
+    public Rectangle SomeRectangle { get; set; }
+}
+
+
+public class ExampleClassA
+{
+    /// &lt;summary&gt;
+    /// Ctor
+    /// &lt;/summary&gt;
+    public ExampleClassA()
+    {
+        someList = new List&lt;string&gt;();
+        SomeClassB_1 = new ExampleClassB();
+    }
+
+    [Validate]
+    public string SomeString { get; set; }
+
+    [Validate]
+    public int SomeInt { get; set; }
+
+    [Validate]
+    public TimeSpan SomeTimeSpan { get; set; }
+
+    [Validate]
+    public Guid SomeGuid { get; set; }
+
+    private List&lt;string&gt; someList;
+    [Validate]
+    public List&lt;string&gt; SomeList =&gt; someList;
+
+    [Validate]
+    public ExampleClassB SomeClassB_1 { get; set; }
+
+    [Validate]
+    public ExampleClassB SomeClassB_2 { get; set; }
+
+    public string WontBeValidated { get; set; }
+}
+</code></pre>
+
+<p>This test will test the following:</p>
+
+<ul>
+<li>POD types for both reference types and value types (I chose Guid, TimeSpan, DateTime as well as some classics like int and double as well as Rectangle for you graphics types out there)</li>
+<li>IList for testing generics</li>
+<li>Recursive testing of nested classes, one that is instantiated, one that remains dangling (NULL)</li>
+</ul>
+
+<p>We test this as follows in a console app:</p>
+
+<pre><code>/// &lt;summary&gt;
+/// Main program
+/// &lt;/summary&gt;
+internal static class Program
+{
+    /// &lt;summary&gt;
+    /// Main entry point
+    /// &lt;/summary&gt;
+    /// &lt;param name="args"&gt;&lt;/param&gt;
+    static void Main(string[] args)
+    {
+        var exampleClass = new ExampleClassA();
+        var results = Validate.FindAllPropertiesWithDefaultValues&lt;ValidateAttribute&gt;(exampleClass);
+        results.ForEach(Console.WriteLine);
+        Console.ReadLine();
+    }
+}
+</code></pre>
+
+<p>Our output looks as follows:</p>
+
+<p><a href="https://i.stack.imgur.com/v1quT.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/v1quT.png" alt="enter image description here"></a></p>
+
+<p>So this begs the question... why would you want to return a cloned class with only the properties present that are NULL default? Is that really your intent?</p>
+
+<p>Some possibilities...</p>
+
+<p>A collection (List? Set/Hash? Dictionary? etc) of classes/properties that are NULL/default? It could look something like this:</p>
+
+<pre><code>public class DefaultProp
+{
+    public string Class { get; set; }
+    public string Property { get; set; }
+    public string Type { get; set; }
+}
+
+var PropList = new List&lt;DefaultProp&gt;();
+</code></pre>
+
+<p>You could then do whatever you need to with this information. </p>
+
+<p>Just my two shekels...</p>
+    </div>

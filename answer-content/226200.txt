@@ -1,0 +1,208 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>My answer makes the assumption that you mean to compare the <strong>values</strong> of the data and not the <strong>formulas</strong>, though much of the other comments here remain valid for your code.</p>
+
+<ol>
+<li><a href="https://www.excel-easy.com/vba/examples/byref-byval.html" rel="nofollow noreferrer">Identify your function parameters as <code>ByRef</code> or <code>ByVal</code></a>. As you may guess, passing a variable "by reference" generally allows you to reference the variable as held by the caller and make modifications to its value (there are some exceptions, but this is the concept). Passing a variable "by value" effectively copies the value of the variable to a new variable in your routine. When passing objects, such as <code>Worksheet</code>, to a function, I nearly always pass these objects <code>ByRef</code> so I'm thinking there is some deep copy action happening.</li>
+<li>It's generally recommended to declare your variables as close to its first use as possible. This will save you (and anyone else reviewing your code) from having to scroll up/down to determine variable types and definitions.</li>
+</ol>
+
+<p>So to declare references to the two source worksheets would look like this:</p>
+
+<pre><code>Dim area1 As Range
+Dim area2 As Range
+Set area1 = ws1.UsedRange
+Set area2 = ws2.UsedRange
+</code></pre>
+
+<ol start="3">
+<li>You can simplify how you determine the maximum number of rows and columns using two statements with the <code>IIf</code>.</li>
+</ol>
+
+<p>Notice how I'm overwriting the initial <code>Set</code> of each area variable, possibly expanding it to cover the largest possible range.</p>
+
+<pre><code>'--- calculate the max-sized range for the data and expand
+'    the ranges as needed
+Dim maxRows As Long
+Dim maxCols As Long
+maxRows = IIf(area1.Rows.Count &gt; area2.Rows.Count, _
+              area1.Rows.Count, area2.Rows.Count)
+maxCols = IIf(area1.Columns.Count &gt; area2.Columns.Count, _
+              area1.Columns.Count, area2.Columns.Count)
+Set area1 = area1.Resize(maxRows, maxCols)
+Set area2 = area2.Resize(maxRows, maxCols)
+</code></pre>
+
+<ol start="4">
+<li>Here's where the real speed improvement kicks in - <a href="https://excelmacromastery.com/excel-vba-array/" rel="nofollow noreferrer">memory-based arrays (see #19 and #20)</a>. When you're working with a <code>Range</code> object, Excel incurs a lot of overhead to manage all the aspects of that range object. This is expensive in execution time, especially if all you want is the value of each cell in the range. It's a quick step to copy all the values into an array.</li>
+</ol>
+
+<p>Note that each array is declared as a <code>Variant</code> without array dimensions. The assignment of the range <code>.Value</code> will cast the variant into an array:</p>
+
+<pre><code>'--- create memory-based arrays for the data in the ranges
+Dim data1 As Variant
+Dim data2 As Variant
+data1 = area1.value
+data2 = area2.value
+</code></pre>
+
+<ol start="5">
+<li>In keeping with the idea of speed, I'm creating a <code>Collection</code> of items that captures all of the differences/discrepancies discovered between the two worksheet areas. Because the <code>Collection</code> is also a memory-based object, it will also be very fast.</li>
+</ol>
+
+<p>Each entry in the <code>Collection</code> is a comma separated value string, which we'll pull apart later on.</p>
+
+<pre><code>'--- we'll build up the report as a series of discrepancy
+'    entries in a Collection for now
+Dim report As Collection
+Set report = New Collection
+
+Dim r As Long
+Dim c As Long
+For r = 1 To maxRows
+    For c = 1 To maxCols
+        If data1(r, c) &lt;&gt; data2(r, c) Then
+            '--- add a discrepancy entry to log the difference
+            '    as a comma separated string:
+            '          "row,column,value1 &lt;&gt; value2"
+            report.Add r &amp; "," &amp; c &amp; "," &amp; data1(r, c) &amp; " &lt;&gt; " &amp; data2(r, c)
+        End If
+    Next c
+Next r
+</code></pre>
+
+<ol start="6">
+<li>The example here shows two different ways to present your results, depending on your requirements. The first simply reports the results as a virtual list (array) that is copied directly to a worksheet. (I didn't create a separate workbook, for simplicity of my example.) </li>
+</ol>
+
+<p>This list does not mimic the dimensions of the data areas at all.</p>
+
+<pre><code>'--- results as a simple list
+Dim reportData As Variant
+ReDim reportData(1 To report.Count + 1, 1 To 3)
+reportData(1, 1) = "Row"
+reportData(1, 2) = "Column"
+reportData(1, 3) = "Difference"
+For r = 2 To report.Count + 1
+    Dim parts() As String
+    parts = Split(report.Item(r - 1), ",")
+    reportData(r, 1) = parts(0)
+    reportData(r, 2) = parts(1)
+    reportData(r, 3) = parts(2)
+Next r
+Set finalReport = reportWS.Range("A1").Resize(report.Count + 1, 3)
+finalReport.value = reportData
+</code></pre>
+
+<p>An alternative solution is to report the discrepancies in a worksheet range that is dimensionally similar to your source worksheets. Your original post is trying to applying shading to cells with differences. </p>
+
+<p>The example here works very fast for two reasons:  1) because of how we've collected the discrepancies earlier, there's no need to loop over every single cell in the range. We have the row and column of each discrepancy, so we can directly (and quickly) just set the highlight colors and be finished, and 2) by disabling/enabling <code>Application.ScreenUpdating</code> we prevent Excel from interacting with the display, and that gains more speed.</p>
+
+<pre><code>'--- results as a data range with highlighted cells
+Application.ScreenUpdating = False
+Set reportWS = Sheet4
+Set finalReport = reportWS.Range("A1").Resize(maxRows, maxCols)
+Dim discrepancy As Variant
+For Each discrepancy In report
+    'Dim parts() As String
+    parts = Split(discrepancy, ",")
+    With finalReport.Cells(CLng(parts(0)), CLng(parts(1)))
+        .value = parts(2)
+        .Interior.Color = 255
+        .Font.ColorIndex = 2
+        .Font.Bold = True
+    End With
+Next discrepancy
+Application.ScreenUpdating = True
+</code></pre>
+
+<p>Here is the full module you can use for testing:</p>
+
+<pre><code>Option Explicit
+
+Sub test()
+    CompareData Sheet1, Sheet2
+End Sub
+
+Sub CompareData(ByRef ws1 As Worksheet, ByRef ws2 As Worksheet)
+    Dim area1 As Range
+    Dim area2 As Range
+    Set area1 = ws1.UsedRange
+    Set area2 = ws2.UsedRange
+
+    '--- calculate the max-sized range for the data and expand
+    '    the ranges as needed
+    Dim maxRows As Long
+    Dim maxCols As Long
+    maxRows = IIf(area1.Rows.Count &gt; area2.Rows.Count, _
+                  area1.Rows.Count, area2.Rows.Count)
+    maxCols = IIf(area1.Columns.Count &gt; area2.Columns.Count, _
+                  area1.Columns.Count, area2.Columns.Count)
+    Set area1 = area1.Resize(maxRows, maxCols)
+    Set area2 = area2.Resize(maxRows, maxCols)
+
+    '--- create memory-based arrays for the data in the ranges
+    Dim data1 As Variant
+    Dim data2 As Variant
+    data1 = area1.value
+    data2 = area2.value
+
+    '--- we'll build up the report as a series of discrepancy
+    '    entries in a Collection for now
+    Dim report As Collection
+    Set report = New Collection
+
+    Dim r As Long
+    Dim c As Long
+    For r = 1 To maxRows
+        For c = 1 To maxCols
+            If data1(r, c) &lt;&gt; data2(r, c) Then
+                '--- add a discrepancy entry to log the difference
+                '    as a comma separated string:
+                '          "row,column,value1 &lt;&gt; value2"
+                report.Add r &amp; "," &amp; c &amp; "," &amp; data1(r, c) &amp; " &lt;&gt; " &amp; data2(r, c)
+            End If
+        Next c
+    Next r
+
+    Dim reportWB As Workbook
+    Dim reportWS As Worksheet
+    Dim finalReport As Range
+    'Set reportWB = Workbooks.Add
+    'Set reportWS = reportWB.Sheets(1)
+    Set reportWS = Sheet3
+
+    '--- results as a simple list
+    Dim reportData As Variant
+    ReDim reportData(1 To report.Count + 1, 1 To 3)
+    reportData(1, 1) = "Row"
+    reportData(1, 2) = "Column"
+    reportData(1, 3) = "Difference"
+    For r = 2 To report.Count + 1
+        Dim parts() As String
+        parts = Split(report.Item(r - 1), ",")
+        reportData(r, 1) = parts(0)
+        reportData(r, 2) = parts(1)
+        reportData(r, 3) = parts(2)
+    Next r
+    Set finalReport = reportWS.Range("A1").Resize(report.Count + 1, 3)
+    finalReport.value = reportData
+
+    '--- results as a data range with highlighted cells
+    Application.ScreenUpdating = False
+    Set reportWS = Sheet4
+    Set finalReport = reportWS.Range("A1").Resize(maxRows, maxCols)
+    Dim discrepancy As Variant
+    For Each discrepancy In report
+        'Dim parts() As String
+        parts = Split(discrepancy, ",")
+        With finalReport.Cells(CLng(parts(0)), CLng(parts(1)))
+            .value = parts(2)
+            .Interior.Color = 255
+            .Font.ColorIndex = 2
+            .Font.Bold = True
+        End With
+    Next discrepancy
+    Application.ScreenUpdating = True
+End Sub
+</code></pre>
+    </div>

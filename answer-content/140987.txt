@@ -1,0 +1,228 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<ol>
+<li><p>There's no space before the parenthesis on an enum variant</p></li>
+<li><p><code>derive</code>s are combined into one line.</p></li>
+<li><p>Make <code>precedence</code> an inherent method on <code>Token</code>.</p></li>
+<li><p>Inside of <code>precedence</code>, match on the dereference of the value. This avoids the spread of <code>&amp;</code>.</p></li>
+<li><p>There's no need for <code>lazy_static</code>; just create a structure and put the regex in it, the reuse it in the loop.</p></li>
+<li><p>There's no need for the large amount of string allocation. Take in a <code>&amp;str</code> instead of a <code>String</code> and simply slice it up.</p></li>
+<li><p>Instead of trimming the input by the operator characters, skip by the number of bytes the first character was.</p></li>
+<li><p>There's no need to specify the type of <code>parse</code>.</p></li>
+<li><p>The code trims the left multiple times; just do it once.</p></li>
+<li><p>There's no need to specify type of <code>queue</code> as it's inferrable.</p></li>
+<li><p>There's no need to use the <code>@</code> pattern binding; can just use <code>token</code>.</p></li>
+</ol>
+
+<p>Larger ideas:</p>
+
+<ol>
+<li><p>Create a newtype around <code>Vec&lt;Token&gt;</code> to indicate that data is in RPN order. Types avoid the need for documentation.</p></li>
+<li><p>Create multiple types of enums; one with parens and one without. Then there's one less place to have an <code>unreachable</code>. If there's subsets, you could embed the subset in the superset. </p></li>
+<li><p>The error handling is pretty rough for the end user. Mismatched parenthesis kill the program instead of explaining the error and letting the user continue. There's no (obvious) way to exit the program other than by killing it or closing stdin (which produces another error message).</p></li>
+</ol>
+
+<hr>
+
+<pre><code>use std::io;
+extern crate regex; // 0.1.80
+#[macro_use]
+extern crate lazy_static;
+
+use regex::Regex;
+
+fn main() {
+    let tokenizer = Tokenizer::new();
+
+    loop {
+        println!("Enter input:");
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&amp;mut input)
+            .expect("Failed to read line");
+        let tokens = tokenizer.tokenize(&amp;input);
+        let stack = shunt(tokens);
+        let res = calculate(stack);
+        println!("{}", res);
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Token {
+    Number(i64),
+    Plus,
+    Sub,
+    Mul,
+    Div,
+    LeftParen,
+    RightParen,
+}
+
+impl Token {
+    /// Returns the precedence of op
+    fn precedence(&amp;self) -&gt; usize {
+        match *self {
+            Token::Plus | Token::Sub =&gt; 1,
+            Token::Mul | Token::Div =&gt; 2,
+            _ =&gt; 0,
+        }
+    }
+}
+
+struct Tokenizer {
+    number: Regex,
+}
+
+impl Tokenizer {
+    fn new() -&gt; Tokenizer {
+        Tokenizer {
+            number: Regex::new(r"^[0-9]+").expect("Unable to create the regex"),
+        }
+    }
+
+    /// Tokenizes the input string into a Vec of Tokens.
+    fn tokenize(&amp;self, mut input: &amp;str) -&gt; Vec&lt;Token&gt; {
+        let mut res = vec![];
+
+        loop {
+            input = input.trim_left();
+            if input.is_empty() { break }
+
+            let (token, rest) = match self.number.find(input) {
+                Some((_, end)) =&gt; {
+                    let (num, rest) = input.split_at(end);
+                    (Token::Number(num.parse().unwrap()), rest)
+                },
+                _ =&gt; {
+                    match input.chars().next() {
+                        Some(chr) =&gt; {
+                            (match chr {
+                                '+' =&gt; Token::Plus,
+                                '-' =&gt; Token::Sub,
+                                '*' =&gt; Token::Mul,
+                                '/' =&gt; Token::Div,
+                                '(' =&gt; Token::LeftParen,
+                                ')' =&gt; Token::RightParen,
+                                _ =&gt; panic!("Unknown character!"),
+                            }, &amp;input[chr.len_utf8()..])
+                        }
+                        None =&gt; panic!("Ran out of input"),
+                    }
+                }
+            };
+
+            res.push(token);
+            input = rest;
+        }
+
+        res
+    }
+}
+
+/// Transforms the tokens created by `tokenize` into RPN using the
+/// [Shunting-yard algorithm](https://en.wikipedia.org/wiki/Shunting-yard_algorithm)
+fn shunt(tokens: Vec&lt;Token&gt;) -&gt; Vec&lt;Token&gt; {
+    let mut queue = vec![];
+    let mut stack: Vec&lt;Token&gt; = vec![];
+    for token in tokens {
+        match token {
+            Token::Number(_) =&gt; queue.push(token),
+            Token::Plus | Token::Sub | Token::Mul | Token::Div =&gt; {
+                while let Some(o) = stack.pop() {
+                    if token.precedence() &lt;= o.precedence() {
+                        queue.push(o);
+                    } else {
+                        stack.push(o);
+                        break;
+                    }
+                }
+                stack.push(token)
+            },
+            Token::LeftParen =&gt; stack.push(token),
+            Token::RightParen =&gt; {
+                let mut found_paren = false;
+                while let Some(op) = stack.pop() {
+                    match op {
+                        Token::LeftParen =&gt; {
+                            found_paren = true;
+                            break;
+                        },
+                        _ =&gt; queue.push(op),
+                    }
+                }
+                assert!(found_paren)
+            },
+        }
+    }
+    while let Some(op) = stack.pop() {
+        queue.push(op);
+    }
+    queue
+}
+
+/// Takes a Vec of Tokens converted to RPN by `shunt` and calculates the result
+fn calculate(tokens: Vec&lt;Token&gt;) -&gt; i64 {
+    let mut stack = vec![];
+    for token in tokens {
+        match token {
+            Token::Number(n) =&gt; stack.push(n),
+            Token::Plus =&gt; {
+                let (b, a) = (stack.pop().unwrap(), stack.pop().unwrap());
+                stack.push(a + b);
+            },
+            Token::Sub =&gt; {
+                let (b, a) = (stack.pop().unwrap(), stack.pop().unwrap());
+                stack.push(a - b);
+            },
+            Token::Mul =&gt; {
+                let (b, a) = (stack.pop().unwrap(), stack.pop().unwrap());
+                stack.push(a * b);
+            },
+            Token::Div =&gt; {
+                let (b, a) = (stack.pop().unwrap(), stack.pop().unwrap());
+                stack.push(a / b);
+            },
+            _ =&gt; {
+                // By the time the token stream gets here, all the LeftParen
+                // and RightParen tokens will have been removed by shunt()
+                unreachable!();
+            },
+        }
+    }
+    stack[0]
+}
+</code></pre>
+
+<hr>
+
+<p>I'm not really happy with the parsing aspect of the code, but I'm not seeing an obvious better thing at the moment.</p>
+
+<hr>
+
+<p>As <a href="https://codereview.stackexchange.com/questions/140982/rust-calculator/140987#comment264098_140987">pointed out by Francis Gagné</a>, you can call <a href="https://doc.rust-lang.org/stable/std/str/struct.Chars.html#method.as_str" rel="nofollow noreferrer"><code>Chars::as_str</code></a> to get the remainder of the string after pulling off the first character:</p>
+
+<pre><code>let mut chars = input.chars();
+match chars.next() {
+    Some(chr) =&gt; {
+        (match chr {
+            '+' =&gt; Token::Plus,
+            '-' =&gt; Token::Sub,
+            '*' =&gt; Token::Mul,
+            '/' =&gt; Token::Div,
+            '(' =&gt; Token::LeftParen,
+            ')' =&gt; Token::RightParen,
+            _ =&gt; panic!("Unknown character!"),
+        }, chars.as_str())
+</code></pre>
+
+<blockquote>
+  <p>I don't get the point of creating a whole new structure just for the tokenizer function when <code>lazy_static!</code> can do the same thing</p>
+</blockquote>
+
+<p>Likewise, I don't get the point of using <code>lazy_static!</code> when normal language constructs can do the same thing ^_^.</p>
+
+<p><code>lazy_static!</code> <a href="https://github.com/rust-lang-nursery/lazy-static.rs/blob/ffe65c818474f863945ca535c0e53f3b8b848ff7/src/lazy.rs#L16" rel="nofollow noreferrer">currently requires heap allocation</a> and that memory can never be reclaimed until the program exits.</p>
+
+<p>Creating a value and using a reference to it is made completely safe by Rust's semantics and lifetimes, so I find myself using stack allocations far more frequently than I would with a language like C.</p>
+
+<p>I generally dislike singletons of any kind, for the reasons espoused throughout the Internet. In this case, the singleton is created in the final binary, which ameliorates the problem somewhat.</p>
+    </div>

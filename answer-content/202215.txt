@@ -1,0 +1,147 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>If performance aren't critical (measure, do not guess) then you can use some Reflection:</p>
+
+<pre><code>public virtual void SetValue(string field, string value)
+{
+    var property = GetType().GetProperty(field);
+    property.SetValue(this, value);
+}
+</code></pre>
+
+<p>This will handle all simple cases (1:1 name matching and no complex conversions). You can handle some more conversions explicitely converting from string to the target type:</p>
+
+<pre><code>property.SetValue(this,
+    Convert.ChangeType(value, property.PropertyType, CultureInfo.InvariantCulture));
+</code></pre>
+
+<p>With this you probably covert most of trivial cases. For everything else (or for non 1:1 name mapping) you can use a dictionary:</p>
+
+<pre><code>const Dictionary&lt;string, ValueConverter&gt; _converters = ...;
+</code></pre>
+
+<p>Where the key is the input field name and <code>ValueConverter</code> is something like this:</p>
+
+<pre><code>sealed class ValueConverter
+{
+    public ValueConverter(string name, Func&lt;string, object&gt; converter)
+    {
+        OutputPropertyName = name;
+        Converter = converter;
+    }
+
+    public string OutputPropertyName { get; }
+    public Func&lt;string, object&gt; Converter { get; }
+}
+</code></pre>
+
+<p>For example an hypotetical mapping between <code>FaceValue</code> property and <code>Price</code> field name:</p>
+
+<pre><code>{ "Price", new ValueConverter(nameof(FinProductData.FaceValue), StringOperations.ParseEuroCurrency) }
+</code></pre>
+
+<p>Note that I'm using <code>nameof()</code> instead of hard-coding the property name. Now you can first search in the dictionary:</p>
+
+<pre><code>public virtual void SetValue(string field, string value)
+{
+    if (_converters.TryGet(field, out var converter))
+    {
+        var property = GetType().GetProperty(converter.OutputPropertyName);
+        property.SetValue(this, converter.Convert(value));
+    }
+    else
+    {
+        var property = GetType().GetProperty(field);
+        if (property == null)
+        {
+            logger.Warn($"Unsupported descriptor ({field}), it will be ignored");
+        }
+
+        var convertedValue = Convert.ChangeType(value,
+            property.PropertyType,
+            CultureInfo.InvariantCulture));
+
+        property.SetValue(this, convertedValue);
+
+    }
+}
+</code></pre>
+
+<p>How to provide additional conversion rules in derived classes? You have to add more rules (if default behavior isn't enough) to the conversions dictionary. I think it's then time to <strong>move this logic to a separate class</strong> because it's both reusable and outside <code>FinProductData</code> responsibilities. You may do:</p>
+
+<ul>
+<li>Add more rules in the ctor (discouraged outside very simple cases, it's a waste of resources).</li>
+<li>Remove <code>virtual</code> from <code>SetValue()</code> and delegate to a separate method (see later).</li>
+<li>Use conventions and <code>static</code> mappers (declared as fields).</li>
+</ul>
+
+<p>Two words about the second option:</p>
+
+<p>Change <code>if (_converters.TryGet(field, out var converter))</code> to accept a list instead of a dictionary and <code>ValueConverter</code> to hold both names:</p>
+
+<pre><code>var converter = ResolveConverters()
+    .FirstOrDefault(x =&gt; x.Field.Equals(field, StringComparison.Ordinal));
+
+if (converter != null)
+{
+    var property = GetType().GetProperty(converter.OutputPropertyName);
+    property.SetValue(this, converter.Convert(value));
+}
+else
+{
+    // Same as before
+}
+</code></pre>
+
+<p>Add this:</p>
+
+<pre><code>protected virtual IEnumerable&lt;ValueConverter&gt; ResolveConverters()
+{
+    return ...; // Return a static list
+}
+</code></pre>
+
+<p>And in derived classes:</p>
+
+<pre><code>protected override IEnumerable&lt;ValueConverter&gt; ResolveConverters()
+{
+    return super.ResolveConverters().Concat(...);
+}
+</code></pre>
+
+<p>With closures you can also use class properties, if you need to.</p>
+
+<hr>
+
+<p>Note that we're messing with responsibilities, for more complex cases (or ever-changing code) you should have:</p>
+
+<ul>
+<li><code>ValueConverter</code> class which describes a single conversion, more or less as described before.</li>
+<li><code>PropertyMapper</code> class which performs this mapping (which, IMHO, shouldn't be part of data class responsibilities).</li>
+<li>The list of conversions for each class might be specified with an attribute <code>PropertyMappingAttribute</code>.</li>
+</ul>
+
+<p>You might then have something like this:</p>
+
+<pre><code>[PropertyMapping(typeof(FinProductDataMapper))]
+abstract class FinProductData { ... }
+
+[PropertyMapping(typeof(ExpressCertificateMapper))]
+sealed class ExpressCertificate{ ... }
+</code></pre>
+
+<p>With <code>PropertyMapper</code> which simply goes (top to bottom) through the class hierarchy to find relevant mappings (in this way you may also handle weird cases with properties hidden with <code>new</code>).</p>
+
+<hr>
+
+<p>If it's not a problem for your design you may even drop the conversion list and use attributes on your properties:</p>
+
+<pre><code>[PropertyMapping("Price", typeof(FaceValueConverter))]
+public float FaceValue { get; set; }
+</code></pre>
+
+<p>Converter may even directly derive from <code>TypeConverter</code>, in this way you gain a reusable code snippet.</p>
+
+<hr>
+
+<p>Which one is better? Hard to say. If you have few classes and few fields then I'd start with the simplest working solution then I'd move to more complex implementations when required. Note that property access may even be made pretty fast without Reflection (check what Dapper, for example, does).</p>
+    </div>

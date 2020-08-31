@@ -1,0 +1,78 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First things first, always have an entry point with your Python code - </p>
+
+<pre><code>if __name__ == "__main__":
+    fetch_stream()
+</code></pre>
+
+<p>As this will allow code documenting tools to auto-generate documents without executing your code (and it's obvious where your code runs from for other developers).<br>
+Next, I see lots of code duplication (DRY/Don't repeat yourself), it's important to extract all these into their own separate functions, for instance, you open and close the database connection a few times, which is expensive. Let's extract that out, and make the db an injectable parameter: </p>
+
+<pre><code>def open_database():
+    return mysql.connector.connect(**AuthDB.config)
+
+ def fetch_stream(db):
+    cursor = db.cursor(buffered=True)
+    # ....
+
+if __name__ == "__main__":
+    db = open_database()
+    fetch_stream(db)
+    db.close()
+</code></pre>
+
+<p>However, now looking across all the functions, we can see that the cursor creation is the same, and we also see the same pattern - create cursor, run query, get results - yet you have code which manipulates the data per-database row - this too is an expensive process because you can tie up the database memory holding your query results, and you perform <code>fetch_one()</code> operations instead of a <code>fetch_all()</code> operation.  </p>
+
+<p>Unfortunately my suggestions will now break your existing code structure - but let's continue. We extract the database query process into a faster method (Python2 map returns a list automatically, Python3 we need to wrap the map with a list):  </p>
+
+<pre><code>def execute_query(db, query):
+    cursor = db.cursor(buffered=True)
+    cursor.execute(query)
+    results = cursor.fetch_all()
+    col_names = [column[0] for column in cursor.description]
+    rows_dict = list(map(lambda row: dict(zip(col_names, row)), results))
+    cursor.close()
+    return rows_dict
+</code></pre>
+
+<p>We now have a function which will grab the data quickly and return an object which is easily iterated. This would result in a change to your <code>fetch_stream()</code> function, into something like this:</p>
+
+<pre><code>if __name__ == "__main__":
+    db = open_database()
+    query = "SELECT * FROM user_activity_load WHERE protocol = 6 AND tcp_flag = 'SYN' AND stream_index IS NULL OR protocol = 17  AND stream_index IS NULL LIMIT 100"
+    all_user_activity_load = execute_query(db, query)
+</code></pre>
+
+<p>This is important to bring the query out of the function, because having "magic numbers" and SQL queries inside functions violates the Open/Close Principal - being that your code should be Open for extension but Closed for modification. 
+Database structures will always change, and if you want to modify the query to get different columns instead - you'd have to open up the code and edit the code, then run it again to see if it resulted in your expected outcome, correct?<br>
+That means you're always modifying the code and you might make a mistake and push to production, etc. We have S.O.L.I.D as it's a way of writing code to avoid common pitfalls. So, you can see we've moved the query out of the function, and make it an injectable parameter into <code>execute_query()</code>. Personally, I'd have the queries in an .ini file, and load them based on section heading. That way the code can be deployed as read-only, but other IT people can edit the .ini file to modify the query if the database changes.</p>
+
+<p>Of course, the <code>fetch_stream()</code> function is now broken completely. Looking at that function, it iterates through the initial results, and separates TCP and UDP based on protocol. Given we now have names for each field in the dictionary from the <code>execute_query()</code> function, we can easily filter the original results into a new list:</p>
+
+<pre><code>def filter_by_protocol(results, protocol_number):
+    return [x for x in results if x['protocol'] == protocol_number]
+</code></pre>
+
+<p>So you'd filter those based on protocol == 6 for the TCP etc. with a set of lines like:</p>
+
+<pre><code>all_user_activity_load = execute_query(db, query)
+tcp_results = filter_by_protocol(all_user_activity_load, 6)
+udp_results = filter_by_protocol(all_user_activity_load, 17)
+</code></pre>
+
+<p>Now we can throw those lists at both <code>get_tcp_stream(tcp_results)</code> and <code>get_udp_stream(udp_results)</code> - but digging into the code for those functions, if I'm reading your intention correctly - it appears we're going back to the database to pull the exact same information which we've already got? Is that right? If so, we don't need those functions, just to clean up the current <code>tcp_results</code> and <code>udp_results</code> with the sequence number, for the <code>update_index()</code> function. You should end up with a main something like this:</p>
+
+<pre><code>if __name__ == "__main__":
+    db = open_database()
+    query = "SELECT * FROM user_activity_load WHERE protocol = 6 AND tcp_flag = 'SYN' AND stream_index IS NULL OR protocol = 17  AND stream_index IS NULL LIMIT 100"
+    all_user_activity_load = execute_query(db, query)
+    tcp_results = filter_by_protocol(all_user_activity_load, 6)
+    udp_results = filter_by_protocol(all_user_activity_load, 17)
+    update_index(filter_id_from_data(tcp_results))
+    update_index(filter_id_from_data(udp_results))
+    db.close()
+</code></pre>
+
+<p>I'll leave that as an exercise to you, but it should be quite straight forward. I hope this small review helps somewhat, with an introduction into one of the SOLID concepts (which you can learn to improve your coding), and suggestions to remove code duplication (DRY).<br>
+Good luck!</p>
+    </div>

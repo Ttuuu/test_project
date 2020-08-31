@@ -1,0 +1,88 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>There are indeed a few weird/bad practices in your code.</p>
+
+<ul>
+<li><p><strong>Error handling:</strong>  Broadly speaking, there are two categories of things that can go wrong when running this program: I/O errors and malformed input.  You handle both of those poorly.</p>
+
+<ul>
+<li><p><code>IOException</code>: In <code>CSVParser.fileExists()</code>, you verify in advance that the file exists and is readable.  First of all, the method does more than its name suggests.  However, you shouldn't be performing those tests at all.  Most importantly, your <code>CSVParser.readFile()</code> method should not be catching <code>IOException</code> at all, and <em>certainly</em> should not be rethrowing it as a degraded <code>RuntimeException</code>, which contains less information about what went wrong.</p>
+
+<p>There are many conditions that could lead to an <code>IOException</code>, besides the file not existing or your process lacking the permission to read it.  The disk could spontaneously fail.  The file might be on a network share, and there might be a network timeout.  Don't try to screen for all the possible failure conditions.  Even if you did check in advance, you might still encounter an error when you actually work with the file (if, for example, someone deletes the file at just the right moment).</p></li>
+<li><p><code>Optional&lt;CSVData&gt;</code>: Under certain conditions (if the CSV file does not exist, or you lack read permission, or the data is malformed), <code>SurveyCSVParser.parse()</code> returns a <code>null</code> wrapped in an <code>Optional</code>.  That makes no sense: those conditions should trigger an exception instead of causing a <code>null</code> to be returned.  (What is <code>Optional</code> good for?  If you have a function that finds the minimum value of a list, then the <code>Optional</code> forces the caller to prepare for the possibility that there is no well defined minimum, if the list is empty.  There's no result, but it's not really an error.)</p>
+
+<p>Under other conditions, it throws a <code>RuntimeException</code> instead.  It's not clear why that would happen.</p></li>
+</ul>
+
+<p>A more reasonable design would be to have your methods throw the right kind of exception for each error condition.  <code>CSVParser.readFile()</code> should simply declare that it <code>throws IOException</code> — then you do away with the <code>fileExists()</code> check, and get rid of the <code>catch (IOException e)</code> clause.  You should define a <code>class MalformedCSVException extends Exception</code>, and throw it if you encounter a line of bad data during normal processing.  Finally, <code>SurveyCSVParser.parse()</code> should just return a <code>CSVData</code> instead of an <code>Optional&lt;CSVData&gt;</code>.</p></li>
+<li><p><strong>Object-oriented design:</strong> Your <code>CSVParser</code> isn't actually a CSV parser.  It's just a utility that opens a file for reading, splits it into lines, and counts commas per line.</p>
+
+<p>Your <code>SurveyCSVParser</code> extends <code>CSVParser</code>.  I don't see any reason to use inheritance there.  The survey-specific code simply needs to <em>use</em> a CSV parser; it doesn't need to <em>be</em> a CSV parser.</p>
+
+<p>Furthermore, there is a circular dependency here.  A generic CSV parser shouldn't know anything about what it's to be used for, and therefore shouldn't contain any mentions of <code>SurveyCSVData</code> or <code>SurveyCSVParser</code>.</p></li>
+<li><p><strong>Generalization:</strong> I'm not convinced that each level of the tree needs to have its own class (<code>SurveyCSVParser.SurveyCSVData.Division</code>, <code>SurveyCSVParser.SurveyCSVData.Team</code>, etc.).  All you need is a generalized container that knows its type (e.g. <code>"division"</code>), its ID, and can contain a sortable list of nested members.</p>
+
+<p>In fact, I'd like to see a smarter approach to sorting that involves writing less code.  If you think of the CSV file as a database table, you should be able to do write a generalized <code>Comparator</code> that lets you specify, for example, that you want to sort by column 1 ascending, then column 3 descending, then column 2 ascending.</p></li>
+<li><p><strong>Null handling:</strong> In <code>CSVParser.buildSurveyData()</code>, you validate that the parameters are non-null.  But <code>Integer.parseInt(divisionId)</code> would naturally crash anyway if <code>divisionId</code> is null, so why bother with an explicit check?</p></li>
+<li><p><strong><code>synchronized</code> and <code>transient</code>:</strong> The <code>CSVParser.readFile()</code> and <code>SurveyCSVParser.buildSurveyData()</code> methods are <code>synchronized</code>.  I'm not sure why.  It doesn't look like the code is thread-safe in general, so it looks like you threw those in for no reason.</p>
+
+<p>Similarly, some of your instance variables are declared <code>transient</code>, or even <code>transient final</code>.  Why?  I suspect that you wrote those modifiers out of superstition.</p></li>
+<li><p><strong>Looping:</strong> <code>SurveyCSVParser.processLineOfCSV()</code> has a <code>while</code> loop that contains a <code>switch</code>:</p>
+
+<blockquote>
+<pre><code>String divisionId = null, teamId = null, managerId = null, employeeId = null, lastName = null, firstName = null, birthdate = null;
+while (tokenizer.hasMoreTokens() &amp;&amp; indexOfTokenFound &lt; MIN_TOKENS_PER_LINE) {
+
+    String token = tokenizer.nextToken();
+    switch (indexOfTokenFound) {
+        case 0:
+            divisionId = token;
+            break;
+        case 1:
+            teamId = token;
+            break;
+        case 2:
+            managerId = token;
+            break;
+        case 3:
+            employeeId = token;
+            break;
+        case 4:
+            firstName = token;
+            break;
+        case 5:
+            lastName = token;
+            break;
+        case MIN_TOKENS_PER_LINE-1:
+            birthdate = token;
+            break;
+        default:
+            assert false;
+    }
+    indexOfTokenFound++;
+}
+if (indexOfTokenFound &gt;= MIN_TOKENS_PER_LINE)
+    buildSurveyData(divisionId, teamId, managerId, employeeId, firstName, lastName, birthdate, data, sortOrderOfDataOrEmployees, sortDirectionOfEmployees);
+</code></pre>
+</blockquote>
+
+<p>Why not just write…</p>
+
+<pre><code>try {
+    String divisionId = tokenizer.nextToken();
+    String teamId = tokenizer.nextToken();
+    String managerId = tokenizer.nextToken();
+    String firstName = tokenizer.nextToken();
+    String lastName = tokenizer.nextToken();
+    String birthdate = tokenizer.nextToken();
+    if (tokenizer.hasMoreTokens()) {
+        throw new MalformedCSVException("Extra field in CSV");
+    }
+    buildSurveyData(divisionId, teamId, managerId, employeeId, firstName, lastName, birthdate, data, sortOrderOfDataOrEmployees, sortDirectionOfEmployees);
+} catch (NoSuchElementException missingField) {
+    throw new MalformedCSVException("Missing field in CSV");
+}
+</code></pre>
+
+<p>Note that no extra verification is necessary, and no magic numbers (<code>MIN_TOKENS_PER_LINE</code>) are necessary.  The processing just happens naturally, and you throw an exception as you encounter an error.</p></li>
+</ul>
+    </div>

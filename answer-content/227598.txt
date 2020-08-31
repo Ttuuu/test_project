@@ -1,0 +1,128 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Don't reimplement functionality that is already provided by the standard library</h1>
+
+<p>Why do you need a <code>FilesManager</code>? It is just a glorified <code>std::map</code>. The only extra features it has is a limit for the maximum number of files, and that you can specify a base directory. In my opinion, that's not enough to warrant this class.</p>
+
+<p>Why would you ever want to set a limit to the number of files? That will only cause it to fail to add a file when you want to. Also, the <code>FilesManager::add()</code> function will just return without any error when it didn't insert a <code>File</code> into <code>files</code>.</p>
+
+<p>What's even weirder is that the <code>FilesManager::get()</code> function will actually add a new <code>File</code> to <code>files</code> when it couldn't find the <code>id</code>, bypassing the <code>max_files</code> restriction. But unless you remember to call <code>File::set_name()</code>, it will try to open the base path...</p>
+
+<p>Many functions will never return any errors, and they don't do any error checking themselves. For example, when you close a file, you don't check if the <code>failbit</code> is set.</p>
+
+<p>So, I suggest you avoid making wrappers for <code>std::fstream</code> and <code>std::map</code>, and just let the application use those standard library classes directly.</p>
+
+<h1>Focus on making the new functionality generic enough to work on <code>std::fstream</code></h1>
+
+<p>The main novelty of your code is reading and writing vectors and arrays from/to files in an easy way. You can make your templates that do this work on file streams instead. For example, to ensure you can write vectors to an output stream, you can write:</p>
+
+<pre><code>template&lt;class T&gt;
+std::ostream &amp;operator&lt;&lt;(std::ostream &amp;out, const std::vector&lt;T&gt; &amp;data) {
+    out.write(reinterpret_cast&lt;const char *&gt;(val.data()), sizeof(T) * val.size());
+    return *this;
+}
+</code></pre>
+
+<h1>Adding locks to <code>read()</code> and <code>write()</code> is not useful.</h1>
+
+<p>If you are going to read and write to a file from multiple threads, the mutex you use to synchronize calls to <code>File::read()</code> and <code>File::write()</code> are not going to be of much help, because these mutexes don't guarantee anything about the order in which those functions are going to be executed. So, any thread will probably want to do its own high level locking, to ensure for example that multiple consecutive reads in one thread actually also read consecutive data from the file.</p>
+
+<h1>Maps are not thread-safe</h1>
+
+<p>While you added locks to individual functions of <code>class File</code>, you did not add a mutex to <code>class FilesManager</code> to protect against concurrent access of the map <code>files</code>. This means that if multiple threads try to add or remove files from a <code>FilesManager</code> object, it will corrupt the map, at best resulting in a crash, at worst resulting in a security hole.</p>
+
+<h1>Example without <code>class FilesManager</code> and <code>class File</code></h1>
+
+<p>The following code shows how your use example would work by only providing the operator overloads to read and write vectors to files, the <code>rw_soft()</code> wrapper. It uses the standard library for everything else. The code looks mostly the same, and has roughly the same level of verbosity.</p>
+
+<pre><code>#include &lt;complex&gt;
+#include &lt;iostream&gt;
+#include &lt;fstream&gt;
+#include &lt;map&gt;
+#include &lt;vector&gt;
+
+template&lt;typename T&gt;
+struct rw_s {
+    T *data;
+    size_t size;
+};
+
+template&lt;typename T&gt; rw_s&lt;T&gt; rw_soft(T &amp;data, size_t size = 1) {
+    return rw_s&lt;T&gt;{&amp;data, size};
+}
+
+template&lt;typename T&gt;
+std::ostream &amp;operator&lt;&lt;(std::ostream &amp;out, const std::vector&lt;T&gt; &amp;vec) {
+    out.write(reinterpret_cast&lt;const char *&gt;(vec.data()), sizeof(T) * vec.size());
+    return out;
+}
+
+
+template&lt;typename T&gt;
+std::istream &amp;operator&gt;&gt;(std::istream &amp;in, std::vector&lt;T&gt; &amp;vec) {
+    in.read(reinterpret_cast&lt;char *&gt;(vec.data()), sizeof(T) * vec.size());
+    return in;
+}
+
+template&lt;typename T&gt;
+std::ostream &amp;operator&lt;&lt;(std::ostream &amp;out, const rw_s&lt;T&gt; &amp;info) {
+    out.write(reinterpret_cast&lt;const char *&gt;(info.data), sizeof(T) * info.size);
+    return out;
+}
+
+template&lt;typename T&gt;
+std::istream &amp;operator&gt;&gt;(std::istream &amp;in, const rw_s&lt;T&gt; &amp;info) {
+    in.read(reinterpret_cast&lt;char *&gt;(info.data), sizeof(T) * info.size);
+    return in;
+}
+
+int main() {
+    const auto create = std::ios_base::in | std::ios_base::out | std::ios_base::trunc;
+
+    std::map&lt;const std::string, std::fstream&gt; fm;
+    fm["1"] = std::fstream("test_file.bin", create);
+
+    std::vector&lt;std::complex&lt;float&gt;&gt; wdata = {{1, 9}, {3, 75}, {213.34, 21.4}, {153.1, 15.85}};
+    std::vector&lt;std::complex&lt;float&gt;&gt; rdata(wdata.size());
+
+    fm["1"] &lt;&lt; wdata;
+    fm["1"].seekg(0);
+    fm["1"] &gt;&gt; rdata;
+
+    fm["5"] = std::fstream("test_file2.bin", create);
+    int a = 12;
+    int b = 0;
+    fm["5"] &lt;&lt; rw_soft(a);
+    fm["5"].seekg(0);
+    fm["5"] &gt;&gt; rw_soft(b);
+    std::cout &lt;&lt; b &lt;&lt; '\n';
+
+    fm.erase("5");
+    fm["5"] &lt;&lt; rw_soft(a); // Error
+    fm["5"].seekg(0); // Error
+    fm["5"] &gt;&gt; rw_soft(b); // Error
+
+    for (auto &amp;&amp;val: rdata) {
+        std::cout &lt;&lt; val &lt;&lt; '\n';
+    }
+
+    fm["2"] = std::fstream("test_file2.bin", create);
+
+    for (size_t i = 0; i &lt; 100; i++) {
+        fm["2"] &lt;&lt; rw_soft(i);
+    }
+
+    fm["2"].seekg(0);
+
+    for (size_t i = 0; i &lt; 100; i++) {
+        size_t j = 0;
+        fm["2"] &gt;&gt; rw_soft(j);
+        std::cout &lt;&lt; j &lt;&lt; ' ';
+    }
+    std::cout &lt;&lt; '\n';
+}
+</code></pre>
+
+<h1>Avoid using maps to store a collection of objects if it's not necessary.</h1>
+
+<p>This is not so much about the implementation of your classes, but rather about your intended use of <code>class FilesManager</code>. Maps are not free; looking up an element in a map means traversing a tree structure, comparing strings at every node in this tree. While you mention you don't want to hold 200 files in 200 separate variables, there are many other ways to avoid having to declare 200 variables, some of them simpler and/or faster than a <code>std::map</code>. For example, you could just make an array or a <code>std::vector</code> of 200 files.</p>
+    </div>

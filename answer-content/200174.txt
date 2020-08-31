@@ -1,0 +1,1361 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Definitely not bad for a first attempt! Let's start at the top.</p>
+
+<pre><code>#include &lt;SDL.h&gt;
+#include &lt;SDL_image.h&gt;
+#include &lt;iostream&gt;
+#include &lt;random&gt;
+#include &lt;SDL_ttf.h&gt;
+#include &lt;string&gt;
+</code></pre>
+
+<p>It's generally wise to organize your includes for several reasons, not least being the ability to see what you've included and what you haven't clearly. I generally like to group standard includes, then system includes, then project includes, and sort each group in itself. So:</p>
+
+<pre><code>#include &lt;iostream&gt;
+#include &lt;random&gt;
+#include &lt;string&gt;
+
+#include &lt;SDL.h&gt;
+#include &lt;SDL_image.h&gt;
+#include &lt;SDL_ttf.h&gt;
+</code></pre>
+
+<p>Next up is the globals. Global variables are problematic. A lot of tutorials are sloppy and use them, but they cause endless headaches in real-world code.</p>
+
+<p>Getting rid of the globals is not going to be easy. It's going to require a complete restructuring of your code. I'll make suggestions bit by bit as the review goes along.</p>
+
+<pre><code>const int SCREEN_WIDTH = 640;
+const int SCREEN_HEIGHT = 480;
+</code></pre>
+
+<p>The modern way to declare constants is with <code>constexpr</code>, not <code>const</code>. This makes them not only constant, but also <em>compile-time</em> constant.</p>
+
+<p>Unlike all the other globals, these are constants, so it's not a problem if they're global. Everything that follows, though, should not be global.</p>
+
+<pre><code>SDL_Window* gWindow = NULL;
+SDL_Renderer* gRenderer = NULL;
+</code></pre>
+
+<p>You should never use <code>NULL</code> in modern C++. what you want here is <code>nullptr</code>.</p>
+
+<pre><code>int getRandomNumber(int x, int y)
+{
+    std::random_device rd;
+    std::mt19937 mersenne(rd());
+    std::uniform_int_distribution&lt;&gt; number(x, y);
+    int rng = number(mersenne);
+    return rng;
+}
+</code></pre>
+
+<p>This function has a major problem: the random generator is constructed every time it's called. That ruins any guarantee of randomness.</p>
+
+<p>The way to solve the problem is to use function static variables. They will get initialized <em>once</em>, the first time the function is called.</p>
+
+<p>You should start by pulling the random number <em>engine</em> out of the function, so it can be reused by other things that need randomness. That might look like:</p>
+
+<pre><code>std::mt19937&amp; random_engine()
+{
+    static std::mt19937 mersenne{std::random_device{}());
+    return mersenne;
+}
+</code></pre>
+
+<p>To get what's going on there: first a <code>std::random_device</code> is constructed (<code>std::random_device{}</code>), then it is used to generate a seed (<code>std::random_device{}()</code>), and that is used to construct the Mersenne twister <code>mersenne</code> (<code>mersenne{std::random_device{}()}</code>), which is stored as a function static variable.</p>
+
+<p>All of that gets one <em>once</em>, the first time <code>random_engine()</code> is called.</p>
+
+<p>Once you have that, you can make your <code>getRandomNumber()</code> with it:</p>
+
+<pre><code>int getRandomNumber(int x, int y)
+{
+    std::uniform_int_distribution&lt;&gt; dist{x, y};
+    return dist(random_engine());
+}
+</code></pre>
+
+<p>Next up is <code>class LTexture</code>. It's excellent that you created a class for your textures. However, there is a crucial error with how you did it. The reason is <em>very</em> technical, and <a href="https://web.archive.org/web/20170825031611/http://cpp.indi.frih.net:80/blog/2015/07/the-universal-resource-class-pattern" rel="noreferrer">explained in great detail here</a>.</p>
+
+<p>Basically what you need the <code>LTexture</code> class to look like is this:</p>
+
+<pre><code>class LTexture
+{
+public:
+    // Note that the default constructor can now be defaulted.
+    LTexture() = default;
+
+    ~LTexture();
+
+    void free();
+    void loadfromSurface(std::string path);
+    void loadfromText(std::string text, SDL_Color);
+    void render(int x, int y);
+
+    // You need to initialize *AT LEAST* mTexture. The others are
+    // optional (but it's a good idea to initialize everything anyway).
+    SDL_Texture* mTexture = nullptr;
+    int mWidth = 0;
+    int mHeight = 0;
+    SDL_Rect mButton = {};
+
+    // Copy operations must be deleted.
+    LTexture(LTexture const&amp;) = delete;
+    LTexture&amp; operator=(LTexture const&amp;) = delete;
+
+    // Move operations must be defined.
+    LTexture(LTexture&amp;&amp;) noexcept;
+    LTexture&amp; operator=(LTexture&amp;&amp;) noexcept;
+
+    // And you need a swap function.
+    friend void swap(LTexture&amp;, LTexture&amp;) noexcept;
+};
+</code></pre>
+
+<p>First let's define the swap. It's pretty simple... just swap everything:</p>
+
+<pre><code>void swap(LTexture&amp; a, LTexture&amp; b) noexcept
+{
+    using std::swap;
+    swap(a.mTexture, b.mTexture);
+    swap(a.mWidth, b.mWidth);
+    swap(a.mHeight, b.mHeight);
+    swap(a.mButton, b.mButton);
+}
+</code></pre>
+
+<p>Once you have swap, the move operations are trivial:</p>
+
+<pre><code>LTexture::LTexture(LTexture&amp;&amp; other) noexcept
+{
+    using std::swap;
+    swap(*this, other);
+}
+
+LTexture&amp; LTexture::operator=(LTexture&amp;&amp; other) noexcept
+{
+    using std::swap;
+    swap(*this, other);
+    return *this;
+}
+</code></pre>
+
+<p>Those things will fix the critical problems with the texture class so it's safe. From this point on, it's all about improving the design.</p>
+
+<pre><code>void free();
+</code></pre>
+
+<p>Properly written C++ classes should generally not have any <code>free()</code> functions, or <code>close()</code> functions, or <code>cleanup()</code> functions, or anything like that. That's what the destructor is for.</p>
+
+<p>In fact, you delete the texture <em>twice</em>... once in <code>free()</code>, and once in the destructor. SDL may tolerate sloppy programming like that - or you may have just got lucky and your program didn't crash, but it's wrong in any case. You don't need the <code>free()</code> function at all. (Well, as your code is currently written you do. But we'll work on fixing that.)</p>
+
+<pre><code>void loadfromSurface(std::string path);
+void loadfromText(std::string text, SDL_Color);
+</code></pre>
+
+<p>Another problem with your <code>LTexture</code> class is that the constructor doesn't actually construct a texture. You are using a technique called "two-phase initialization" - first you construct, then you init (using <code>loadfromSurface()</code> or <code>loadfromText()</code>). Between those two phases, the object is in a half-broken state. This is bad practice.</p>
+
+<p>Instead, these functions should be constructors:</p>
+
+<pre><code>LTexture(std::string path);
+LTexture(std::string text, SDL_Color);
+</code></pre>
+
+<p>and the default constructor should be removed.</p>
+
+<p>Now, these constructors aren't great, because their names aren't very clear. What you can do use use "tags", like this:</p>
+
+<pre><code>struct from_surface_tag {} from_surface;
+struct from_text_tag {} from_text;
+
+LTexture(from_surface_tag, std::string path);
+LTexture(from_text_tag, std::string text, SDL_Color);
+</code></pre>
+
+<p>Now you construct a texture from a surface like this:</p>
+
+<pre><code>auto highLowTexture = LTexture{from_surface, "Resources/HiLo.png"};
+</code></pre>
+
+<p>and from text like this:</p>
+
+<pre><code>auto playAgain = LTexture{from_text, "Play again?", textColor};
+</code></pre>
+
+<p>It is now basically impossible to use <code>LTexture</code> wrong. You can't construct it then forget to initialize it. You can't forget to free it. You can't free it multiple times.</p>
+
+<p>That is what a good, modern C++ type looks like.</p>
+
+<pre><code>LTexture::LTexture()
+{
+    mTexture = NULL;
+    mWidth = 0;
+    mHeight = 0;
+}
+
+LTexture::~LTexture()
+{
+    SDL_DestroyTexture(mTexture);
+    mTexture = NULL;
+    mWidth = 0;
+    mHeight = 0;
+}
+</code></pre>
+
+<p>If you follow the advice above, you don't need the default constructor. In fact, you shouldn't have one.</p>
+
+<p>As for the destructor, if you read the blog post about the universal resource class pattern, you know that you need to check <code>mTexture</code> for <code>nullptr</code> before calling <code>SDL_DestroyTexture()</code>. Other than that, there's no real point to setting everything to null and zero. It's just wasting cycles for no purpose.</p>
+
+<p>So the above two functions become:</p>
+
+<pre><code>LTexture::~LTexture()
+{
+    if (mTexture)
+        SDL_DestroyTexture(mTexture);
+}
+</code></pre>
+
+<p>That's all you need.</p>
+
+<pre><code>void LTexture::loadfromSurface(std::string path)
+{
+    SDL_Surface *surface = IMG_Load(path.c_str());
+    mTexture = SDL_CreateTextureFromSurface(gRenderer, surface);
+    mWidth = surface-&gt;w;
+    mHeight = surface-&gt;h;
+}
+</code></pre>
+
+<p>The first thing that bothers me here is that you do no error checking. Failing to load images is a very common failure! It's something you should check for.</p>
+
+<p>The second problem is that you use <code>gRenderer</code>, which is a global. Globals are bad, so this function should take the renderer as an argument.</p>
+
+<p>And you take the string by value, even though you only read it with <code>c_str()</code>. That's very wasteful. You should take it by <code>const&amp;</code>.</p>
+
+<p>As mentioned above, this should be a tagged constructor, so put altogether, it becomes:</p>
+
+<pre><code>LTexture::LTexture(from_surface_tag, SDL_Renderer* renderer, std::string const&amp; path)
+{
+    auto surface = IMG_Load(path.c_str());
+    if (!surface)
+        throw std::runtime_error{"failed to load image texture: " + path};
+
+    mTexture = SDL_CreateTextureFromSurface(renderer, surface);
+    if (!mTexture)
+        throw std::runtime_error{"failed to create texture from surface"};
+
+    mWidth = surface-&gt;w;
+    mHeight = surface-&gt;h;
+}
+</code></pre>
+
+<p>The next function is much the same, but there are a few extra issues:</p>
+
+<pre><code>void LTexture::loadfromText(std::string text, SDL_Color color)
+{
+    free();
+    SDL_Surface* textSurface = TTF_RenderText_Blended_Wrapped(gFont, text.c_str(), color, 250);
+    mTexture = SDL_CreateTextureFromSurface(gRenderer, textSurface);
+    mWidth = textSurface-&gt;w;
+    mHeight = textSurface-&gt;h;
+    SDL_FreeSurface(textSurface);
+    textSurface = NULL;
+}
+</code></pre>
+
+<p>First, that call to <code>free()</code> is troubling. Most of the places I see you using <code>loadFromText()</code>, it's right after the constructor, so there's nothing to free. You're asking for a crash with a pattern like that. If you follow the advice about writing a proper resource management class, you won't have these problems.</p>
+
+<p>Hard-coding the width for wrapping seems unwise, especially as just a magic number in the middle of this function. It should be passed in as a parameter.</p>
+
+<p>There's no reason to set <code>textSurface</code> to null. It doesn't help anything.</p>
+
+<p>Fixed, it might look like this:</p>
+
+<pre><code>LTexture::LTexture(from_text_tag, SDL_Renderer* renderer, std::string const&amp; text, SDL_Color color, int width)
+{
+    auto textSurface = TTF_RenderText_Blended_Wrapped(gFont, text.c_str(), color, width);
+    if (!textSurface)
+        throw std::runtime_error{"failed to render text: " + text};
+
+    mTexture = SDL_CreateTextureFromSurface(renderer, textSurface);
+    if (!textSurface)
+        throw std::runtime_error{"failed to create texture from surface"};
+
+    mWidth = textSurface-&gt;w;
+    mHeight = textSurface-&gt;h;
+
+    SDL_FreeSurface(textSurface);
+}
+</code></pre>
+
+<p>On to <code>render()</code>.</p>
+
+<pre><code>void LTexture::render(int x, int y)
+{
+    SDL_Rect destRect = { x, y, mWidth, mHeight };
+    SDL_RenderCopy(gRenderer, mTexture, NULL, &amp;destRect);
+    //create a rectangle that coincides with texture to check for button presses
+    mButton = { x, y, mWidth, mHeight };
+}
+</code></pre>
+
+<p>Again, this needs to take the renderer as a parameter:</p>
+
+<pre><code>void LTexture::render(SDL_Renderer* renderer, int x, int y)
+{
+    SDL_Rect destRect = { x, y, mWidth, mHeight };
+    SDL_RenderCopy(renderer, mTexture, nullptr, &amp;destRect);
+    //create a rectangle that coincides with texture to check for button presses
+    mButton = { x, y, mWidth, mHeight };
+}
+</code></pre>
+
+<p>And <code>free()</code> doesn't need to exist at all.</p>
+
+<p>Before moving on, here's the collected summary of suggested changes to <code>LTexture</code>, all put together:</p>
+
+<pre><code>class LTexture
+{
+public:
+    static struct from_surface_tag {} from_surface;
+    static struct from_text_tag {} from_text;
+
+    LTexture(from_surface_tag, SDL_Renderer* renderer, std::string const&amp; path);
+    LTexture(from_text_tag, SDL_Renderer* renderer, std::string const&amp; text, SDL_Color color, int width);
+
+    // Move operations must be defined.
+    LTexture(LTexture&amp;&amp; other) noexcept
+    {
+        using std::swap;
+        swap(*this, other);
+    }
+
+    ~LTexture();
+
+    void render(SDL_Renderer* renderer, int x, int y);
+
+    LTexture&amp; operator=(LTexture&amp;&amp;) noexcept
+    {
+        using std::swap;
+        swap(*this, other);
+        return *this;
+    }
+
+    // You need to initialize *AT LEAST* mTexture. The others are
+    // optional (but it's a good idea to initialize everything anyway).
+    SDL_Texture* mTexture = nullptr;
+    int mWidth = 0;
+    int mHeight = 0;
+    SDL_Rect mButton = {};
+
+    // Copy operations must be deleted.
+    LTexture(LTexture const&amp;) = delete;
+    LTexture&amp; operator=(LTexture const&amp;) = delete;
+
+    // And you need a swap function.
+    friend void swap(LTexture&amp;, LTexture&amp;) noexcept;
+};
+
+LTexture::LTexture(from_surface_tag, SDL_Renderer* renderer, std::string const&amp; path)
+{
+    auto surface = IMG_Load(path.c_str());
+    if (!surface)
+        throw std::runtime_error{"failed to load image texture: " + path};
+
+    mTexture = SDL_CreateTextureFromSurface(renderer, surface);
+    if (!mTexture)
+        throw std::runtime_error{"failed to create texture from surface"};
+
+    mWidth = surface-&gt;w;
+    mHeight = surface-&gt;h;
+}
+
+LTexture::LTexture(from_text_tag, SDL_Renderer* renderer, std::string const&amp; text, SDL_Color color, int width)
+{
+    auto textSurface = TTF_RenderText_Blended_Wrapped(gFont, text.c_str(), color, width);
+    if (!textSurface)
+        throw std::runtime_error{"failed to render text: " + text};
+
+    mTexture = SDL_CreateTextureFromSurface(renderer, textSurface);
+    if (!textSurface)
+        throw std::runtime_error{"failed to create texture from surface"};
+
+    mWidth = textSurface-&gt;w;
+    mHeight = textSurface-&gt;h;
+
+    SDL_FreeSurface(textSurface);
+}
+
+void LTexture::render(SDL_Renderer* renderer, int x, int y)
+{
+    SDL_Rect destRect = { x, y, mWidth, mHeight };
+    SDL_RenderCopy(renderer, mTexture, nullptr, &amp;destRect);
+    //create a rectangle that coincides with texture to check for button presses
+    mButton = { x, y, mWidth, mHeight };
+}
+
+void swap(LTexture&amp; a, LTexture&amp; b) noexcept
+{
+    using std::swap;
+    swap(a.mTexture, b.mTexture);
+    swap(a.mWidth, b.mWidth);
+    swap(a.mHeight, b.mHeight);
+    swap(a.mButton, b.mButton);
+}
+</code></pre>
+
+<p>Next up is another set of globals... still a bad idea. Don't worry, I'll be explaining how to do away with all these globals eventually.</p>
+
+<p>On with the review!</p>
+
+<pre><code>`void buttonPress(SDL_Event &amp;e, SDL_Rect &amp;button, int buttonNum)`
+</code></pre>
+
+<p>There are a number of issues with this function that are general across the program, so I'll discuss them here and then not repeat.</p>
+
+<p>The first problem is that it does <em>way</em> too much. The general rule is one function, one job... most of your functions should be ~3-5 lines of actual code. If your function starts getting longer than ~20-25 lines, that is a pretty clear sign that it needs to be broken up into smaller functions.</p>
+
+<p>This function checks for a button press... and then checks <em>which</em> button was pressed... and then does <em>all</em> the logic for <em>every</em> button in the game. That's <em>way</em> too much work for a single function.</p>
+
+<p>That brings up the next problem. Your game logic is dispersed all throughout the code. For example, if you wanted to add another difficulty level for 1 to 10000, you'd have to edit <em>this</em> function, <code>mainMenu()</code>, <code>loadMedia()</code>, <code>close()</code>, and possibly others that I've missed. The reason you need to use globals is because your game logic is all over the place. If you localized the logic, you wouldn't need globals to share state across functions all across the code.</p>
+
+<p>That leads to another issue: You're using magic numbers to determine which button has been pressed. Think of what happens you mix up the numbers for "1-100" and "1-1000", or "Play again" and "Quit". Or if you add a new function and accidentally reuse a number. There's no way to detect the error until your game starts acting weirdly or crashing, and then it will be <em>really</em> hard to track down <em>why</em>.</p>
+
+<p>To give you an idea of how convoluted your game logic is, consider this:</p>
+
+<ul>
+<li><code>main()</code> calls <code>mainMenu()</code>
+
+<ul>
+<li><code>mainMenu()</code> calls <code>buttonPress()</code> (to check for tenButton etc.)
+
+<ul>
+<li><code>buttonPress()</code> calls <code>mainMenu()</code>
+
+<ul>
+<li><code>mainMenu()</code> calls <code>buttonPress()</code>
+
+<ul>
+<li><code>buttonPress()</code> calls <code>mainMenu()</code>
+
+<ul>
+<li><code>mainMenu()</code> calls <code>buttonPress()</code>
+
+<ul>
+<li><code>buttonPress()</code> calls <code>mainMenu()</code></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul></li>
+</ul>
+
+<p>which means that if someone plays the game long enough, it will stack overflow and crash.</p>
+
+<p>And there's still another issue: You use this function in the following way:</p>
+
+<pre><code>buttonPress(e, tenButton.mButton, 2);
+buttonPress(e, hundredButton.mButton, 3);
+buttonPress(e, thousandButton.mButton, 4);
+</code></pre>
+
+<p>Now, this will "work" so long as there's no overlap between the buttons. But let's say that the thousand button rectangle <em>slightly</em> overlaps the ten button rectangle. The first line will detect a ten button press and set up a 1-10 game, then <em>immediately after</em> the third line will detect a thousand button press and set up a 1-1000 game... and if the overlap between the two buttons isn't obvious, the poor player will be baffled at why their easy game turned out so hard.</p>
+
+<p>Once you've detected a button has been pressed, you shouldn't be trying to detect others. That way lies madness. What you need is a simple "button_is_pressed()" function like:</p>
+
+<pre><code>auto button_is_pressed(SDL_Event const&amp; event, SDL_Rect const&amp; button_rect)
+{
+    if (event.type == SDL_MOUSEBUTTONDOWN)
+    {
+        auto const&amp; mouse_button_event = event.button;
+
+        auto const mouse_position = SDL_Point{mouse_button_event.x, mouse_button_event.y};
+
+        return (mouse_button_event.button == SDL_BUTTON_LEFT) &amp;&amp; SDL_PointInRect(&amp;mouse_position, &amp;button_rect);
+    }
+
+    return false;
+}
+</code></pre>
+
+<p>which you'd then use like:</p>
+
+<pre><code>if (button_is_pressed(e, tenButton.mButton))
+{
+    // handle new 1-10 game logic
+}
+else if (button_is_pressed(e, hundredButton.mButton))
+{
+    // handle new 1-100 game logic
+}
+else if (button_is_pressed(e, thousandButton.mButton))
+{
+    // handle new 1-1000 game logic
+}
+</code></pre>
+
+<p>On to <code>compare()</code>:</p>
+
+<pre><code>int compare(int randomNumber, int guess)
+{
+    if (randomNumber == guess)
+    {
+        return 0;
+
+    }
+    //if player has run out of guesses
+    else if (guessCount == numberofGuesses)
+    {
+        return 3;
+    }
+    else if (randomNumber &lt; guess)
+    {
+        return 1;
+    }
+    else if (randomNumber &gt; guess)
+    {
+        return 2;
+    }
+}
+</code></pre>
+
+<p>The first thing that bothers me about this function is that it is standard practice for comparison functions to return <code>&lt;0</code> for "less than", <code>0</code> for "equal", and <code>&gt;0</code> for "greater than". This will even be the behaviour of the upcoming "spaceship" three-way comparison operator. By not following this pattern, this function has surprising behaviour.</p>
+
+<p>The other problem is that, once again, this function is doing multiple jobs. It compares, as promised... but it also checks to see if the guess count is up. For that, it needs access to <em>two</em> globals.</p>
+
+<p>Here's the logic you need (and as a side note: you have your game logic in the middle of your render function - it shouldn't be there):</p>
+
+<pre><code>if (guessCount == 0)
+{
+    // starting message
+}
+else if (guessCount == numberofGuesses)
+{
+    // you lose
+}
+else
+{
+    auto const cmp = compare(randomNumber, input);
+    if (cmp &lt; 0)
+    {
+        // too low
+    }
+    else if (cmp &gt; 0)
+    {
+        // too high
+    }
+    else
+    {
+        // you win
+    }
+}
+</code></pre>
+
+<p>once you've done this, <code>compare()</code> just becomes:</p>
+
+<pre><code>auto compare(int randomNumber, int guess)
+{
+    if (randomNumber &lt; guess)
+        return -1;
+    if (randomNumber &gt; guess)
+        return 1;
+    return 0;
+
+    // or in C++20, just:
+    // return randomNumber &lt;=&gt; guess;
+}
+</code></pre>
+
+<p>Now the next function is interesting:</p>
+
+<pre><code>void playAgain(int x)
+</code></pre>
+
+<p>This function is actually <em>very</em> well-designed... roughly. Game logic follows a universal pattern - <em>all</em> game loops in their most basic form looks like this:</p>
+
+<ol>
+<li>process input</li>
+<li>do game logic</li>
+<li>render</li>
+</ol>
+
+<p>aka:</p>
+
+<pre><code>while (!done)
+{
+    input();
+    update();
+    render();
+}
+</code></pre>
+
+<p><code>playAgain()</code> does almost exactly that:</p>
+
+<pre><code>void playAgain(int x)
+{
+    willPlayAgain = false;
+
+    SDL_Event e;
+
+    // &lt;~~~~~~~ GAME LOOP STARTS HERE ~~~~~~~&gt;
+    while (!quit &amp;&amp; !willPlayAgain)
+    {
+        // &lt;~~~~~~~ input() ~~~~~~~&gt;
+        while (SDL_PollEvent(&amp;e) != 0)
+        {
+            if (e.type == SDL_QUIT)
+            {
+                quit = true;
+            }
+
+            buttonPress(e, yesButton.mButton, 0);
+            buttonPress(e, noButton.mButton, 1);
+        }
+
+        // &lt;~~~~~~~ update() ~~~~~~~&gt;
+        std::string dialogue;
+
+        if (x == 1)
+        {
+            dialogue = "YOU WON!!! The correct answer was " + std::to_string(randomNumber) + ".";
+        }
+        else
+        {
+            dialogue = "You lose. The correct answer was " + std::to_string(randomNumber) + ".";
+        }
+
+        // &lt;~~~~~~~ render() ~~~~~~~&gt;
+        SDL_RenderClear(gRenderer);
+        highLowTexture.render(0, 0);
+
+        LTexture winlose;
+        winlose.loadfromText(dialogue, textColor);
+        winlose.render(335, 70);
+
+        LTexture playAgain;
+        playAgain.loadfromText("Play again?", textColor);
+        playAgain.render(325, 300);
+
+        yesButton.render(300, 350);
+        noButton.render(300 + yesButton.mWidth + 10, 350);
+
+        SDL_RenderPresent(gRenderer);
+    }
+}
+</code></pre>
+
+<p>Almost all of the problems with this function have to do with spaghetti logic and the use of globals. Let's go through it bit-by-bit and see how it could be improved.</p>
+
+<p>First let's simplify the logic. You have two booleans: <code>quit</code> and <code>willPlayAgain</code>. If both are <code>false</code>, then the loop continues; fine. If one's <code>true</code> and the other's <code>false</code>, then that's fine, too - the user either wants to quit or play again. But... what does it mean if both are <code>true</code>? The user wants to quit <em>and</em> play again? (This could conceivably happen, too. If I click first one button and then the other while the game is temporarily frozen (because my system is slowing down), SDL might record <em>both</em> clicks in the event queue, so when you pump it your input loop will detect <em>both</em> events and then... I don't even know what will happen, because the logic is all over the place).</p>
+
+<p>It seems to me that you are interested in two conditions: is the loop done, and what did the user choose (to quit or play again)?</p>
+
+<p>With that, no confusion is possible. You keep looping until "loop done" is true, and "quit/play-again" will be whatever the last thing detected was. The logic is easy to follow.</p>
+
+<p>So that gives:</p>
+
+<pre><code>void playAgain()
+{
+    auto done = false;
+    auto quit = true; // you could default this to true or false, depending on your preference
+
+    while (!done)
+    {
+        // ...
+    }
+}
+</code></pre>
+
+<p>Now your input logic is very simple. You just check for button presses and <code>SDL_QUIT</code>:</p>
+
+<pre><code>while (SDL_PollEvent(&amp;e) != 0)
+{
+    if (e.type == SDL_QUIT || is_button_pressed(e, noButton))
+    {
+        quit = true;
+        done = true;
+        break; // no sense in continuing checking for events!
+    }
+    else if (is_button_pressed(e, yesButton))
+    {
+        quit = false;
+        done = true;
+    }
+}
+</code></pre>
+
+<p>But wait! Where do <code>yesButton</code> and <code>noButton</code> come from? Are they globals?</p>
+
+<p>No.</p>
+
+<p>You have two (practical) options. The first is to create the buttons when you enter the play-again state:</p>
+
+<pre><code>void playAgain()
+{
+    auto done = false;
+    auto quit = true;
+
+    auto yesButton = LTexture{LTexture::from_surface, "Resources/HiLoYes.png"};
+    auto noButton = LTexture{LTexture::from_surface, "Resources/HiLoNo.png"};
+
+    while (!done)
+    {
+        // ...
+    }
+}
+</code></pre>
+
+<p>The other is to create a texture manager object, and pass it to the function:</p>
+
+<pre><code>void playAgain(texture_manager&amp; textures)
+{
+    auto done = false;
+    auto quit = true;
+
+    auto&amp; yesButton = textures["yes-button"];
+    auto&amp; noButton = textures["no-button"];
+
+    while (!done)
+    {
+        // ...
+    }
+}
+</code></pre>
+
+<p>That's a bit more work, but it allows you to preload all the textures at game start, and reuse them rather than reloading them each time the play-again screen pops up.</p>
+
+<p>Next comes the update logic. Here, all you do is check whether the user has won or lost the last game, and generate a message accordingly:</p>
+
+<pre><code>std::string dialogue;
+if (game_was_won)
+    dialogue = // ...
+else
+    dialogue = // ...
+</code></pre>
+
+<p>But wait! Whether the user won or lost doesn't change, does it? You can determine that right at the start of the function!</p>
+
+<p>But there's more! Once you know what <code>dialogue</code> is, you can render it one time and keep reusing it. And you can do that at the start of the function... <em>before</em> you start looping:</p>
+
+<pre><code>void playAgain(SDL_Renderer* renderer, TTF_Font* font, bool game_was_won)
+{
+    auto done = false;
+    auto quit = true;
+
+    auto yesButton = LTexture{LTexture::from_surface, "Resources/HiLoYes.png"};
+    auto noButton = LTexture{LTexture::from_surface, "Resources/HiLoNo.png"};
+
+    auto dialogue = std::string{};
+    if (game_was_won)
+        dialogue = // ...
+    else
+        dialogue = // ...
+
+    // Note: the colour and width can be passed as arguments, too
+    // (and probably should be). It might be worthwhile to pass some
+    // kind of object describing describing the "theme": fonts,
+    // colours, textures, etc..
+    auto const textColor = SDL_Color{ 0, 0, 0 };
+    auto const textWidth = 250;
+    auto winlose = LTexture{from_text, renderer, dialogue, font, textColor, textWidth};
+
+    while (!done)
+    {
+        // ...
+    }
+}
+</code></pre>
+
+<p>While you're at it, you could also pre-render the "play again" message.</p>
+
+<p>With everything prerendered, the render phase is much simpler, and much <em>faster</em>:</p>
+
+<pre><code>SDL_RenderClear(renderer);
+
+highLowTexture.render(0, 0);
+
+winlose.render(335, 70);
+
+playAgain.render(325, 300);
+
+yesButton.render(300, 350);
+noButton.render(300 + yesButton.mWidth + 10, 350);
+
+SDL_RenderPresent(renderer);
+</code></pre>
+
+<p>Putting that altogether gives something like:</p>
+
+<pre><code>bool playAgain(SDL_Renderer* renderer, TTF_Font* font, bool game_was_won)
+{
+    auto done = false;
+    auto quit = true;
+
+    // Set everything up, including all pre-rendering, so the loop
+    // is as fast as possible.
+    auto yesButton = LTexture{LTexture::from_surface, "Resources/HiLoYes.png"};
+    auto noButton = LTexture{LTexture::from_surface, "Resources/HiLoNo.png"};
+
+    auto dialogue = std::string{};
+    if (game_was_won)
+        dialogue = // ...
+    else
+        dialogue = // ...
+
+    auto const textColor = SDL_Color{ 0, 0, 0 };
+    auto const textWidth = 250;
+    auto winlose = LTexture{from_text, renderer, dialogue, font, textColor, textWidth};
+
+    auto playAgain = LTexture{from_text, renderer, "Play again?", textColor, textWidth};
+
+    // Begin the loop.
+    while (!done)
+    {
+        // Input.
+        while (SDL_PollEvent(&amp;e) != 0)
+        {
+            if (e.type == SDL_QUIT || is_button_pressed(e, noButton))
+            {
+                quit = true;
+                done = true;
+                break; // no sense in continuing checking for events!
+            }
+            else if (is_button_pressed(e, yesButton))
+            {
+                quit = false;
+                done = true;
+            }
+        }
+
+        // Update.
+        // Nothing to do here, because this is a pretty static
+        // state: everything is determined at the start.
+
+        // Render.
+        SDL_RenderClear(renderer);
+
+        highLowTexture.render(0, 0);
+
+        winlose.render(335, 70);
+
+        playAgain.render(325, 300);
+
+        yesButton.render(300, 350);
+        noButton.render(300 + yesButton.mWidth + 10, 350);
+
+        SDL_RenderPresent(renderer);
+    }
+
+    return quit;
+}
+</code></pre>
+
+<p>Now, of course, this shouldn't all be one function. If we break the input, update, and render stages out to functions, where each function returns <code>false</code> if the loop must end:</p>
+
+<pre><code>bool playAgain_input(LTexture const&amp; yesButton, LTexture const&amp; noButton, bool&amp; quit)
+{
+    SDL_Event e;
+    while (SDL_PollEvent(&amp;e) != 0)
+    {
+        if (e.type == SDL_QUIT || is_button_pressed(e, noButton))
+        {
+            quit = true;
+            return false;
+        }
+        else if (is_button_pressed(e, yesButton))
+        {
+            quit = false;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool playAgain_update()
+{
+    // Nothing to do here.
+    return true;
+}
+
+bool playAgain_render(SDL_Renderer* renderer, LTexture const&amp; highLowTexture, /* rest of textures... */)
+{
+    SDL_RenderClear(renderer);
+
+    highLowTexture.render(0, 0);
+
+    winlose.render(335, 70);
+
+    playAgain.render(325, 300);
+
+    yesButton.render(300, 350);
+    noButton.render(300 + yesButton.mWidth + 10, 350);
+
+    SDL_RenderPresent(renderer);
+
+    return true; // technically you could check that all the render
+                 // operations succeeded, and return false on
+                 // failure.
+}
+
+bool playAgain(SDL_Renderer* renderer, TTF_Font* font, bool game_was_won)
+{
+    // Set everything up, including all pre-rendering, so the loop
+    // is as fast as possible.
+    auto yesButton = LTexture{LTexture::from_surface, "Resources/HiLoYes.png"};
+    auto noButton = LTexture{LTexture::from_surface, "Resources/HiLoNo.png"};
+
+    auto dialogue = std::string{};
+    if (game_was_won)
+        dialogue = // ...
+    else
+        dialogue = // ...
+
+    auto const textColor = SDL_Color{ 0, 0, 0 };
+    auto const textWidth = 250;
+    auto winlose = LTexture{from_text, renderer, dialogue, font, textColor, textWidth};
+
+    auto playAgain = LTexture{from_text, renderer, "Play again?", textColor, textWidth};
+
+    // The loop.
+    auto quit = true;
+    while (
+            playAgain_input(yesButton, noButton, quit) &amp;&amp;
+            playAgain_update() &amp;&amp;
+            playAgain_render(renderer, highLowTexture, /* rest of textures... */))
+    {}
+
+    return quit;
+}
+</code></pre>
+
+<p>Now, this is still not <em>great</em>, because you end up having to pass a ton of textures as function arguments (it's all very <em>fast</em>; speed is not a problem).but it is actually very close to perfect. The important things are:</p>
+
+<ol>
+<li>No globals.</li>
+<li>No spaghetti code - there is one way in to the play-again state, and one way out, with no recursion.</li>
+<li>All logic for the play-again state is in a single place. The entire play-again state of the game is completely self-contained - changes elsewhere in the code won't affect it, and changes in any of these functions won't affect the rest of the code.</li>
+</ol>
+
+<p>But as I said, this still isn't <em>great</em>. We can do better. But let's put a pin in that for now.</p>
+
+<p>The same ideas here apply to many of the following functions because - as I said at the start - your code is actually remarkably well-designed for a first attempt. Most of your functions follow the input-update-render loop logic... <em>roughly</em>. The problem is really just that they use globals to reach out of their little box and muck with stuff the rest of the program will see.</p>
+
+<pre><code>void renderScene(std::string guessInput, int compare)
+</code></pre>
+
+<p>The input section is missing (it's handled elsewhere, unfortunately). But the update and render sections are there.</p>
+
+<pre><code>void gameLoop()
+</code></pre>
+
+<p>This function is actually the input section for the previous function.</p>
+
+<pre><code>void mainMenu()
+</code></pre>
+
+<p>This is another input-update-render loop. The update section is empty (as it is for <code>playAgain()</code>) because there's not much logic needs doing here.</p>
+
+<pre><code>void init()
+void loadMedia()
+void close()
+</code></pre>
+
+<p>These functions are fine for what they are - the issue is that that they're all just working with globals.</p>
+
+<p>And now, finally, we get to <code>main()</code>.</p>
+
+<p><code>main()</code> is where all the problems start, because all the data is global, rather than local to <code>main()</code>. Also, you're mostly using C-style patterns (likely because most, if not all, SDL tutorials are C-based), which means you need a <code>close()</code> function.</p>
+
+<p>To update this to C++, you need to wrap a lot of SDL. For example, SDL itself should be wrapped in a class. Here's a very basic example:</p>
+
+<pre><code>class sdl
+{
+public:
+    sdl()
+    {
+        auto const result = SDL_Init(SDL_INIT_VIDEO);
+        if (result != 0)
+            throw std::runtime_error{std::string{"SDL initialization failed: "} + SDL_GetError()};
+    }
+
+    sdl(sdl&amp;&amp; other) noexcept
+    {
+        _swap(*this, other);
+    }
+
+    ~sdl()
+    {
+        if (_own)
+            SDL_Quit();
+    }
+
+    auto operator=(sdl&amp;&amp; other) noexcept -&gt; sdl&amp;
+    {
+        _swap(*this, other);
+        return *this
+    }
+
+    // Non-copyable
+    sdl(sdl const&amp;) = delete;
+    auto operator=(sdl const&amp;) -&gt; sdl&amp; = delete;
+
+private:
+    static auto _swap(sdl&amp; a, sdl&amp; b) noexcept
+    {
+        using std::swap;
+        swap(a._own, b._own);
+    }
+
+    bool _own = false;
+};
+</code></pre>
+
+<p>And you'd use it in <code>main()</code> like this:</p>
+
+<pre><code>int main()
+{
+    try
+    {
+        auto sdl = sdl{}; // initializes SDL
+
+        // Use any SDL stuff you want here.
+
+        // Even if there's an error, no problem:
+        //   throw std::runtime_error{"some error"};
+
+        // SDL will be automatically cleaned up.
+    }
+    catch (std::exception const&amp; x)
+    {
+        std::cerr &lt;&lt; "Error: " &lt;&lt; x &lt;&lt; '\n';
+        return EXIT_FAILURE;
+    }
+}
+</code></pre>
+
+<p>You can make nearly identical classes for SDL image and SDL ttf, and use them the same way:</p>
+
+<pre><code>int main()
+{
+    try
+    {
+        auto sdl = sdl{};
+        auto img = sdl_image{};
+        auto ttf = sdl_ttf{};
+
+        // Safe to use, will automatically clean up.
+    }
+    catch (std::exception const&amp; x)
+    {
+        std::cerr &lt;&lt; "Error: " &lt;&lt; x &lt;&lt; '\n';
+        return EXIT_FAILURE;
+    }
+}
+</code></pre>
+
+<p>For stuff like <code>SDL_CreateWindow()</code> that returns pointers, you can use <code>std::unique_ptr</code> with a custom deleter:</p>
+
+<pre><code>struct sdl_deleter
+{
+    auto operator()(SDL_Window* p) noexcept
+    {
+        if (p)
+            SDL_DestroyWindow(p);
+    }
+
+    auto operator()(SDL_Renderer* p) noexcept
+    {
+        if (p)
+            SDL_DestroyRenderer(p);
+    }
+
+    auto operator()(TTF_Font* p) noexcept
+    {
+        if (p)
+            TTF_CloseFont(p);
+    }
+
+    // and any more you need
+};
+
+int main()
+{
+    try
+    {
+        auto const sdl = sdl{};
+        auto const img = sdl_image{};
+        auto const ttf = sdl_ttf{};
+
+        auto const window = std::unique_ptr&lt;SDL_Window, sdl_deleter&gt;{
+            SDL_CreateWindow("HiLo", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, SCREEN_WIDTH, SCREEN_HEIGHT, SDL_WINDOW_SHOWN)
+        };
+
+        auto const renderer = std::unique_ptr&lt;SDL_Renderer, sdl_deleter&gt;{
+            SDL_CreateRenderer(gWindow, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC)
+        };
+
+        // and so on, loading the font and all the textures, etc.
+
+        // Main game logic goes here.
+
+        // Everything gets automatically cleaned up in the right
+        // order.
+    }
+    catch (std::exception const&amp; x)
+    {
+        std::cerr &lt;&lt; "Error: " &lt;&lt; x &lt;&lt; '\n';
+        return EXIT_FAILURE;
+    }
+}
+</code></pre>
+
+<p>Keep following that pattern, and you can load all the game's resources and they'll all be automatically cleaned up even in the event of an error.</p>
+
+<p>Now, as with the <code>playAgain()</code> function, this is <em>good</em>... but still not great.</p>
+
+<p>You did right so far to study up on C++ - the language you need to write your game - and SDL - the library you need to display your game's graphics, handle input, and so on. But you are missing a third element. You need a tutorial on the high-level structure of a game: things like how to manage assets and so on. You've got the low-level stuff down with SDL, but you need an idea of how to make the high-level structure.</p>
+
+<p>I very highly recommend <a href="https://gameprogrammingpatterns.com/" rel="noreferrer">Game Programming Patterns by Robert Nystrom</a>, but there are dozens of resources out there on high-level game structure.</p>
+
+<p>As a very rough sample of the kind of thing you'll learn from those resources, I suggest you try to design your game using a <a href="https://gameprogrammingpatterns.com/state.html" rel="noreferrer">state machine</a>.</p>
+
+<p>What does that even mean? Well, I haven't played your game (I don't have the textures), but as I understand it, your game works like this:</p>
+
+<ol>
+<li>The game starts.</li>
+<li>The game shows a menu letting the user chose the game type. The game types are all the same, so I'll only describe one. <em>Also</em>, the user could hit the quit button to quit.
+
+<ol>
+<li>If the user chooses to play, the guessing game starts. It ends either with a win or a loss, and then goes to the play-again screen.
+
+<ol>
+<li>At the play-again screen the user can choose to quit, or play again. Depending on what they choose, they jump to either the guessing game state or the quit state.</li>
+</ol></li>
+<li>If the user chooses to quit, the game ends.</li>
+</ol></li>
+</ol>
+
+<p>Here's what that looks like graphically:</p>
+
+<p><a href="https://i.stack.imgur.com/VBb1J.png" rel="noreferrer"><img src="https://i.stack.imgur.com/VBb1J.png" alt="HiLo guessing game state machine"></a></p>
+
+<p>Each of those bubbles is a high-level <em>state</em> that your game is in. Some of those states have sub-states (like the guessing-game state has states where the number of guesses is zero, where the number is greater than zero but less than the max number of guesses, and so on).</p>
+
+<p>At the highest level what your game is really doing is transitioning from one of those states to another based on the conditions in the current state.</p>
+
+<p>Each of those states can be isolated as it's own "sub-game", with its own game loop with input-update-render logic. And here's the neat thing... <em>you've already MOSTLY done that</em>. It's a little clumsy and undisciplined, but you have <em>already</em> basically structured your game correctly as isolated states. Except... because of the globals and the logic being spread out all over the place, it's not exactly isolated... but it <em>could</em> be.</p>
+
+<p>Let's start with the basics - a base class for your current game state:</p>
+
+<pre><code>class state
+{
+    enum class update_result_type
+    {
+        continue_state, // continue in the current state
+        end_state,      // current state is done; no new state
+        replace_state,  // current state is done; new state is given
+        push_state,     // enter a new state, but remember the current state
+        quit_state,     // just quit the whole game immediately
+    };
+
+    struct update_result_t
+    {
+        update_result_type type = update_result_type::continue_state;
+        std::unique_ptr&lt;state&gt; next = nullptr;
+    };
+
+    virtual ~state() = default;
+
+    virtual void input() = 0;
+    virtual update_result_t update() = 0;
+    virtual void render() = 0;
+
+    // Non-copyable.
+    state(state const&amp;) = delete;
+    auto operator=(state const&amp;) -&gt; state = delete;
+}
+</code></pre>
+
+<p>At the highest level, your game has a stack of states, and a main loop that looks like this:</p>
+
+<pre><code>auto state_stack = std::stack&lt;std::unique_ptr&lt;state&gt;&gt;{};
+
+// The game starts in the main menu state.
+state_stack.push_back(new main_menu_state{/*params*/});
+
+// Main game loop.
+while (!state_stack.empty())
+{
+    state_stack.top()-&gt;input();
+
+    auto result = state_stack.top()-&gt;update();
+    if (result.type == state::update_result_type::continue_state)
+    {
+        // Just continue in the current state: so render.
+        state_stack.top()-&gt;render();
+    }
+    else if (result.type == state::update_result_type::end_state)
+    {
+        // This state is done, so pop it off the state stack.
+        // The previous state will be used, and if there is none
+        // the game ends.
+        state_stack.pop();
+    }
+    else if (result.type == state::update_result_type::push_state)
+    {
+        // Switch to a new state by pushing the new state to the
+        // top of the stack.
+        state_stack.push(std::move(result.next));
+    }
+    else if (result.type == state::update_result_type::replace_state)
+    {
+        // Switch to a new state by (effectively) popping the
+        // current state, then pushing the new state.
+        state_stack.top().swap(result.next);
+    }
+    else if (result.type == state::update_result_type::quit_state)
+    {
+        // Just clear out the state stack.
+        while (!state_stack.empty())
+            state_stack.pop();
+    }
+}
+</code></pre>
+
+<p>Now each game state gets its own class. For example, the play-again state:</p>
+
+<pre><code>class play_again_state : public state
+{
+public:
+    play_again_state(SDL_Renderer* renderer, TTF_Font* font, bool game_was_won);
+
+    void input() override;
+    update_result_t update() override;
+    void render() override;
+
+private:
+    enum class user_choice
+    {
+        none, // no choice made
+        play_again,
+        quit,
+    };
+
+    user_choice choice = user_choice::none;
+    SDL_Renderer* renderer = nullptr;
+    LTexture yesButton = {LTexture::from_surface, "Resources/HiLoYes.png"};
+    LTexture noButton = {LTexture::from_surface, "Resources/HiLoNo.png"};
+    // and so on for other textures and stuff
+};
+
+play_again_state::play_again_state(SDL_Renderer* renderer, TTF_Font* font, bool game_was_won) :
+    renderer{renderer},
+    // initialize other members
+{
+    // initialize members
+}
+
+void play_again_state::input()
+{
+    SDL_Event e;
+    while (SDL_PollEvent(&amp;e) != 0)
+    {
+        if (e.type == SDL_QUIT || is_button_pressed(e, noButton))
+        {
+            choice = user_choice::quit;
+            break;
+        }
+        else if (is_button_pressed(e, yesButton))
+        {
+            choice = user_choice::play_again;
+            break;
+        }
+    }
+
+    return user_choice::none;
+}
+
+state::update_result_t play_again_state::update()
+{
+    switch (choice)
+    {
+    case user_choice::play_again:
+        return {state::update_result_type::end_state};
+        // or, depending on how you lay out your states:
+        // return {state::update_result_type::replace_state, std::unique_ptr&lt;state&gt;{new main_menu_state{/*params*/}}};
+    case user_choice::quit:
+        return {state::update_result_type::quit_state};
+    case user_choice::none:
+        // fallthrough
+    default:
+        return {};
+    }
+}
+
+void play_again_state::render()
+{
+    SDL_RenderClear(renderer);
+
+    highLowTexture.render(0, 0);
+
+    winlose.render(335, 70);
+
+    playAgain.render(325, 300);
+
+    yesButton.render(300, 350);
+    noButton.render(300 + yesButton.mWidth + 10, 350);
+
+    SDL_RenderPresent(renderer);
+}
+</code></pre>
+
+<p>As you can see, those are basically the same functions from before, just now in a class. Which means no need to pass everything in parameters, you can use the class's data members.</p>
+
+<p>And as before, everything about the play-again state is completely isolated in this class, so you can modify it freely without breaking anything else (and modify everything else freely without breaking <em>it</em>).</p>
+
+<p>With states managed like this, you can very trivially add even more states to your game. For example: You could add a button in the main menu that pushes an "about this game" state that displays info about the game, and when you press "ok" it ends the state, pops it off the stack, and falls back to the main menu state.</p>
+
+<p>You could also test states in isolation, so you don't need to play all through the game just to see that the play-again state works.</p>
+
+<p>You are already on the right track by <em>almost</em> isolating your game's states into functions. What mostly tripped you up was sharing information from state to state, which led to falling back on globals. Reading up on this kind of high-level game design will help you get a sense of how to structure your game's code to be more robust.</p>
+
+<h1>Question</h1>
+
+<blockquote>
+  <p>I also have one specific question. On Lazy Foo's tutorials everything done is on one file. When is it recommended to make use of other cpp or header files? Maybe for this simple of a game it's fine, but when I get into more complicated games, I would assume it gets to be fairly overwhelming to have the entire game in one file.</p>
+</blockquote>
+
+<p>First, this game isn't as simple as you're making it out to be! You really bit off quite a bit for a first attempt, and frankly, handled it admirably.</p>
+
+<p><em>Most</em> people's first guessing game would simply start with "guess a number between _ and _", and maybe not even have a play again option. You went for a game with a play again option, and <em>three</em> different difficulty levels. That ain't half bad. But it's why I spent so much of this review on high-level structural stuff. You're aiming big, and that's cool. Read up on the high-level stuff, and you might be able to tackle even <em>bigger</em> challenges cleanly.</p>
+
+<p>To answer the question directly: There are two major reasons to start breaking code up into units (header/cpp pairs usually):</p>
+
+<ol>
+<li><p>When you've written a "thing" (function, class, group of functions and classes, etc.) that looks like it might be useful in other projects.</p>
+
+<p>For example, <code>LTexture</code> looks handy. The next time you make a game, rather than rewriting it or copy-pasting (always unwise if you can avoid it), it might be nice if you had a <code>ltexture.hpp</code> and <code>ltexture.cpp</code> that you could copy to the new project.</p>
+
+<p>In fact, I've found in practice that someone's <em>first</em> program/game is by far the hardest an most time consuming. But if they designed well, they'll have lots of little reusable bits they can use for their <em>next</em> program/game. <code>LTexture</code> is an example, but also most of the stuff I suggested can also be reused, like the classes for SDL stuff and the state machine stuff. Once you write it <em>once</em> and do all the testing and stuff so you know it's working, it's <em>really</em> nice to be able to just copy the files from one project to another.</p>
+
+<p>I recommend to beginning programmers to build their own personal code library - just keep adding useful stuff to it as you code, from time to time go through and update, and eventually you'll be able to put stuff together <em>fast</em>.</p></li>
+<li><p>When some subsection of your program is getting too big and complex, and can be easily put off to one side.</p>
+
+<p>This isn't really an issue in your game - there's not really much that really demands to be pulled out and set aside. But it does come up as programs get more "stuff" in them.</p>
+
+<p>One common thing I find myself pulling out and moving to its own source file is command line argument processing. I have one file with <code>main()</code> that calls <code>parse_command_line(argc, argv);</code>, and that function is defined in a separate file. That file does all the command line parsing, prints any help or version messages, and so on, and then returns a settings object to the main program, so that crap doesn't clutter up the main source file.</p></li>
+</ol>
+
+<p>Don't be shy about breaking your programs up into smaller components. Not only does that often lead to more reusability, it can make development <em>so</em> much faster (because most build systems will not recompile stuff that doesn't change).</p>
+
+<h1>Summary</h1>
+
+<p>The main issue with your code is a lack of high-level structuring. That lack causes you to scatter game logic around and fall back on globals.</p>
+
+<p>You've got two out of three parts of what a game needs down: you write decent C++, you've learned your low-level I/O stuff (SDL)... what you're lacking is the high-level design stuff. High-level design concepts like state machines and manager classes will bring structure to the program, reducing or eliminating interdependencies and spaghetti logic. That should be the next thing you research. I recommend <a href="https://gameprogrammingpatterns.com/" rel="noreferrer">Game Programming Patterns by Robert Nystrom</a> as a good book to check out.</p>
+
+<p>The second major issue is that most of your code is very C-ish, which is a bad look for C++. Unfortunately, SDL is a C library, which makes it a pain to work with, because you need to wrap <em>everything</em> to get good, safe, easy-to-use C++ code. But on the other hand, if you do a good job of wrapping it up well, you can reuse your C++ SDL library for other game projects... and since you'll be starting out with good quality C++ (hopefully), those later projects should be a breeze.</p>
+
+<p>That's all for the review! Happy coding!</p>
+    </div>

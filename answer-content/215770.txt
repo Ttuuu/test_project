@@ -1,0 +1,219 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>Update</h3>
+
+<p>After further usage, I did discover one issue with regard to usability. Once a <code>Timer</code> instance has been cancelled, it is no longer valid and should not be used. So, if the pointer variable is going to hang around, it should be set to <code>NULL</code>.</p>
+
+<p>The game I'm working on has several reentrant state machines, some of which contain <code>Timer</code> variables. So, everywhere I cancelled a timer, I had to be sure to set the variable to <code>NULL</code>, so that if the state machine is entered again, I could check it. I decided to enforce this by refactoring the <code>timer_Cancel()</code> function to accept the address of a <code>Timer</code> instance, and set it to <code>NULL</code> before returning from that function.</p>
+
+<p>Here is the revised code, along with @Reinderien 's suggestions for improvement. Instead of including <code>stdint.h</code>, I moved the <code>#include &lt;SDL.h&gt;</code> line to the timer header file to eliminate the header dependency. That way, I avoid including any headers from the standard libraries, which means I don't have to take a dependency on the C runtime. I also refactored the while loop, which looks a <em>little</em> cleaner, but still sorta sets off some bells, because the first thing I look at when reviewing a <code>for</code> loop is how the iterator variable is used. I tend to get suspicious if it isn't used at all. Probably a question of <em>style</em> more than anything, I guess. The test program code is unchanged, so I didn't include it here.</p>
+
+<h3>Timer.h</h3>
+
+<pre><code>#ifndef TIMER_H
+#define TIMER_H
+
+#include &lt;SDL.h&gt;
+
+typedef struct Timer Timer;
+typedef void(*TimerCallback)(void *data);
+
+/*
+    Initializes the timer mechanism, and allocates resources for 'nTimers'
+    number of simultaneous timers.
+
+    Returns non-zero on failure.
+*/
+int timer_InitTimers(int nTimers);
+
+/*
+    Add this to the main game loop, either before or after the loop that
+    polls events. If timing is very critical, add it both before and after.
+*/
+void timer_PollTimers(void);
+
+/*
+    Creates an idle timer that has to be started with a call to 'timer_Start()'.
+
+    Returns NULL on failure. Will fail if 'timer_InitTimers()' has not already
+    been called.
+*/
+Timer *timer_Create(Uint32 interval, TimerCallback fCallback, void *data);
+
+/*
+    Pauses a timer. If the timer is already paused, this is a no-op.
+
+    Fails with non-zero if 'timer' is NULL or not a valid timer.
+*/
+int timer_Pause(Timer *timer);
+
+/*
+    Starts a timer. If the timer is already running, this function resets the
+    delta time for the timer back to zero.
+
+    Fails with non-zero if 'timer' is NULL or not a valid timer.
+*/
+int timer_Start(Timer *timer);
+
+/*
+    Cancels an existing timer. If the timer is NULL, this is a no-op.
+
+    Accepts the address of a 'Timer' pointer, and sets that pointer to
+    NULL before returning.
+*/
+void timer_Cancel(Timer **timer);
+
+/*
+    Releases the resources allocated for the timer mechanism. Call at program
+    shutdown, along with 'SDL_Quit()'.
+*/
+void timer_Quit(void);
+
+/*
+    Returns true if the timer is running, or false if the timer is paused or
+    is NULL.
+*/
+int timer_IsRunning(Timer *timer);
+
+#endif
+</code></pre>
+
+<h3>Timer.c</h3>
+
+<pre><code>#include "timer.h"
+
+static Timer *Chunk; /* BLOB of timers to use */
+static int ChunkCount;
+static Timer *Timers; /* Linked list of active timers */
+static Uint64 TicksPerMillisecond;
+static Uint64 Tolerance; /* Fire the timer if it's this close */
+
+struct Timer {
+  int active;
+  int running;
+  TimerCallback callback;
+  void *user;
+  Timer *next;
+  Uint64 span;
+  Uint64 last;
+};
+
+static void addTimer(Timer *t) {
+  Timer *n = NULL;
+
+  if (Timers == NULL) {
+    Timers = t;
+  }
+  else {
+    n = Timers;
+    while (n-&gt;next != NULL) {
+      n = n-&gt;next;
+    }
+    n-&gt;next = t;
+  }
+}
+
+static void removeTimer(Timer *t) {
+  Timer *n = NULL;
+  Timer *p = NULL;
+
+  if (t == Timers) {
+    Timers = Timers-&gt;next;
+  }
+  else {
+    p = Timers;
+    n = Timers-&gt;next;
+    while (n != NULL) {
+      if (n == t) {
+        p-&gt;next = t-&gt;next;
+        SDL_memset(n, 0, sizeof(*n));
+        break;
+      }
+      p = n;
+      n = n-&gt;next;
+    }
+  }
+}
+
+int timer_InitTimers(int n) {
+  TicksPerMillisecond = SDL_GetPerformanceFrequency() / 1000;
+  Tolerance = TicksPerMillisecond / 2; /* 0.5 ms tolerance */
+  Chunk = calloc(n, sizeof(Timer));
+  if (Chunk == NULL) {
+    //LOG_ERROR(Err_MallocFail);
+    return 1;
+  }
+  ChunkCount = n;
+  return 0;
+}
+
+Timer *timer_Create(Uint32 interval, TimerCallback fCallback, void *data) {
+  Timer *t = Chunk;
+
+  for (int i = 0; i &lt; ChunkCount; i++) {
+    if (!t-&gt;active) {
+      t-&gt;span = TicksPerMillisecond * interval - Tolerance;
+      t-&gt;callback = fCallback;
+      t-&gt;user = data;
+      t-&gt;active = 1;
+      addTimer(t);
+      return t;
+    }
+    t++;
+  }
+  return NULL;
+}
+
+void timer_PollTimers(void) {
+  Timer *t = Timers;
+  Uint64 ticks = SDL_GetPerformanceCounter();
+
+  while (t) {
+    /* if a timer is not 'active', it shouldn't be 'running' */
+    SDL_assert(t-&gt;active);
+
+    if (t-&gt;running &amp;&amp; ticks - t-&gt;last &gt;= t-&gt;span) {
+      t-&gt;callback(t-&gt;user);
+      t-&gt;last = ticks;
+    }
+    t = t-&gt;next;
+  }
+}
+
+int timer_Pause(Timer* t) {
+  if (t &amp;&amp; t-&gt;active) {
+    t-&gt;running = 0;
+    t-&gt;last = 0;
+    return 0;
+  }
+  return 1;
+}
+
+int timer_Start(Timer *t) {
+  if (t &amp;&amp; t-&gt;active) {
+    t-&gt;running = 1;
+    t-&gt;last = SDL_GetPerformanceCounter();
+    return 0;
+  }
+  return 1;
+}
+
+void timer_Cancel(Timer **t) {
+  if (*t) {
+    removeTimer(*t);
+    *t = NULL;
+  }
+}
+
+void timer_Quit(void) {
+  Timers = NULL;
+  free(Chunk);
+}
+
+int timer_IsRunning(Timer *t) {
+  if (t) {
+    return t-&gt;running;
+  }
+  return 0;
+}
+</code></pre>
+    </div>

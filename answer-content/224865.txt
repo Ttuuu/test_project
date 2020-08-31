@@ -1,0 +1,251 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><em>(self-answer)</em></p>
+
+<hr>
+
+<h3>Decorators to the recue!</h3>
+
+<p>Based on the reviews and also comments I completely redesigned my <code>FeatureToggle</code>. Instead of trying to squeeze everything into the main class I decomposed it to separate classes and their decorators.</p>
+
+<hr>
+
+<p>The <code>IFeatureToggle</code> interface has lost methods for feature options:</p>
+
+<pre><code>[PublicAPI]
+public interface IFeatureToggle
+{
+    IFeatureOptionRepository Options { get; }
+
+    Task&lt;T&gt; ExecuteAsync&lt;T&gt;(string name, Func&lt;Task&lt;T&gt;&gt; body, Func&lt;Task&lt;T&gt;&gt; fallback);
+}
+</code></pre>
+
+<p>It now has only one property for options and the execute method. I put <code>IsEnabled</code> into an extension:</p>
+
+<pre><code>    public static bool IsEnabled(this IFeatureToggle toggle, string name)
+    {
+        return toggle.Options.GetOption(name).Contains(FeatureOption.Enable);
+    }
+</code></pre>
+
+<p>The new interface <code>IFeatureOptionRepository</code> is now responsible for keeping feature options.</p>
+
+<pre><code>public interface IFeatureOptionRepository
+{
+    bool IsDirty(string name);
+
+    [NotNull]
+    FeatureOption GetOption(string name);
+
+    [NotNull]
+    FeatureOption UpdateOption(string name, Func&lt;FeatureOption, FeatureOption&gt; configure);
+}
+</code></pre>
+
+<p>It has a default implementation with a dictionary that previously was a part of <code>FeatureToggle</code>:</p>
+
+<pre><code>public class FeatureOptionRepository : IFeatureOptionRepository
+{
+    private readonly IDictionary&lt;string, FeatureOption&gt; _options = new Dictionary&lt;string, FeatureOption&gt;(SoftString.Comparer);
+
+    public bool IsDirty(string name) =&gt; _options.ContainsKey(name);
+
+    public FeatureOption GetOption(string name)
+    {
+        return _options.TryGetValue(name, out var option) ? option : FeatureOption.None;
+    }
+
+    public FeatureOption UpdateOption(string name, Func&lt;FeatureOption, FeatureOption&gt; configure)
+    {
+        var newOption = configure(GetOption(name));
+        if (newOption == FeatureOption.None)
+        {
+            // Don't store default options.
+            _options.Remove(name);
+        }
+        else
+        {
+            _options[name] = newOption;
+        }
+
+        return newOption;
+    }
+}
+</code></pre>
+
+<p>You might noticed that there is no default option anymore. I created another decorator to support this:</p>
+
+<pre><code>public class FeatureOptionFallback : IFeatureOptionRepository
+{
+    private readonly IFeatureOptionRepository _options;
+    private readonly FeatureOption _defaultOption;
+
+    public FeatureOptionFallback(IFeatureOptionRepository options, FeatureOption defaultOption)
+    {
+        _options = options;
+        _defaultOption = defaultOption;
+    }
+
+    public bool IsDirty(string name) =&gt; _options.IsDirty(name);
+
+    public FeatureOption GetOption(string name)
+    {
+        return _options.GetOption(name) is var option &amp;&amp; option != FeatureOption.None ? option : _defaultOption;
+    }
+
+    public FeatureOption UpdateOption(string name, Func&lt;FeatureOption, FeatureOption&gt; configure)
+    {
+        return _options.UpdateOption(name, _ =&gt; configure(GetOption(name)));
+    }
+}
+</code></pre>
+
+<p>And if I later want to lock some features, I just decorate an option repository with my new <code>FeatureOptionLock</code>:</p>
+
+<pre><code>public class FeatureOptionLock : IFeatureOptionRepository
+{
+    private readonly IFeatureOptionRepository _options;
+    private readonly IImmutableSet&lt;string&gt; _lockedFeatures;
+
+    public FeatureOptionLock(IFeatureOptionRepository options, IEnumerable&lt;string&gt; lockedFeatures)
+    {
+        _options = options;
+        _lockedFeatures = lockedFeatures.ToImmutableHashSet(SoftString.Comparer);
+    }
+
+    public bool IsDirty(string name) =&gt; _options.IsDirty(name);
+
+    public FeatureOption GetOption(string name)
+    {
+        return _options.GetOption(name);
+    }
+
+    public FeatureOption UpdateOption(string name, Func&lt;FeatureOption, FeatureOption&gt; configure)
+    {
+        if (_lockedFeatures.Contains(name))
+        {
+            throw new InvalidOperationException($"Cannot configure feature '{name}' because it's locked.");
+        }
+
+        return _options.UpdateOption(name, configure);
+    }
+}
+</code></pre>
+
+<p>The default implementation of <code>FeatureToggle</code> is now trivial:</p>
+
+<pre><code>public class FeatureToggle : IFeatureToggle
+{
+    private readonly ILogger _logger;
+
+    public FeatureToggle(ILogger&lt;FeatureToggle&gt; logger, IFeatureOptionRepository options)
+    {
+        Options = options;
+        _logger = logger;
+    }
+
+    public IFeatureOptionRepository Options { get; }
+
+    public async Task&lt;T&gt; ExecuteAsync&lt;T&gt;(string name, Func&lt;Task&lt;T&gt;&gt; body, Func&lt;Task&lt;T&gt;&gt; fallback)
+    {
+        // Not catching exceptions because the caller should handle them.
+        return
+            this.IsEnabled(name)
+                ? await body().ConfigureAwait(false)
+                : await fallback().ConfigureAwait(false);
+    }
+}
+</code></pre>
+
+<p>But in case I want to log some statistics about features, I'll just decorate it with the new <code>FeatueTelemetry</code>:</p>
+
+<pre><code>public class FeatureTelemetry : IFeatureToggle
+{
+    private readonly ILogger _logger;
+    private readonly IFeatureToggle _featureToggle;
+
+    public FeatureTelemetry(ILogger&lt;FeatureTelemetry&gt; logger, IFeatureToggle featureToggle)
+    {
+        _logger = logger;
+        _featureToggle = featureToggle;
+    }
+
+    public IFeatureOptionRepository Options =&gt; _featureToggle.Options;
+
+    public async Task&lt;T&gt; ExecuteAsync&lt;T&gt;(string name, Func&lt;Task&lt;T&gt;&gt; body, Func&lt;Task&lt;T&gt;&gt; fallback)
+    {
+        using (_logger.BeginScope().CorrelationHandle("Feature").AttachElapsed())
+        {
+            _logger.Log(Abstraction.Layer.Service().Meta(new { FeatureName = name }).Trace());
+
+            if (_featureToggle.Options.IsDirty(name))
+            {
+                _logger.Log(Abstraction.Layer.Service().Decision("Using custom feature options.").Because("Customized by user."));
+            }
+
+            return await _featureToggle.ExecuteAsync(name, body, fallback);
+        }
+    }
+}
+</code></pre>
+
+<hr>
+
+<h3><em>Bonus</em> - feature keys</h3>
+
+<p>Here's an example of how I create featue keys with my <em>key-generator</em>:</p>
+
+<pre><code>namespace Features
+{
+    [UseType, UseMember]
+    [PlainSelectorFormatter]
+    public class DemoFeatures : SelectorBuilder&lt;DemoFeatures&gt;
+    {
+        public static StringSelector&lt;object&gt; Greeting { get; } = Select(() =&gt; Greeting).AsString();
+
+        [Tags("io")]
+        public static StringSelector&lt;object&gt; ReadFile { get; } = Select(() =&gt; ReadFile).AsString();
+    }
+
+    [UseType, UseMember]
+    [PlainSelectorFormatter] // todo - comment out to trigger selector-formatter-not-found-exception
+    public class DatabaseFeatures : SelectorBuilder&lt;DatabaseFeatures&gt;
+    {
+        [Tags("io")]
+        public static StringSelector&lt;object&gt; Commit { get; } = Select(() =&gt; Commit).AsString();
+    }
+}
+</code></pre>
+
+<p>I use them the same way any any other readonly static members but they give me a lot more flexibility in ensuring consistent naming, providing <code>T</code> in other use-cases, tagging and reflection.</p>
+
+<pre><code>    [Fact]
+    public void Can_configure_features_by_tags()
+    {
+        var options =
+            new FeatureOptionRepository()
+                .DecorateWith(o =&gt; new FeatureOptionFallback(o, FeatureOption.Enable | FeatureOption.Warn | FeatureOption.Telemetry));
+
+        var features = new FeatureToggle(Logger&lt;FeatureToggle&gt;.Empty, options);
+
+        var names =
+            ImmutableList&lt;Selector&gt;
+                .Empty
+                .AddFrom&lt;DemoFeatures&gt;()
+                .AddFrom&lt;DatabaseFeatures&gt;()
+                .Where&lt;TagsAttribute&gt;("io")
+                .Format();
+
+        features.Configure(names, o =&gt; o.Reset(FeatureOption.Enable));
+
+        var bodyCounter = 0;
+        var otherCounter = 0;
+        features.Execute(DemoFeatures.Greeting, () =&gt; bodyCounter++, () =&gt; otherCounter++);
+        features.Execute(DemoFeatures.ReadFile, () =&gt; bodyCounter++, () =&gt; otherCounter++);
+        features.Execute(DatabaseFeatures.Commit, () =&gt; bodyCounter++, () =&gt; otherCounter++);
+
+        Assert.Equal(1, bodyCounter);
+        Assert.Equal(2, otherCounter);
+    }
+</code></pre>
+    </div>

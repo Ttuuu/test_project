@@ -1,0 +1,212 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>An important property of code that is going to change in the future is <em>testability</em>; how expensive will it be to validate a later change?</p>
+
+<p>One technique for keeping the costs low is to separate the code that needs to talk to the world outside the program (the imperative shell) from the code that doesn't (the imperative shell).  Gary Bernhardt gives a good introduction to this idea in his talk <a href="https://www.youtube.com/watch?v=eOYal8elnZk" rel="nofollow noreferrer">Boundaries</a>.</p>
+
+<p>Input, output, time, random, environment... these are all examples of things that interact with the boundary.</p>
+
+<p>Key takeaway: the functional core should have no dependencies on the imperative shell.  Instead, the core describes the capabilities that it needs, and the shell provides them.</p>
+
+<pre><code>public static void printDeck(Card[] cards) {
+  for (int i = 0; i &lt; cards.length; i++) {
+    System.out.println(cards[i]);
+  }
+}
+</code></pre>
+
+<p>This is core code that depends on the imperative shell -- the output capability.  So the dependency arrow is pointing the wrong direction.  Compare this with</p>
+
+<pre><code>public static void printDeck(Card[] cards, PrintStream out) {
+  for (int i = 0; i &lt; cards.length; i++) {
+    out.println(cards[i]);
+  }
+}
+</code></pre>
+
+<p>I can easily isolate a test of this version, simply by providing a PrintStream that is local to the test.</p>
+
+<p>Yes, there is going to be a binding <em>somewhere</em> to <code>System.out</code>; we typically arrange those bindings in the <a href="http://blog.ploeh.dk/2011/07/28/CompositionRoot/" rel="nofollow noreferrer">composition root</a> -- Mark Seemann's blog has a lot of great material on this topic; read <em>all</em> of it.</p>
+
+<p>In the case of a stand alone app like this one, that binding will usually happen in <code>main</code></p>
+
+<pre><code>public static void main(String[] args) {
+
+  Eights game = new Eights(System.out);
+  game.playGame();
+}
+</code></pre>
+
+<p>Or even</p>
+
+<pre><code>public static void main(String[] args) {
+  EightsUI ui = new ConsoleEightsUI(System.in, System.out)
+  Eights game = new Eights(ui);
+  game.playGame();
+}
+</code></pre>
+
+<p>Here's another example of the same idea, based on Random</p>
+
+<pre><code>public void shuffle() {
+  Random random = new Random();
+  for (int i = size() - 1; i &gt; 0; i--) {
+    int j = random.nextInt(i);
+    swapCards(i, j);
+  }
+}
+</code></pre>
+
+<p>Bonus hint: <code>new</code> is a <a href="http://wiki.c2.com/?CodeSmell" rel="nofollow noreferrer">code smell</a> -- seeing it coupled to logic is an immediate hint that something is going wrong. <a href="http://misko.hevery.com/2008/09/30/to-new-or-not-to-new/" rel="nofollow noreferrer">Misko Hevery</a> wrote a lot about this.</p>
+
+<p>So there are two problems here - one is that we are creating a capability that should be passed as an argument...</p>
+
+<pre><code>public void shuffle(Random random) {
+  for (int i = size() - 1; i &gt; 0; i--) {
+    int j = random.nextInt(i);
+    swapCards(i, j);
+  }
+}
+</code></pre>
+
+<p>By itself, this change makes the behavior deterministic - in the sense that if you know what state the random number generator is in, you can predict the result of the shuffle.  </p>
+
+<pre><code>public static void main(String[] args) {
+  Random random = new Random();
+  EightsUI ui = new ConsoleEightsUI(System.in, System.out)
+  Eights game = new Eights(ui, random);
+  game.playGame();
+}
+</code></pre>
+
+<p>The other problem is that we're being too specific -- <code>shuffle</code> doesn't actually care whether the stream of numbers is deterministic or not, it just cares that the value returned is within the defined bounds.</p>
+
+<p>In Java 8, you might see the code written as...</p>
+
+<pre><code>interface BoundedInt {
+    int boundedInt(int excludedUpperBound);
+}
+
+public void shuffle(BoundedInt bounded) {
+  for (int i = size() - 1; i &gt; 0; i--) {
+    int j = bounded.boundedInt(i);
+    swapCards(i, j);
+  }
+}
+
+public static void main(String[] args) {
+  Random random = new Random();
+  BoundedInt boundedInt = random::nextInt;
+
+  EightsUI ui = new ConsoleEightsUI(System.in, System.out)
+  Eights game = new Eights(ui, boundedInt);
+  game.playGame();
+}
+</code></pre>
+
+<p>Because we've decoupled the capability we need from a specific provider, we can more precisely control what numbers are used during testing, without having to reverse engineer a pseudo random seed that gives us what we want.</p>
+
+<pre><code>BoundedInt zero = x -&gt; 0;
+BoundedInt upperBound = x -&gt; x-1;
+</code></pre>
+
+<p>What's really happening here is that we are making a <em>decision</em> about how the required capability is implemented, and designing the code so that the visibility of that decision is limited.  This approach was described by <a href="http://cabibbo.dia.uniroma3.it/asw/altrui/parnas-1972.pdf" rel="nofollow noreferrer">Parnas in 1972</a>; see also <a href="https://blog.acolyer.org/2016/09/05/on-the-criteria-to-be-used-in-decomposing-systems-into-modules/" rel="nofollow noreferrer">Adrian Colyer's summary</a> of that paper.</p>
+
+<p>The code as written uses an implicit interface to communicate with the player.  Make it explicit.</p>
+
+<pre><code>public String playerName() {
+  System.out.println("Enter player name: ");
+  String name = in.next();
+  while (name == "") {
+    name = in.nextLine();
+  }
+  return name;
+}
+</code></pre>
+
+<p>There are a couple issues here.  One is that <code>println</code> is the wrong abstraction level.  The motivation isn't to write bytes, it's to prompt the user</p>
+
+<pre><code>interface UI {
+    void promptUserForName();
+}
+</code></pre>
+
+<p>Another way of thinking of this: we are sending <em>messages</em> to the user, and receiving <em>messages</em> back.  </p>
+
+<pre><code>  String name = in.next();
+  while (name == "") {
+    name = in.nextLine();
+  }
+  return name;
+</code></pre>
+
+<p>This block confuses two different ideas that you may want to tease apart -- there's the capability of reading data provided by the user, and there's also the <em>state machine</em> that decides whether or not we need to try again.  Watch Cory Benfield's <a href="https://www.youtube.com/watch?v=Evchk7aNKdQ" rel="nofollow noreferrer">Building Protocol Libraries The Right Way</a>; the key points here</p>
+
+<ul>
+<li>recognizing that this interaction <em>is</em> a protocol</li>
+<li>understanding that the tool for implementing protocols is a <em>state machine</em>
+
+<ul>
+<li>an <em>explicit</em> state machine, please</li>
+</ul></li>
+<li>separating the I/O from the state machine (which is doing the bookkeeping).</li>
+</ul>
+
+<p>That's the big picture.  Some smaller things of note</p>
+
+<pre><code>public int compareValueALSD(Card that) 
+public int compareValueAHSD(Card that)
+</code></pre>
+
+<p>These look like they are trying to become <a href="https://docs.oracle.com/javase/7/docs/api/java/util/Comparator.html" rel="nofollow noreferrer">Comparator&lt;Card&gt;</a>.</p>
+
+<pre><code>public boolean equals(Card that) {
+  return rank == that.rank
+      &amp;&amp; suit == that.suit;
+}
+</code></pre>
+
+<p>Respect the <a href="https://docs.oracle.com/javase/7/docs/api/java/lang/Object.html#equals(java.lang.Object)" rel="nofollow noreferrer">Object.equals</a> contract -- see Effective Java, Item 10.  Also, remember to override <a href="https://docs.oracle.com/javase/7/docs/api/java/lang/Object.html#hashCode()" rel="nofollow noreferrer">Object.hashCode</a>.  Alternatively, if what you want is a domain specific semantics, don't use the spelling <code>equals</code>.  See, for instance, <a href="https://hackernoon.com/value-objects-like-a-pro-f1bfc1548c72" rel="nofollow noreferrer">Value Objects like a Pro</a> </p>
+
+<pre><code>final class Card {
+    private Rank rank;
+    private Suit suit;
+
+    public Card(Rank rank, Suit suit) {
+        this.rank = rank;
+        this.suit = suit;
+    }
+
+    public boolean sameAs(Card anotherCard) {
+        return rank.sameAs(anotherCard.rank) &amp;&amp;
+                suit.sameAs(anotherCard.suit);
+    }
+}
+</code></pre>
+
+<p>There's a lot to be said for using domain specific types to isolate the decisions you have made about the in memory representations.  Using primitive types like ints, Strings, and so on is a code smell called <a href="http://wiki.c2.com/?PrimitiveObsession" rel="nofollow noreferrer">Primitive</a> <a href="http://blog.ploeh.dk/2011/05/25/DesignSmellPrimitiveObsession/" rel="nofollow noreferrer">Obsession</a>.  Unfortunately, Java doesn't have a great toolkit for introducing new types; there are some libraries that can help if you are willing to introduce new dependencies.</p>
+
+<pre><code>public EightsCard convert(Card card) {
+  if (card != null) {
+  EightsCard result = new EightsCard(card.getRank(), card.getSuit());
+  return result;
+  } 
+  return null;
+}
+</code></pre>
+
+<p>If you really need to be managing nulls, I would consider teasing these apart into two different ideas</p>
+
+<pre><code>public static EightsCard convert(Card card) {
+  if (null == card) {
+    // This could reasonably be an AssertionError if you think
+    // this _can't_ ever happen
+    throw new IllegalArgumentException();
+  }
+  return new EightsCard(card.getRank(), card.getSuit());
+}
+
+public static Optional&lt;EightsCard&gt; convert(Optional&lt;Card&gt; card) {
+    return card.map(EightsCard::convert);
+}
+</code></pre>
+    </div>

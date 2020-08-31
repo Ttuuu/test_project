@@ -1,0 +1,113 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Here are some things that may help you improve your code.</p>
+
+<h2>Use the required <code>#include</code>s</h2>
+
+<p>The code uses <code>std::string</code> which means that it should <code>#include &lt;string&gt;</code>.  It might compile on your machine because some other header includes that file, but you can't count on that, and it could change with the next compiler update.</p>
+
+<h2>Use only necessary <code>#include</code>s</h2>
+
+<p>The <code>#include &lt;stdexcept&gt;</code> and <code>#include &lt;memory&gt;</code> lines are not necessary and can be safely removed because nothing from those headers appears to be used here.</p>
+
+<h2>Avoid C-style macros</h2>
+
+<p>I'd advise not using C-style macros like the ones in this code, preferring either inline functions or even lambdas.  See <a href="https://github.com/isocpp/CppCoreGuidelines/blob/master/CppCoreGuidelines.md#Res-macros2" rel="noreferrer">ES.31</a> for details.</p>
+
+<h2>Consider thread safety</h2>
+
+<p>If multiple threads are using this code, there is likely to be a problem because the single shared instance of the <code>std::vector</code> is not protected by a mutex.  I would also recommend renaming the existing <code>locked</code> variable to something like <code>complete</code> or <code>finished</code> to better distinguish what it's doing.</p>
+
+<h2>Avoid singletons</h2>
+
+<p>A singleton is basically just another way to create global variables, and we don't like global variables much because they make code linkages much harder to see and understand.  See <a href="https://github.com/isocpp/CppCoreGuidelines/blob/master/CppCoreGuidelines.md#Ri-singleton" rel="noreferrer">I.3</a> for more on that. In this case, since you already have two global variables, much of the complexity can easily be avoided by simply using a namespace instead of a class.  Here's one way to do that which eliminates the need for <code>instance</code> and <code>CREATE_LEAK_DET</code>:</p>
+
+<pre><code>namespace LeakDbg
+{
+    struct Pair
+    {
+        std::string name;
+        void* ref;
+        bool operator==( const Pair &amp;other ) const { return ref == other.ref; }
+
+    };
+    static bool locked = false;
+    static std::vector&lt;Pair&gt; stack;
+
+    static void addRef(const std::string&amp; nm, void* ptr)
+    {
+        stack.emplace_back(Pair{ nm, ptr });
+    }
+    static void remRef(void* ptr)
+    {
+        if( !LeakDbg::locked ){
+            stack.erase(std::remove(stack.begin(), stack.end(), Pair{"",ptr}), stack.end());
+        }
+    }
+    void checkLeakStack()
+    {
+        std::cout &lt;&lt; "There are " &lt;&lt; LeakDbg::stack.size() &lt;&lt; " leaks ..." "\n";
+        for ( LeakDbg::Pair pair : LeakDbg::stack) {
+            std::cout &lt;&lt; pair.name &lt;&lt; " is leaked\n";
+        }
+    }
+    static const bool registered{std::atexit( checkLeakStack ) == 0};
+}
+</code></pre>
+
+<h2>Consider the user</h2>
+
+<p>The current code requires that the user explicitly instruments the code, which seems a bit intrusive.  Here's an alternative approach the modifies things just slightly, using the <a href="https://en.wikipedia.org/wiki/Curiously_recurring_template_pattern" rel="noreferrer">Curiously Recurring Template Pattern</a>, or CRTP for short.  First we isolate the leak detector bits into a templated class.</p>
+
+<pre><code>template &lt;typename T&gt;
+struct LeakDetector {
+    LeakDetector() {
+        LeakDbg::addRef(typeid(T).name(), this);
+    }
+    ~LeakDetector() {
+        LeakDbg::remRef(this);
+    }
+};
+</code></pre>
+
+<p>Now to use it is much simpler than before.  No ugly macros are required and we only need to add one simple thing to the declaration of the class to be monitored:</p>
+
+<pre><code>struct Test : public LeakDetector&lt;Test&gt; 
+{
+    Test() {
+    }
+    ~Test() {
+    }
+};
+</code></pre>
+
+<p>An even less intrusive approach might be to override <code>new</code> and <code>delete</code> as outlined in <a href="https://stackoverflow.com/questions/438515/how-to-track-memory-allocations-in-c-especially-new-delete">this question</a>.</p>
+
+<h2>Consider alternatives</h2>
+
+<p>Leak detection is a worthwhile thing to do, since many C++ bugs stem from that kind of error.  However, there are already a number of existing approaches to this, some of which may already be installed on your computer.  There is, for example the useful <a href="https://valgrind.org/" rel="noreferrer"><code>valgrind</code></a> tool.  If you're using <code>clang</code> or <code>gcc</code> and have the <a href="https://github.com/google/sanitizers/wiki/AddressSanitizer" rel="noreferrer"><code>libasan</code></a> library installed, you can get a very nice runtime printout.  Just compile the code with</p>
+
+<pre><code>g++ -g -fsanitize=address myprogram.cpp -o myprogram
+</code></pre>
+
+<p>Then at runtime, a memory leak report might look like this:</p>
+
+<pre>There are 2 leaks ...
+Cls is leaked
+Cls is leaked
+
+=================================================================
+<b>==71254==ERROR: LeakSanitizer: detected memory leaks</b>
+
+<b>Direct leak of 1 byte(s) in 1 object(s) allocated from:</b>
+    #0 0x7fe67c2c69d7 in operator new(unsigned long) (/lib64/libasan.so.5+0x10f9d7)
+    #1 0x4057a6 in main /home/edward/test/memleak/src/main.cpp:97
+    #2 0x7fe67bcbb1a2 in __libc_start_main (/lib64/libc.so.6+0x271a2)
+
+<b>Direct leak of 1 byte(s) in 1 object(s) allocated from:</b>
+    #0 0x7fe67c2c69d7 in operator new(unsigned long) (/lib64/libasan.so.5+0x10f9d7)
+    #1 0x405774 in main /home/edward/test/memleak/src/main.cpp:95
+    #2 0x7fe67bcbb1a2 in __libc_start_main (/lib64/libc.so.6+0x271a2)
+
+SUMMARY: AddressSanitizer: 2 byte(s) leaked in 2 allocation(s).
+</pre>
+    </div>

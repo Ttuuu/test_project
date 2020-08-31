@@ -1,0 +1,186 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>In reviewing your code first, there are several things you can do to make your code more consistent.</p>
+
+<ol>
+<li>Always use <code>Option Explicit</code>. Please.</li>
+<li>When you're looking at performance, you can do more than just disable <code>ScreenUpdating</code>. See <a href="https://stackoverflow.com/a/51636805/4717755">this answer</a> for my usual solution if you feel you still need it.</li>
+<li>Typical professional developers will use start variable names with lower case letters. Functions/Subs will start with upper case. CamelCaseVariableOrSubNames is also most common.</li>
+<li>Your "main code" loop uses <code>Rows</code>, which implies the rows on the active worksheet. "Implying" which rows you're referencing will get you into loads of trouble. Always declare variables to specifically reference which worksheet or range that you're using and it's easier to keep it straight.</li>
+</ol>
+
+<p>As with many of the performance questions in Code Review, your need for speed will be solved with a memory-based array. But one of the stumbling blocks you have is detecting the indent level for each of the rows in your source data. My quick solution is to create a "helper column" of data next to your source that uses a simple User Defined Function (UDF) to identify the indent level. The UDF is a single line:</p>
+
+<pre><code>Public Function GetIndent(ByRef target As Range) As Long
+    '--- UDF to return the numeric indent level of the target cell
+    '    handles the multi-cell case and will return the indent
+    '    level of ONLY the top left cell of the range
+    GetIndent = target.Resize(1, 1).IndentLevel
+End Function
+</code></pre>
+
+<p>Using this function in the first column to the right of your data (<code>=GetIndent(A1)</code>) now turns my source data into this:</p>
+
+<p><a href="https://i.stack.imgur.com/PDp2M.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/PDp2M.png" alt="enter image description here"></a></p>
+
+<p>I had to do this because if I pull your original source data into an array, the array loses the indent level information. Otherwise, I'd have to continually refer back to the worksheet which is taking the bulk of your processing time.</p>
+
+<p><strong>A quick side note</strong> on how I am defining and accessing columns of data in my code. (I deeply regret I've lost track of which user on SO/CR I lifted this tip from. Whoever you are, mad props!) I find that much of my column-based data can change "shape" over a period of development and use. Columns can be added or deleted or switched in order. Hard-coding the column number in code then becomes problematic and forces lots of code changes to keep up. For the longest time I defined a set of <code>Const</code> declarations to keep track of column numbers, such as</p>
+
+<pre><code>Const COL_FIRST_NAME As Long = 1
+Const COL_LAST_NAME As Long = 2
+Const COL_ADDRESS As Long = 3
+</code></pre>
+
+<p>And this works just fine, but the names get tedious and it's easy to lose track of which constant to use for which range of data. So from one of the many things I've learned here, I now create an <code>Enum</code> to define column indexes that can more specifically be tied to a set of data. In the course of your solution, I have created</p>
+
+<pre><code>'--- convenience declarations for accessing data columns
+Private Enum SrcColumns
+    ID = 1
+    Number = 2
+    Indent = 3
+End Enum
+
+Private Enum DstColumns
+    L1 = 1
+    L2 = 2
+    L3 = 3
+    Number = 4
+End Enum
+</code></pre>
+
+<p>You'll see how they are used below.</p>
+
+<p>First get your data into your memory-based array:</p>
+
+<pre><code>Dim srcWS As Worksheet
+Dim dstWS As Worksheet
+Set srcWS = ThisWorkbook.Sheets("Sheet1")
+Set dstWS = ThisWorkbook.Sheets("Sheet2")
+
+'--- get our source data into an array
+Dim srcRange As Range
+Dim srcData As Variant
+Set srcRange = srcWS.UsedRange
+srcData = srcRange
+</code></pre>
+
+<p>We have to next figure out how many rows we'll need in our resulting database. This turns out to be straightforward by counting the number of times the maximum indent level appears in the data. In this case, the max indent level is 2. So:</p>
+
+<pre><code>Const MAX_LEVEL = 2
+Dim i As Long
+Dim maxDBRows As Long
+For i = 1 To UBound(srcData, 1)
+    If srcData(i, SrcColumns.Indent) = MAX_LEVEL Then
+        maxDBRows = maxDBRows + 1
+    End If
+Next i
+</code></pre>
+
+<p>Optionally (ideally), you can dynamically determine the maximum indent level instead of creating a <code>Const</code>. You could use a <code>WorksheetFunction</code> to accomplish the same thing if you'd prefer.</p>
+
+<p>In order to create your database, I'm making a strict assumption that you will always encounter previous indent levels before reaching the maximum indent. This means that inside my loop I can capture all the level labels up to the maximum level and keep them. So creating the database now becomes a simple loop:</p>
+
+<pre><code>For i = 1 To UBound(srcData, 1)
+    Select Case srcData(i, SrcColumns.Indent)
+        Case 0
+            level1 = srcData(i, SrcColumns.ID)
+        Case 1
+            level2 = srcData(i, SrcColumns.ID)
+        Case 2
+            level3 = srcData(i, SrcColumns.ID)
+            dstData(newDBRow, DstColumns.L1) = level1
+            dstData(newDBRow, DstColumns.L2) = level2
+            dstData(newDBRow, DstColumns.L3) = level3
+            dstData(newDBRow, DstColumns.Number) = srcData(i, SrcColumns.Number)
+            newDBRow = newDBRow + 1
+    End Select
+Next i
+</code></pre>
+
+<p>And finally, it's a quick copy to get the database array out to the destination:</p>
+
+<pre><code>Dim dstRange As Range
+Set dstRange = dstWS.Range("A1").Resize(UBound(dstData, 1), UBound(dstData, 2))
+dstRange = dstData
+</code></pre>
+
+<p>This runs very fast. Here's the entire module:</p>
+
+<pre><code>Option Explicit
+
+'--- convenience declarations for accessing data columns
+Private Enum SrcColumns
+    ID = 1
+    Number = 2
+    Indent = 3
+End Enum
+
+Private Enum DstColumns
+    L1 = 1
+    L2 = 2
+    L3 = 3
+    Number = 4
+End Enum
+
+Public Function GetIndent(ByRef target As Range) As Long
+    '--- UDF to return the numeric indent level of the target cell
+    GetIndent = target.IndentLevel
+End Function
+
+Sub ConvertToDatabase()
+    Dim srcWS As Worksheet
+    Dim dstWS As Worksheet
+    Set srcWS = ThisWorkbook.Sheets("Sheet1")
+    Set dstWS = ThisWorkbook.Sheets("Sheet2")
+
+    '--- get our source data into an array
+    Dim srcRange As Range
+    Dim srcData As Variant
+    Set srcRange = srcWS.UsedRange
+    srcData = srcRange
+
+    '--- we can determine how many rows in the destination database
+    '    by getting a count of the highest indent level in the array
+    Const MAX_LEVEL = 2
+    Dim i As Long
+    Dim maxDBRows As Long
+    For i = 1 To UBound(srcData, 1)
+        If srcData(i, SrcColumns.Indent) = MAX_LEVEL Then
+            maxDBRows = maxDBRows + 1
+        End If
+    Next i
+
+    '--- establish an empty database
+    Dim dstData() As Variant
+    ReDim dstData(1 To maxDBRows, 1 To 4)
+
+    '--- load up the database
+    Dim level1 As String
+    Dim level2 As String
+    Dim level3 As String
+    Dim newDBRow As Long
+    newDBRow = 1
+    For i = 1 To UBound(srcData, 1)
+        Select Case srcData(i, SrcColumns.Indent)
+            Case 0
+                level1 = srcData(i, SrcColumns.ID)
+            Case 1
+                level2 = srcData(i, SrcColumns.ID)
+            Case 2
+                level3 = srcData(i, SrcColumns.ID)
+                dstData(newDBRow, DstColumns.L1) = level1
+                dstData(newDBRow, DstColumns.L2) = level2
+                dstData(newDBRow, DstColumns.L3) = level3
+                dstData(newDBRow, DstColumns.Number) = srcData(i, SrcColumns.Number)
+                newDBRow = newDBRow + 1
+        End Select
+    Next i
+
+    '--- finally copy the array out to the destination
+    Dim dstRange As Range
+    Set dstRange = dstWS.Range("A1").Resize(UBound(dstData, 1), UBound(dstData, 2))
+    dstRange = dstData
+
+End Sub
+</code></pre>
+    </div>

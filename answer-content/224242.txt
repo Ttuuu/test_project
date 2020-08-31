@@ -1,0 +1,158 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>Specification Considerations</h3>
+
+<p>Note that the first caller that gets access is the one that provides the <code>cancellationToken</code> for the <code>valueFactory</code>. Other callers use their own <code>cancellationToken</code> for timing out on awaiting the result of the async operation. This is how you designed your class. I did not change this part of the behavior.</p>
+
+<p>If this behavior is not wanted, consider storing a cancellation token through the constructor. This one is used solely for the factory. And each call to <code>GetValueAsync</code> could then use its own cancellation token to time out, without influencing possible cancellation of the factory. This is a design decision you would have to make.</p>
+
+<hr>
+
+<h2>Review</h2>
+
+<p>This is not a good solution. You know it, we all know it :-)</p>
+
+<blockquote>
+<pre><code>await Task.Run(() =&gt;
+{
+    while (_shouldWait) Thread.Sleep(1);
+});
+</code></pre>
+</blockquote>
+
+<p>The way to delay a thread the async way is to use <code>Task.Delay</code> (<a href="https://blog.stephencleary.com/2012/02/async-and-await.html" rel="nofollow noreferrer">Overview TAP Guidelines)</a>. This is already better. But as you mentioned, this still feels like a hack (and it is). Using some sort of <code>Mutex</code> would be a better approach, as you rightfully indicated. We'll get to that.</p>
+
+<p>Lets' walk through your code.</p>
+
+<p>You define 2 similar variables <code>_isValueCreated</code> and <code>_shouldWait</code>. If you think about it, they have the same purpose. As long the value is not created, a caller should wait. Let's merge them into a variable named .. let's say <code>_memoized</code>. This is common terminology in caching.</p>
+
+<blockquote>
+<pre><code>private bool _isValueCreated = false;
+private volatile bool _shouldWait = false;
+</code></pre>
+</blockquote>
+
+<p>Rather than the whole construct of abusing a thread's <code>Sleep</code> and using a <code>volatile</code> bool to simulate a lock, we could use a <code>Semaphore</code> (<a href="https://blog.cdemi.io/async-waiting-inside-c-sharp-locks/" rel="nofollow noreferrer">Async Mutex using a Semaphore</a>). </p>
+
+<p>As discussed in the previous link, this is not possible..</p>
+
+<pre><code>// example code
+lock (lockObject)
+{
+    await Task.Delay(1000);
+}
+</code></pre>
+
+<p>.. but this is..</p>
+
+<pre><code>// example code
+await semaphoreSlim.WaitAsync();
+try
+{
+    await Task.Delay(1000);
+}
+finally
+{
+    semaphoreSlim.Release();
+}
+</code></pre>
+
+<p>Let's see how we can implement this in your cancellable async lazy class.</p>
+
+<hr>
+
+<h2>Refactoring the Code</h2>
+
+<p>We define our variables. Your two booleans are merged into one. And we use the semaphore described above.</p>
+
+<pre><code>private readonly Func&lt;CancellationToken, Task&lt;T&gt;&gt; _valueFactory;
+private volatile bool _memoized;
+private readonly SemaphoreSlim _mutex;
+private T _value;
+</code></pre>
+
+<p>The constructor is straight-forward. Make sure to use a <code>Semaphore</code> than emulates a <code>Mutex</code> so one thread has access to the resource simultaneously.</p>
+
+<pre><code>public CancelableAsyncLazy(Func&lt;CancellationToken, Task&lt;T&gt;&gt; valueFactory)
+{
+    _valueFactory = valueFactory ?? throw new ArgumentNullException(nameof(valueFactory));
+    _mutex = new SemaphoreSlim(1, 1);
+}
+</code></pre>
+
+<p>The infamous <code>GetValueAsync</code> can then be rewritten completely. Each caller thread can provide its own <code>cancellationToken</code>. Use it to acquire a lock on <code>_mutex</code>. Once we have the lock, check whether <code>_value</code> is already memoized. If not (<code>!_memoized</code>) execute <code>_valueFactory</code>, and memoize the value. Now, we perform another timeout check for the calling thread <code>ThrowIfCancellationRequested</code>. Even though we have the value available now, the caller might still have timed out, so let him now. Don't forget to release the mutex.</p>
+
+<pre><code>public async Task&lt;T&gt; GetValueAsync(CancellationToken cancellationToken)
+{
+    await _mutex.WaitAsync(cancellationToken);
+    try
+    {
+        if (!_memoized)
+        {
+            _value = await _valueFactory(cancellationToken).ConfigureAwait(false);
+            _memoized = true;
+            cancellationToken.ThrowIfCancellationRequested();
+        }
+        return _value;
+    }
+    finally
+    {
+        _mutex.Release();
+    }
+}
+</code></pre>
+
+<p>We should allow for a convenience overload if no cancellation support is required for a given caller.</p>
+
+<pre><code>public async Task&lt;T&gt; GetValueAsync() =&gt; await GetValueAsync(CancellationToken.None);
+</code></pre>
+
+<p>And since we comply to the concept of <code>Lazy</code> we should also provide a synchronous property <code>Value</code>.</p>
+
+<pre><code>public T Value =&gt; GetValueAsync().Result;
+</code></pre>
+
+<h3>Refactored Code</h3>
+
+<pre><code>public sealed class CancelableAsyncLazy&lt;T&gt;
+{
+    private readonly Func&lt;CancellationToken, Task&lt;T&gt;&gt; _valueFactory;
+    private volatile bool _memoized;
+    private readonly SemaphoreSlim _mutex;
+    private T _value;
+
+    public CancelableAsyncLazy(Func&lt;CancellationToken, Task&lt;T&gt;&gt; valueFactory)
+    {
+        _valueFactory = valueFactory 
+            ?? throw new ArgumentNullException(nameof(valueFactory));
+        _mutex = new SemaphoreSlim(1, 1);
+    }
+
+    public T Value =&gt; GetValueAsync().Result;
+
+    public async Task&lt;T&gt; GetValueAsync() =&gt; await GetValueAsync(CancellationToken.None);
+
+    public async Task&lt;T&gt; GetValueAsync(CancellationToken cancellationToken)
+    {
+        await _mutex.WaitAsync(cancellationToken);
+        try
+        {
+            if (!_memoized)
+            {
+                _value = await _valueFactory(cancellationToken).ConfigureAwait(false);
+                _memoized = true;
+                // at this point, the value is available, however, the caller
+                // might have indicated to cancel the operation; I favor 
+                // checking for cancellation one last time here, but you
+                // might decide against it and return the result anyway
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+            return _value;
+        }
+        finally
+        {
+            _mutex.Release();
+        }
+    }
+}
+</code></pre>
+    </div>

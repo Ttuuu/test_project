@@ -1,0 +1,79 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I am confused about the design. Normally one reuses the same thread instead of creating one for each minor task. Thread creation is not cheap on most platforms.</p>
+<p><strong>1.</strong> <code>void give(Input&amp;&amp; resource)</code> will be clunky to use as input is an r-value reference which is inconvenient. In many template functions you see <code>&amp;&amp;</code> used a lot but there it is most often interpreted as a universal/forwarding reference which accepts any input. In your case it will be r-values only, i.e., <code>int a = 5; producer.give(a);</code> will not compile and you'll have to write <code>producer.give(std::move(a));</code>. You should read more on r-values and forwarding references.</p>
+<p>For 99% of the cases in should be preferable to have <code>void give(Input resource)</code> instead of <code>void give(Input&amp;&amp; resource)</code>.</p>
+<p><strong>2.</strong> Okey,</p>
+<pre><code>std::thread thread([&amp;] {
+        m_output = start(std::move(resource)); // this is a bug
+
+        std::lock_guard&lt;std::mutex&gt; lock(m_mutex);
+        m_done = true;
+        m_waiting = true;
+
+        m_condition.notify_one();
+    });
+</code></pre>
+<p>The operation might occur after leaving the function and destruction of <code>resource</code> which will make resource to be a dangling reference resulting in UB.</p>
+<p>To fix it you can write it like this:</p>
+<pre><code>std::thread thread([this](Input res) {
+        m_output = start(std::move(res)); // this is a bug
+
+        std::lock_guard&lt;std::mutex&gt; lock(m_mutex);
+        m_done = true;
+        m_waiting = true;
+
+        m_condition.notify_one();
+    }, std::move(resource));
+</code></pre>
+<p><strong>3.</strong> This isn't too good:</p>
+<pre><code> std::lock_guard&lt;std::mutex&gt; lock(m_mutex);
+ m_done = true;
+ m_waiting = true;
+
+ m_condition.notify_one();
+</code></pre>
+<p>You have the <code>mutex</code> locked while notifying another thread so it might result in "hurry up and wait" as it tries to lock the mutex. One should unlock the mutex prior to notifying.</p>
+<p><strong>4.</strong> About stopping:</p>
+<pre><code>void stop()
+{
+    std::unique_lock lock(m_mutex);
+
+    while(!m_waiting) {
+        m_condition.wait(lock);
+    }
+
+    if(m_done) { // if zero tasks were accomplished, do not join the empty constructed default thread.
+        m_thread.join(); // should returns immediately. Required &amp; cleanup
+    }
+}
+</code></pre>
+<p>You have lots of unnecessary code here. Just write:</p>
+<pre><code>void stop()
+{
+    if(m_thread.joinable()) m_thread.join();
+}
+</code></pre>
+<p>Also the stop, doesn't actually do what the name implies - for what it does should be named <code>wait()</code> or something. <code>stop</code> would have to set the general state to "I refuse to get any more input".</p>
+<p>P.S. don't know why you wrote C++20. There isn't any C++20 here.</p>
+<p><strong>Edit.</strong> also</p>
+<pre><code>  virtual ~ThreadConsumer()
+  { stop(); }
+</code></pre>
+<p>Is a bug in design. Whatever class that derives from <code>ThreadConsumer</code> will first destroy its members and only then will trigger <code>~ThreadConsumer</code> and subsequently <code>stop()</code> - leading to possible UB as members were likely destroyed before procedure finished.</p>
+<hr>
+<p>Overall, I don't see much use for this <code>ThreadConsumer</code> class. It can be hard to figure out useful abstractions for multithreading. For myself, I figured messaging concept to be both most flexible and efficient.</p>
+<p>What's messaging? You have a <code>transmitter</code> and <code>receiver</code> classes which act according to their names. So the whole <code>ThreadConsumer</code> can be trivially implemented via these two as:</p>
+<pre><code>std::thread([](receiver&lt;Input&gt; recv, transmitter&lt;Output&gt; trans, Func foo)
+{
+      Input in;
+      while(recv.Receive(in)) // Receive returns false when communication ended.
+      {
+           if(not trans.Send(foo(in))) // Send forwards data, and returns false when communication is terminated.
+           {
+               return;
+           } 
+      }
+}, ....);
+</code></pre>
+<p>You only need to figure out how to implement the messaging classes. I made mine via an additional shared control block class that manages the internal logic of how data transmission is performed between <code>transmitter</code> and <code>receiver</code>. Normally, one just needs a safe-thread queue of data but sometimes it is preferable to limit the size of the queue or forward data in different order according to some priorities or whatever. Or perhaps apply some minor conversion in between the operations (so that input type differs from output type).</p>
+    </div>

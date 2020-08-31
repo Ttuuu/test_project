@@ -1,0 +1,105 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Here is another solution which uses the <code>rollRegres</code> package</p>
+
+<pre class="lang-r prettyprint-override"><code># simulate data
+library(data.table)
+set.seed(144)
+DT &lt;- data.table(        Y = rnorm(10000),
+                         X = rnorm(10000),
+                 key.group = rep(LETTERS[1:10], each = 1000))
+
+# assign suggested function
+library(rollRegres)
+f &lt;- function(SD, width = 12L)
+  roll_regres.fit(x = cbind(1, SD$X), y = SD$Y, width = 12L)$coefs[, 2]
+o &lt;- DT[, .(beta = f(.SD)), by = key.group]
+
+# assign function to compare with
+library(RcppRoll)
+rolling2 &lt;- function(DT, window.length) {
+  setNames(lapply(unique(DT$key.group), function(g) {
+    regressed.DT &lt;- DT[key.group == g]
+    xyBar = roll_mean(regressed.DT$X*regressed.DT$Y, window.length)
+    xBar = roll_mean(regressed.DT$X, window.length)
+    yBar = roll_mean(regressed.DT$Y, window.length)
+    x2Bar = roll_mean(regressed.DT$X^2, window.length)
+    c(rep(NA, window.length-1), (xyBar - xBar*yBar) / (x2Bar - xBar^2))
+  }), unique(DT$key.group))
+}
+X.coef2 &lt;- rolling2(DT, 12)
+
+# gets the same
+all.equal(unlist(X.coef2), o$beta, check.attributes = FALSE)
+#R TRUE
+
+microbenchmark::microbenchmark(
+  X.coef2 = rolling2(DT, 12),
+  roll_regres.fit = DT[, .(beta = f(.SD)), by = key.group])
+#R Unit: milliseconds
+#R             expr   min    lq   mean median     uq   max neval
+#R          X.coef2 9.453 9.726 20.729 10.529 13.705 440.0   100
+#R  roll_regres.fit 4.235 4.312  7.173  4.374  4.517 136.9   100
+</code></pre>
+
+<p>I make a comparision with the answer from <a href="https://codereview.stackexchange.com/a/125516/191204">josliber</a>. The implementation is faster as shown above and more numerically stable.</p>
+
+<hr>
+
+<h1>Update</h1>
+
+<p>The package uses the LINPACK routines <code>dchdd</code> and <code>dchud</code> to update the Cholesky decomposition in the triangular matrix of the QR decomposition of the design matrix. See the LINPACK user guide at chapter 8 and 9. It is also be numerically stable unlike the aforementioned answer which can be subject have catastrophic cancellation as shown below</p>
+
+<pre class="lang-r prettyprint-override"><code>set.seed(60679655)
+X &lt;- rnorm(100) + 1e6
+Y &lt;- rnorm(100, sd = .01) + X + 1e6 # large intercept!
+
+library(data.table)
+DT &lt;- data.table(X, Y, key.group = "a")
+o1 &lt;- DT[, .(beta = f(.SD))]
+o2 &lt;- rolling2(DT, 12)
+library(zoo)
+lm_res &lt;- rollapply(data.frame(1, X, Y), 12L, function(x)
+  lm.fit(x[, c("X1", "X")], x[, "Y"])$coefficients[2L],
+  by.column = FALSE, fill = NA_real_, align = "right")
+
+# compare the error
+c_func &lt;- function(x, y)
+  mean(abs(x[[1L]] - y), na.rm = TRUE)
+c_func(o1, lm_res)
+#R [1] 2.067e-09
+c_func(o2, lm_res)
+#R [1] 0.0003046
+
+# redo above but with larger intercept
+set.seed(60679655)
+X &lt;- rnorm(100) + 1e7
+Y &lt;- rnorm(100, sd = .01) + X + 1e7 # slope is 1
+DT &lt;- data.table(X, Y, key.group = "a")
+o1 &lt;- DT[, .(beta = f(.SD))]
+o2 &lt;- rolling2(DT, 12)
+lm_res &lt;- rollapply(data.frame(1, X, Y), 12L, function(x)
+  lm.fit(x[, c("X1", "X")], x[, "Y"])$coefficients[2L],
+  by.column = FALSE, fill = NA_real_, align = "right")
+c_func(o1, lm_res)
+#R [1] 1.879e-08
+c_func(o2, lm_res)
+#R [1] 0.01634
+</code></pre>
+
+<p>The above is run with <a href="https://github.com/boennecd/rollRegres/commit/c5811c69dbc" rel="nofollow noreferrer">this version</a> of the package which is not yet on CRAN. It does not matter at all for moderate means relative to the noise </p>
+
+<pre class="lang-r prettyprint-override"><code>set.seed(60679655)
+X &lt;- rnorm(100) + 1e3
+Y &lt;- rnorm(100, sd = 2) + X + 1e3 # slope is 1
+DT &lt;- data.table(X, Y, key.group = "a")
+o1 &lt;- DT[, .(beta = f(.SD))]
+o2 &lt;- rolling2(DT, 12)
+lm_res &lt;- rollapply(data.frame(1, X, Y), 12L, function(x)
+  lm.fit(x[, c("X1", "X")], x[, "Y"])$coefficients[2L],
+  by.column = FALSE, fill = NA_real_, align = "right")
+c_func(o1, lm_res)
+#R [1] 1.982e-12
+c_func(o2, lm_res)
+#R [1] 3.047e-10
+</code></pre>
+    </div>

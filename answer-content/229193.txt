@@ -1,0 +1,184 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p>"The Properties ParameterNumericScale and ParameterPrecision are used for setting the total number of digits and number of digits to the right of the decimal point in a number respectively. I opted to make these Properties instead of passing them as function parameters to either of GetRecordSet, GetDisconnectedRecordset, ExecuteNonQuery, or QuickExecuteNonQuery, because I felt that it was far too cluttered otherwise."</p>
+</blockquote>
+
+<p>Consider the case where there are several numeric parameters being passed in, each with varying precision and numericscale. Setting a property at the class level generalizes the <code>NumericScale</code> and <code>Precision</code> for parameters passed which is quite limiting. The way around this would be to create 2 functions that automatically calculate this for each parameter passed in: </p>
+
+
+
+<pre class="lang-vb prettyprint-override"><code>Private Function CalculatePrecision(ByVal Value As Variant) As Byte
+    CalculatePrecision = CByte(Len(Replace(CStr(Value), ".", vbNullString)))
+End Function
+
+Private Function CalculateNumericScale(ByVal Value As Variant) As Byte
+    CalculateNumericScale = CByte(Len(Split(CStr(Value), ".")(1)))
+End Function
+</code></pre>
+
+<p>Regarding a <code>Connection</code>'s <code>Error Collection</code>, If you are only interested in the collection itself, then why not pass IT, instead of the entire <code>Connection</code> Object to <code>ValidateConnection</code> and <code>PopulateADOErrorObject</code>: </p>
+
+<pre class="lang-vb prettyprint-override"><code>Private Sub ValidateConnection(ByRef ConnectionErrors As ADODB.Errors)
+
+    If ConnectionErrors.Count &gt; 0 Then
+
+        If Not this.HasADOError Then PopulateADOErrorObject ConnectionErrors
+
+        Dim ADOError As ADODB.Error
+        Set ADOError = GetError(ConnectionErrors, ConnectionErrors.Count - 1) 'Note: 0 based collection
+
+        Err.Raise ADOError.Number, ADOError.Source, ADOError.Description, ADOError.HelpFile, ADOError.HelpContext
+
+    End If
+
+End Sub
+</code></pre>
+
+<p>Lastly, you are only allowing the use of <code>Input</code> Parameters. Consider the case where a stored procedure has <code>InPut, OutPut, InputOutput, or ReturnValue</code> parameters. </p>
+
+<p>The way the code is written now, an error would be thrown. The challenge in addressing this is that there is no way to know what Direction a parameter should be mapped, unless you were to implement some sort of class to create named parameters and use string interpolation to allow parameter specific mapping. </p>
+
+<p>Saying that, there is an alternative method that allows something close to the above that is provided in the <code>ADODB</code> library already, i.e. the <code>Parameters.Refresh</code> method. </p>
+
+<p>It is worth mentioning however, that this would cause an ever so slight performance decrease, but this will likely be unnoticeable
+Microsoft mentions that using the Parameters.Refresh method of the Parameters collection to retrieve information from the provider, is a potentially resource-intensive operation. </p>
+
+<p>I have found that implicitly calling <code>Parameters.Refresh</code>, as mentioned <a href="https://flylib.com/books/en/3.405.1.22/1/" rel="nofollow noreferrer">here</a> is the best way to go: </p>
+
+<p>The link says the following: </p>
+
+<blockquote>
+  <p>You don't even have to use the Refresh method if you don't want to, and using it might even cause ADO to execute an extra round-trip. When you try to read a property of an uninitialized Command.Parameters collection for the first time, ADO constructs the Parameters collection for you—just as if you had executed the Refresh method.</p>
+</blockquote>
+
+<p>As long as parameters are specified in the correct order, you could change <code>CreateCommand</code> and the methods called by it as follows: </p>
+
+<pre class="lang-vb prettyprint-override"><code>Private Function CreateCommand(ByRef Connection As ADODB.Connection, _
+                               ByVal CommandText As String, _
+                               ByVal CommandType As ADODB.CommandTypeEnum, _
+                               ByRef ParameterValues As Variant) As ADODB.Command
+
+        Set CreateCommand = New ADODB.Command
+        With CreateCommand
+            .ActiveConnection = Connection
+            .CommandText = CommandText
+            .CommandType = CommandType  'if set here, Parameters.Refresh is impilicitly called
+            .CommandTimeout = 0
+            SetParameterValues CreateCommand, ParameterValues
+        End With
+
+
+End Function
+
+'AppendParameters ==&gt; SetParameterValues  
+Private Sub SetParameterValues(ByRef Command As ADODB.Command, ByRef ParameterValues As Variant)
+
+    Dim i As Long
+    Dim ParamVal As Variant
+
+        If UBound(ParameterValues) = -1 Then Exit Sub 'not allocated
+
+        With Command
+
+            If .Parameters.Count = 0 Then
+                Err.Raise vbObjectError + 1024, TypeName(Me), "This Provider does " &amp; _
+                                                              "not support parameter retrieval."
+            End If
+
+            Select Case .CommandType
+
+                Case adCmdStoredProc
+
+                    If .Parameters.Count &gt; 1 Then 'Debug.Print Cmnd.Parameters.Count prints 1 b/c it includes '@RETURN_VALUE'
+                                                  'which is a default value
+                        For i = LBound(ParameterValues) To UBound(ParameterValues)
+                            ParamVal = ParameterValues(i)
+
+                            'Explicitly set size to prevent error
+                            'as per the Note at: https://docs.microsoft.com/en-us/sql/ado/reference/ado-api/refresh-method-ado?view=sql-server-2017
+                            SetVariableLengthProperties .Parameters(i + 1), ParamVal
+
+                            .Parameters(i + 1).Value = ParamVal
+
+
+                        Next i
+                    End If
+
+                Case adCmdText
+
+                    For i = LBound(ParameterValues) To UBound(ParameterValues)
+                        ParamVal = ParameterValues(i)
+
+                        'Explicitly set size to prevent error
+                        SetVariableLengthProperties .Parameters(i), ParamVal
+
+                        .Parameters(i).Value = ParamVal
+
+                    Next i
+
+            End Select
+
+        End With
+
+End Sub
+
+
+Private Sub SetVariableLengthProperties(ByRef Parameter As ADODB.Parameter, ByRef ParameterValue As Variant)
+
+        With Parameter
+            Select Case VarType(ParameterValue)
+
+                Case vbSingle
+                    .Precision = CalculatePrecision(ParameterValue)
+                    .NumericScale = CalculateNumericScale(ParameterValue)
+
+                Case vbDouble
+                    .Precision = CalculatePrecision(ParameterValue)
+                    .NumericScale = CalculateNumericScale(ParameterValue)
+
+                Case vbCurrency
+                    .Precision = CalculatePrecision(ParameterValue)
+                    .NumericScale = CalculateNumericScale(ParameterValue)
+
+                Case vbString
+                    .Size = Len(ParameterValue)
+
+            End Select
+
+        End With
+
+End Sub
+</code></pre>
+
+<p>You could then add a property that will expose the <code>Command</code> object's OutPut/InputOutput/ReturnValue parameters to the client code like so: </p>
+
+<pre class="lang-vb prettyprint-override"><code>Public Property Get OuputParameters() As Collection
+    Set OuputParameters = this.OuputParameters
+End Property
+
+Private Sub PopulateOutPutParameters(ByRef Parameters As ADODB.Parameters)
+
+    Dim Param As ADODB.Parameter
+
+    Set this.OuputParameters = New Collection
+
+    For Each Param In Parameters
+        Select Case Param.Direction
+            Case adParamInputOutput
+
+                this.OuputParameters.Add Param
+
+            Case adParamOutput
+
+                this.OuputParameters.Add Param
+
+            Case adParamReturnValue
+
+                this.OuputParameters.Add Param
+
+        End Select
+    Next
+
+End Sub
+</code></pre>
+    </div>

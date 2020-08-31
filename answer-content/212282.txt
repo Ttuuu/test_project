@@ -1,0 +1,404 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>Code:</strong></p>
+
+<ul>
+<li><p>The only real utility of the <code>inline</code> keyword nowadays is to allow function definitions to be placed header files. However, template functions, or functions in template classes, don't need to be marked <code>inline</code>. There's also no need to mark both the declaration and the definition as inline.</p></li>
+<li><p>Use <code>std::size_t</code>, not <code>size_t</code> (the former is the C++ version, the latter is the C version).</p></li>
+<li><p>Don't overload random operators because it looks cool! Call it <code>as_derived</code> or something.</p></li>
+<li><p>The <code>Number</code> class stores the <code>hash_</code> of the string (o.O), but the <code>hash()</code> function returns a hash of the value? Seems weird.</p></li>
+<li><p>Use the default implementations of the copy and move constructors and assignment operators where appropriate, e.g.:</p>
+
+<pre><code>Number(Number const&amp;) = default;
+Number&amp; operator=(Number const&amp;) = default;
+Number(Number&amp;&amp;) = default;
+Number&amp; operator=(Number&amp;&amp;) = default;
+</code></pre></li>
+<li><p>If we allow assignment of a value to <code>Number</code>, it might be cleaner to implement const and non-const reference versions of the <code>value()</code> member function instead:</p>
+
+<pre><code>T&amp; value() { return value_; }
+T const&amp; value() const { return value_; }
+</code></pre></li>
+<li><p>Having different, non-virtual <code>as_ptr()</code> functions in <code>BaseSymbolic</code> and <code>Symbolic</code> is quite confusing. Do we actually need the <code>BaseSymbolic</code> version?</p></li>
+<li><p>The <code>operator std::string() const</code> in <code>Symbolic</code> should be made explicit. And then deleted, since it does exactly what <code>as_str()</code> does.</p></li>
+<li><p>There doesn't seem to be any reason to split off <code>_as_str()</code> from <code>as_str()</code> and <code>_hash()</code> from <code>hash()</code> in <code>Symbolic</code>. Since <code>Number</code> and <code>ExprAdd</code> are ultimately derived from <code>BaseSymbolic</code>, we can avoid just override them there, and leave them as abstract in <code>Symbolic</code>.</p></li>
+<li><p><code>operator+()</code> to make the <code>ExprAdd</code> will work fine without the <code>operator~</code>!</p></li>
+<li><p>Storing references will cause problems, e.g.: <code>sym a = sym(3) + sym(5); a.as_str();</code> will crash (or something). Both those temporaries are destroyed before <code>a.as_str()</code> is evaluated. We should probably store symbols by value and provide a way to store references when explicitly requested by the user (see below).</p>
+
+<ul>
+<li><p><code>sym a = 5; a-&gt;as_ptr();</code> will crash (or something) because the <code>sym</code> isn't created as a <code>std::shared_ptr</code>.</p></li>
+<li><p>Note that allocating symbols on the heap as shared pointers adds overhead, if we don't need to build a tree of arbitrary expressions at run-time, this is quite a steep price to pay to save some keystrokes (and seems quite contrary to trying to optimize the math expressions).</p></li>
+<li><p>We can actually replace <code>std::shared_ptr</code> in the <code>sym</code> class with <code>std::unique_ptr</code>. This further highlights that we don't actually need <code>operator~()</code> at all. The only time we need the derived type is when copying the object. So we can add a <code>virtual BaseSymbolic* clone() const</code> function instead.</p></li>
+</ul></li>
+</ul>
+
+<p>Suddenly, we don't need <code>std::enable_shared_from_this</code>, or <code>as_ptr()</code>, and we can delete a fair amount of code:</p>
+
+<pre><code>#include &lt;iostream&gt;
+#include &lt;string&gt;
+#include &lt;memory&gt;
+
+class BaseSymbolic {
+public:
+
+    virtual ~BaseSymbolic() {}
+
+    virtual BaseSymbolic* clone() const = 0;
+
+    virtual std::string as_str() const = 0;
+    virtual std::size_t hash() const = 0;
+};
+
+template&lt;typename Derived&gt;
+class Symbolic : public BaseSymbolic {
+public:
+
+    // ¯\_(ツ)_/¯
+
+};
+
+template&lt;typename T&gt;
+class Number : public Symbolic&lt;Number&lt;T&gt;&gt; {
+private:
+
+    T value_;
+
+public:
+
+    explicit Number(T value): value_(value) { }
+
+    Number(Number const&amp;) = default;
+    Number&amp; operator=(Number const&amp;) = default;
+    Number(Number&amp;&amp;) = default;
+    Number&amp; operator=(Number&amp;&amp;) = default;
+
+    Number* clone() const override { return new Number(value_); }
+
+    std::string as_str() const { return std::to_string(value_); }
+    std::size_t hash() const { return std::hash&lt;T&gt;{}(value_); }
+
+    T&amp; value() { return value_; }
+    T const&amp; value() const { return value_; }
+};
+
+template&lt;typename T1, typename T2&gt;
+class ExprAdd : public Symbolic&lt;ExprAdd&lt;T1, T2&gt;&gt; {
+private:
+
+    T1 lhs_;
+    T2 rhs_;
+
+public:
+
+    explicit ExprAdd(const T1 &amp;lhs, const T2 &amp;rhs): lhs_(lhs), rhs_(rhs) { }
+
+    ExprAdd(ExprAdd const&amp;) = default;
+    ExprAdd&amp; operator=(ExprAdd const&amp;) = default;
+    ExprAdd(ExprAdd&amp;&amp;) = default;
+    ExprAdd&amp; operator=(ExprAdd&amp;&amp;) = default;
+
+    ExprAdd* clone() const override { return new ExprAdd(lhs_, rhs_); }
+
+    std::string as_str() const override { return lhs_.as_str() + " + " + rhs_.as_str(); }
+    std::size_t hash() const override { return lhs_.hash() ^ rhs_.hash(); }
+};
+
+template&lt;typename T1, typename T2&gt;
+auto operator+(const Symbolic&lt;T1&gt; &amp;lhs, const Symbolic&lt;T2&gt; &amp;rhs) -&gt; const ExprAdd&lt;T1, T2&gt; {
+    return ExprAdd&lt;T1, T2&gt;(lhs, rhs);
+}
+
+class sym : public Symbolic&lt;sym&gt; {
+private:
+
+    std::unique_ptr&lt;BaseSymbolic&gt; ptr_;
+
+public:
+
+    sym(int m):
+        ptr_(std::make_unique&lt;Number&lt;int&gt;&gt;(m)) { }
+
+    template&lt;class Derived&gt;
+    sym(Symbolic&lt;Derived&gt; const&amp; m):
+        ptr_(m.clone()) { }
+
+    sym(sym const&amp; other):
+        ptr_(other.ptr_-&gt;clone()) { }
+
+    sym&amp; operator=(sym const&amp; other)
+    {
+        sym temp(other);
+        ptr_ = std::move(temp.ptr_);
+        return *this;
+    }
+
+    sym(sym&amp;&amp;) = default;
+    sym&amp; operator=(sym&amp;&amp;) = default;
+
+    sym* clone() const override { return new sym(*this); }
+
+    std::string as_str() const override { return ptr_-&gt;as_str(); }
+    std::size_t hash() const override { return ptr_-&gt;hash(); }
+};
+
+int main() {
+
+    sym a = 5;
+    sym b = 10;
+    sym c = a + b;
+
+    std::cout &lt;&lt; c.as_str() &lt;&lt; std::endl;
+}
+</code></pre>
+
+<p>We could probably get rid of the <code>Symbolic</code> class too, but maybe there's a better way to organize things...</p>
+
+<hr>
+
+<p><strong>Design:</strong></p>
+
+<p>It's a little unclear whether you want to be able to construct an expression tree at run-time (e.g. parsing arbitrary string input from the user and calculating the result), or at compile time (e.g. improving C++ code efficiency with expression templates).</p>
+
+<p>These are two different things. The latter (which is what <a href="https://stackoverflow.com/questions/414243/lazy-evaluation-in-c/414260#414260">that stackoverflow question</a> seems to be about) shouldn't require virtual functions or run-time polymorphism at all.</p>
+
+<hr>
+
+<p><strong>Compile-time:</strong></p>
+
+<p>For static lazy evaluation we don't need the base-class and inheritance hierarchy. As long as we implement the same static interface with our types, we can use them in template functions without caring what type they are.</p>
+
+<p>We can use the <code>auto</code> keyword, and some utility functions to save the user bit of typing:</p>
+
+<pre><code>#include &lt;memory&gt;
+#include &lt;string&gt;
+#include &lt;utility&gt;
+
+template&lt;class T&gt;
+struct Number
+{
+    T value;
+
+    std::string to_string() const { return std::to_string(value); }
+    std::size_t hash() const { return std::hash&lt;T&gt;()(value); }
+};
+
+template&lt;class T&gt;
+Number&lt;T&gt; make_num(T value)
+{
+    return{ value };
+}
+
+template&lt;class T&gt;
+struct Ref
+{
+    T* thing;
+
+    std::string to_string() const { return thing-&gt;to_string(); }
+    std::size_t hash() const { return thing-&gt;hash(); }
+};
+
+template&lt;class T&gt;
+Ref&lt;T&gt; make_ref(T&amp; value)
+{
+    return{ &amp;value };
+}
+
+template&lt;class T&gt;
+Ref&lt;const T&gt; make_ref(T const&amp; value)
+{
+    return{ &amp;value };
+}
+
+template&lt;class LeftT, class RightT&gt;
+struct Add
+{
+    LeftT left;
+    RightT right;
+
+    std::string to_string() const { return left.to_string() + " + " + right.to_string(); }
+    std::size_t hash() const { return left.hash() ^ right.hash(); }
+};
+
+template&lt;class LeftT, class RightT&gt;
+Add&lt;LeftT, RightT&gt; operator+(LeftT a, RightT b) // copy
+{
+    return{ std::move(a), std::move(b) }; // and move
+}
+
+#include &lt;iostream&gt;
+
+int main()
+{
+    auto a = make_num(5);
+    auto b = make_num(10);
+
+    auto sum = a + make_ref(b);
+    std::cout &lt;&lt; sum.to_string() &lt;&lt; std::endl;
+
+    auto test = make_num(3) + make_num(34);
+    std::cout &lt;&lt; test.to_string() &lt;&lt; std::endl;
+}
+</code></pre>
+
+<p>We could even use free-functions instead of member functions for <code>to_string()</code> and <code>hash()</code>. If we supply appropriate overloads for standard numeric types (<code>int</code>, <code>float</code>, etc.), then we don't need the <code>Number</code> class at all.</p>
+
+<p>Since the type information is immediately available, it's also simple (in an awful C++ way) to overload various operators to do particular things, e.g.</p>
+
+<pre><code>namespace impl
+{
+    // "simple"
+
+    template&lt;class A, class B&gt;
+    struct AddImpl
+    {
+        using return_type = Add&lt;A, B&gt;;
+
+        static return_type add(A a, B b) // general version
+        {
+            return{ std::move(a), std::move(b) };
+        }
+    };
+
+    template&lt;class A, class B&gt;
+    struct AddImpl&lt;Number&lt;A&gt;, Number&lt;B&gt;&gt;
+    {
+        using return_type = Number&lt;decltype(A() + B())&gt;;
+
+        static return_type add(Number&lt;A&gt; const&amp; a, Number&lt;B&gt; const&amp; b) // specific version
+        {
+            return return_type{ a.value + b.value }; // trivial types, so just do this now...
+        }
+    };
+
+} // impl
+
+template&lt;class LeftT, class RightT&gt;
+typename impl::AddImpl&lt;LeftT, RightT&gt;::return_type operator+(LeftT const&amp; a, RightT const&amp; b)
+{
+    return impl::AddImpl&lt;LeftT, RightT&gt;::add(a, b);
+}
+
+
+#include &lt;iostream&gt;
+
+int main()
+{
+    auto a = make_num(5);
+    auto b = make_num(10);
+
+    auto sum = a + make_ref(b);
+    std::cout &lt;&lt; sum.to_string() &lt;&lt; std::endl;
+
+    auto test = make_num(3) + make_num(34);
+    std::cout &lt;&lt; test.to_string() &lt;&lt; std::endl;
+}
+</code></pre>
+
+<hr>
+
+<p><strong>Run-time:</strong></p>
+
+<p>If you do need to construct the tree at run-time, I'd suggest watching one of Sean Parent's talks, which describe an alternative approach to run-time polymorphism:</p>
+
+<ul>
+<li><a href="https://www.youtube.com/watch?v=2bLkxj6EVoM" rel="nofollow noreferrer">Going Native 2013 - Inheritance is the Base Class of Evil</a>.</li>
+<li><a href="https://www.youtube.com/watch?v=QGcVXgEVMJg" rel="nofollow noreferrer">NDC London 2017 - Better Code: Runtime Polymorphism</a>.</li>
+</ul>
+
+<p>In short, we make our expression / number types adhere to a static interface (concept) as above. Then we can use a type-hiding class to add the run-time polymorphism in a very self-contained fashion:</p>
+
+<pre><code>#include &lt;memory&gt;
+#include &lt;string&gt;
+#include &lt;utility&gt;
+
+class Expression
+{
+public:
+
+    template&lt;class T&gt;
+    explicit Expression(T e):
+        model(std::make_unique&lt;Model&lt;T&gt;&gt;(std::move(e))) { }
+
+    Expression(Expression const&amp; other):
+        model(other.model-&gt;clone()) { }
+
+    Expression&amp; operator=(Expression const&amp; other)
+    {
+        model.reset(other.model-&gt;clone());
+        return *this;
+    }
+
+    Expression(Expression&amp;&amp; other):
+        model(std::move(other.model)) { }
+
+    Expression&amp; operator=(Expression&amp;&amp; other)
+    {
+        model = std::move(other.model);
+        return *this;
+    }
+
+    std::string to_string() const { return model-&gt;to_string(); }
+    std::size_t hash() const { return model-&gt;hash(); }
+
+private:
+
+    struct Concept
+    {
+        virtual Concept* clone() const = 0;
+
+        virtual std::string to_string() const = 0;
+        virtual std::size_t hash() const = 0;
+    };
+
+    template&lt;class T&gt;
+    class Model : public Concept
+    {
+    public:
+
+        explicit Model(T const&amp; e):
+            expression(e) { }
+
+        explicit Model(T&amp;&amp; e):
+            expression(e) { }
+
+        virtual Model* clone() const { return new Model(expression); }
+
+        virtual std::string to_string() const { return expression.to_string(); }
+        virtual std::size_t hash() const { return expression.hash(); }
+
+    private:
+
+        T expression;
+    };
+
+    std::unique_ptr&lt;Concept&gt; model;
+};
+</code></pre>
+
+<p>This works fine together with compile-time code above so we can do things like this:</p>
+
+<pre><code>#include &lt;iostream&gt;
+
+int main()
+{
+    auto a = Expression(make_num(5));
+    auto b = make_num(10);
+
+    auto sum = a + Expression(make_ref(b));
+
+    std::cout &lt;&lt; sum.to_string() &lt;&lt; std::endl; // evaluate!
+}
+</code></pre>
+
+<p>It's a little wordy when creating the expressions, but if we're parsing user input to make an expression tree, that's unlikely to be a big problem.</p>
+
+<p>We could get more towards the desired syntax with a utility function, e.g.:</p>
+
+<pre><code>template&lt;class T, typename = std::enable_if_t&lt;std::is_integral&lt;T&gt;::value || std::is_floating_point&lt;T&gt;::value&gt;&gt;
+Expression make_expr(T number)
+{
+    return Expression(Number&lt;T&gt;{ number });
+}
+</code></pre>
+
+<p>But note again that the main point of adding the run-time polymorphism is to allow us to construct arbitrary expression trees at run-time. We can probably make the syntax "nice-enough" with the compile-time version if we don't need this feature.</p>
+    </div>

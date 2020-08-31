@@ -1,0 +1,142 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>"Relatively simple" is in the eye of the beholder. Some ideas though:</p>
+
+<p>This code</p>
+
+<blockquote>
+<pre><code>int_temp = []
+int_sal = []
+
+for i in range(5):
+    int_temp.append(np.digitize(np.ndarray.flatten(T_mean[i,:,:,:]), T_bins))
+    int_sal.append(np.digitize(np.ndarray.flatten(S_mean[i,:,:,:]), S_bins))
+</code></pre>
+</blockquote>
+
+<p>can be transformed into two list comprehesions</p>
+
+<pre><code>int_temp = np.array([np.digitize(T_mean[i, :, :, :].flatten(), T_bins) for i in range(5)])
+int_sal = np.array([np.digitize(S_mean[i, :, :, :].flatten(), S_bins) for i in range(5)])
+</code></pre>
+
+<p>I also converted the results into numpy arrays, for reasons that I'll refer to later. Also take note that <code>np.ndarray.flatten(T_mean[i,:,:,:])</code> was rewritten as <code>T_mean[i, :, :, :].flatten()</code> which is the usual way to use <code>np.ndarray.&lt;fun&gt;</code>: call <code>whatever.&lt;fun&gt;()</code> (<code>&lt;fun&gt;</code> is meant to be a placeholder here, not actual code).</p>
+
+<p>The next part of the code that caught my eye was</p>
+
+<blockquote>
+<pre><code>np.ndarray.flatten(volume_mean[k, l, :, :, :])
+    [np.argwhere(np.logical_and(int_temp[l] == i, int_sal[l] == j))])
+</code></pre>
+</blockquote>
+
+<p>This line is very hard to read, but can easily be rewritten as:</p>
+
+<pre><code>indices = np.argwhere(np.logical_and(int_temp[l] == i, int_sal[l] == j))
+volume_sum[k, l, j, i] = nansum(volume_mean[k, l, :, :, :].flatten()[indices])
+</code></pre>
+
+<p>which looks muss less frightening. You can even get rid of <code>np.argwhere</code> and use <code>np.logical_and(int_temp[l] == i, int_sal[l] == j)</code> directly as binary mask:</p>
+
+<pre><code>mask = np.logical_and(int_temp[l] == i, int_sal[l] == j)
+volume_sum[k, l, j, i] = (
+    np.nansum(volume_mean[k, l, :, :, :].flatten()[mask])
+)
+</code></pre>
+
+<p>To see if there is a difference in performance, I put the original code and the refactored version into functions:</p>
+
+<pre><code>def compute_volume_sum(volume_mean, s_mean, t_mean, s_bins, t_bins):
+    """Original implementation"""
+    int_temp = []
+    int_sal = []
+    for i in range(5):
+        int_temp.append(np.digitize(np.ndarray.flatten(t_mean[i,:,:,:]), t_bins))
+        int_sal.append(np.digitize(np.ndarray.flatten(s_mean[i,:,:,:]), s_bins))
+
+    volume_sum = np.zeros((2, 5, s_bins.size, t_bins.size))
+    for k in range(2):
+        for l in range(5):
+            for i in range(t_bins.size):
+                for j in range(s_bins.size):
+                    volume_sum[k, l, j, i] = (np.nansum(
+                        np.ndarray.flatten(volume_mean[k, l, :, :, :])[np.argwhere(
+                            np.logical_and(int_temp[l] == i, int_sal[l] == j))]))
+
+    return volume_sum
+
+
+def compute_volume_sum_ref(volume_mean, s_mean, t_mean, s_bins, t_bins):
+    """Refactored implementation"""
+    int_temp = np.array([np.digitize(t_mean[i, :, :, :].flatten(), t_bins) for i in range(5)])
+    int_sal = np.array([np.digitize(s_mean[i, :, :, :].flatten(), s_bins) for i in range(5)])
+
+    volume_sum = np.zeros((2, 5, s_bins.size, t_bins.size))
+    for k in range(2):
+        for l in range(5):
+            for i in range(t_bins.size):
+                for j in range(s_bins.size):
+                    mask = np.logical_and(int_temp[l] == i, int_sal[l] == j)
+                    volume_sum[k, l, j, i] = (
+                        np.nansum(volume_mean[k, l, :, :, :].flatten()[mask])
+                    )
+
+    return volume_sum
+</code></pre>
+
+<p>BTW: You can confirm that both functions return the same value using <code>np.allclose</code></p>
+
+<p>I then measured how long it takes to run each function ten times. The results were as follows:</p>
+
+<pre class="lang-none prettyprint-override"><code>original: 16.860085s
+refactored: 11.849922s
+</code></pre>
+
+<p>Not bad, but those loops still hurt.</p>
+
+<p>Enter <a href="http://numba.pydata.org/" rel="nofollow noreferrer"><code>numba</code></a>, a just-in-time Python compiler. It works nicely with numpy and can make loops quite a bit faster since they are compiled to native code. I recommend to use a scientific Python distribution like <a href="https://www.anaconda.com/distribution/" rel="nofollow noreferrer">Anaconda</a> if you want to try/use it.</p>
+
+<p>Unfortunately, numba does not support the full feature set of Python (e.g. list comprehensions are not supported), so I had to resort to a little bit of trickery to get it working:</p>
+
+<pre><code>import numba
+
+def compute_volume_sum_nb(volume_mean, s_mean, t_mean, s_bins, t_bins):
+    """numba version"""
+    int_temp = np.array([np.digitize(t_mean[i, :, :, :].flatten(), t_bins) for i in range(5)])
+    int_sal = np.array([np.digitize(s_mean[i, :, :, :].flatten(), s_bins) for i in range(5)])
+
+    return _numba_inner(volume_mean, s_bins, t_bins, int_temp, int_sal)
+
+@numba.njit()
+def _numba_inner(volume_mean, s_bins, t_bins, int_temp, int_sal):
+    volume_sum = np.zeros((2, 5, s_bins.size, t_bins.size))
+    for k in range(2):
+        for l in range(5):
+            for i in range(t_bins.size):
+                for j in range(s_bins.size):
+                    mask = np.logical_and(int_temp[l] == i, int_sal[l] == j)
+                    volume_sum[k, l, j, i] = (
+                        np.nansum(volume_mean[k, l, :, :, :].flatten()[mask])
+                    )
+
+    return volume_sum
+</code></pre>
+
+<p><code>numba.njit()</code> is a decorator that can be used on functions to mark their function body for jit-compilation. The first time <code>compute_volume_sum_nb</code> is called, numba triggers the compilation process so be sure to exclude the first call from any timings you do.</p>
+
+<p>Let's see how the timings now look like:</p>
+
+<pre class="lang-none prettyprint-override"><code>original: 16.860085s
+refactored: 11.849922s
+numba: 0.833529s
+</code></pre>
+
+<p>That's quite a bit faster, isn't it?</p>
+
+<p>I'm almost sure that some of the loops could be replaced by clever indexing and use of vectorized functions in numpy, but I don't have the time to dive deeper into the problem.</p>
+
+<hr>
+
+<p>A few non-performance related notes: be sure so have a look at the <a href="https://www.python.org/dev/peps/pep-0008/" rel="nofollow noreferrer">Style Guide for Python Code (aka PEP 8)</a>. The code sometimes already follows those guidelines, but sometimes also doesn't, e.g. when using uppercase letters in variable names.</p>
+
+<p>Maybe also think about how you can modularize your code, e.g by using functions. Those separated parts are also easier to document. You want to write <a href="https://www.python.org/dev/peps/pep-0257/" rel="nofollow noreferrer"><code>""""documentation"""</code></a> to save future you some headache, don't you?</p>
+    </div>

@@ -1,0 +1,181 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Probably the single, most-used module in my personal library is <code>Lib_PerformanceSupport</code>, which helps to manage <code>Application</code> level performance controls. I designed (evolved) the methods in a way that they can be sprinkled liberally through the code and reused easily, even when nested. Though I could have designed this as a persistent object, it's implemented as a single module with function calls to avoid a requirement to keep track of an object's scope.</p>
+
+<p>The idea is that as my code breaks down into a variety of routines, a good percentage of these will benefit from disabling and reenabling performance controls. Since I strive to design the routines with reuse in mind, I can (almost) never know for certain if the performance control calls are nested or how deeply. </p>
+
+<p><a href="https://i.stack.imgur.com/05hMq.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/05hMq.png" alt="enter image description here"></a></p>
+
+<p>My design for this uncertainty adds a depth counter to the functions that will reset the performance controls to their original state only when execution control is returned to the original caller.</p>
+
+<p>Certainly this can present a problem in handling exceptions, leaving all the performance controls disabled. But you have this problem regardless of how you're dealing with those controls. Designing for and handling errors for your application is a separate question.</p>
+
+<p>I've also added a <code>DEBUG_MODE</code> flag as an application level/compile time option for those situations when you want to know where your code has gone off the rails for debugging. So from the example above, the calls might be:</p>
+
+<pre><code>Sub MoveStuffToCells(ByRef dest As Range)
+    DisableUpdates debugMsg:="enter MoveStuffToCells: destination cells " &amp; dest.Address
+    ' move my stuff
+    EnableUpdates debugMsg:="exit  MoveStuffToCells"
+End Sub
+</code></pre>
+
+<p>A bonus set of functions in the module use the Windows <code>QueryPerformanceCounter</code> function in the kernel as a microsecond precision timer.</p>
+
+<p>The module is presented as a <code>.bas</code> file. So copy/pasta the code below into a text file with the <code>.bas</code> extension, then import the file into your VBA Editor.</p>
+
+<pre><code>Attribute VB_Name = "Lib_PerformanceSupport"
+Attribute VB_Description = "Methods to control disabling/enabling of the Application level screen updates. Supports call nesting and debug messaging, plus high precision timer calls."
+Option Explicit
+
+'------------------------------------------------------------------------------
+' For Update methods
+'
+Private Type SavedState
+    screenUpdate As Boolean
+    calculationType As XlCalculation
+    eventsFlag As Boolean
+    callCounter As Long
+End Type
+
+Private previousState As SavedState
+
+Private Const DEBUG_MODE As Boolean = False 'COMPILE TIME ONLY!!
+
+'------------------------------------------------------------------------------
+' For Precision Counter methods
+'
+Private Type LargeInteger
+    lowpart As Long
+    highpart As Long
+End Type
+
+Private Declare Function QueryPerformanceCounter Lib _
+                         "kernel32" (lpPerformanceCount As LargeInteger) As Long
+Private Declare Function QueryPerformanceFrequency Lib _
+                         "kernel32" (lpFrequency As LargeInteger) As Long
+
+Private counterStart As LargeInteger
+Private counterEnd As LargeInteger
+Private crFrequency As Double
+
+Private Const TWO_32 = 4294967296#               ' = 256# * 256# * 256# * 256#
+
+'==============================================================================
+' Screen and Event Update Controls
+'
+Public Sub ReportUpdateState()
+Attribute ReportUpdateState.VB_Description = "Prints to the immediate window the current state and values of the Application update controls."
+    Debug.Print ":::::::::::::::::::::::::::::::::::::::::::::::::::::"
+    Debug.Print "Application.ScreenUpdating      = " &amp; Application.ScreenUpdating
+    Debug.Print "Application.Calculation         = " &amp; Application.Calculation
+    Debug.Print "Application.EnableEvents        = " &amp; Application.EnableEvents
+    Debug.Print "--previousState.screenUpdate    = " &amp; previousState.screenUpdate
+    Debug.Print "--previousState.calculationType = " &amp; previousState.calculationType
+    Debug.Print "--previousState.eventsFlag      = " &amp; previousState.eventsFlag
+    Debug.Print "--previousState.callCounter     = " &amp; previousState.callCounter
+    Debug.Print "--DEBUG_MODE is currently " &amp; DEBUG_MODE
+End Sub
+
+Public Sub DisableUpdates(Optional debugMsg As String = vbNullString, _
+                          Optional forceZero As Boolean = False)
+Attribute DisableUpdates.VB_Description = "Disables Application level updates and events and saves their initial state to be restored later. Supports nested calls. Displays debug messages according to the module-global DEBUG_MODE flag."
+    With Application
+        '--- capture previous state if this is the first time
+        If forceZero Or (previousState.callCounter = 0) Then
+            previousState.screenUpdate = .ScreenUpdating
+            previousState.calculationType = .Calculation
+            previousState.eventsFlag = .EnableEvents
+            previousState.callCounter = 0
+        End If
+
+        '--- now turn it all off and count
+        .ScreenUpdating = False
+        .Calculation = xlCalculationManual
+        .EnableEvents = False
+        previousState.callCounter = previousState.callCounter + 1
+
+        '--- optional stuff
+        If DEBUG_MODE Then
+            Debug.Print "Updates disabled (" &amp; previousState.callCounter &amp; ")";
+            If Len(debugMsg) &gt; 0 Then
+                Debug.Print debugMsg
+            Else
+                Debug.Print vbCrLf
+            End If
+        End If
+    End With
+End Sub
+
+Public Sub EnableUpdates(Optional debugMsg As String = vbNullString, _
+                         Optional forceZero As Boolean = False)
+Attribute EnableUpdates.VB_Description = "Restores Application level updates and events to their state, prior to the *first* DisableUpdates call. Supports nested calls. Displays debug messages according to the module-global DEBUG_MODE flag."
+    With Application
+        '--- countdown!
+        If previousState.callCounter &gt;= 1 Then
+            previousState.callCounter = previousState.callCounter - 1
+        ElseIf forceZero = False Then
+            '--- shouldn't get here
+            Debug.Print "EnableUpdates ERROR: reached callCounter = 0"
+        End If
+
+        '--- only re-enable updates if the counter gets to zero
+        '    or we're forcing it
+        If forceZero Or (previousState.callCounter = 0) Then
+            .ScreenUpdating = True
+            .Calculation = xlCalculationAutomatic
+            .EnableEvents = True
+        End If
+
+        '--- optional stuff
+        If DEBUG_MODE Then
+            Debug.Print "Updates enabled (" &amp; previousState.callCounter &amp; ")";
+            If Len(debugMsg) &gt; 0 Then
+                Debug.Print debugMsg
+            Else
+                Debug.Print vbCrLf
+            End If
+        End If
+    End With
+End Sub
+
+'==============================================================================
+' Precision Timer Controls
+' from: https://stackoverflow.com/a/198702/4717755
+'
+Private Function LI2Double(lgInt As LargeInteger) As Double
+Attribute LI2Double.VB_Description = "Converts LARGE_INTEGER to Double"
+    '--- converts LARGE_INTEGER to Double
+    Dim low As Double
+    low = lgInt.lowpart
+    If low &lt; 0 Then
+        low = low + TWO_32
+    End If
+    LI2Double = lgInt.highpart * TWO_32 + low
+End Function
+
+Public Sub StartCounter()
+Attribute StartCounter.VB_Description = "Captures the high precision counter value to use as a starting reference time."
+    '--- Captures the high precision counter value to use as a starting
+    '    reference time.
+    Dim perfFrequency As LargeInteger
+    QueryPerformanceFrequency perfFrequency
+    crFrequency = LI2Double(perfFrequency)
+    QueryPerformanceCounter counterStart
+End Sub
+
+Public Function TimeElapsed() As Double
+Attribute TimeElapsed.VB_Description = "Returns the time elapsed since the call to StartCounter in microseconds."
+    '--- Returns the time elapsed since the call to StartCounter in microseconds
+    If crFrequency = 0# Then
+        Err.Raise Number:=11, _
+                  Description:="Must call 'StartCounter' in order to avoid " &amp; _
+                                "divide by zero errors."
+    End If
+    Dim crStart As Double
+    Dim crStop As Double
+    QueryPerformanceCounter counterEnd
+    crStart = LI2Double(counterStart)
+    crStop = LI2Double(counterEnd)
+    TimeElapsed = 1000# * (crStop - crStart) / crFrequency
+End Function
+</code></pre>
+    </div>

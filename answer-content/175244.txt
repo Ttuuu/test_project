@@ -1,0 +1,66 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The line ...</p>
+
+<blockquote>
+<pre><code> dbContext.Set&lt;DomainEntityRecord&gt;().AddOrUpdate(domainEntityRecord);
+</code></pre>
+</blockquote>
+
+<p>... will always try to find an existing record in the database in order to determine whether <code>domainEntityRecord</code> should be marked as <code>Added</code> or as <code>Modified</code>.</p>
+
+<p>But you already fetch the existing record by the statement:</p>
+
+<blockquote>
+<pre><code>var existingDomainEntity = dbContext.Set&lt;DomainEntityRecord&gt;()
+   .Where(x =&gt; x.DomainEntityId == domainEntityRecord.DomainEntityId)
+   .Include(x =&gt; x.DomainEntityDetailRecords)
+   .SingleOrDefault();
+</code></pre>
+</blockquote>
+
+<p>So there is a redundant database roundtrip in your code. After this statement <code>var existingDomainEntity = ...</code> you know everything that <code>AddOrUpdate</code> is going to find out again. So you may as well do it yourself: if the record exist: modify it and its details, if it doesn't: add it. To modify the existing records, use <code>CurrentValues.SetValues</code>:</p>
+
+<pre><code>  var domainEntityRecord = mapper.Map&lt;DomainEntityRecord&gt;(message);
+
+  var existingDomainEntity = dbContext.Set&lt;DomainEntityRecord&gt;()
+    .Where(x =&gt; x.DomainEntityId == domainEntityRecord.DomainEntityId)
+    .Include(x =&gt; x.DomainEntityDetailRecords)
+    .SingleOrDefault();
+
+  if (existingDomainEntity != null)
+  {
+    // Delete detail records that no longer exist.
+    foreach (var existingDetail in existingDomainEntity.DomainEntityDetailRecords.ToList())
+    {
+      if (domainEntityRecord.DomainEntityDetailRecords.All(
+        x =&gt; x.DomainEntityDetailId != existingDetail.DomainEntityDetailId))
+      {
+        dbContext.Set&lt;DomainEntityDetailRecord&gt;().Remove(existingDetail);
+      }
+    }
+    // Copy current (incoming) values to db entry:
+    dbContext.Entry(existingDomainEntity).CurrentValues.SetValues(domainEntityRecord);
+    var detailPairs = from curr in domainEntityRecord.DomainEntityDetailRecords
+                      join db in existingDomainEntity.DomainEntityDetailRecords 
+                        on curr.DomainEntityDetailId equals db.DomainEntityDetailId into grp
+                      from db in grp.DefaultIfEmpty()
+                      select new { curr, db };
+    foreach(var pair in detailPairs)
+    {
+      if (pair.db != null)
+        dbContext.Entry(pair.db).CurrentValues.SetValues(pair.curr);
+      else
+        dbContext.Set&lt;DomainEntityDetailRecord&gt;().Add(pair.curr);
+    }
+  }
+  else
+  {
+    dbContext.Set&lt;DomainEntityRecord&gt;().Add(domainEntityRecord);
+    // This also adds its DomainEntityDetailRecords
+  }
+
+  dbContext.SaveChanges();
+</code></pre>
+
+<p>As you see, for the details I use a <code>GroupJoin</code> (<code>join - into</code> which serves as an outer join) to determine the existing and the new details. The existing ones are modified, the new ones are added.</p>
+    </div>

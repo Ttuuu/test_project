@@ -1,0 +1,118 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Don't <code>catch</code> errors you can't handle</h1>
+<p>You should catch exceptions if you can do something useful with them. However, just printing an error message and then quitting immediately is not useful. If you don't catch an exception, that is what will happen by default anyway.</p>
+<h1>Don't specify the window position</h1>
+<p>You should let the window manager decide the initial position of your window. It knows better where the user would like the window, and can use heuristics like where the mouse cursor is currently, where there is still unused space on the screen, and so on.</p>
+<h1>Make game menu buttons member variables</h1>
+<p>Why are the three buttons added to <code>game_menu</code> created with <code>new</code>, when other buttons are just member variables of <code>Snake_window</code>? Looking at your code it seems <code>Window::attach()</code> also has an overload that takes a reference to a <code>Button</code>, so that should just work, and will be more consistent.</p>
+<h1>Move the help text out of the constructor, use a raw string literal</h1>
+<p>The constructor of <code>Snake_window()</code> contains mostly logic for adding widgets to the window, but there's a huge blob of help text in the middle of it. It might make sense to move the text itself out of this function, and put it in a static variable. You can also use a raw <a href="https://en.cppreference.com/w/cpp/language/string_literal" rel="nofollow noreferrer">string literal</a> so you don't have to write quote characters and escape newlines anymore:</p>
+<pre><code>static const char *help_text =
+R"( SNAKE GAME
+ Snake is a video game concept where the player maneuvers a line
+that grows in length, with the line itself being a primary obstacle.
+The concept originated in the 1976 arcade game Blockade.
+...
+ ADDITIONAL NOTES
+ Good luck on the game, try to eat as much as you can!
+)";
+
+...
+
+Snake_window::Snake_window(...)
+    : ...
+{
+    ...
+    help_box.put(help_text);
+    ...
+}
+</code></pre>
+<h1>Remove debug statements</h1>
+<p>In <code>Snake_window::handle()</code> you are printing something everytime the snake changes direction. It looks like you used this for debugging? You should remove this in production code. There are other examples throughout your code that prints to <code>cout</code> that should be removed.</p>
+<h1>Give a name to <code>reference_to&lt;Snake_window&gt;(pw)</code></h1>
+<p>It's a bit unfortunate that FLTK doesn't support callbacks to non-static member functions. So now you have to write <code>reference_to&lt;Snake_window&gt;(pw)</code> to get the class instance. But it's a bit long and cryptic. Consider giving it a name, like <code>self</code>, which should be reasonably self-explanatory:</p>
+<pre><code>void Snake_window::cb_pause(Address, Address pw)
+{
+    auto self = reference_to&lt;Snake_window&gt;(pw);
+    self.pause();
+    self.game();
+}
+</code></pre>
+<h1>The body of the snake</h1>
+<p>This is where it went horribly wrong. Let's look at how the body is declared:</p>
+<pre><code>Vector_ref&lt;Rectangle&gt; body;
+</code></pre>
+<p>I see that <code>Vector_ref</code> is kind of a wrapper around <code>std::vector&lt;T *&gt;</code>. But why do you need to store the <code>Rectangle</code>s by pointer or reference? Looking at your GitHub repository, it seems <code>Rectangle</code> derives from <code>Shape</code>, but you deleted the copy constructor and copy assignment operator. I don't see a reason for that. If you want to prevent someone from copying a bare <code>Shape</code>, it is better to make the copy operations <code>protected</code>, like so:</p>
+<pre><code>class Shape {
+    ...
+protected:
+    Shape(const Shape &amp;other) = default;
+    Shape &amp;operator=(const Shape &amp;other) = default;
+    ...
+};
+</code></pre>
+<p>Once you have that, you should be able to create a vector of <code>Rectangle</code>s like so:</p>
+<pre><code>std::vector&lt;Rectangle&gt; body;
+</code></pre>
+<p>But there are other issues, which I'll discuss below:</p>
+<h1>Use a <code>std::deque&lt;&gt;</code> to store the body positions</h1>
+<p>You are using a vector, and whenever you remove the tail piece and add a new head piece, you have to shift all the positions in the body. That's quite an expensive operation. Your own <code>for</code>-loop is very inefficient, because you move each point twice. If you use a <code>std::vector</code>, you could use <code>pop_back()</code> and <code>emplace()</code> like so:</p>
+<pre><code>void Snake::move_forward() {
+    body.pop_back();
+    body.emplace(body.begin(), { /* new head constructor arguments */ });
+}
+</code></pre>
+<p>But then <code>std::vector</code> will just shift all element for you. What you ideally want is to keep all the body positions as they are, and then remove the tail and add a new head in O(1) time. That can be done by using either a <a href="https://en.cppreference.com/w/cpp/container/list" rel="nofollow noreferrer"><code>std::list</code></a>, but if you want something that works more like a <code>std::vector</code>, a <a href="https://en.cppreference.com/w/cpp/container/deque" rel="nofollow noreferrer"><code>std::deque</code></a> is ideal. Your code would then look like:</p>
+<pre><code>void Snake::move_forward() {
+    body.pop_back();
+    body.emplace_front({ /* new head constructor arguments */ });
+}
+</code></pre>
+<p>And again:</p>
+<h1>Avoid moving points unnecessarily</h1>
+<p>I see this pattern being used in several places:</p>
+<pre><code>fruit.move(-fruit.point(0).x, -fruit.point(0).y); // Top-left angle of window
+fruit.move(fruit_xy.x, fruit_xy.y);
+</code></pre>
+<p>Basically what you want is setting the fruit position to <code>fruit_xy</code>. Why not create a member function of <code>Rectangle</code> that allows direct setting of the desired position, so you can write the following:</p>
+<pre><code>fruit.set_xy(fruit_xy);
+</code></pre>
+<h1>Simplifying growing the body</h1>
+<p>Instead of having a separate function to grow the body, which first moves the snake (which removes its old tail), and then add the old tail back, consider changing <code>Snake::move_forward()</code> to optionally not remove the tail. I would do this by adding a member variable to <code>Snake</code> that indicates how many elements the body needs to grow with:</p>
+<pre><code>class Snake {
+    ...
+public:
+    void grow(size_t length) { to_grow += length; }
+private:
+    size_t to_grow;
+};
+</code></pre>
+<p>And then in <code>Snake::move_forward()</code>, do something like this:</p>
+<pre><code>void Snake::move_forward() {
+    if (to_grow)
+        to_grow--;
+    else
+        body.pop_back();
+
+    body.emplace_front({ /* new head constructor arguments */ });
+}
+</code></pre>
+<h1>Use <code>assert()</code> to check for things that shouldn't be possible</h1>
+<p>I see several member functions of <code>Snake</code> that check whether <code>body.begin() == body.end()</code>. That's only true if the length of the body is zero. But the constructor of <code>Snake</code> already throws an error if you specify a length that is less than 1. So this check if in principle unnecessary. But, it's good practice to encode your assumptions using <code>assert()</code> statements, so these assumptions can be checked in debug builds, but won't slow down release builds, like so:</p>
+<pre><code>#include &lt;cassert&gt;
+...
+const Rectangle &amp;Snake::body_head() const {
+    assert(head_ind &gt;= 0 &amp;&amp; head_ind &lt; body.size());
+    return body[head_ind];
+}
+</code></pre>
+<p>Although it would be simpler to either use <code>body.front()</code> to get the head element, and write:</p>
+<pre><code>const Rectangle &amp;Snake::body_head() const {
+    assert(!body.empty());
+    return body.front();
+}
+</code></pre>
+<p>Although personally, in this particular case, if it is clear that the Snake always has a non-zero body length, I wouldn't write those <code>assert()</code> statements at all; they just clutter the code, and tools like <a href="https://valgrind.org/" rel="nofollow noreferrer">Valgrind</a> can catch out-of-bounds errors as well.</p>
+<p>Regardless, I would use an assert in the constructor of <code>Snake</code> to check the length parameter instead of throwing an exception.</p>
+<p>Asserts should generally be used to check for assumptions about your own code. But use <code>if (...)</code> plus some kind of error reporting (like throwing an exception) when the condition is something that depends on user input.</p>
+    </div>

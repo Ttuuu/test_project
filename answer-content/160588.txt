@@ -1,0 +1,209 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>1. Review</h3>
+
+<ol>
+<li><p>The error messages are not very helpful:</p>
+
+<pre><code>&gt;&gt;&gt; eval_expr('2+')
+Traceback (most recent call last):
+    ...
+    fst, snd = tokens[where-1].info, tokens[where+1].info
+IndexError: list index out of range
+</code></pre>
+
+<p>I would prefer to see something like "expected a term but found end of input".</p></li>
+<li><p>It's usual to have blank lines between top-level declarations, to make the code easier to read (just as prose is usually broken up into paragraphs rather than being one big block).</p></li>
+<li><p><code>DIGITS</code> is not used — but if you need it, it is already built into Python as <a href="https://docs.python.org/3/library/string.html#string.digits" rel="nofollow noreferrer"><code>string.digits</code></a>.</p></li>
+<li><p>Defining <code>OPS</code> is unnecessary, since it's just the keys of the <code>OP_FUNCS</code> dictionary, and so instead of <code>expr[index] in OPS</code> you can write <code>expr[index] in OP_FUNCS</code>.</p></li>
+<li><p>The function <code>lambda x, y:x + y</code> is built into Python as <a href="https://docs.python.org/3/library/operator.html#operator.add" rel="nofollow noreferrer"><code>operator.add</code></a>; similarly there are <a href="https://docs.python.org/3/library/operator.html#operator.sub" rel="nofollow noreferrer"><code>operator.sub</code></a>, <a href="https://docs.python.org/3/library/operator.html#operator.mul" rel="nofollow noreferrer"><code>operator.mul</code></a>, <a href="https://docs.python.org/3/library/operator.html#operator.truediv" rel="nofollow noreferrer"><code>operator.truediv</code></a> and <a href="https://docs.python.org/3/library/operator.html#operator.pow" rel="nofollow noreferrer"><code>operator.pow</code></a>.</p></li>
+<li><p><code>PLACEHOLDER</code> is not used.</p></li>
+<li><p>Instead of:</p>
+
+<pre><code>possible_valid_pairs = []
+for valid_pair in VALID_PAIRS:
+    possible_valid_pairs.append((curr_kind, next_kind) == valid_pair)
+    #Test if it's equal to a valid pair
+if not any(possible_valid_pairs):
+    return False
+</code></pre>
+
+<p>you could write:</p>
+
+<pre><code>if (curr_kind, next_kind) not in VALID_PAIRS:
+    return False
+</code></pre></li>
+</ol>
+
+<h3>2. Improved data structures &amp; algorithms</h3>
+
+<ol>
+<li><p>For the <code>Token</code> class you write "This is not really useful but tuples could be less clear". Python provides <a href="https://docs.python.org/3/library/collections.html#collections.namedtuple" rel="nofollow noreferrer"><code>collections.namedtuple</code></a> for this use case:</p>
+
+<pre><code>from collections import namedtuple
+
+Token = namedtuple('Token', 'type value')
+</code></pre></li>
+<li><p>The type field of a <code>Token</code> is a string that must be <code>OP</code>, <code>NUM</code>, <code>OPAREN</code>, or <code>CPAREN</code>. Using strings to represent a fixed set of values is risky — if you wrote <code>CPERAN</code> by mistake then you wouldn't get an error but the program wouldn't work. It is better to use an <a href="https://docs.python.org/3/library/enum.html" rel="nofollow noreferrer">enumeration</a>:</p>
+
+<pre><code>from enum import Enum
+
+class TokenType(Enum):
+    OP = 1                      # Operator
+    NUM = 2                     # Number
+    OPAREN = 3                  # Open parenthesis
+    CPAREN = 4                  # Close parenthesis
+    END = 5                     # End of input
+</code></pre>
+
+<p>(We'll need <code>TokenType.END</code> later when we come to the parsing step.)</p>
+
+<p>Now if you write <code>TokenType.CPERAN</code> by mistake then you get <code>AttributeError: CPERAN</code>.</p></li>
+<li><p>Tokenization is often easiest using a single regular expression. Here you can write:</p>
+
+<pre><code>_TOKEN_RE = re.compile(r'''
+    \s*(?:                      # Optional whitespace, followed by one of
+    ([+*/^-])                   # Operator
+    |((?:[1-9]\d*|0)(?:\.\d+)?) # Number
+    |(\()                       # Open parenthesis
+    |(\))                       # Close parenthesis
+    |(.))                       # Any other character is an error
+''', re.VERBOSE)
+
+def tokenize(expr):
+    "Generate the tokens in the string expr, followed by END."
+    for match in _TOKEN_RE.finditer(expr):
+        op, num, oparen, cparen, error = match.groups()
+        if op:
+            yield Token(TokenType.OP, op)
+        elif num:
+            yield Token(TokenType.NUM, float(num))
+        elif oparen:
+            yield Token(TokenType.OPAREN, oparen)
+        elif cparen:
+            yield Token(TokenType.CPAREN, cparen)
+        else:
+            raise SyntaxError("Unexpected character: {!r}".format(error))
+    yield Token(TokenType.END, "end of input")
+</code></pre>
+
+<p>Notice that the tokens are <em>generated</em> using the <code>yield</code> instruction, instead of returned as a list by repeatedly calling <code>append</code>. This is convenient because, as we'll see later, the parser needs to fetch tokens one at a time. If you have a use case where you do need a list of tokens, you can always call <code>list(tokenize(expr))</code>.</p></li>
+<li><p>The next stage after tokenization should be <a href="https://en.wikipedia.org/wiki/Parsing" rel="nofollow noreferrer"><em>parsing</em></a>. The idea is to turn the stream of tokens into a <a href="https://en.wikipedia.org/wiki/Abstract_syntax_tree" rel="nofollow noreferrer"><em>parse tree</em></a> (also known as an <em>abstract syntax tree</em>). For example, the input <code>1*2+3</code> would be transformed into a data structure looking something like this:</p>
+
+<pre><code>BinExpr(
+    left=BinExpr(
+        left=Number(value=1.0),
+        op=operator.mul,
+        right=Number(value=2.0)),
+    op=operator.add,
+    right=Number(value=3.0))
+</code></pre>
+
+<p>This kind of data structure is easy to define:</p>
+
+<pre><code># Parse tree: either number or binary expression with left operand,
+# operator function, and right operand.
+Number = namedtuple('Number', 'value')
+BinExpr = namedtuple('BinExpr', 'left op right')
+</code></pre>
+
+<p>and really easy to evaluate:</p>
+
+<pre><code>def eval_tree(tree):
+    "Evaluate a parse tree and return the result."
+    if isinstance(tree, Number):
+        return tree.value
+    elif isinstance(tree, BinExpr):
+        return tree.op(eval_tree(tree.left), eval_tree(tree.right))
+    else:
+        raise TypeError("Expected tree but found {}"
+                        .format(type(tree).__name__))
+</code></pre>
+
+<p>(Compare this with the difficulty you have in <code>eval_tokens</code>.)</p></li>
+<li><p>So how to turn a stream of tokens into a parse tree? Well, there are lots of techniques for parsing but a good one to start with is <a href="https://en.wikipedia.org/wiki/Recursive_descent_parser" rel="nofollow noreferrer"><em>recursive descent</em></a>:</p>
+
+<pre><code>def parse(tokens):
+    "Parse iterable of tokens and return a parse tree."
+    tokens = iter(tokens)       # Ensure we have an iterator.
+    token = next(tokens)        # The current token.
+
+    def error(expected):
+        # Current token failed to match, so raise syntax error.
+        raise SyntaxError("Expected {} but found {!r}"
+                          .format(expected, token.value))
+
+    def match(type, values=None):
+        # If the current token matches type and (optionally) value,
+        # advance to the next token and return True. Otherwise leave
+        # the current token in place and return False.
+        nonlocal token
+        if token.type == type and (values is None or token.value in values):
+            token = next(tokens)
+            return True
+        else:
+            return False
+
+    def term():
+        # Parse a term starting at the current token.
+        t = token
+        if match(TokenType.NUM):
+            return Number(value=t.value)
+        elif match(TokenType.OPAREN):
+            tree = addition()
+            if match(TokenType.CPAREN):
+                return tree
+            else:
+                error("')'")
+        else:
+            error("term")
+
+    def exponentiation():
+        # Parse an exponentiation starting at the current token.
+        left = term()
+        t = token
+        if match(TokenType.OP, '^'):
+            right = exponentiation()
+            return BinExpr(left=left, op=OP_FUNCS[t.value], right=right)
+        else:
+            return left
+
+    def multiplication():
+        # Parse a multiplication or division starting at the current token.
+        left = exponentiation()
+        t = token
+        while match(TokenType.OP, '*/'):
+            right = exponentiation()
+            left = BinExpr(left=left, op=OP_FUNCS[t.value], right=right)
+        return left
+
+    def addition():
+        # Parse an addition or subtraction starting at the current token.
+        left = multiplication()
+        t = token
+        while match(TokenType.OP, '+-'):
+            right = multiplication()
+            left = BinExpr(left=left, op=OP_FUNCS[t.value], right=right)
+        return left
+
+    tree = addition()
+    if token.type != TokenType.END:
+        error("end of input")
+    return tree
+</code></pre>
+
+<p>Note:</p>
+
+<ol>
+<li><p>The <code>exponentiation</code> parser is different from the other two expression parsers. That's because exponentiation is right-associative (we want <code>3^3^2</code> to evaluate to 19683, not 729) but multiplication/division and addition/subtraction are left-associative (we want <code>4/2/2</code> to evaluate to 1, not 4).</p></li>
+<li><p>The <code>multiplication</code> and <code>addition</code> functions are very similar and it would be easy to eliminate the duplication. I've left them like this to make the recursive descent structure as clear as possible.</p></li>
+</ol></li>
+<li><p>Now the top-level evaluation looks like this:</p>
+
+<pre><code>def eval_expr(expr):
+    "Evaluate an expression and return the result."
+    tokens = tokenize(expr)
+    tree = parse(tokens)
+    return eval_tree(tree)
+</code></pre></li>
+</ol>
+    </div>

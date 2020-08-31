@@ -1,0 +1,161 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Update: here's the edited code thanks to the feedback!</p>
+
+<pre class="lang-c prettyprint-override"><code>/* Flexible array member example in C89 - Just because we can!
+ * It's demonstrated by vectors, but can be generalized.
+ * By Scorbie, 2019.
+ * Reviewed by StackExchange users "chux - Reinstate Monica" and "Björn Lindqvist":
+ * https://codereview.stackexchange.com/questions/234514
+ * 
+ * MIT License
+ * Copyright (c) 2019 Scorbie
+ * Copyright (c) 2019 chux - Reinstate Monica
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+#ifndef VECTOR_H
+#define VECTOR_H
+
+#include &lt;assert.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;stddef.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+
+/* We will use a plain array!
+ * We just store the header/metadata/other-fields/whatever
+ * in the front few fields, the number of which determined below.
+ * So the overall picture is the following:
+ *   v-- The start of the allocated memory.
+ *   v           v-- The pointer returned.
+ *  | | | | | | |*| | | | | ...
+ *  |&lt;- header-&gt;|&lt;- array-- ...
+ * If we don't know the header size in advance, we can use another
+ * size_t for specifying the header size:
+ *  | | | | | | | | | | | | |*| | | | | ...
+ *  |&lt;- header-&gt;|&lt;- size_t-&gt;|&lt;- array-- ...
+ * */
+
+/* We will going to use this fixed header for our vector. */
+struct vector_header {
+    size_t size;
+    size_t capacity;
+};
+
+/* We define SIZE_MAX, because C89 doesn't define it for us. */
+#ifndef SIZE_MAX
+#define SIZE_MAX ((size_t)(-1))
+#endif
+
+/* Get the size needed to completely cover the header by items of size item_size. */
+size_t vector_header_get_offset(size_t item_size) {
+    const size_t header_size = sizeof(struct vector_header);
+    /* header_len: how many items needed to cover the header. */
+    const size_t header_len = (header_size/item_size) + ((header_size%item_size) ? 1 : 0);
+    const size_t offset = (item_size * header_len);
+    return offset;
+}
+
+void* vector_get_mem_start(void* vec, size_t item_size) {
+    assert(vec);
+    return (unsigned char*)vec - vector_header_get_offset(item_size);
+}
+
+struct vector_header vector_get_header(void* vec, size_t item_size) {
+    struct vector_header header;
+    unsigned char* src = vector_get_mem_start(vec, item_size);
+    memcpy(&amp;header, src, sizeof header);
+    return header;
+}
+
+void vector_set_header(void* vec, size_t item_size, struct vector_header header) {
+    unsigned char* dest = vector_get_mem_start(vec, item_size);
+    memcpy(dest, &amp;header, sizeof header);
+}
+
+/* Initialize vector with the given initial_capacity. 
+ * Initial capacity should be &gt;= 1. */
+void* vector_init(size_t item_size, size_t initial_capacity) {
+    struct vector_header header = {0, initial_capacity};
+    void* vec;
+    /* Assertions to prevent divide-by-0 and overflows */
+    assert(item_size);
+    assert(initial_capacity != 0 &amp;&amp; initial_capacity &lt; (SIZE_MAX/item_size));
+    vec = malloc(initial_capacity * item_size);
+    if (!vec) { return NULL; }
+    vec = (unsigned char*)vec + vector_header_get_offset(item_size);
+    vector_set_header(vec, item_size, header);
+    return vec;
+}
+
+/* If needed, increase the capacity of the given header.
+ * On success, return the new header.
+ * On failure, return {0, 0} to signal an error. */
+struct vector_header vector_header_increase_capacity(struct vector_header header) {
+    assert(header.size &lt;= header.capacity);
+    if (header.size == SIZE_MAX) {
+        /* No more memory, set it to error value */
+        header.size = header.capacity = 0;
+    } else if (header.size == header.capacity) {
+        header.capacity = (header.capacity &gt;= SIZE_MAX/2) ? SIZE_MAX : (2 * header.capacity);
+    }
+    return header;
+}
+
+void* vector_increase_capacity(void* vec, size_t item_size) {
+    struct vector_header header;
+    const size_t header_offset = vector_header_get_offset(item_size);
+    void* vec_mem_start = vector_get_mem_start(vec, item_size);
+    void* new_vec_mem_start = vec_mem_start;
+    assert(vec);
+    assert(item_size);
+    assert(header_offset);
+    /* Try to allocate more memory with overflow checks. */
+    header = vector_header_increase_capacity(vector_get_header(vec, item_size));
+    if (header.capacity == 0 || header.capacity &gt; (SIZE_MAX-header_offset)/(item_size)) {
+        errno = EDOM;
+        perror("Error: vector_increase_capacity failed");
+        return NULL;
+    }
+    new_vec_mem_start = realloc(vec_mem_start, header_offset + item_size * header.capacity);
+    /* Check for failure. */
+    if (!new_vec_mem_start) {
+        perror("Error: vector_increase_capacity failed");
+        return NULL;
+    } else {
+        void* new_vec = (unsigned char*)new_vec_mem_start + header_offset;
+        vector_set_header(new_vec, item_size, header);
+        return new_vec;
+    }
+}
+
+int vector_is_out_of_bounds(void* vec, size_t item_size, size_t i) {
+    return (i &gt; vector_get_header(vec, item_size).size);
+}
+
+void vector_free(void* vec, size_t item_size) {
+    void* vec_mem_start = vector_get_mem_start(vec, item_size);
+    free(vec_mem_start);
+}
+
+#endif /* VECTOR_H */
+<span class="math-container">```</span>
+</code></pre>
+    </div>

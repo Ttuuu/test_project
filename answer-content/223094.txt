@@ -1,0 +1,71 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Events can be cleared much simpler:</p>
+
+<blockquote>
+<pre><code>public void Clear() {
+    foreach (Delegate d in DataReceived.GetInvocationList())
+        DataReceived -= (EventHandler&lt;NetworkReceiveEventArgs&gt;)d;
+    foreach (Delegate d in Disconnected.GetInvocationList())
+        Disconnected -= (EventHandler)d;
+}
+</code></pre>
+</blockquote>
+
+<pre><code>public void Clear() {
+    DataReceived = null;
+    Disconnected = null;
+}
+</code></pre>
+
+<hr>
+
+<p><em>This is by no means a full review of your code, but I would like to explain a couple of things to you.</em></p>
+
+<p>You are using seperate locks for sending, checking connection status, initializing and disconnecting. Think about the implications by using a seperate lock for operations that all require a common thread-aware resource <code>Connected</code>. Since they all take a different lock, they can simultaniously change the state and corrupt the other ongoing operation. <strong>This is why you should use a single lock for all these operations</strong>.</p>
+
+<pre><code>private object syncRoot = new object();
+</code></pre>
+
+<p>But even then, since you check the condition before the lock, data integrity might still be breached by an unfortunate flow of events. </p>
+
+<pre><code>public void Send(NetworkHeader header, byte[] data) {
+    if (!Connected) // ..      // &lt;- outside lock
+    lock (syncRoot) {          // &lt;- inside lock, but condition might no longer be true
+        // ..
+    }
+}
+</code></pre>
+
+<p>As an example, suppose two threads simultaniously call respectively <code>Send</code> and <code>Disconnect</code>. A possible flow is:</p>
+
+<pre><code>- thread A: call Send                    // thread A is first
+- thread A: check IsConnected: true
+- thread B: call Disconnect              // thread B starts a fraction later
+- thread B: check IsConnected: true
+- thread B: take lock
+- thread B: set IsConnected: false
+- thread B: release lock
+- thread A: take lock                    // thread A reaches a point where it 
+             // expected its state to still be valid, but thread B changed it
+- thread A: connection.Send(..)          // &lt;- null-reference exception
+</code></pre>
+
+<p>There used to be a recommedation about double-checked locking. <a href="https://help.semmle.com/wiki/display/CSHARP/Double-checked+lock+is+not+thread-safe" rel="nofollow noreferrer">But here is a good reason not to use it</a>. So we will have to take the condition inside the lock.</p>
+
+<pre><code>public void Send(NetworkHeader header, byte[] data) {
+    lock (syncRoot) { 
+        if (!Connected) // ..   
+        // ..
+    }
+}
+</code></pre>
+
+<p>Moving on, we can change <code>Connected</code> to take a <a href="https://docs.microsoft.com/en-us/dotnet/csharp/language-reference/keywords/volatile" rel="nofollow noreferrer">volatile boolean</a>, so we don't require additional locking when just getting its value. Just make sure to set its value when connection is established and reset on <code>Disconnect</code>. The volatile field is read as an atomic operation. You get the actual value, rather than a cached value (which might be done to optimize state in a non-concurrent context).</p>
+
+<pre><code>private volatile bool _connected = false;
+
+public bool Connected =&gt; _connected;   // &lt;- no locking required
+</code></pre>
+
+<p>I hope this explains some basic concepts of locks and thread-safety.</p>
+    </div>

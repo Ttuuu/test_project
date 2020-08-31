@@ -1,0 +1,102 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Return the condition</h1>
+<p>When we test for equality, <code>a == b</code> is either <code>1</code> if they're equal or <code>0</code> if they're not (see C11 §6.5.8 Relational operators). Therefore we can simply return the expression instead of an <code>if</code>-<code>else</code> construct:</p>
+<pre><code>bool fifo_is_full(struct fifo * fifo)
+{
+    return fifo-&gt;elements == fifo-&gt;size;
+}
+
+bool fifo_is_empty(struct fifo * fifo)
+{
+    return fifo-&gt;elements == 0;
+}
+</code></pre>
+<p>Feel free to add parentheses around the expression to make it more readable. Alternatively we can use a ternary expression, but that just adds noise and has no additional benefit.</p>
+<h1>Interrupt safety</h1>
+<p><code>fifo_add_byte</code> and <code>fifo_get_byte</code> are not interrupt safe.</p>
+<p>Let's say we're using <code>fifo_add_byte</code> somewhere in our usual code but also in an interrupt handler, for example to queue jobs. In <code>main</code> we check current GPIO pin states, and the interrupt comes from some kind of bus.</p>
+<p>For the sake of simplicity, let's assume <code>fifo-&gt;write_index == 0</code> and <code>fifo-&gt;elements == 0</code>.</p>
+<p>We enter <code>fifo_add_byte</code> in <code>main</code>:</p>
+<pre><code>// in main:
+fifo_add_byte(job_fifo, GPIO_PIN4_STATE);
+</code></pre>
+<p>and follow its definition:</p>
+<pre><code>bool fifo_add_byte(struct fifo * fifo, uint8_t newbyte)
+{
+    if (fifo_is_full(fifo))
+    {
+        return 0;
+    }
+    else
+    {
+        if (fifo-&gt;data_ptr == NULL)
+        {
+            return 0;
+        }
+        const uint16_t MASK = fifo-&gt;size - 1;
+        fifo-&gt;data_ptr[fifo-&gt;write_index] = newbyte;
+...
+</code></pre>
+<p>And then an interrupt occurs. We already wrote <code>fifo-&gt;data_ptr[0] = GPIO_PIN4_STATE</code> so our data is safe, right?</p>
+<p>Well, inside the interrupt handler, we have the following line:</p>
+<pre><code>// in interrupt_handler_i2c:
+fifo_add_byte(job_fifo, i2c_read_data);
+</code></pre>
+<p><code>fifo-&gt;write_index</code> didn't get updated in our <code>main</code> yet, so our <code>fifo-&gt;data_ptr[0]</code> will now be set to <code>i2c_read_data</code>. Afterwards, <code>fifo-&gt;write_index</code> gets incremented before we exit the interrupt handler and then <em>again</em> after we enter <code>main</code> again:</p>
+<pre><code>// ... back in main:
+        fifo-&gt;write_index = (++fifo-&gt;write_index) &amp; MASK;
+        fifo-&gt;elements++;
+        return 1;
+    }
+}
+</code></pre>
+<p>Our <code>fifo-&gt;data_ptr</code> now contains <code>{ i2c_read_data, 0, ... }</code>, <code>fifo-&gt;write_index = fifo-&gt;elements = 2</code>. However, <code>GPIO_PIN4_STATE</code>'s value is lost.</p>
+<p>Depending on the plattform, <code>fifo-&gt;elements++</code> or another increment operation might get interrupted and even that operation won't work. <a href="https://www.iar.com/support/resources/articles/beyond-volatile/" rel="noreferrer">And no, <code>volatile</code> isn't a proper solution for interrupts.</a></p>
+<p>We have some ways to remedy this:</p>
+<ul>
+<li>we could use critical sections in our index-logic to prevent interrupts</li>
+<li>we could use atomic indices/sizes, if our platform supports those</li>
+<li>we could mark the fifo "in use" and just return <code>false</code> during an interrupt, but that hinders functionality (it's also very error prone and subject to similar issues)</li>
+<li>we could do nothing and simply state that the FIFO isn't safe to be written to from both the usual program and interrupt handlers (same for reading from both locations)</li>
+</ul>
+<p>And that's the least we can do to fix this issue: add <strong>documentation</strong>.</p>
+<h1>Documentation</h1>
+<p>None of our code is documented. At least <code>fifo_init</code> needs a documentation, and it needs a very large warning about using a power-of-two <code>size</code>. Otherwise, our <code>MASK</code> logic will yield most interesting behaviours.</p>
+<p>The documentation is also the perfect place to state interrupt safety. The FIFO is safe to use within interrupts*, as long as its only written to from within those and only read from outside of an interrupt context.</p>
+<p>Usual C-style comments (or Doxygen comments for fancy exports) can be used within our code:</p>
+<pre><code>/**
+ * \file fifo.c
+ *
+ * \warning When you use a FIFO in the context of ISRs, make sure that the information
+ *          flows only in one direction, e.g. use fifo_add_byte only in ISRs and
+ *          fifo_get_byte only in the rest of your program or vice versa.
+ *          
+ *          Using fifo_add_byte in both ISRs and the rest of your program might
+ *          yield unexpected results.
+*/
+
+...
+
+/**
+ * Adds the given byte to the fifo.
+ *
+ * \returns false if the fifo is full or the data pointer is invalid
+ *
+ * \warning This function MUST be either used exclusively from ISRs OR the rest
+ *          of your program and MUST NOT be used in a recursive ISR context.
+*/
+bool fifo_add_byte(struct fifo * fifo, uint8_t newbyte)
+...
+</code></pre>
+<p>Now, you might think that this is a little bit too much, and you're completely right. The following documentation might prove enough:</p>
+<pre><code>/** WARNING WARNING WARNING
+ * Only push bytes in interrupt routines and only pull bytes in your `main`
+ * (or the other way round)!
+*/
+</code></pre>
+<p>However, there should be at least <em>something</em>, even if it will be only read by a future version of you. But that future version will be glad to have some hint why data might get lost or duplicated.</p>
+<p><sup>*: Truth be told: that depends whether <code>elements++</code> and <code>elements--</code> are atomic operations on our platform.</sup></p>
+<h1>Parting words</h1>
+<p>Interrupt safety, code brevity and missing documetation aside: well done. Your code is well-formatted, the overall ring-buffer FIFO design is sound, and it's something I'd write in a similar way. I'm not a fan of the <code>&amp; MASK</code> logic, to be honest, but that's personal preference. Also keep in mind that <code>volatile</code> does not mean thread- or interrupt-safe, so better have a look at the keyword and atomics.</p>
+<p>Other than that: Well done.</p>
+    </div>

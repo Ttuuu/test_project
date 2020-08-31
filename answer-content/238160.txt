@@ -1,0 +1,227 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Cargo Fmt</h1>
+<p>There's a very common tool accessible through <code>cargo</code> which can format all of the code in your project according to Rust's official style guide. Many major open source Rust libraries use this tool (and even enforce it through CI on pull requests), which you can access through <code>cargo fmt</code>. You can also customize its output using a <code>.rustfmt</code> config file. See the project's repo under the official rust-lang organization <a href="https://github.com/rust-lang/rustfmt" rel="noreferrer">here</a>.</p>
+<h1>Time to <code>try_</code> again?</h1>
+<p>The closure that starts here contains several <code>.unwrap()</code> because some locks you do might not yield anything.</p>
+<blockquote>
+<pre><code>        new_urls.par_iter().for_each(|url| {
+            // ...
+            found_urls.lock().unwrap().extend(&amp;links);
+            visited.lock().unwrap().insert(url.to_string());
+</code></pre>
+</blockquote>
+<p>Instead of <code>.unwrap()</code>ing whenever something goes wrong, which could poison all of your locked Mutexes, consider <a href="https://docs.rs/rayon/1.3.0/rayon/iter/trait.ParallelIterator.html#method.try_for_each" rel="noreferrer">try_for_each</a>.</p>
+<p>With <code>try_for_each</code>, your closure has to return a <code>Result&lt;T, E&gt;</code> or an <code>Option&lt;T&gt;</code> instead of <code>()</code> (nothing, unit). This allows you to use Rust's special <code>?</code> operator, which is like a shorter version of <code>.unwrap()</code> that's actually a bit nicer because instead of crashing your program, it returns the error to be handled somewhere else.</p>
+<pre class="lang-rust prettyprint-override"><code>            found_urls.lock().ok()?.extend(links);
+            visited.lock().ok()?.insert(url.to_string());
+            Some(())
+</code></pre>
+<p>Note that in this case, we do have to use <code>.ok()</code> because the <code>PoisonError</code> the Mutex returns also contains a reference to the Mutex, which isn't thread safe. A better practice here might be to use a custom Error enum. (more on that later)</p>
+<p>This practice can be propagated throughout the code base.</p>
+<h1>Compiler Warnings</h1>
+<p>The Rust compiler is your friend! When I compile your code on my machine, I get several warnings.</p>
+<pre class="lang-rust prettyprint-override"><code>warning: unused variable: `dir`
+  --&gt; src\main.rs:60:9
+   |
+60 |     let dir = fs::create_dir_all(format!("static{}", path)).unwrap();
+   |         ^^^ help: consider prefixing with an underscore: `_dir`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: variable does not need to be mutable
+  --&gt; src\main.rs:73:9
+   |
+73 |     let mut visited = Arc::new(Mutex::new(HashSet::new()));
+   |         ----^^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` on by default
+
+warning: variable does not need to be mutable
+  --&gt; src\main.rs:82:13
+   |
+82 |         let mut found_urls = Arc::new(Mutex::new(HashSet::new()));
+   |             ----^^^^^^^^^^
+   |             |
+   |             help: remove this `mut`
+
+warning: unused `std::result::Result` that must be used
+  --&gt; src\main.rs:61:5
+   |
+61 |     fs::write(format!("static{}/index.html", path), content);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_must_use)]` on by default
+   = note: this `Result` may be an `Err` variant, which should be handled
+</code></pre>
+<p>These can all be handled in straightforward ways.</p>
+<blockquote>
+<pre><code>fn write_file(path: &amp;str, content: &amp;String) {
+   let dir = fs::create_dir_all(format!("static{}", path)).unwrap();
+   fs::write(format!("static{}/index.html", path), content);
+}
+</code></pre>
+</blockquote>
+<p>Here, for example, you create a <code>dir</code> variable that's never used, and <code>fs::write</code> could fail but you never handle the error.</p>
+<pre class="lang-rust prettyprint-override"><code>fn write_file(path: &amp;str, content: &amp;String) -&gt; Result&lt;(), ()&gt; {
+</code></pre>
+<p>Filling in unit <code>()</code> types will get the compiler to tell us what types should actually go there.</p>
+<pre class="lang-rust prettyprint-override"><code>PS C:\Users\cedhu\reqtwest&gt; cargo check
+    Checking reqtwest v0.1.0 (C:\Users\cedhu\reqtwest)
+error[E0308]: mismatched types
+  --&gt; src\main.rs:60:5
+   |
+59 | fn write_file(path: &amp;str, content: &amp;String) -&gt; Result&lt;(), ()&gt; {
+   |                                                -------------- expected `std::result::Result&lt;(), ()&gt;` because of return type
+60 |     fs::write(format!("static{}/index.html", path), content)
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `()`, found struct `std::io::Error`
+   |
+   = note: expected enum `std::result::Result&lt;_, ()&gt;`
+              found enum `std::result::Result&lt;_, std::io::Error&gt;`
+
+error: aborting due to previous error
+</code></pre>
+<p>Now, thanks mostly due to the Rust compiler, we have</p>
+<pre class="lang-rust prettyprint-override"><code>fn write_file(path: &amp;str, content: &amp;String) -&gt; Result&lt;(), std::io::Error&gt; {
+    fs::create_dir_all(format!("static{}", path))?;
+    fs::write(format!("static{}/index.html", path), content)
+}
+</code></pre>
+<p>And now the Rust compiler will continue by warning us about places where we don't handle the error that <code>write_file</code> now returns. Handling errors seems like a lot of typing, but it helps you make much more stable programs, and Rust's Result types really do force you to think about edge cases you would otherwise simply ignore.</p>
+<pre><code>write_file(&amp;url[origin_url.len() - 1..], &amp;body)
+    .unwrap_or_else(|e| panic!("Couldn't write {:?} to file: {}", url, e));
+</code></pre>
+<h1>Custom Error Type</h1>
+<pre class="lang-rust prettyprint-override"><code>new_urls.par_iter().try_for_each(|url| {
+    let body = fetch_url(&amp;client, url);
+    write_file(&amp;url[origin_url.len() - 1..], &amp;body)
+        .unwrap_or_else(|e| panic!("Couldn't write {:?} to file: {}", url, e));
+
+    let links = get_links_from_html(&amp;body);
+    println!("Visited: {} found {} links", url, links.len());
+    found_urls.lock().ok()?.extend(links);
+    visited.lock().ok()?.insert(url.to_string());
+    Some(())
+}).unwrap();
+</code></pre>
+<p>Our <code>par_iter</code> looks like this now, but it's a bit ugly and inconsistent. For the file writing, we just panic if that creates an error, but for the <code>.lock()</code>s we return <code>None</code> through <code>?</code> to create an early return. Furthermore, that <code>None</code> won't contain any information that could be useful for debugging. We do have information to return from the <code>write_file</code>, so we could stop using <code>Option&lt;()&gt;</code> and maybe start using <code>Result&lt;(), String&gt;</code>, and get some information from the failed <code>.lock()</code>s and put that in a <code>String</code>, but <code>String</code>s are really big and messy, so let's try to avoid turning anything into a <code>String</code> until the last possible moment. To do that, we can use an enum to represent all of the possible failures our program might make.</p>
+<pre class="lang-rust prettyprint-override"><code>enum Error {
+    // TODO: get useful information from the mutex
+    // before dropping it and store it in this error.
+    Lock,
+
+    Write {
+        url: String,
+        e: IoErr
+    }
+}
+</code></pre>
+<p>In this example, <code>Error::Lock</code> doesn't store any useful information quite yet, but <code>Error::Write</code> does. Let's start by doing two things that will make it very easy for us to change our <code>write_file</code> function to use our custom error type.</p>
+<pre class="lang-rust prettyprint-override"><code>type Result&lt;T&gt; = std::result::Result&lt;T, Error&gt;;
+</code></pre>
+<p>This little bit of code will allow us to just write <code>Result&lt;()&gt;</code> and have that turn into <code>Result&lt;(), Error&gt;</code>, since all of the errors used in our program will use be our Error type, we don't want to have to keep typing <code>Error</code> all of the time.</p>
+<pre class="lang-rust prettyprint-override"><code>use std::io::Error as IoErr;
+
+// ...
+
+impl&lt;S: AsRef&lt;str&gt;&gt; From&lt;(S, IoErr)&gt; for Error {
+    fn from((url, e): (S, IoErr)) -&gt; Self {
+        Error::Write {
+            url: url.as_ref().to_string(), 
+            e
+        }
+    }
+}
+</code></pre>
+<p>This code will let us use <code>?</code> to create <code>Error</code>s from <code>std::io::Error</code>s like <code>fs::write_file</code> returns. This will make it very easy for us to make a <code>write_file</code> function that returns our custom error type.</p>
+<pre class="lang-rust prettyprint-override"><code>fn write_file(path: &amp;str, content: &amp;String) -&gt; Result&lt;()&gt; {
+    let dir = format!("static{}", path);
+    fs::create_dir_all(&amp;dir).map_err(|e| (&amp;dir, e))?;
+
+    let index = format!("static{}/index.html", path);
+    fs::write(&amp;index, content).map_err(|e| (&amp;index, e))?;
+
+    Ok(())
+}
+</code></pre>
+<p>The errors will now contain lots of very useful information that will make debugging a breeze.</p>
+<p>Before we can clean up our <code>par_iter</code> call, now we need to take care of turning <code>.lock()</code> errors into our custom error type. For now, this will suffice.</p>
+<pre class="lang-rust prettyprint-override"><code>impl&lt;T&gt; From&lt;PoisonError&lt;T&gt;&gt; for Error {
+    fn from(_: PoisonError&lt;T&gt;) -&gt; Self {
+        //TODO: get useful information from the Mutex and store it in the Lock
+        Error::Lock
+    }
+}
+</code></pre>
+<p>Now our <code>par_iter</code> call can be just:</p>
+<pre class="lang-rust prettyprint-override"><code>new_urls.par_iter().try_for_each::&lt;_, Result&lt;()&gt;&gt;(|url| {
+    let body = fetch_url(&amp;client, url);
+    write_file(&amp;url[origin_url.len() - 1..], &amp;body)?;
+
+    let links = get_links_from_html(&amp;body);
+    println!("Visited: {} found {} links", url, links.len());
+    found_urls.lock()?.extend(links);
+    visited.lock()?.insert(url.to_string());
+    Ok(())
+}).unwrap();
+</code></pre>
+<p>There are no more <code>.unwrap()</code>s or even <code>.ok()</code>s everywhere (except for at the very end), and we can easily store information for debugging without having to <code>panic!</code> and risk poisoning <code>Mutex</code>s.</p>
+<p>Before we go ahead and start getting useful information to put in our <code>Lock</code> errors, let's try to clean up <code>fn main</code> a bit, since it uses <code>.unwrap()</code> a lot as well.</p>
+<pre class="lang-rust prettyprint-override"><code>fn main() -&gt; Result&lt;()&gt; {
+</code></pre>
+<p>Let's have <code>main</code> return a result with one of our fancy custom errors.</p>
+<pre class="lang-rust prettyprint-override"><code>write_file("", &amp;body)?;
+// ...
+visited.lock()?.insert(origin_url.to_string());
+// ...
+let mut new_urls = found_urls
+    .difference(&amp;*visited.lock()?)
+    // ...
+</code></pre>
+<p>Notice that we need <code>&amp;*visited.lock()?</code> now to coerce our <code>MutexGuard&lt;HashMap&lt;_&gt;&gt;</code> into a <code>HashMap&lt;_&gt;</code>, because <code>?</code> is already converting it from a <code>Result&lt;MutexGuard&gt;</code> to a <code>MutexGuard</code>, so we need to do two derefs, one of which will have to be explicit since only one can be done implicitly.</p>
+<pre class="lang-rust prettyprint-override"><code>new_urls.par_iter().try_for_each::&lt;_, Result&lt;()&gt;&gt;(|url| {
+    // ...
+})?;
+</code></pre>
+<p>Notice that the <code>par_iter</code> call can now end simply with <code>?</code> instead of <code>.unwrap()</code>, because our <code>fn main</code> returns a <code>Result&lt;_&gt;</code>.</p>
+<pre class="lang-rust prettyprint-override"><code>new_urls = found_urls
+    .lock()
+    .unwrap()
+    .difference(&amp;visited.lock().unwrap())
+</code></pre>
+<p>becomes now just (two unwraps gone!)</p>
+<pre class="lang-rust prettyprint-override"><code>new_urls = found_urls
+    .lock()?
+    .difference(&amp;*visited.lock()?)
+</code></pre>
+<h1>Question every use of .unwrap()</h1>
+<p><code>.unwrap()</code> is a scaaaary thing. Like maggots sprinkled in your code, each of them represents a limitation on the domain of your program. Another situation in which your crawler collapses into the fetal position and cries for its mother. Another reminder that you really can't control much anything at all and you've only been lying to yourself this entire time.</p>
+<p>Take, for example, this code.</p>
+<pre class="lang-rust prettyprint-override"><code>if new_url.has_host() &amp;&amp; new_url.host_str().unwrap() == "rolisz.ro" {
+    Some(url.to_string())
+} else {
+    None
+}
+</code></pre>
+<p>Grab the URL you found, make sure it has a host, <em>crash the program if it doesn't</em> ... prosaic, indeed</p>
+<p>hold up! <em>crash the program!?</em> ... I don't like the sound of that! Granted, in this case, you're almost guaranteed not to crash because you just checked on the other side of the <code>&amp;&amp;</code> that you wouldn't, but then... why write code that at the first glance reads like it would crash? In this case, you either want to return the url if it has <code>"rolisz.ro"</code> as the host string, or you want to return <code>None</code> in any other situation. Let Rust express what you really mean.</p>
+<pre class="lang-rust prettyprint-override"><code>if let Some("rolisz.ro") = new_url.host_str() {
+    Some(url.to_string())
+} else {
+    None
+}
+</code></pre>
+<p>There are some people who use Rust who like Haskell. They might tell you to write</p>
+<pre class="lang-rust prettyprint-override"><code>Ok(new_url) =&gt; new_url
+    .host_str()
+    .filter(|&amp;h| h == "rolisz.ro")
+    .map(|_| url.to_string()),
+</code></pre>
+<p>Before choosing this solution please keep in mind that these Haskell people are mean to other people who don't have PhDs.</p>
+<p>Also keep in mind that there are other places where <code>.unwrap()</code> and <code>.expect()</code> are used in your application. Adding to your error enum may be necessary, but in other cases like the one above it may be as simple as rethinking the problem you were trying to solve and finding a new way to express it using the tools Rust gives you. Only add to your error enum when you're sure you've found an edge case that's probably outside of the scope of your program.</p>
+<h1>Multiple Producer, Single Consumer</h1>
+<p><code>.unwrap()</code> is pretty evil, and <code>.lock()</code> is really just more of the same. Every <code>.lock()</code> you find in your codebase is an exclamation that reminds you that your program isn't truly asynchronous. Every <code>.lock()</code> is somewhere where your program has to wait on another thread. That's slow. Why wait when you could, like, <em>do things?</em>. In order to write fast programs, you want to avoid <code>.lock()</code> as much as you can.</p>
+<p>This program uses <code>.lock()</code> a lot. That's because it's using async badly. You slapped <code>par_iter</code> on there, but ... each of your threads has to keep begging for the mutex to get anything done. What if, instead of waiting for exclusive control of the mutex, your threads could just ship off what they have to another thread and get right back to work?</p>
+<p><a href="https://doc.rust-lang.org/nightly/std/sync/mpsc/index.html" rel="noreferrer">mpsc</a> is a channel you can use to send data across threads.</p>
+    </div>

@@ -1,0 +1,210 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I find the code presented here notably more readable than the previous iteration - the main apparent difference is meaningful naming of variables (most not in snake_case, yet).</p>
+
+<p>It looks like you want the results in one file per file of GpsData:<br>
+such should be specified explicitly, as should be whether output records <em>need to</em> stay in the order of jobs in the vehicle event file (with "prev"<code>job_end</code> taken care of).</p>
+
+<p>You read the vehicle event file once per file of GpsData - if you don't expect it to change, don't:<br>
+read it once before even touching the GpsData. Into a <code>dict</code> with "Vhcl" as key (see below)</p>
+
+<p>Given <code>csv.DictReader</code>'s ability to handle fieldnames, don't open code that.</p>
+
+<p>You don't use the list of <code>prev_job_end</code>s: just keep one.</p>
+
+<p>Why convert datetimes to ISO8601?</p>
+
+<hr>
+
+<p>(running out of time.<br>
+Checking every combination of GPS×event record most likely kills your time performance, vectorised&amp;filtered or not.<br>
+My current take: event list per vehicle, ordered by timestamp<br>
+got fed up with all the indexing and conversion, introduced classes. Work in progress:<br>
+classes &amp; reading vehicles</p>
+
+<pre><code>#@functools.total_ordering()
+class Gps:
+    def __init__(self, distance, timestamp):
+        self.distance = distance
+        self.timestamp = timestamp
+
+    def __str__(self):
+        return "Gps(" + str(self.distance) + ", " + str(self.timestamp) + ')'
+
+    def __eq__(self, other):
+        return self.timestamp == other.timestamp
+
+    def __lt__(self, other):
+        return self.timestamp &lt; other.timestamp
+
+    def __le__(self, other):
+        return self.timestamp &lt;= other.timestamp
+
+    def __ge__(self, other):
+        return self.timestamp &gt;= other.timestamp
+
+    def __gt__(self, other):
+        return self.timestamp &gt; other.timestamp
+
+
+class Vehicle_event:
+    def __init__(self, mode, engine_on, engine_off,
+                 work_start, work_end, park_start, park_end):
+        self.mode = mode
+        self.engine_on = engine_on
+        self.engine_off = engine_off
+        self.work_start = work_start
+        self.work_end = work_end
+        self.park_start = park_start
+        self.park_end = park_end
+
+    def __str__(self):
+        return '&lt;'+self.mode+", ".join(("",
+            str(self.engine_on), str(self.engine_off),
+            str(self.work_start), str(self.work_end),
+            str(self.park_start), str(self.park_end)))+'&gt;'
+
+class Vehicle:
+    def __init__(self, vid):
+        self.id = vid
+        self.events = []
+        self.gps = []
+</code></pre>
+
+<p>reading vehicle events:</p>
+
+<pre><code>EVENTDEFAULT = 2000  # whatever is appropriate
+
+
+def event2timestamp(index, row, default=None):
+    if default:
+        try:
+            return from_excel(float(row[index]  # .strip()
+                                    )).timestamp()
+        except:
+            return default
+    return from_excel(float(row[index]  # .strip()
+                            )).timestamp()
+
+
+def read_records(csv_path, key_name):
+    """ Read records from the CSV file named into lists that are values of a
+        dict keyed by the values of column key_name.
+        Return this directory.
+    """
+    with open(csv_path, "r") as f:
+        records = dict()    # defaultdict(list)
+        rows = csv.reader(f)
+        header = next(rows)
+        KEY_INDEX = header.index(key_name)
+        # JOB_ID = header.index("ID")
+        # VEHICLE_NO = header.index('Vhcl')
+        MODE = header.index('Mode')
+        ENGINE_ON = header.index("Engineon")
+        ENGINE_OFF = header.index("Engineoff")
+        WORK_START = header.index("WorkStart")
+        WORK_END = header.index("WorkEnd")
+        PARK_START = header.index("ParkStart")
+        PARK_END = header.index("ParkEnd")
+        for row in rows:
+            vid = row[KEY_INDEX]
+            vehicle = records.get(vid)
+            if None is vehicle:
+                vehicle = Vehicle(vid)
+                records[vid] = vehicle
+            vehicle.events.append(Vehicle_event(
+                row[MODE],
+                event2timestamp(ENGINE_ON, row),
+                event2timestamp(ENGINE_OFF, row),
+                event2timestamp(WORK_START, row, EVENTDEFAULT),
+                event2timestamp(WORK_END, row, EVENTDEFAULT),
+                event2timestamp(PARK_START, row, EVENTDEFAULT),
+                event2timestamp(PARK_END, row, EVENTDEFAULT)))
+    return records
+
+
+def read_vehicle_events():
+    return read_records("VehicleEvents.csv", 'Vhcl')
+
+
+vehicles = read_vehicle_events()
+</code></pre>
+
+<p>outermost loop over GPS files, inner loops over vehicles and events:</p>
+
+<pre><code>for x in range(1, 2):  # 34): # handle CSV files containing GPS records
+    csvfilepath = "GpsData{}.csv".format(x)
+    # Here the GPS data is appended to lists of Gps
+    with open(csvfilepath, "r") as f:
+        reader = csv.reader(f)
+        headers = next(reader)
+        COLUMNS = len(headers)
+        ID = headers.index('gps_id')
+        DISTANCE = headers.index('distance')
+        TIMESTAMP = headers.index('Timestamp')
+        eventless = defaultdict(int)
+        for rec in reader:
+            if len(rec) &lt; COLUMNS:
+                continue
+            vid = rec[ID]
+            vehicle = vehicles.get(vid)
+            if None is vehicle:
+                eventless[vid] += 1
+            else:
+                timestamp = rec[TIMESTAMP]
+                try:
+                    gps_timestamp = datetime.datetime.strptime(timestamp, '%m/%d/%Y %H:%M')
+                except:
+                    gps_timestamp = datetime.datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
+                vehicle.gps.append(Gps(float(rec[DISTANCE]),
+                                       gps_timestamp.timestamp()))
+
+    print(eventless)
+
+    dists = [[]]*4  # distances in the various states
+
+    for vehicle in vehicles.values():
+        vehicle.gps = sorted(vehicle.gps)
+        prev_job_end = datetime.datetime(2019, 12, 15, 5, 2, 10).timestamp()
+
+        driving = idle = working = 0.0
+        first, beyond = 0, len(vehicle.gps)
+
+        for job in vehicle.events:
+            first = bisect_left(vehicle.gps, Gps(0, prev_job_end), 0,  # first?
+                                beyond)
+            beyond = bisect_right(vehicle.gps, Gps(0, job.engine_off), first)
+            for g in range(first, beyond):  # all Gps from previous Engineoff to current
+                gps = vehicle.gps[g]
+                timestamp = gps.timestamp
+                distance = gps.distance
+                if timestamp &lt; job.engine_on:
+                    if prev_job_end &lt;= timestamp:
+                        working += distance
+                elif job.mode == 'DIS':
+                    if timestamp &lt;= job.park_start:
+                        idle += distance
+                    elif timestamp &lt;= job.park_end:
+                        driving += distance
+                else:
+                    if job.park_end &lt;= timestamp:
+                        driving += distance
+                    else:
+                        idle += distance
+        prev_job_end = job.engine_off
+        vehicle.events.clear()
+
+        dists[0].append(vehicle.id)
+        dists[1].append(driving)
+        dists[2].append(idle)
+        dists[3].append(working)
+    toc = timeit.default_timer()
+    with open("outfile{}.csv".format(x), 'w') as outfile:
+        outfile_writer = csv.writer(outfile, delimiter=",", quotechar='"',
+                                    quoting=csv.QUOTE_MINIMAL)
+        outfile_writer.writerow(dists)
+    tac = timeit.default_timer()
+    print('exporting {}'.format(tac - toc))
+</code></pre>
+
+<p>)</p>
+    </div>

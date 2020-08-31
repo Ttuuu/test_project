@@ -1,0 +1,140 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First I'm not a fan of recycling IDs. Too much confusion can happen.  For example Thread 1 adds a Dog Image and gets ID 1.   Thread 2 calls ReleaseAllImages and then adds a Cat image and gets ID 1.  Now Thread 1 think it has a Dog image but instead returns back a Cat image.  There are times we need to recycle ID but only you know the business requirements if it's truly needed or not. </p>
+
+<p>Second It's thread safe but you are not getting the benefit of ConcurrentDictionary this way. Everything is locked.  If two threads are trying to add one will be blocked until the other is free.  It doesn't have to be this way.  </p>
+
+<p>I'm going to go down the path that you need to recycle IDs</p>
+
+<p>Instead of leaving the record in the dictionary you can remove it and have a queue of ID to recycle.  Then on the removing methods check if we removed all the records from the Dictionary and if so then enter the lock to see if we can reset the counter and queue. Going to use <a href="https://docs.microsoft.com/en-us/dotnet/api/system.threading.readerwriterlockslim?view=netframework-4.7.2" rel="noreferrer">ReaderWriterLockSlim</a> to allow multiple adds and only block when we are removing.</p>
+
+<pre><code>public static class ImageCache
+{
+    private static int currentId = 0;
+
+    private static readonly ConcurrentDictionary&lt;int, MemoryStream&gt; images =
+        new ConcurrentDictionary&lt;int, MemoryStream&gt;();
+
+    // stores removed ID to reuse
+    private static ConcurrentQueue&lt;int&gt; recycle = new ConcurrentQueue&lt;int&gt;();
+    private static readonly ReaderWriterLockSlim recycleLocker = new ReaderWriterLockSlim();
+
+    /// &lt;summary&gt;
+    /// Release an image based on its id.
+    /// &lt;/summary&gt;
+    /// &lt;param name="id"&gt;&lt;/param&gt;
+    public static void ReleaseIamge(int id)
+    {
+        ReleaseMemoryStream(id);
+        TryReset();
+    }
+
+    /// &lt;summary&gt;
+    /// Releases all Images
+    /// &lt;/summary&gt;
+    public static void ReleaseAllImages()
+    {
+        foreach (var id in images.Keys)
+        {
+            ReleaseMemoryStream(id);
+        }
+
+        TryReset();
+    }
+
+    private static void ReleaseMemoryStream(int id)
+    {
+        MemoryStream ms = null;
+        if (images.TryRemove(id, out ms))
+        {
+            recycle.Enqueue(id);
+            ms.Dispose();
+        }
+    }
+
+    private static void TryReset()
+    {
+        if (!images.IsEmpty)
+        {
+            return;
+        }
+
+        //need to lock here
+        if (recycleLocker.TryEnterWriteLock(TimeSpan.FromMilliseconds(100)))
+        {
+            try
+            {
+                // make sure another thread didn't sneak in and add another image
+                if (images.IsEmpty)
+                {
+                    currentId = 0;
+                    Interlocked.Exchange(ref recycle, new ConcurrentQueue&lt;int&gt;());
+                }
+            }
+            finally
+            {
+                recycleLocker.ExitWriteLock();
+            }
+        }
+    }
+</code></pre>
+
+<p>GetBitmap method doesn't need to check if the image is null now we can use the TryGetValue and not need to lock at all </p>
+
+<pre><code>/// &lt;summary&gt;
+/// Returns a Bitmap from the cache which is identified by an id
+/// &lt;/summary&gt;
+/// &lt;param name="id"&gt;&lt;/param&gt;
+/// &lt;returns&gt;&lt;/returns&gt;
+public static Bitmap GetBitmap(int id)
+{
+    MemoryStream ms = null;
+    if (images.TryGetValue(id, out ms))
+    {
+        return (Bitmap) Image.FromStream(ms);
+    }
+    return null;
+}
+</code></pre>
+
+<p>Add method will need to let the lock know we are reading from the recycle queue </p>
+
+<pre><code>/// &lt;summary&gt;
+/// Adds an Bitmap to the cache
+/// &lt;/summary&gt;
+/// &lt;param name="bitmap"&gt;&lt;/param&gt;
+/// &lt;returns&gt;0 if the Bitmap is null, otherwise a uique id&lt;/returns&gt;
+public static int Add(Bitmap bitmap)
+{
+    if (bitmap == null)
+    {
+        return 0;
+    }
+
+    recycleLocker.EnterReadLock();
+
+    try
+    {
+        var ms = new MemoryStream();
+        bitmap.Save(ms, ImageFormat.Tiff);
+
+        // Recycle Id or make new one
+        int id;
+        if (!recycle.TryDequeue(out id))
+        {
+            id = Interlocked.Increment(ref currentId);
+        }
+
+        // this should never be possible to fail
+        images.TryAdd(id, ms);
+
+        return id;
+    }
+    finally 
+    { 
+        recycleLocker.ExitReadLock();
+    }
+}
+</code></pre>
+
+<p>Using the ReaderLockerSlim will allow multiple reads but only one write.  Now multiple threads could Add images and Get images without blocking each other and the code only blocks when it's resetting the counters.  </p>
+    </div>

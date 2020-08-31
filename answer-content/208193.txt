@@ -1,0 +1,145 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<ol>
+<li><p>The <code>#region Private variables</code> is buying you nothing. It turns your one private variable declaration into three lines, without adding any information. <a href="https://marketplace.visualstudio.com/items?itemName=Shanewho.IHateRegions" rel="nofollow noreferrer">I hate regions</a> in general, and there are exceptions<sup>1</sup>, but this isn't one of them.</p></li>
+<li><p>If you expect a <code>List&lt;MailMessage&gt;</code> and I give you a <code>null</code>, you'll do nothing? That's very kind... I would sooner throw an exception, so that the code passing in the nulls can be found and fixed.</p></li>
+<li><p>If you expect each <code>MailMessage</code> to have a single pdf attachment, and I give you a message has no pdf attachments, or multiple pdf attachments, what will you do? Quietly do nothing? Attempt to do something, but fail in a strange way (for example, attempting to move a message that has already been moved)? I would sooner throw an exception that points to the direct cause. This is easy to do with Linq. Instead of</p></li>
+</ol>
+
+
+
+<pre class="lang-csharp prettyprint-override"><code>foreach (var attachment in message.Attachments)
+{
+    var fileAttach = (FileAttachment) attachment;
+    if (fileAttach.Name.EndsWith(".pdf"))
+    {
+        // handle any pdf attachment
+    }
+    else
+    {
+        // ignore any non-pdf attachment
+    }
+}
+</code></pre>
+
+<p>You can
+</p>
+
+<pre class="lang-csharp prettyprint-override"><code>var pdfAttachment = message
+    .Attachments
+    .Cast&lt;FileAttachment&gt;()
+    .Single(file =&gt; file.Name.EndsWith(".pdf"));
+
+// Handle the single pdf attachment
+</code></pre>
+
+<ol start="4">
+<li><p>This may not be as important for you, but it's a good practice to use <code>Path.Combine</code> when constructing file paths. It's arguably simpler, saves you from having to escape strings, prevents possible issues with multiple directory separator characters in a row, and leaves you with cross-platform compatibility.</p></li>
+<li><p>The main function here accepts a <code>List&lt;MailMessage&gt;</code>. But, the only thing that's ever done with the list is to iterate through it. What if I have a <code>MailMessage[]</code>? <a href="https://en.wikipedia.org/wiki/Robustness_principle" rel="nofollow noreferrer">As a rule</a>, you should be as accepting as possible of different kinds of input. In this case, <code>IEnumerable&lt;MailMessage&gt;</code> is as specific as you need to be.</p></li>
+<li><p>The pattern you're using for moving these messages is</p></li>
+</ol>
+
+<pre class="lang-csharp prettyprint-override"><code>Create an empty collection of work items
+For each input element:
+    Possibly add a work item to the collection
+Do all the work in the collection
+</code></pre>
+
+<p>Unless the "do all work" step is <em>drastically</em> more efficient in batches, I much prefer the simplified</p>
+
+<pre class="lang-csharp prettyprint-override"><code>For each input element:
+    Possibly do an item of work
+</code></pre>
+
+<ol start="7">
+<li><p>For function calls with more than a couple arguments, <em>especially</em> if the parameters you're passing in aren't well-named variables, it's a good idea to use the named parameter syntax. This would make it much clearer, for example, that you aren't passing any <code>additionalProperties</code> to <code>_service.GetAttachments()</code></p></li>
+<li><p><code>PdfReader</code> implements <code>IDisposable</code>, but it's not being disposed. It's a good idea to wrap every disposable object your code uses in a <code>using</code> block, to ensure proper disposal. If that starts to move your code too far to the right, you can address that by moving the code into a separate function.</p></li>
+<li><p>The code involved in constructing the file name and writing the file to disk is in the same function as the code to iterate through the messages. Those kinds of details should probably be separated out to helper functions. In fact, I would separate this code out into a <em>lot</em> of functions.</p></li>
+</ol>
+
+<p>Taking all of that into account, here's my rewrite:</p>
+
+
+
+<pre class="lang-cs prettyprint-override"><code>public class Client
+{
+    private ExchangeService _service;
+
+    /// &lt;summary&gt;
+    /// Given a collection of messages with exactly one Pdf attachment,
+    /// write all single-page pdfs to disk. Any messages with a single-page
+    /// pdf attachment will be moved to one folder. Any messages with a
+    /// multi-page pdf attachment will be moved to another folder.
+    /// &lt;/summary&gt;
+    public void MoveSinglePagePdfsToFolder(IEnumerable&lt;EmailMessage&gt; messagesWithSinglePdf)
+    {
+        if (messagesWithSinglePdf is null) throw new ArgumentNullException(nameof(messagesWithSinglePdf));
+
+        foreach (var message in messagesWithSinglePdf)
+        {
+            MoveSinglePagePdfsToFolder(message);
+        }
+    }
+
+    private void MoveSinglePagePdfsToFolder(EmailMessage messageWithSinglePdf)
+    {
+        _service.GetAttachments(
+            attachments: messageWithSinglePdf.Attachments.ToArray(),
+            bodyType: BodyType.HTML,
+            additionalProperties: null);
+
+        var pdfAttachment = messageWithSinglePdf
+            .Attachments
+            .Cast&lt;FileAttachment&gt;()
+            .Where(attachment =&gt; attachment.Name.EndsWith(".pdf"))
+            .Single(); // throws if the number of pdfs is not exactly one
+
+        if (PageCount(pdfAttachment) == 1)
+        {
+            SaveToEmaDirectory(pdfAttachment);
+            MoveMailToFolder(Statics.Processed, messageWithSinglePdf);
+        }
+        else
+        {
+            MoveMailToFolder(Statics.Rejected, messageWithSinglePdf);
+        }
+    }
+
+    private int PageCount(FileAttachment pdfAttachment)
+    {
+        using (var reader = new PdfReader(pdfAttachment.Content))
+            return reader.NumberOfPages;
+    }
+
+    private void SaveToEmaDirectory(FileAttachment singlePagePdf)
+    {
+        File.WriteAllBytes(
+            path: GenerateFilePath(singlePagePdf),
+            bytes: UnEditableVersionOf(singlePagePdf.Content));
+    }
+
+    private string GenerateFilePath(FileAttachment singlePagepdf)
+    {
+        return Path.Combine(
+            Statics.EmaFileWatcherWorkingDirectory,
+            GenerateFileName(singlePagepdf));
+    }
+
+    private string GenerateFileName(FileAttachment singlePagePdf)
+    {
+        return string.Join("_",
+            "fax",
+            DateTime.Now.Date.ToShortDateString(),
+            singlePagePdf.Name,
+            DateTime.Now.Ticks + ".pdf");
+    }
+
+    private byte[] UnEditableVersionOf(byte[] pdfContent)
+    {
+        return IsEditablePdf(pdfContent)
+            ? GetUnEditablePdf(pdfContent)
+            : pdfContent;
+    }
+</code></pre>
+
+<p><sup><sup>1</sup>I could go on at length about regions, but I will spare you for now.</sup></p>
+    </div>

@@ -1,0 +1,102 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The usage example is unrealistic, as it fails to show the error handling that's necessary when initialising the stack.  Wrapping the initialisation in command-like macros makes it harder to write the correct checks (as we can't just use a return value, we have to inspect the macro to see where the result went):</p>
+
+<pre><code>STACK_INIT(8);
+if (!stack_global) { /* not obviously connected to above */
+    fprintf("Stack allocation failure\n");
+    return EXIT_FAILURE;
+}
+STACK_FINI();
+</code></pre>
+
+<p>I'm not a big fan of expanding <code>STACK_FINI()</code> here:</p>
+
+<blockquote>
+<pre><code>#define STACK_INIT(size) \
+do { \
+    STACK_FINI(); \
+    stack_global = stack_create(size); \
+} while(0)
+</code></pre>
+</blockquote>
+
+<p>Firstly, I'd prefer the <code>stack_global</code> definition to explicitly initialize with a null pointer, rather than relying on the implicit initialization; secondly, I consider an init of an already inited stack to be a programming error - and we're already willing to <code>abort()</code> on underflow.</p>
+
+<p>I'm concerned about these allocations in <code>stack_create()</code>:</p>
+
+<blockquote>
+<pre><code>    if((ret = malloc(sizeof(*ret))))
+    {
+        ret-&gt;beg = malloc(size);
+        ret-&gt;end = ret-&gt;cur = ret-&gt;beg + size;
+    }
+    return ret;
+</code></pre>
+</blockquote>
+
+<p>On the style side, I'd separate the assignment from the test, and give the variable a more meaningful name:</p>
+
+<pre><code>    stack = malloc(sizeof *stack);
+    if (!stack) {
+        return stack;
+    }
+</code></pre>
+
+<p>More worryingly, what happens when this first allocation succeeds, but the allocation of <code>size</code> chars (for <code>stack-&gt;beg</code>) fails?  We return a stack that's unusable, and callers need to test <code>beg</code> as well:</p>
+
+<pre><code>STACK_INIT(8);
+if (!stack_global || !stack_global-&gt;beg) { /* even less obvious */
+    fprintf("Stack allocation failure\n");
+    return EXIT_FAILURE;
+}
+STACK_FINI();
+</code></pre>
+
+<p>A better approach, if <code>beg</code> can't be allocated, is to release the stack and return null:</p>
+
+<pre><code>    stack = malloc(sizeof *stack);
+    if (!stack) {
+        return stack;
+    }
+    stack-&gt;beg = malloc(size);
+    if (!stack-&gt;beg) {
+        free(stack);
+        return NULL;
+    }
+    ret-&gt;end = ret-&gt;cur = ret-&gt;beg + size;
+</code></pre>
+
+<p>Other error handling is also suspect.  For example, if the <code>realloc()</code> fails in <code>stack_resize()</code>, most programmers would expect the stack to be unchanged.  But we have this code instead:</p>
+
+<blockquote>
+<pre><code>    newptr = realloc(stack-&gt;beg, newsize);
+
+    if(!newptr)
+    {
+        free(stack-&gt;beg);
+        return -1;
+    }
+</code></pre>
+</blockquote>
+
+<p>So if we couldn't realloc, we now have a <em>broken</em>, unusable stack; any attempt to use it will dereference the dangling pointer, which is Undefined Behaviour.  And in the success case, we fail to free the memory which is about to become inaccessible (a leak).  I think what's intended is:</p>
+
+<pre><code>    newptr = realloc(stack-&gt;beg, newsize);
+    if (!newptr) {
+        return -1;
+    }
+    free(stack-&gt;beg);
+    stack-&gt;beg = newptr;
+</code></pre>
+
+<hr>
+
+<p>Problems with the interface:</p>
+
+<ul>
+<li>There's no <code>size()</code> function to determine whether <code>pop()</code> and <code>peek()</code> can be called - the programmer needs to maintain their own count of elements.</li>
+<li><code>pop()</code> aborts on underflow, but <code>peek()</code> does no checking, which is inconsistent.</li>
+<li><code>peek()</code> requires a pointer to mutable stack, but would be expected to work with a const one.</li>
+<li>The term "safe" is highly misleading.  If objects of differing sizes are pushed, the <code>pop()</code> calls must exactly match, as there's no checking built into the stack to record object sizes.</li>
+</ul>
+    </div>

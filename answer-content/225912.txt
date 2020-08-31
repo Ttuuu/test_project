@@ -1,0 +1,174 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>To Your Comment</h1>
+
+<blockquote>
+  <p>One of the things I feel wrong NOW is that the method play takes a PlayerRequest but uses it only for two lines, all other work is done from the injected dependencies.</p>
+</blockquote>
+
+<p>For me it feels right if the statement <code>playerService.changePlayerState(playRequest.getPlayerName(), State.PLAYING)</code> would be inside <code>currentSession.changeStateTo(GameSession.State.PLAYING)</code>.</p>
+
+<p>I would replace the statement by something like:</p>
+
+<pre class="lang-java prettyprint-override"><code>gameSessionService.enterPlayingState(currentSession);
+</code></pre>
+
+<p>The reasons behind this feeling are:</p>
+
+<ul>
+<li>we loose the dependency to <code>playerService</code> in <code>GameplayService</code></li>
+<li>we loose the dependency to <code>State.PLAYING</code></li>
+<li>we reduce the number of lines and some complexity</li>
+</ul>
+
+<h1>To My Comments</h1>
+
+<p>Sadly you provide only a little code snipped of your application so it is hard to give you good advice without knowing what the other components do.. but here is my try :)</p>
+
+<h2>Reduce Complexity</h2>
+
+<p>At the first glance it is not possible to see what the method <code>play</code> do. This has multiple reasons:</p>
+
+<ul>
+<li>has 3 levels of nesting</li>
+<li>is longer than it has to be</li>
+</ul>
+
+<p>It is possible to divide <code>play</code> in 3 sections:</p>
+
+<ul>
+<li>enter the playing state</li>
+<li>play the turn</li>
+<li>evaluate the round</li>
+</ul>
+
+<blockquote>
+  <pre class="lang-java prettyprint-override"><code>public void play(PlayRequest playRequest) throws &gt;RPSException {
+   // enter playing state
+   GameSession currentSession = gameSessionService.sessions().get(playRequest.getInviteCode());
+   /* ... */
+
+   try {
+       // play turn
+       Turn turn = new Turn(player, Enum.valueOf(Move.class, playRequest.getMove()));
+       /* ... */
+
+       // evaluate round
+       Round latestRoundAfterAllUpdates = currentSession.latestRound();
+       /* ... */
+   } catch (InvalidOperationException e) {
+       throw new RPSException(e.getMessage());
+   }
+}
+</code></pre>
+</blockquote>
+
+<h2>Law of Demeter</h2>
+
+<p>The expression <code>gameSessionService.sessions().get(playRequest.getInviteCode())</code> violates the <a href="https://en.wikipedia.org/wiki/Law_of_Demeter" rel="nofollow noreferrer">Law of Demeter</a>.</p>
+
+<blockquote>
+  <p>Only talk to your immediate friends.</p>
+</blockquote>
+
+<p><code>GameSessionService</code> is a intermediate friend of <code>GameplayService</code> but with <code>get(playRequest.getInviteCode())</code> we "talk" to the friend of our friend.</p>
+
+<blockquote>
+  <p>The statement could be also expressed as <code>gameSessionService.prodiveBy(playRequest)</code>.</p>
+</blockquote>
+
+<p>The following statements violates the Law of Demeter too:</p>
+
+<blockquote>
+  <pre class="lang-java prettyprint-override"><code>currentSession.rounds().isEmpty()
+currentSession.getFirstPlayer().changeStateTo(State.WAITING);
+currentSession.getSecondPlayer().changeStateTo(State.WAITING);
+</code></pre>
+</blockquote>
+
+<h2>Feature Envy</h2>
+
+<blockquote>
+  <p>A method accesses the data of another object more than its own data.</p>
+</blockquote>
+
+<p>When we look at</p>
+
+<blockquote>
+  <pre class="lang-java prettyprint-override"><code>if (currentSession.rounds().isEmpty()) {
+ createNewRound(turn, currentSession);
+} else if (!currentSession.rounds().isEmpty()) {
+ Round latestRound = currentSession.latestRound();
+ if (OVER.equals(latestRound.getState())) {
+   createNewRound(turn, currentSession);
+ } else if (PLAYING.equals(latestRound.getState())) {
+   latestRound.pushLatestTurn(turn);
+ }
+}
+Round latestRoundAfterAllUpdates = currentSession.latestRound();
+Optional&lt;Result&gt; resultOptional = latestRoundAfterAllUpdates.getResult();
+/* ... */
+
+private void createNewRound(Turn turn, GameSession gameSession) {
+ gameSession.addRound(new Round(turn));
+}
+</code></pre>
+</blockquote>
+
+<p>We use the variable <code>currentSession</code> 6 times in this little code snipped with the goal to update it by deciding how to handle the update by its data which violates the feature envy.</p>
+
+<p>We should simply call a method on <code>currentSession</code>:</p>
+
+<pre class="lang-java prettyprint-override"><code>Result result = currentSession.play(player, playRequest.getMove());
+</code></pre>
+
+<h1>Polymorphism and If-Else-Statements</h1>
+
+<blockquote>
+  <pre class="lang-java prettyprint-override"><code>Optional&lt;Result&gt; resultOptional = latestRoundAfterAllUpdates.getResult();
+
+/* ... */
+
+Result result = resultOptional.get();
+if (result.isTie()) {
+ currentSession.setTie(true);
+} else {
+ currentSession.setWinner(result.getWinner());
+}
+</code></pre>
+</blockquote>
+
+<p>With an <code>Optional</code> we can express in Java that there could be no result after a method call. For example if we search in a database for a id. </p>
+
+<p>But in this case we try to express different typs of <code>Result</code>:</p>
+
+<ul>
+<li>NoResult (the optional is empty case)</li>
+<li>Tie</li>
+<li>Win</li>
+</ul>
+
+<p>The goal would be to enter the next state of the game by the <code>result</code> which could be expressed as</p>
+
+<pre class="lang-java prettyprint-override"><code>currentState.enterNextStateBy(result)
+</code></pre>
+
+<h1>The goal</h1>
+
+<p>The goal of a refactoring would be to have only some method calls which show the flow a play takes</p>
+
+<p>Form your the little snipped you provide it could look like:</p>
+
+<pre class="lang-java prettyprint-override"><code>public void play(PlayRequest playRequest) throws &gt;RPSException {
+  GameSession session = gameSessionService.prodiveBy(playRequest);
+
+  session.enterPlayState();
+  Result result = session.play(player, playRequest.getMove());
+  currentState.enterNextStateBy(result);
+
+}
+</code></pre>
+
+<h1>Last Advice</h1>
+
+<p>I would take a look into the <a href="https://en.wikipedia.org/wiki/State_pattern" rel="nofollow noreferrer">State pattern</a> to handle the states of your game.</p>
+    </div>

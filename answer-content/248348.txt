@@ -1,0 +1,118 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I was able to improve the performance of the program by about 900% without understanding or changing much of the algorithm in about an hour. Here's what I did:</p>
+<p>First of all, you need a benchmark. It's very simple, just time your program</p>
+<pre class="lang-py prettyprint-override"><code>start = time.time()
+solve(grid)
+print(time.time()-start)
+</code></pre>
+<p>On my computer, it took about 4.5 seconds. This is our baseline.</p>
+<p>The next thing is to profile. The tool I chose is VizTracer, which is developed by myself :) <a href="https://github.com/gaogaotiantian/viztracer" rel="nofollow noreferrer">https://github.com/gaogaotiantian/viztracer</a></p>
+<p>VizTracer will generate an HTML report(or json that could be loaded by chrome:://tracing) of timeline of your code execution. It looks like this in your original version:</p>
+<p><a href="https://i.stack.imgur.com/Ltzmm.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/Ltzmm.png" alt="Original version"></a></p>
+<p>As you can tell, there are a lot of calls on there. The thing we need to do is to figure out what is the bottleneck here. The structure is not complicated, a lot of <code>fill_singles</code> are called, and we need to zoom in to check what's in there.</p>
+<p><a href="https://i.stack.imgur.com/47nAc.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/47nAc.png" alt="Original Zoom in"></a></p>
+<p>It's very clear that <code>get_candidates</code> is the function that caused most of the time in <code>fill_singles</code>, which is occupying most of the timeline. So that's the function we want to take a look at first.</p>
+<pre><code>def get_candidates(grid : np.ndarray) -&gt; list:
+    """Get a list of candidates to fill empty cells of the input grid"""
+
+    def subgrid_index(i, j):
+        return (i//3) * 3 + j // 3
+
+    subgrids = get_subgrids(grid)
+    grid_candidates = []
+    for i in range(9):
+        row_candidates = []
+        for j in range(9):
+            # Row, column and subgrid digits
+            row = set(grid[i])
+            col = set(grid[:, j])
+            sub = set(subgrids[subgrid_index(i, j)])
+            common = row | col | sub
+            candidates = set(range(10)) - common
+            # If the case is filled take its value as the only candidate
+            if not grid[i][j]:
+                row_candidates.append(list(candidates))
+            else:
+                row_candidates.append([grid[i][j]])
+        grid_candidates.append(row_candidates)
+    return grid_candidates
+</code></pre>
+<p>The thing that caught my eyes first was the end of your nested for loop. You checked whether <code>grid[i][j]</code> is filled. If it is, then that's the only candidate. However, if it's filled, then it has nothing to do with <code>candidates</code>, which you computed very hard in your nested for loop.</p>
+<p>So the first thing I did was moving the check to the beginning of the for loop.</p>
+<pre><code>    for i in range(9):
+        row_candidates = []
+        for j in range(9):
+            if grid[i][j]:
+                row_candidates.append([grid[i][j]])
+                continue
+            # Row, column and subgrid digits
+            row = set(grid[i])
+            col = set(grid[:, j])
+            sub = set(subgrids[subgrid_index(i, j)])
+            common = row | col | sub
+            candidates = set(range(10)) - common
+            row_candidates.append(list(candidates)) 
+</code></pre>
+<p>This optimization alone cut the running time in half, we are at about 2.3s now.</p>
+<p>Then I noticed in your nested for loop, you are doing a lot of redundant set operations. Even row/col/sub only needs to be computed 9 times, you are computing it 81 times, which is pretty bad. So I moved the computation out of the for loop.</p>
+<pre><code>def get_candidates(grid : np.ndarray) -&gt; list:
+    """Get a list of candidates to fill empty cells of the input grid"""
+
+    def subgrid_index(i, j):
+        return (i//3) * 3 + j // 3
+
+    subgrids = get_subgrids(grid)
+    grid_candidates = []
+
+    row_sets = [set(grid[i]) for i in range(9)]
+    col_sets = [set(grid[:, j]) for j in range(9)]
+    subgrid_sets = [set(subgrids[i]) for i in range(9)]
+    total_sets = set(range(10))
+
+    for i in range(9):
+        row_candidates = []
+        for j in range(9):
+            if grid[i][j]:
+                row_candidates.append([grid[i][j]])
+                continue
+            # Row, column and subgrid digits
+            row = row_sets[i]
+            col = col_sets[j]
+            sub = subgrid_sets[subgrid_index(i, j)]
+            common = row | col | sub
+            candidates = total_sets - common
+            # If the case is filled take its value as the only candidate
+            row_candidates.append(list(candidates))
+        grid_candidates.append(row_candidates)
+    return grid_candidates
+</code></pre>
+<p>This cut the running time to about 1.5s. Notice that, I have not try to understand your algorithm yet. Thing only thing I did was to use VizTracer to find the function that needs to be optimized and do same-logic transform. I improved performance by about 300% in like 15 minutes.</p>
+<p>To this point, the overhead of VizTracer on WSL is significant, so I turned off the C function trace. Only Python functions were left and the overhead was about 10%.</p>
+<p><a href="https://i.stack.imgur.com/byr2G.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/byr2G.png" alt="first fix"></a></p>
+<p>Now the <code>get_candidates</code> was improved(although it can be done better), we need to take a bigger picture of this. What I can observe from VizTracer's result was that <code>fill_singles</code> called <code>get_candidates</code> very frequently, just too many calls. (This is something that's hard to notice on cProfiler)</p>
+<p>So the next step was to figure out if we can make <code>fill_singles</code> call <code>get_candidates</code> less often. Here it requires some level of algorithm understanding.</p>
+<pre><code>    while any_fill:
+        any_fill = False
+        for i in range(9):
+            for j in range(9):
+                if len(candidates[i][j]) == 1 and grid[i][j] == 0:
+                    grid[i][j] = candidates[i][j][0]
+                    candidates = merge(get_candidates(grid), candidates)
+                    any_fill = True
+</code></pre>
+<p>It looks like here you tried to fill in one blank with only one candidate, and recalculate the candidates of the whole grid, then find the next blank with one candidate. This is a valid method, but this caused too many calls to <code>get_candidates</code>. If you think about it, when we fill in a blank with a number <code>n</code>, all the other blanks with only one candidate that's not <code>n</code> won't be affected. So during one pass of the grid, we could actually try to fill more blanks in, as long as we do not fill in the same number twice. This way, we can call <code>get_candidates</code> less often, which is a huge time consumer. I used a set to do this.</p>
+<pre><code>        filled_number = set()
+        for i in range(9):
+            for j in range(9):
+                if len(candidates[i][j]) == 1 and grid[i][j] == 0 and candidates[i][j][0] not in filled_number:
+                    grid[i][j] = candidates[i][j][0]
+                    filled_number.add(candidates[i][j][0])
+                    any_fill = True
+        candidates = merge(get_candidates(grid), candidates)
+</code></pre>
+<p>This brought the running time to 0.9s.</p>
+<p>Then I looked at the VizTracer report, I realized <code>fill_singles</code> is almost always called by <code>filter_candidates</code> and the only thing <code>filter_candidates</code> is interested in, is whether <code>fill_singles</code> returns a valid grid. This is an information we might know early, as long as <code>fill_singles</code> finds a position with no candidates. If we return early, we don't need to calculate <code>get_candidates</code> that many times.</p>
+<p>So I changed the code structure a little bit, made <code>fill_singles</code> return <code>None</code> if it can't find a valid grid.</p>
+<p>Finally I was able to make the run time to 0.5s, which is 900% faster than the original version.</p>
+<p>It was actually a fun adventure because I was testing my project VizTracer and tried to figure out if it was helpful to locate the time consuming part. It worked well :)</p>
+    </div>

@@ -1,0 +1,152 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Code:</p>
+
+<ul>
+<li><p><code>// CTors / DTor</code>: This comment doesn't add anything that we can't see from the code.</p>
+
+<p>Sometimes comments like this denote sections or regions of code in a file, but without consistently doing this for all the code, we don't know where the "constructor / destructor" section ends. I'd suggest just removing the comment.</p></li>
+<li><p><code>Sequencer(std::string const first_frame_in)</code>: There's little benefit to making function arguments that are passed by value <code>const</code>. It doesn't affect the caller, and makes the function signature harder to read.</p>
+
+<p>Perhaps this should be a <code>const&amp;</code> though?</p></li>
+<li><p>When we have lots of member variables in a class, adding an <code>m_</code> prefix on the names (e.g. <code>m_current_frame</code>) helps to distinguish them from local variables or function arguments.</p></li>
+<li><p><code>first_frame_name</code>, <code>match_pattern</code>, and <code>first_frame_regex_results</code> are all unused after the constructor, so they could just be local variables rather than members.</p></li>
+<li><p><code>tmp_num</code> and <code>tmpname</code> are not informative names. They should also be local variables since they are each used in only one function.</p></li>
+<li><p>Presumably negative frame numbers can't exist. If this is the case we should be using an unsigned integer type, not a signed one.</p></li>
+<li><p>We should check the result of the regex search and handle an error (since presumably this is going to be a user specified string).</p></li>
+<li><p>The regex captures "zero or more" digits, but we don't check that we got a match before trying to convert the frame number. Perhaps we should require "one or more" digits / letters when matching.</p></li>
+<li><p>Perhaps the regex pattern should use the specified <code>file_delim</code> too.</p></li>
+<li><p>Using a chain of <code>+</code> operators for <code>std::string</code>s tends to create a lot of temporary strings. Using <code>std::string::append</code> is likely to be faster, especially if we <code>reserve()</code> the memory we need first.</p></li>
+<li><p>We can add the padding digits in one operation by using <code>std::string::insert</code>.</p></li>
+</ul>
+
+<hr>
+
+<p>Design:</p>
+
+<ul>
+<li><p>I'd suggest grouping the information extracted from the first frame filename into a struct. We can then put the regex search and data extraction into a separate function, and more easily use the constructor initializer list.</p></li>
+<li><p>Unless there's a particular reason for it, I wouldn't try finding the last frame inside the <code>Sequencer</code> class. It's probably simpler to restrict the "sequencer" to only generating filenames, and leave checking if the file exists for code that does actual processing.</p></li>
+<li><p>Perhaps something like <code>FrameFilenameGenerator</code> might be a more accurate name than <code>Sequencer</code>?</p></li>
+<li><p>We can effectively use the same code to generate the input and output filenames.</p></li>
+<li><p>If we let the user keep track of the current frame, our generator can generate the filename for any requested frame, and doesn't have to keep track of the frame itself.</p></li>
+</ul>
+
+<hr>
+
+<p>So applying the above points, we might get something like:</p>
+
+<pre><code>#include &lt;regex&gt;
+#include &lt;string&gt;
+#include &lt;experimental/filesystem&gt;
+
+class FrameFilenameGenerator
+{
+public:
+
+    // note: 
+    // `first_frame_filename` isn't copied, so we only need a const&amp;
+    // `file_delim` is a "sink argument" (i.e. we store a copy in the class), so we take the argument by value and move it into place.
+    FrameFilenameGenerator(std::string const&amp; first_frame_filename, std::string file_delim = "."):
+        m_file_delim(std::move(file_delim)),
+        m_info(get_first_filename_info(first_frame_filename))
+    {
+
+    }
+
+    // note: we should probably be more careful with the frame offset!
+    // first_frame_number + frame_offset could overflow!
+    std::string make_filename(std::uint32_t frame_offset, std::string const&amp; output_suffix = "") const
+    {
+        auto result_size = 
+            m_info.prefix.size() + 
+            output_suffix.size() + 
+            m_file_delim.size() + 
+            m_info.digit_padding + 
+            m_file_delim.size() + 
+            m_info.extension.size();
+
+        auto result = std::string();
+        result.reserve(result_size);
+
+        result.append(m_info.prefix);
+        result.append(output_suffix);
+        result.append(m_file_delim);
+        result.append(frame_number_to_string(m_info.first_frame_number + frame_offset, m_info.digit_padding));
+        result.append(m_file_delim);
+        result.append(m_info.extension);
+
+        return result;
+    }
+
+private:
+
+    struct FirstFilenameInfo
+    {
+        std::string prefix;
+        std::uint32_t first_frame_number;
+        std::size_t digit_padding;
+        std::string extension;
+    };
+
+    static FirstFilenameInfo get_first_filename_info(std::string const&amp; first_frame_filename)
+    {
+        auto result = FirstFilenameInfo();
+
+        const auto match_pattern = std::regex("([a-zA-Z]*).([0-9]*).(\\w{3})");
+        std::smatch regex_results;
+
+        if (!std::regex_search(first_frame_filename, regex_results, match_pattern))
+            throw std::runtime_error("First frame filename does not meet the required format!");
+
+        result.prefix = regex_results[1];
+
+        if (regex_results[2].length())
+        {
+            result.first_frame_number = std::uint32_t{ std::stoul(regex_results[2]) };
+            result.digit_padding = regex_results[2].length();
+        }
+
+        result.extension = regex_results[3];
+
+        return result;
+    }
+
+    static std::string frame_number_to_string(std::uint32_t frame_number, std::size_t digit_padding)
+    {
+        auto result = std::to_string(frame_number);
+
+        if (result.size() &gt;= digit_padding)
+            return result;
+
+        auto const zeros_needed = (digit_padding - result.size());
+        result.insert(result.begin(), zeros_needed, '0');
+
+        return result;
+    }
+
+    std::string m_file_delim;
+    FirstFilenameInfo m_info;
+};
+
+#include &lt;iostream&gt;
+
+int main()
+{
+    std::string image_filename = "prefix.00030.ext";
+    auto generator = FrameFilenameGenerator(image_filename);
+
+    for (auto i = 0u; i != 20u; ++i)
+    {
+        auto in = generator.make_filename(i);
+        auto out = generator.make_filename(i, "_signature");
+
+        //if (!std::experimental::filesystem::exists(in))
+        //  break;
+
+        std::cout &lt;&lt; in &lt;&lt; " -&gt; " &lt;&lt; out &lt;&lt; "\n";
+    }
+
+    return EXIT_SUCCESS;
+}
+</code></pre>
+    </div>

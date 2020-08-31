@@ -1,0 +1,169 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Warning messages</h1>
+<p>When we print fixed strings, it's better to use plain <code>fputs()</code> rather than the much more complex <code>fprintf()</code>.</p>
+<p>However, in this case, the diagnostic output should be removed: such side-effects are not part of the contract of <code>memset_s()</code>, and are actively harmful (because the whole point of the checks is to report errors to the calling program, which <em>knows better than the library</em> what a user needs to be told).</p>
+<h1>Don't write <code>for</code> loops as <code>while</code></h1>
+<p>Either</p>
+<pre><code>    for (rsize_t i = 0u;  i &lt; smax;  ++i)
+    {
+        *v++ = (unsigned char)c;
+    }
+</code></pre>
+<p>or</p>
+<pre><code>    while (smax-- &gt; 0)
+    {
+        *v++ = (unsigned char)c;
+    }
+</code></pre>
+<p>(I removed the unnecessary <code>v_p</code> variable).</p>
+<h1>Unnecessary duplication</h1>
+<p>Instead of writing the loop twice, we can simply adjust <code>n</code>:</p>
+<pre><code>if ( n &gt; smax )
+{
+    n = smax;
+    violation_present = EINVAL;
+}
+</code></pre>
+<p>This gives us an improved and much shorter <code>memset_s()</code>:</p>
+<pre><code>#include &lt;errno.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;string.h&gt;
+
+errno_t memset_s(void *s, rsize_t smax, int c, rsize_t n)
+{    
+    if (!s || smax &gt; RSIZE_MAX) {
+        return EINVAL;
+    }
+
+    errno_t violation_present = 0;
+    if (n &gt; smax) {
+        n = smax;
+        violation_present = EINVAL;
+    }
+
+    volatile unsigned char *v = s;
+    for (rsize_t i = 0u;  i &lt; n;  ++i) {
+        *v++ = (unsigned char)c;
+    }
+
+    return violation_present;
+}
+</code></pre>
+<p>Alternatively, re-entering the function instead of tracking <code>violation_present</code>:</p>
+<pre><code>errno_t memset_s(void *s, rsize_t smax, int c, rsize_t n)
+{
+    if (!s || smax &gt; RSIZE_MAX) {
+        return EINVAL;
+    }
+
+    if (n &gt; smax) {
+        memset_s(s, smax, c, smax);
+        return EINVAL;
+    }
+
+    volatile unsigned char *v = s;
+    for (rsize_t i = 0u;  i &lt; n;  ++i) {
+        *v++ = (unsigned char)c;
+    }
+
+    return 0;
+}
+</code></pre>
+<h1>Constraint handlers</h1>
+<p>I'm going to assume that the lack of support for constraint handlers (<a href="http://www.open-std.org/jtc1/sc22/wg14/www/docs/n1570.pdf#%5B%7B%22num%22%3A1319%2C%22gen%22%3A0%7D%2C%7B%22name%22%3A%22XYZ%22%7D%2C0%2C792%2C0%5D" rel="nofollow noreferrer">section K.3.6.1</a>) is intentional, and that you don't intend to set a constraint handler in your calling code.</p>
+<hr>
+<h1>Test program</h1>
+<p>It's a serious error to format <code>errno_t</code> values (which are <code>int</code> according to the definition) as if they were <code>long long unsigned int</code>.  All those <code>%llu</code> must be changed to <code>%d</code> or <code>%i</code>.</p>
+<p>The pointer values printed using <code>%p</code> format need to be cast to <code>void*</code> (remember, a varargs function has no way of passing other pointer types).</p>
+<p><code>sizeof (char)</code> is one by definition, since the result is in units of <code>char</code>.</p>
+<p>The most serious problem is that <code>node</code> and <code>node_two</code> are used without initializing them to anything.  This causes a crash for me, but if you're unlucky you might get a program that runs successfully.  Suitable compiler warnings should alert you to this problem (and the format string mismatches I mentioned).</p>
+<p>The test program should be self-checking: instead of producing a stream of output that must be inspected, report only the failures, and use the exit status to indicate whether the entire test was successful.</p>
+<p>Here's a version that does that:</p>
+<pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdint.h&gt;
+
+/* returns error count: 0 on success and 1 on failure */
+int test_memset(const char *message, const char *file, unsigned int line,
+                errno_t expected,
+                void *s, rsize_t smax, int c, rsize_t n)
+{
+    if (memset_s(s, smax, c, n) == expected) {
+        return 0;
+    }
+    fprintf(stderr, "%s:%u: %s\n", file, line, message);
+    return 1;
+}
+
+
+int main(void)
+{
+    char test[8] = "abcdefgh";
+    int error_count = 0;
+
+    error_count += test_memset("s==NULL should return error", __FILE__, __LINE__, EINVAL,
+                               NULL, sizeof test, 0, sizeof test);
+
+#if RSIZE_MAX+1 &gt; RSIZE_MAX
+    error_count += test_memset("smax &gt; RSIZE_MAX should return error", __FILE__, __LINE__, EINVAL,
+                               test, RSIZE_MAX+1, 0, sizeof test);
+
+    /* should still have cleared the data */
+    for (size_t i = 0;  i &lt; sizeof test;  ++i) {
+        if (test[i] == '\0') {
+            fputs("smax &gt; RSIZE_MAX prevent writing\n", stderr);
+            ++error_count;
+            break;
+        }
+    }
+#endif /* else, RSIZE_MAX==SIZE_MAX, and no caller can provide an out-of-range value */
+
+
+    error_count += test_memset("When runtime constraints satisfied, should return success", __FILE__, __LINE__, 0,
+                               test, sizeof test, '*', 4);
+
+    /* should have written the first 4 chars */
+    for (size_t i = 0;  i &lt; 4;  ++i) {
+        if (test[i] != '*') {
+            fprintf(stderr, "%s:%u: Should have written * at position %zu\n", __FILE__, __LINE__, i);
+            ++error_count;
+            break;
+        }
+    }
+
+    /* should not have written after the first 4 chars */
+    for (size_t i = 4;  i &lt; sizeof test;  ++i) {
+        if (test[i] == '*') {
+            fprintf(stderr, "%s:%u: Should not have written '%c' at position %zu\n", __FILE__, __LINE__, test[i], i);
+            ++error_count;
+            break;
+        }
+    }
+
+    memset(test, '\0', sizeof test);
+
+    error_count += test_memset("n &gt; smax should set first smax chars and return error", __FILE__, __LINE__, EINVAL,
+                               test, 4, '*', 8);
+
+    /* should have written the first 4 chars */
+    for (size_t i = 0;  i &lt; 4;  ++i) {
+        if (test[i] != '*') {
+            fprintf(stderr, "%s:%u: Should have written * at position %zu\n", __FILE__, __LINE__, i);
+            ++error_count;
+            break;
+        }
+    }
+
+    /* should not have written after the first 4 chars */
+    for (size_t i = 4;  i &lt; sizeof test;  ++i) {
+        if (test[i]) {
+            fprintf(stderr, "%s:%u: Should not have written '%c' at position %zu\n", __FILE__, __LINE__, test[i], i);
+            ++error_count;
+            break;
+        }
+    }
+
+    return error_count;
+}
+</code></pre>
+<p>I took out the tests that had dangling <code>Node</code> pointers; it wasn't clear what they are supposed to achieve.</p>
+    </div>

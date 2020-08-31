@@ -1,0 +1,658 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First of all, I have to commend you on even attempting this undertaking. As you probably discovered, <code>std::vector</code> is a <em>lot</em> more complicated than it first appears. I believe implementing <code>std::vector</code> is a <em>very</em> good learning exercise… <em>especially</em> if you’re going to go whole hog and make it allocator-aware (whenever I’ve had students reimplement <code>std::vector</code>, I don’t ask them to add allocator support, because it’s so complicated (and, historically, <em>woefully</em> underspecified)).</p>
+<p>And reimplmenting <code>std::vector</code> is not even really a waste of time, because there are ways you can actually <em>improve</em> on <code>std::vector</code>: for example, by implementing the “small string optimization” trick, which is illegal for <code>std::vector</code> due to iterator invalidation requirments, but could be a massive performance gain. I note you’ve actually added some extra functions.</p>
+<p>So kudos for even <em>attempting</em> this. And it’s a really good attempt, too!</p>
+<p>So, let’s dive into the review:</p>
+<pre><code>constexpr size_t upper_power_of_two(size_t v) {
+    v--;
+    v |= v &gt;&gt; 1;
+    v |= v &gt;&gt; 2;
+    v |= v &gt;&gt; 4;
+    v |= v &gt;&gt; 8;
+    v |= v &gt;&gt; 16;
+    if constexpr (sizeof(size_t) == 8) { v |= v &gt;&gt; 32; }
+    v++;
+    return v;
+}
+</code></pre>
+<p>One of my biggest pet peeves when reviewing people’s code—and pretty much the first thing I look for—is bad comments… or worse, no comments. Now, in your case you can mostly get away without comments, because you’re simply reimplementing <code>std::vector</code>… it doesn’t really make a lot of sense to have a bunch of comments like <code>/* void push_back(T const&amp;): Does what std::vector::push_back(T const&amp;) does. */</code>. But for things like this function… you really do need comments to explain what you’re doing, and why.</p>
+<p>So, what I’m assuming is that you want your vector’s size when automatically growing—when the size isn’t <em>specifically</em> being set, such as in a call to <code>resize()</code> or <code>reserve()</code>—to always be a power of 2. That’s cool; there’s nothing wrong with that… but I can’t help but wonder if that’s not just based on a misunderstanding of growth factors. Most standard library vectors have a growth factor of 2 (I think Dinkumware’s is 1.5)… but that doesn’t mean the vector’s size is a power of 2. It just means they multiply the current size by 2. So your <code>T_grow()</code> function’s guts would look something like: <code>reallocate(max(capacity_ * 2, size));</code>.</p>
+<p>The thing with what you’re doing is that in the worst case scenario, the vector’s size will grow to almost double the <em>requested</em> size… as opposed to double the <em>current</em> size. For example, imagine the current capacity is 10,000, and I want to put 17,000 elements in it. If you do <code>max(10'000 * 2, 17'000)</code>, that will give you a new capacity of 20,000. But if you do <code>upper_power_of_two(17'000)</code>, that will give you 32,768… almost 13,000 more than with a growth factor of 2, and almost 16,000 more than we actually need. In fact, your vector will <em>never</em> allocate less than with a growth factor of 2 strategy. The benefit of that: much less frequent allocations. The downside: much more memory used. That may or may not be a trade-off that works for you.</p>
+<p>Anywho, as for the function itself, I should note that you’ve wisely checked to make sure that <code>std::size_t</code> is 64 bits before doing the last bit shift. Buuuuut….</p>
+<ol>
+<li>You assume that <code>sizeof(std::size_t) == 8</code> means 64 bits. No, that just means that 8 <em>bytes</em>… and a byte is not <em>necessarily</em> 8 bits. If you’re going to assume 8 bit bytes, you should confirm that by checking <code>CHAR_BIT</code>.</li>
+<li>You check that the size is <em>equal</em> to 8 bytes… but what if you’re on a system with 8 bit bytes and 128 bit std::size_t (it could happen!). Then <code>sizeof(std::size_t)</code> would be 16. I think what you meant was <code>sizeof(std::size_t) &gt;= 8</code>.</li>
+<li>You don’t take into account that <code>std::size_t</code> could be 16 bits. It could be!</li>
+</ol>
+<p>This functon could actually be greatly simplified by <em>not</em> unrolling the loop. For example:</p>
+<pre><code>constexpr auto upper_power_of_two(std::size_t v)
+{
+    constexpr auto bit_size = std::size_t(CHAR_BIT * sizeof(std::size_t));
+    
+    --v;
+    for (auto i = std::size_t{1}; i &lt; bit_size; ++i)
+        v |= v &gt;&gt; i;
+    return ++v;
+}
+</code></pre>
+<p>Now it will correctly handle <em>any</em> size of <code>std::size_t</code>… <em>any</em> size of byte… and you count on any half-decent compilier automatically unrolling the loop for you (or, if it’s <em>really</em> smart, maybe recognizing what you’re doing and using some intrinsics).</p>
+<pre><code>template&lt;typename Pointer&gt;
+constexpr auto distance(Pointer first, Pointer last) -&gt; decltype(last - first) {
+    return last - first;
+}
+</code></pre>
+<p>The trailing return type is a little redundant here. I assume the point of this function is so you don’t need to include <code>&lt;iterator&gt;</code>? But, thing is, you already need <code>&lt;iterator&gt;</code> anyway because you’re using <code>std::reverse_iterator</code> (and, in fact, your code is wrong for not including it, though I suppose it “works” because it’s picking the header up transitively somehow, probably via <code>&lt;memory&gt;</code>).</p>
+<p>So you might as well include <code>&lt;iterator&gt;</code>, and then use <code>std::distance()</code>.</p>
+<pre><code>template&lt;typename T, typename Alloc = std::allocator&lt;T&gt;&gt;
+class vector
+{
+</code></pre>
+<p>Now, I would recommend that you always practice safe specialization with your templates, and check that the types the template is being instantiated with are types that make sense. That generally means that you should have a bunch of <code>static_assert</code> statements, verifying your template parameters.</p>
+<p>What things should you check for? Well, figuring that out is a large part of figuring out your type and its interface. But as an example, in this case, it might be wise to make sure that <code>T</code> isn’t a reference type with <code>static_assert(not std::is_reference_v&lt;T&gt;)</code>.</p>
+<pre><code>constexpr vector(const vector &amp;other) { insert(cbegin(), other.cbegin(), other.cend()); }
+</code></pre>
+<p>You copy the other vector’s contents here… but you don’t copy its <em>allocator</em>.</p>
+<p>And unfortunately, doing so isn’t as simple as <code>allocator_(other.allocator_)</code>. What you need to do is:</p>
+<pre><code>constexpr vector(const vector &amp;other) :
+    allocator_(std::allocator_traits&lt;Alloc&gt;::select_on_container_copy_construction(other.allocator_))
+{ insert(cbegin(), other.cbegin(), other.cend()); }
+</code></pre>
+<p>You also forget to move the allocator when moving the vector:</p>
+<pre><code>constexpr vector(vector &amp;&amp;other) noexcept: data_(other.data_), size_(other.size_), capacity_(other.capacity_) {
+    other.data_ = nullptr;
+    other.capacity_ = 0;
+    other.size_ = 0;
+}
+</code></pre>
+<p>Luckily this is an easy fix, because you can just do <code>allocator_(std::move(other.allocator_))</code> and everything else is cool.</p>
+<p>Unfortunately…</p>
+<pre><code>constexpr vector(vector &amp;&amp;other, const Alloc &amp;alloc) {
+    *this = vector(other);
+    allocator_ = alloc;
+}
+</code></pre>
+<p>… things are not going to be so simple here.</p>
+<p><em>If</em> <code>alloc</code> and <code>other._allocator</code> compare equal, then you can safely treat them as indistinct, meaning you can deallocate stuff using <code>alloc</code> even if it was originally allocated by <code>other._allocator</code>. That allows you to do a simple move of the pointer:</p>
+<pre><code>constexpr vector(vector &amp;&amp;other, const Alloc &amp;alloc) :
+    _allocator(alloc)
+{
+    if (_allocator == other._allocator)
+    {
+        using std::swap;
+        
+        swap(data_, other.data_);
+        swap(size_, other.size_);
+        swap(capacity_, other.capacity_);
+    }
+    else
+    {
+        // ...
+    }
+}
+</code></pre>
+<p>But if the allocators <em>don’t</em> compare equal, then you <em>can’t</em> use <code>allocator_</code> to deallocate <code>data_</code> that was allocated by <code>other.allocator_</code>. In that case, your only recourse is to copy:</p>
+<pre><code>constexpr vector(vector &amp;&amp;other, const Alloc &amp;alloc) :
+    _allocator(alloc)
+{
+    if (_allocator == other._allocator)
+    {
+        using std::swap;
+        
+        swap(data_, other.data_);
+        swap(size_, other.size_);
+        swap(capacity_, other.capacity_);
+    }
+    else
+    {
+        insert(begin(), other.cbegin(), other.cend());
+    }
+}
+</code></pre>
+<p>Now you’re probably guessing that if the copy and move constructors were that complicated, the <em>assignment</em> ops are going to be much, much worse. If so, you’d be right.</p>
+<p>But first, there’s one more major allocator complication I have to mention:</p>
+<pre><code>constexpr vector(const std::initializer_list&lt;T&gt; &amp;list, const Alloc &amp;alloc = Alloc()) : allocator_(alloc),
+                                                                                       size_(list.size()) {
+    reallocate(list.size());
+    std::uninitialized_move(list.begin(), list.end(), begin());
+}
+</code></pre>
+<p>Now, you use <code>std::uninitialized_move()</code> and its siblings quite a bit, and that’s good… <em>but</em>… the problem is that what you <em>should</em> be using is <code>std::allocator_traits&lt;Alloc&gt;::construct()</code>. And unfortunately, <code>std::uninitialized_move()</code> doesn’t use that.</p>
+<p>What that means is—and you’re going to hate me for telling you this—you need to <em>reimplment</em> all those uninitialized functions in terms of <code>std::allocator_traits&lt;Alloc&gt;::construct()</code>. Yeah. All of them. (Well, the ones you use anyway.)</p>
+<p>You may be think that’s madness, and why doesn’t the standard library have uninitialized functions for allocators?! I wholeheartedly agree. I’ve seen some proposals for them in the past, but I don’t think they’ve been championed yet. But yes, the standard library absolutely should support allocators with those uninitialized algorithms. It should also have a smart pointer for allocator-allocated memory (which you’re going to see come up later). Unfortunately, we have to work with what we’ve got.</p>
+<p>So you’ll need to reimplement all those uninitialized algorithms you use in terms of allocators, and use them instead of the ones you’re using now. I’m sorry to be the one to tell you this. Yeah, this is why I don’t push my students to work with allocators.</p>
+<p>Anywho, moving on….</p>
+<pre><code>constexpr vector &amp;operator=(const vector &amp;other) {
+    vector temp = other;
+    swap(temp);
+    return *this;
+}
+</code></pre>
+<p>This is great; this would be the correct thing to do… if allocators weren’t a factor. Let’s put allocators aside for the moment, though. Although this creates an entire third vector, with a possibly redundant internal memory buffer, that’s what you need to do to account for exceptions.</p>
+<p>Except… not always though, eh?</p>
+<p>Because if <code>T</code> is <code>noexcept</code> copyable, then all you need to do is <em>possibly</em> grow the internal memory buffer (if and only if <code>other.size() &gt; this-&gt;capacity()</code>… then just copy over whatever’s there. In other words:</p>
+<pre><code>constexpr auto operator=(vector const&amp; other) -&gt; vector&amp;
+{
+    if constexpr (std::is_nothrow_copy_constructible&lt;T&gt;)
+    {
+        if (capacity() &lt; other.size())
+            // This might conceivably throw.
+            reserve(other.size());
+        
+        // This shouldn't throw, because all it should do is destruct
+        // all existing elements (and destructors shouldn't throw),
+        // then copy construct all the new ones (and we've confirmed
+        // that this can't throw).
+        assign(other.cbegin(), other.cend());
+    }
+    else
+    {
+        auto temp = other;
+        swap(temp);
+    }
+    
+    return *this;
+}
+</code></pre>
+<p>If you don’t have to worry about allocators, this can be a <em>much</em> more efficient pattern if, for example, you’re copying a million <code>int</code>s over a vector that already held a million <code>int</code>s.</p>
+<p>Buuuut we do have to worry about allocators…</p>
+<p>… or do we?</p>
+<p>First let’s fix what we already have, assuming we <em>don’t</em> need to copy the allocator from <code>other</code>. The first branch of that <code>if</code> is fine. The <code>else</code> branch, however, has a problem, because when <code>temp</code> is constructed, it is constructed with a copy of <code>other.allocator_</code>. That’s not what we want; we want a copy of <code>this-&gt;allocator_</code>. So at the very least you’d need:</p>
+<pre><code>    else
+    {
+        auto temp = vector(other, allocator_);
+        swap(temp);
+    }
+</code></pre>
+<p>But even that’s problematic, because allocator copying and swapping and so on… it’s a goddam mess that you’d be better off avoiding.</p>
+<p>A better strategy is simply to use <code>this-&gt;allocator_</code> to allocate the memory you directly, copy into it, and then just swap the <code>data_</code> pointer. Assuming you’ve got a <code>std::unique_ptr</code>-like-type for allocators called <code>allocator_ptr</code> type—which is trivial to make—you could do something like:</p>
+<pre><code>    else
+    {
+        // Maintain the existing capacity.
+        auto const new_capacity = std::max(capacity_, other.size());
+        
+        // Internally calls std::allocator_traits&lt;Alloc&gt;::allocate()
+        // with the given args to allocate the memory.
+        auto p = allocator_ptr&lt;Alloc&gt;{
+            allocator_,
+            new_capacity,
+            data_  // try for locality if possible
+        };
+        
+        // Do the copy.
+        std::uninitialized_copy(other.cbegin(), other.cend(), p.get());
+        
+        // Swap the pointers.
+        auto old_p = data_;
+        data_ = p.release();
+        p.reset(old_p);
+        
+        // Clean up old data.
+        for (auto p = old_p; p &lt; (old_p + size_); ++p)
+            std::allocator_traits&lt;Alloc&gt;::destroy(allocator_, p);
+        
+        // Make sure the other members are kosher.
+        size_ = other.size();
+        capacity_ = new_capacity;
+        
+        // And we're done. Old data will be automatically freed.
+    }
+</code></pre>
+<p>But I note that all of the above is simply <code>assign(other.cbegin(), other.cend())</code>… assuming <code>assign()</code> is exception-safe (the current one isn’t).</p>
+<p>So if you <em>don’t</em> need to propagate the allocator, all you need is the code above (which is ultimately just <code>assign(other.cbegin(), other.cend())</code>). But what if you do? First, you should check to see if you do:</p>
+<pre><code>constexpr auto operator=(vector const&amp; other) -&gt; vector&amp;
+{
+    if constexpr (std::allocator_traits&lt;Alloc&gt;::propagate_on_container_copy_assignment)
+    {
+        // ...
+    }
+    else // no need to propagate the allocator
+    {
+        assign(other.begin(), other.end());
+    }
+    
+    return *this;
+}
+</code></pre>
+<p>Now you can just copy the allocator, use it to allocate new memory, and copy the contents of <code>other</code> into it, using exactly the same pattern that was used above (except the allocator has to be transferred as well):</p>
+<pre><code>constexpr auto operator=(vector const&amp; other) -&gt; vector&amp;
+{
+    if constexpr (std::allocator_traits&lt;Alloc&gt;::propagate_on_container_copy_assignment)
+    {
+        auto alloc = other.allocator_;
+        
+        // Maintain the existing capacity.
+        auto const new_capacity = std::max(capacity_, other.size());
+        
+        // Internally calls std::allocator_traits&lt;Alloc&gt;::allocate()
+        // with the given args to allocate the memory.
+        auto p = allocator_ptr&lt;Alloc&gt;{
+            alloc,
+            new_capacity,
+            data_  // try for locality if possible
+        };
+        
+        // Do the copy.
+        std::uninitialized_copy(other.cbegin(), other.cend(), p.get());
+        
+        // Swap the pointers.
+        auto old_p = data_;
+        data_ = p.release();
+        p.reset(old_p);
+        
+        // Clean up old data.
+        for (auto p = old_p; p &lt; (old_p + size_); ++p)
+            std::allocator_traits&lt;Alloc&gt;::destroy(allocator_, p);
+        
+        // Make sure the other members are kosher.
+        size_ = other.size();
+        capacity_ = new_capacity;
+        
+        // And of course, the allocator.
+        allocator_ = std::move(alloc);
+        
+        // And we're done. Old memory will be automatically freed.
+    }
+    else // no need to propagate the allocator
+    {
+        assign(other.begin(), other.end());
+    }
+    
+    return *this;
+}
+</code></pre>
+<p>And that’ll work just fine.</p>
+<p><em>BUT!</em> You can do even better! You can test if <code>alloc</code> and <code>this-&gt;allocator_</code> are equal <em>and</em> <code>T</code> objects are no-throw copyable <em>and</em> <code>other.size() &lt; capacity_</code>. If all those things are true, you don’t need to allocate new memory… you can simply overwrite what’s in <code>data_</code> (and of course, don’t forget to copy <code>alloc</code>). I’ll leave that for you to figure out.</p>
+<pre><code>constexpr void reserve(const size_type &amp;size) {
+    if (size &lt; capacity_) return;
+    reallocate(size);
+}
+</code></pre>
+<p>This function isn’t <em>wrong</em>, but its structure is a little bizarre. The <code>return</code> is hidden off to the right, so it’s easy to miss, leading one to misread the function logic. In fact, I think the logic might actually be wrong—do you really want to call <code>reallocate()</code> if <code>size == capacity_</code>?</p>
+<p>It just seems much more straightforward to do things the other way around:</p>
+<pre><code>constexpr void reserve(size_type size) {
+    if (size &gt; capacity_)
+        reallocate(size);
+}
+</code></pre>
+<p>(That also presumes you don’t want to reallocate if the requested size equals the existing capacity.)</p>
+<pre><code>constexpr void shrink_to_fit() {
+    reallocate(0);
+    capacity_ = 0;
+}
+</code></pre>
+<p>This… seems wrong.</p>
+<p>If I’m reading the code right, then <code>reallocate(0)</code> will simply reallocate the existing capacity. But that’s not the point of <code>shrink_to_fit()</code>. In fact, it seems completely pointless to just reallocate the existing buffer at the exact same size.</p>
+<p>What <code>shrink_to_fit()</code> <em>should</em> do is reallocate the buffer <em>if</em> the capacity doesn’t equal the size. And in that case, it should allocate a buffer where the capacity does equal the size. You can’t do that with your existing interface for <code>reallocate()</code>, because <code>reallocate()</code> will never allocate less than the current capacity.</p>
+<p>And setting <code>capacity_</code> to zero? Why? That just seems <em>completely</em> wrong.</p>
+<p>What you want seems something more like:</p>
+<pre><code>constexpr void shrink_to_fit() {
+    if (size_ != capacity_)
+    {
+        auto p = allocator_ptr{allocator_, size_};
+        // or allocator_ptr{allocator_, size_, data_}; for locality
+        
+        std::unitialized_copy_n(data_, size_, p.get());
+        
+        auto old_p = data_;
+        data_ = p.release();
+        p.reset(old_p);
+        for (auto p = old_p; p &lt; (old_p + size_); ++p)
+            std::allocator_traits&lt;Alloc&gt;::destroy(allocator_, p);
+        
+        capacity_ = size_;
+    }
+}
+</code></pre>
+<p>And because <code>shrink_to_fit()</code> is non-binding, you could also use a more intelligent heuristic to decide whether or not to actually reallocate. Like, only reallocate if the current capacity is greater than 1.5 times the size; otherwise ignore the request. That’s up to you.</p>
+<pre><code>template&lt;typename... Args&gt;
+constexpr void push_back(Args &amp;&amp;... args) { (push_back(std::forward&lt;Args&gt;(args)), ...); }
+</code></pre>
+<p>I’m not sure this is a wise interface choice, given the similarity between <code>push_back()</code> and <code>emplace_back()</code>. For example, suppose you have a type that is constructible from either a single <code>int</code> or a number of <code>int</code>s:</p>
+<pre><code>// These both do the same thing:
+v.push_back(0);
+v.emplace_back(0);
+
+// These do very different things:
+v.push_back(0, 1, 2);
+v.emplace_back(0, 1, 2);
+</code></pre>
+<p>But a careless code maintainer might be following the rule-of-thumb to replace <code>push_back()</code> with <code>emplace_back()</code>. The new code will compile without any warnings, but behave differently.</p>
+<p>I’d also take careful consideration of whether <code>push_back()</code> is allowed to take zero arguments. Does <code>vec.push_back();</code> makes sense? Bear in mind:</p>
+<pre><code>// These do very different things:
+v.push_back();
+v.emplace_back();
+</code></pre>
+<p>Now, a function that appends a number of items isn’t a bad idea. I just don’t think <code>push_back()</code> is a good name, given its symmetry with <code>emplace_back()</code>. Perhaps <code>push_back_n()</code>? In any case, if you’re going to do it, I suggest reserving <code>size_ + sizeof...(Args)</code>.</p>
+<pre><code>template&lt;typename... Args&gt;
+constexpr void emplace_back(Args &amp;&amp;... args) {
+
+// ...
+
+template&lt;typename... Args&gt;
+constexpr void emplace(iterator pos, Args &amp;&amp;... args) {
+</code></pre>
+<p>Just FYI, <code>emplace()</code> and <code>emplace_back()</code> return references to the emplaced object, which is <em>really</em> handy for <code>emplace()</code> especially, because you can do <code>auto&amp;&amp; x = v.emplace(/* ... */);</code> and then play with the emplace-constructed <code>x</code>.</p>
+<pre><code>constexpr void swap(vector &amp;other) {
+    std::swap(other.data_, data_);
+    std::swap(other.size_, size_);
+    std::swap(other.capacity_, capacity_);
+}
+</code></pre>
+<p>Ah, here we go again with allocators.</p>
+<p>So the code above is fine <em>if</em> you don’t need to propagate the allocator on swap <em>and</em> the two allocators are equal. If you need to propagate the allocator, well then, you need to propagate the allocator. If the two allocators aren’t equal, then you can’t use allocator 1 to deallocate the stuff allocated by allocator 2. And logically, if you’re not supposed to swap the allocators, then you can’t swap the pointers if the allocators are not equal. In fact, <a href="https://en.cppreference.com/w/cpp/container/vector/swap" rel="nofollow noreferrer">the standard vector says if the allocators are not equal, then swapping is UB</a>.</p>
+<p>So here’s what the standard actually asks of vector’s swap, as of C++17 (well, with <code>constexpr</code> from C++20 added):</p>
+<pre><code>constexpr void swap(vector&amp; other)
+    noexcept(std::allocator_traits&lt;Alloc&gt;::propagate_on_container_swap::value
+        || std::allocator_traits&lt;Alloc&gt;::is_always_equal::value)
+{
+    using std::swap;
+    
+    if constexpr (std::allocator_traits&lt;Alloc&gt;::propagate_on_container_swap)
+    {
+        swap(allocator_, other._allocator);
+    }
+    else if constexpr (not std::allocator_traits&lt;Alloc&gt;::is_always_equal)
+    {
+        assert(allocator_ == other.allocator_);
+    }
+    
+    swap(data_, other.data_);
+    swap(size_, other.size_);
+    swap(capacity_, other.capacity_);
+}
+</code></pre>
+<p>You don’t actually need the assert if you’re okay with just allowing UB. Or maybe you could just have it assert in debug mode or something.</p>
+<pre><code>constexpr void assign(size_type count, const T &amp;value) {
+    if (count &gt; size_) { resize(count); } //resize if necessary
+    std::fill(begin(), end(), value);  // fill array
+}
+</code></pre>
+<p>This… seems a little dodgy. I’m all for code reuse, but what this function is actually doing is not what it advertises. First it resizes the internal buffer… except, no, that’s not <em>all</em> it does; it resizes the internal buffer and <em>possibly fills it out by default-constructing a bunch of <code>T</code>s</em>. That will “work” assuming two things:</p>
+<ol>
+<li><code>T</code>’s default constructor and copy constructor have no observable side effects; and</li>
+<li><code>T</code> actually has a default constructor.</li>
+</ol>
+<p>One of the reasons I use the <code>assign(n, t)</code> function in vectors is specifically for types that don’t have a default constructor. But that won’t work with this vector.</p>
+<p>The other issue here is exception safety. What happens if one of the copy constructors throws? Your vector will be in an unknown (though valid) state.</p>
+<p>I’m afraid you’re going to need to rethink this. It’s a lot more complicated at first glance:</p>
+<ol>
+<li>If the capacity is less than <code>count</code>, you need to allocate a new buffer. No problem: allocate, then <code>std::uninitialized_fill_n()</code>, then swap the newly allocated buffer with the old one and clean up the old stuff. This can all be done exception-safe. Job done.</li>
+<li>Otherwise, if capacity is greater than or equal to <code>count</code> <em>AND</em> copy construction and assignment are non-throwing, you can assign-in-place safely, but it’s potentially a multi-stage job.
+a.  First you can use <code>std::fill(begin(), end(), value)</code> to overwrite the existing elements, if any.
+b.  Then you can use <code>std::uninitialized_fill(end(), begin() + count, value)</code> to initialize the remaining elements, if any.
+c.  Then just set <code>size_</code> to <code>count</code> and you’re done.</li>
+</ol>
+<p>Though I’d recommend against using <code>std::fill()</code> specifically, because that would require including <code>&lt;algorithm&gt;</code>… and <code>&lt;algorithm&gt;</code> is a heavyweight header.</p>
+<pre><code>constexpr void assign(iterator first, iterator last) {
+    clear();
+    insert(begin(), first, last);
+}
+</code></pre>
+<p>This is a rather destructive <code>assign()</code>, that doesn’t offer the strong exception guarantee. I also think you’ve got the interface wrong.</p>
+<p>For starters, I think this should actually be a function template that takes two <code>Iterator</code> arguments… not a non-template that takes two <code>turtle::vector&lt;T&gt;::iterator</code> arguments. Right now, this function can only assign from another <code>turtle::vector&lt;T&gt;</code> (note: not even a <code>const</code> one, either, because it takes non-<code>const</code> iterators).</p>
+<p>So I think you want:</p>
+<pre><code>template &lt;typename InputIterator&gt;
+constexpr void assign(InputIterator first, InputIterator last) {
+    // ...
+</code></pre>
+<p>(or, using future-style iteration…)</p>
+<pre><code>template &lt;typename InputIterator, typename Sentinel&gt;
+constexpr void assign(InputIterator first, Sentinel last) {
+    // ...
+</code></pre>
+<p>(but let’s ignore future-style iteration for now)</p>
+<p>Now if the iterator category really is <code>InputIterator</code>… then yeah, all you can do is <code>clear()</code> and <code>insert()</code>.</p>
+<p><em>However!</em> If the iterator category is <code>ForwardIterator</code> or better… then you can be smarter. You can first determine the size, and if copy construction/assignment is non-throwing, and potentially assign right into the existing buffer. Even if you <em>can’t</em> assign into the existing buffer, knowing the size lets you allocate a properly-sized buffer and then you can <code>std::uninitialized_fill()</code> right into that.</p>
+<p>And for the next function, this is definitely the case…:</p>
+<pre><code>constexpr void assign(const std::initializer_list&lt;T&gt; &amp;list) {
+    clear();
+    insert(begin(), list); //insert list
+}
+</code></pre>
+<p>… because you know for a fact that <code>std::initializer_list</code>’s iterators are random access. (Plus, <code>std::initializer_list</code> has a <code>size()</code> function.) If the iterator version of <code>assign()</code> is done properly, then this could just be:</p>
+<pre><code>constexpr void assign(std::initializer_list&lt;T&gt; list) {
+    assign(list.begin(), list.end());
+}
+</code></pre>
+<p>(Incidentally, you should never need to pass <code>std::initializer_list</code> around by <code>const&amp;</code>. It’s like <code>std::string_view</code> or <code>std::span</code> in that it’s designed to be passed around by-value.)</p>
+<pre><code>constexpr reference operator[](const size_type &amp;index) noexcept { return *std::launder(begin() + index); }
+
+constexpr const_reference operator[](const size_type &amp;index) const noexcept {
+    return *std::launder(begin() + index);
+}
+</code></pre>
+<p>Why are you using <code>std::launder()</code> here? You’re not doing any type-punning or other mischief so far as I can see.</p>
+<pre><code>constexpr reference at(const size_type &amp;index) { return (*this)[index]; }
+
+constexpr const_reference at(const size_type &amp;index) const { return (*this)[index]; }
+</code></pre>
+<p>You’re kinda missing the whole point of <code>at()</code> here, which is to throw <code>std::out_of_range</code> if <code>index</code> is greater than or equal to <code>size()</code>.</p>
+<p>Also, there’s no point in taking <code>size_type</code> by <code>const&amp;</code> (or returning it by <code>const&amp;</code>, as you do in some other functions). By definition <code>size_type</code> <em>must</em> be an unsigned integer type. You gain nothing by working with references to it (and probably lose out because it’s harder to optimize).</p>
+<pre><code>constexpr const_reference back() const { return *cend(); }
+</code></pre>
+<p>You got a little bug here, because <code>cend()</code> points to one-past-the-last-element… not the last element.</p>
+<pre><code>constexpr iterator T_fill_insert(difference_type offset, size_type n, const T &amp;x) {
+    T_grow(size_ + n);
+    size_ += n;
+    iterator pos = begin() + offset;
+    std::uninitialized_move(pos, end() - n, pos + n);
+    std::uninitialized_fill(pos, pos + n, x);  // fill
+    return pos;
+}
+</code></pre>
+<p>There are some problems here due to being sloppy about keeping track of when you can just move or fill, and when you need to do an <em>uninitialized</em> move or fill. There are multiple possibilities here:</p>
+<ol>
+<li>All new elements are overwriting existing elements; all moved elements are going into uninitialized space.</li>
+<li>All new elements are overwriting existing elements; some moved elements are overwriting existing elements, others are going into uninitialized space.</li>
+<li>Some new elements are overwriting existing elements, others are going into uninitialized space; all moved elements are going in uninitialized space.</li>
+<li>All new elements are going into uninitialized space (no moved elements; this would be a pure append).</li>
+</ol>
+<p>You also need to take exception safety into account.</p>
+<p>If you need to reallocate, then things are easy: just uninitialized copy the before and after elements, and uninitialized fill the space between. (But do keep exception safety in mind!)</p>
+<p>But if moves are non-throwing, and your capacity is enough, then you can move and fill in-place, even if copy assignment might throw. (If a copy does throw, then just “un-move” what you moved at the beginning.)</p>
+<pre><code>constexpr iterator T_insert(difference_type offset, const T &amp;x) {
+</code></pre>
+<p>To help you simplify things, note that this is just <code>T_fill_insert(offset, 1, x)</code>.</p>
+<pre><code>template&lt;typename InputIterator&gt;
+constexpr void T_fill_range(difference_type offset, InputIterator first, InputIterator last) {
+    difference_type n = helper::distance(first, last);
+    iterator pos;
+    T_grow(size_ + n);
+    size_ += n;
+    pos = begin() + offset;
+    std::uninitialized_move(pos, end() - n, pos + n);
+    std::uninitialized_copy(first, last, pos);
+}
+</code></pre>
+<p>If you tried this function with an <em>actual</em> <code>InputIterator</code>, you’d be in for a rude surprise.</p>
+<p>First of all, it won’t compile, because <code>helper::distance()</code> will only work with random access iterators or better. Only random access iterators or better support <code>operator-()</code>.</p>
+<p>But even if you fixed <code>helper::distance()</code> (or, better, used <code>std::distance()</code> instead), while this would now compile, it still won’t work. That’s because input iterators only allow a single pass. Once you’ve done <code>distance()</code>, you’ve burned up your single use. So the call to <code>std::uninitialized_copy()</code> at the end will copy nothing.</p>
+<p>What you need here is <em>two</em> functions—or a single function with two implementations via <code>if constexpr</code>.</p>
+<p>For input iterators… there’s simply no option other than doing a <code>for</code> loop inserting elements one at a time. This isn’t <em>so</em> bad because you’ll either have enough capacity to avoid a reallocation, or you’ll grow by your growth factor, so you won’t be reallocating on <em>every</em> iteration of the <em>for</em> loop.</p>
+<p>For forward iterators or better… well <em>now</em> you can use <code>distance()</code>, then pre-allocate if necessary, and so on. From that point, you just need to take the usual precautions regarding exception safety (that is, either using a whole new buffer, or—if moves are non-throwing—possibly trying to do the fill in-place).</p>
+<pre><code>constexpr void reallocate(const size_type &amp;newSize) {
+    if (!data_) {
+        data_ = allocator_.allocate(newSize);
+        capacity_ = newSize;
+    } else {
+        T *temp = allocator_.allocate(newSize &gt; capacity_ ? newSize : capacity_);
+        std::uninitialized_move(data_, data_ + capacity_, temp);
+        T_destroy(begin(), end());
+        allocator_.deallocate(data_, capacity_);
+        data_ = temp;
+        capacity_ = newSize &gt; capacity_ ? newSize : capacity_;
+    }
+}
+</code></pre>
+<p>The first part of this function is fine.</p>
+<p>The second part is fine <em>if</em> moves are non-throwing. If moves can throw, you have to do copies instead. (Fun fact: there’s actually a function called <code>std::move_if_noexcept()</code> that was created specifically for this problem… that, hilariously, is actually useless in practice because you’re usually moving/copying into uninitialized memory, as you are here.)</p>
+<p>Luckily, the fix here is trivial:</p>
+<pre><code>constexpr void reallocate(size_type newSize)
+{
+    if (!data_)
+    {
+        data_ = std::allocator_traits&lt;Alloc&gt;::allocate(allocator_, newSize);
+        capacity_ = newSize;
+    }
+    else
+    {
+        auto const newCapacity = newSize &gt; capacity_ ? newSize : capacity_; // DRY
+        
+        auto temp = std::allocator_traits&lt;Alloc&gt;::allocate(allocator_, newCapacity); // possibly with _data as hint for locality
+        if constexpr (std::is_nothrow_move_constructible_v&lt;T&gt;)
+        {
+            std::uninitialized_move_n(std::to_address(data_), size_, std::to_address(temp));
+        }
+        else
+        {
+            try
+            {
+                std::uninitialized_copy_n(std::to_address(data_), size_, std::to_address(temp));
+            }
+            catch (...)
+            {
+                std::allocator_traits&lt;Alloc&gt;::deallocate(allocator_, temp, newCapacity);
+                throw;
+            }
+        }
+        
+        T_destroy(begin(), end());
+        std::allocator_traits&lt;Alloc&gt;::deallocate(allocator_, data_, capacity_);
+        
+        data_ = temp;
+        capacity_ = newCapacity;
+    }
+}
+</code></pre>
+<p>Finally, your data members:</p>
+<pre><code>T *data_ = nullptr;
+size_type size_ = 0;
+size_type capacity_ = 0;
+allocator_type allocator_;
+</code></pre>
+<p><code>data_</code> should really be <code>pointer</code>, not <code>T*</code>.</p>
+<p>As for <code>allocator_</code>… the thing is that allocators quite often are empty. However, if you include an allocator data member like this, then it takes up space in your class even though it doesn’t need to. In C++20, you can use <code>[[no_unique_address]]</code>. Prior to that, you’d use <a href="https://en.wikibooks.org/wiki/More_C%2B%2B_Idioms/Empty_Base_Optimization" rel="nofollow noreferrer">the empty base optimization trick</a>. Frankly, I’d suggest not bothering with EBO; it’s going to be obsolete in a few months.</p>
+<p>I think that’s it!</p>
+<h1>Summary</h1>
+<p>There are only a very small number of critical bugs in the code:</p>
+<ul>
+<li>Your custom <code>helper::distance()</code> function only supports random access iterators, though you use it for other iterator categories.</li>
+<li>In a couple places, you copy/move pointers without copying the allocators as well. This could cause a situation where you’re deallocating memory with the wrong allocator.</li>
+<li>In <code>shrink_to_fit()</code> you set the capacity to zero… which is almost sure to lead to crashes and/or leaks.</li>
+<li>In the <code>const</code> version of <code>back()</code>, you dereference past-the-end.</li>
+</ul>
+<p>There are a few potential problems that aren’t <em>necessarily</em> bugs (though could become bugs depending on your intended usage):</p>
+<ul>
+<li>There are a few places where exception safety doesn’t even meet the minimal weak guarantee (where an exception will not only leave the object in an unknown state, it will almost certanly lead to UB).</li>
+<li>There are a few places where you don’t keep track of which parts of your memory are initialized and which are not, and possibly use the wrong type of algorithm.</li>
+<li>There are a few places where you seem to intend to use iterator categories your code doesn’t actually support (for example, making multiple passes through what are supposed to be input iterators).</li>
+<li>There are a few functions that don’t offer the same guarantees as the <code>std::vector</code> versions, like where <code>std::vector</code> promises they will work even with non-default constructible types, but your versions do default constructions.</li>
+</ul>
+<p>Other than that, the only issues worth mentioning are:</p>
+<ul>
+<li>some efficiency gains that could be achieved, for example, by taking advantage cases where you can reuse existing capacity; and</li>
+<li>some correctness issues regarding the use of allocators (mostly revolving around using uninitialized memory algorithms that don’t use the allocator’s <code>construct()</code> or <code>destroy()</code> functions.</li>
+</ul>
+<p>And for style issues:</p>
+<ul>
+<li>lack of comments; and</li>
+<li>unnecessary use of <code>const&amp;</code> for simple types.</li>
+</ul>
+<p>Almost all of the issues are <em>really</em> complex, low-level-detail stuff. Overall, if I were grading this, I’d give it an “A”.</p>
+<h1>Extended answer</h1>
+<pre><code>constexpr iterator T_fill_insert(difference_type offset, size_type n, const T &amp;x) {
+    const auto old_size = size_;
+    /* check if reallocation is needed */
+    T_grow(size_ + n);
+    size_ += n;
+    /* get the iterator at offset */
+    iterator pos = begin() + offset;
+    /* we can move already initialized parts of memory
+     * that we can move */
+    std::move(pos,begin()+old_size-n,pos+n);
+    std::uninitialized_move(pos+old_size-n, end(), end()-n);
+    std::uninitialized_fill(pos, pos + n, x);
+    return pos;
+}
+</code></pre>
+<p>Alright, let’s logic through this together to see if it works. (I honestly don’t know if it does yet! I’m working through it as I write.)</p>
+<p>Let’s skip over the reallocation part, on the assumption that it works fine, and start our reasoning on the line where <code>pos</code> is initialized. Let’s assume the size is 10, containing the digits ‘0’, ‘1’, ‘2’, …. The capacity is 16. We want to insert 3 ‘X’s starting at position 5.</p>
+<p>So at the start, the vector’s contents are:</p>
+<pre><code>0  1  2  3  4  5  6  7  8  9  _  _  _  _  _  _
+               ^
+               | insert position
+</code></pre>
+<p>Where the underscores represent uninitialized memory.</p>
+<p>So <code>offset</code> is 5, and <code>pos</code> points to the position shown.</p>
+<p>This is the before and after states we want:</p>
+<pre><code>start:
+0  1  2  3  4  5  6  7  8  9  _  _  _  _  _  _
+
+final:
+0  1  2  3  4  X  X  X  5  6  7  8  9  _  _  _
+                        ~  ~  +  +  +
+</code></pre>
+<p>Note that two of the elements (5 and 6) are moved onto already initialized memory, while three (7, 8, and 9) are moved onto uninitialized memory. In this case, all three new elements are copied over already initialized elements (but that won’t always be true!).</p>
+<p>The first operation moves everything from <code>pos</code> to the end over to <code>pos+n</code>:</p>
+<pre><code>start:
+0  1  2  3  4  5  6  7  8  9  _  _  _  _  _  _
+
+std::move(pos,begin()+old_size-n,pos+n):
+0  1  2  3  4  ?  ?  7  5  6  _  _  _  _  _  _
+
+final:
+0  1  2  3  4  X  X  X  5  6  7  8  9  _  _  _
+</code></pre>
+<p>(The question mark means a valid but moved-from value.)</p>
+<p>Already you can see a problem. You’ve completely lost 8 and 9. Your steps are out of order. You should have done the following uninitialized move first.</p>
+<p>Let’s try that—let’s swap those two lines (and fix the last argument to <code>std::uninitialized_move()</code>, because it’s exactly the same as the first one, meaning the function ultimately does nothing—it moves from <code>pos+size-n</code> to <code>pos+size-n</code>) and keep going:</p>
+<pre><code>start:
+0  1  2  3  4  5  6  7  8  9  _  _  _  _  _  _
+
+std::uninitialized_move(pos+old_size-n, end(), end()):
+0  1  2  3  4  5  6  ?  ?  ?  7  8  9  _  _  _
+
+std::move(pos,begin()+old_size-n,pos+n):
+0  1  2  3  4  ?  ?  ?  5  6  7  8  9  _  _  _
+
+final:
+0  1  2  3  4  X  X  X  5  6  7  8  9  _  _  _
+</code></pre>
+<p>So far, so good. Ah, but the next step should be a fill… not an <em>uninitialized</em> fill.</p>
+<p>Okay, let’s try replacing it with a normal fill:</p>
+<pre><code>start:
+0  1  2  3  4  5  6  7  8  9  _  _  _  _  _  _
+
+std::uninitialized_move(pos+old_size-n, end(), end()):
+0  1  2  3  4  5  6  ?  ?  ?  7  8  9  _  _  _
+
+std::move(pos,begin()+old_size-n,pos+n):
+0  1  2  3  4  ?  ?  ?  5  6  7  8  9  _  _  _
+
+std::fill(pos, pos + n, x):
+0  1  2  3  4  X  X  X  5  6  7  8  9  _  _  _
+
+final:
+0  1  2  3  4  X  X  X  5  6  7  8  9  _  _  _
+</code></pre>
+<p>Perfect.</p>
+<p>But… does it always work? Let’s try adding 6 elements instead of 3:</p>
+<pre><code>start:
+0  1  2  3  4  5  6  7  8  9  _  _  _  _  _  _
+
+std::uninitialized_move(pos+old_size-n, end(), end()):
+0  1  2  3  ?  ?  ?  ?  ?  ?  4  5  6  7  8  9
+
+// nope (note the 4 was moved) ...
+
+final:
+0  1  2  3  4  X  X  X  X  X  X  5  6  7  8  9
+</code></pre>
+<p>Looks like it’s back to the drawing board. Like I said, this is really a <em>lot</em> more complicated than it looks at first.</p>
+<p>I always tell people I teach programming to that 95% of programming is done before you hit the first keystroke. You can always tell a good programmer from a bad programmer by, ironically, noting who <em>doesn’t</em> start programming right away. It’s all about understanding the problem, the algorithm, and the tools you’re using to implement it. If you start coding before you’ve <em>completely</em> worked through those things, then your code is already broken. If it even works at all, that’s just a fluke.</p>
+<p>My advice is to sit down and work through pictorial representations like the ones above, and try to suss out all the possible cases—What if <code>n</code> is greater than <code>size</code>, for example? Then what would <code>pos+old_size-n</code> do? Crash!</p>
+<p>Then try to determine a set of general rules that work for all cases. That might not even be possible! You might need to use <code>if</code> branches to handle different cases. I honestly don’t know what the solution is; I’d have to do exactly what I’m recommending to you, and sit down and work it through.</p>
+<p>Or, alternately, rather than that method, you may prefer to try to think conceptually about the required steps first, and <em>then</em> try the pictorial representations to test your ideas. Either way is fine; it just boils down to your style.</p>
+<p>But the bottom line is that you shouldn’t even <em>try</em> writing a single line of code until you understand the problem, and the solution, however you choose to do that. Seat-of-your-pants coding can be fun sometimes, but it’s not a serious way to write real code.</p>
+<p>And write tests! I even recommend writing the tests <em>before you write the code</em>! You could make a simple test type that can detect when it hasn’t been initialized (for example, in the constructor, record its address in a static list, and if you’re trying to move-assign over an object whose address isn’t in the list, you’ve detected a bug), and use that in your vector. You could test inserts at the beginning, middle, and end of a 10 element vector, with insert sizes from 1 to 12. Test! Test! Test! Code without tests is just garbage—just throwaway crap you might have fun playing with for a while, but can’t use in serious projects. Pick a test library—I like <a href="https://www.boost.org/doc/libs/release/libs/test/doc/html/index.html" rel="nofollow noreferrer">Boost.Test</a>, but something simpler like <a href="https://github.com/catchorg/Catch2" rel="nofollow noreferrer">Catch2</a> is also great; you can even use <a href="https://github.com/google/googletest" rel="nofollow noreferrer">Google Test</a> if you’re masochistic, I suppose. (Actually, Catch2’s tutorial even shows some basic testing of <code>std::vector</code>.) I’d even argue that being able to write good tests is a more important skill than being able to just code from the hip.</p>
+    </div>

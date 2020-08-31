@@ -1,0 +1,77 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First, I suppose it would be cheating to just use a <a href="https://en.cppreference.com/w/cpp/thread/shared_mutex" rel="noreferrer"><code>std::shared_mutex</code></a>, right? :)</p>
+
+<p>Second, it seems a little weird to declare <code>uintmax_t writers</code> for a variable that can only ever hold the value 0 or 1. But, on the other hand, the symmetry between <code>readers</code> and <code>writers</code> is kind of nice.</p>
+
+<hr>
+
+<pre><code>uintmax_t readers = {0}, writers = {0};
+</code></pre>
+
+<p>Strongly prefer to declare one variable per line. Also, I know some people like to write <code>int i{0};</code>, and of course the <em>natural</em> thing to write is <code>int i = 0;</code>, but your belt-and-suspenders approach is relatively unusual. Prefer</p>
+
+<pre><code>uintmax_t readers = 0;
+uintmax_t writers = 0;  // or, bool has_writer = false;
+</code></pre>
+
+<hr>
+
+<pre><code>explicit MySharedLock() {}
+</code></pre>
+
+<p>I am a big fan of this <code>explicit</code> zero-argument constructor! However, you should probably be in the habit of <code>=default</code>ing things instead of <code>{}</code>.</p>
+
+<hr>
+
+<pre><code>if (writers != 0) {
+  rw_cv.wait(lk, [this]() { return (this-&gt;writers == 0); });
+}
+</code></pre>
+
+<p>Nit: A lambda that doesn't escape should generally just capture <code>[&amp;]</code>. And you needn't write out <code>this-&gt;</code> if you don't want to. So:</p>
+
+<pre><code>if (writers != 0) {
+  rw_cv.wait(lk, [&amp;]() { return (writers == 0); });
+}
+</code></pre>
+
+<p>However, this could be more cleanly expressed as simply</p>
+
+<pre><code>while (writers != 0) {
+  rw_cv.wait(lk);
+}
+</code></pre>
+
+<hr>
+
+<pre><code>lk.unlock();
+</code></pre>
+
+<p><code>unique_lock</code> is an RAII type; it unlocks the controlled mutex automatically in its destructor. You don't need to (and therefore shouldn't) write <code>.unlock</code> explicitly in your code.</p>
+
+<hr>
+
+<p>This implementation has the potential problem that it delegates all of the "queueing" logic to the mutex/cv themselves. It is possible that if customers show up as "reader, writer, reader, writer, reader, writer...", then the readers could starve out the writers, or even vice versa. The only way to fix this, AFAIK, is to implement some kind of a "queue" of waiters, so that each waiter knows exactly when it's at the head of the queue. (Imagine the ticketing system in a deli: "Now serving number 47!")</p>
+
+<hr>
+
+<p>Inside <code>reader_unlock</code>, you have <code>rw_cv.notify_all()</code> — but I <em>think</em> that this could safely be changed to <code>rw_cv.notify_one()</code>. We know that nobody is waiting to read; therefore all waiters are writers; therefore at most one of them will actually be able to do any work right now; therefore it is sufficient to wake up just one of them.</p>
+
+<p>(And of course by the time that guy wakes up, somebody <em>new</em> may have come in and stolen the lock. So even that guy might not get to do any work.)</p>
+
+<p>However, what <code>notify_all</code> <em>does</em> do is transfer over all the waiters from waiting on the <code>rw_cv</code> to waiting on the <code>rw_mutex</code>. If <code>std::mutex</code> implements some kind of fair queueing system, this ensures that no writer will get starved for longer than one epoch-of-readers, because as soon as the epoch ends, all the writers will get woken up and transferred over to the mutex, so that their respective epochs-of-writers will happen bam bam bam one after the other.</p>
+
+<p>Yeah, I think I've convinced myself that <code>notify_all</code> <em>is</em> actually the most effective thing to do here. But it probably deserves a code comment explaining why <em>you</em> think it's the right thing to do!</p>
+
+<hr>
+
+<p>Finally, it's worth mentioning that the standard names for your methods (according to the standard <code>SharedMutex</code> concept) are:</p>
+
+<pre><code>read_lock     -&gt;  lock_shared
+read_unlock   -&gt;  unlock_shared
+write_lock    -&gt;  lock
+write_unlock  -&gt;  unlock
+</code></pre>
+
+<p>There's no standard C++ name for the <em>promotion</em> of a held reader lock to a writer lock (which is deceptively tricky), nor for the <em>downgrading</em> of a held writer lock to a reader lock (which is trivial). You might think about whether you want to provide these operations, and if so, what the interface to them should be.</p>
+    </div>

@@ -1,0 +1,84 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Loki's solution does not enforce the order in which the function calls are performed, because <a href="https://stackoverflow.com/a/2934909/1157100">the order in which function arguments are evaluated is unspecified</a>. Here's a C++14 solution that ensures the function is called from left to right:</p>
+
+<pre><code>#include &lt;cstddef&gt;
+#include &lt;tuple&gt;
+#include &lt;utility&gt;
+
+template &lt;typename Tuple, typename F, std::size_t ...Indices&gt;
+void for_each_impl(Tuple&amp;&amp; tuple, F&amp;&amp; f, std::index_sequence&lt;Indices...&gt;) {
+    using swallow = int[];
+    (void)swallow{1,
+        (f(std::get&lt;Indices&gt;(std::forward&lt;Tuple&gt;(tuple))), void(), int{})...
+    };
+}
+
+template &lt;typename Tuple, typename F&gt;
+void for_each(Tuple&amp;&amp; tuple, F&amp;&amp; f) {
+    constexpr std::size_t N = std::tuple_size&lt;std::remove_reference_t&lt;Tuple&gt;&gt;::value;
+    for_each_impl(std::forward&lt;Tuple&gt;(tuple), std::forward&lt;F&gt;(f),
+                  std::make_index_sequence&lt;N&gt;{});
+}
+</code></pre>
+
+<p>I use <code>swallow{f(x)...}</code> to force the evaluation order. It works because the order in which the arguments to a brace initializer are evaluated is the order in which they appear. You can then use it like:</p>
+
+<pre><code>#include &lt;iostream&gt;
+
+int main() {
+    for_each(std::make_tuple(1, '2', 3.3), [](auto x) {
+        std::cout &lt;&lt; x &lt;&lt; std::endl;
+    });
+}
+</code></pre>
+
+<h3>EDIT</h3>
+
+<p>I modified the code so it works on both <a href="http://coliru.stacked-crooked.com/a/c23e07503cceb7d7" rel="noreferrer">GCC</a> and <a href="http://coliru.stacked-crooked.com/a/08e3ecf5b9529343" rel="noreferrer">Clang</a>. Here's a more in-depth explanation of <code>for_each_impl</code>.</p>
+
+<p>First, we make sure that we call <code>f</code> inside a braced initializer, so the evaluation order is from left to right:</p>
+
+<pre><code>using swallow = int[];
+swallow{f(std::get&lt;Indices&gt;(tuple))...};
+</code></pre>
+
+<p>But then, what if <code>f</code> does not return an integer value? What if it returns <code>void</code> for example? So we use the comma operator to make sure the expression is an integer which can be used inside the braced initializer:</p>
+
+<pre><code>swallow{(f(std::get&lt;Indices&gt;(tuple)), int{})...};
+</code></pre>
+
+<p>The expression <code>(f(stuff), int{})...</code> is a parameter pack expansion. It expands to <code>(f(stuff_1), int{}), (f(stuff_2), int{}), ..., (f(stuff_n), int{})</code>, so each expression is really an <code>int</code>, except that some side effect has been performed before. Then, to avoid nasty overloads of the comma operator by whatever is returned by <code>f</code>, we insert a <code>void</code> between <code>f(...)</code> and <code>int{}</code>. Since <code>operator,(SomeType, void)</code> can't be overloaded, this ensures that the builtin <code>operator,</code> is used, which is what we want. This might seem overkill, but we do this in highly generic code where we must assume that <code>f(...)</code> could overload <code>operator,</code>:</p>
+
+<pre><code>swallow{(f(std::get&lt;Indices&gt;(tuple)), void(), int{})...};
+                                      ^~~~ Make sure the builtin operator, is used
+</code></pre>
+
+<p>Then, what happens if <code>for_each_impl</code> is sent 0 arguments? We're gonna try to create a 0-sized array, so we must make sure the array always has at least one element in it. We use a dummy int for this:</p>
+
+<pre><code>swallow{1, (f(std::get&lt;Indices&gt;(tuple)), void(), int{})...};
+        ^~~~ Now the array always has at least one element in it
+</code></pre>
+
+<p>We're almost done, but now there's an anoying compiler warning saying "You're creating a temporary array 'swallow' which is never used". To silence it, I cast the <code>swallow{...}</code> to <code>void</code>. Finally, just add perfect forwarding of the Tuple and you're done:</p>
+
+<pre><code>(void)swallow{1, (f(std::get&lt;Indices&gt;(std::forward&lt;Tuple&gt;(tuple))), void(), int{})...};
+^^^^^^ Silence warning                ^^^^^^^^^^^^^^^^^^^ Perfect forwarding     
+</code></pre>
+
+<p>Note that the way I use <code>std::forward</code> here could be unsafe in other circumstances. This is because <code>tuple</code> could be double-moved-from if the function I forwarded it to had different characteristics. Consider:</p>
+
+<pre><code>swallow{f(function_that_moves_from_its_arg&lt;Indices&gt;(std::forward&lt;Tuple&gt;(tuple)))...};
+</code></pre>
+
+<p>Now, <code>tuple</code> might be moved-from several times:</p>
+
+<pre><code>swallow{
+    f(function_that_moves_from_its_arg&lt;Index1&gt;(std::forward&lt;Tuple&gt;(tuple))), // move here
+    f(function_that_moves_from_its_arg&lt;Index2&gt;(std::forward&lt;Tuple&gt;(tuple))), // move here
+    f(function_that_moves_from_its_arg&lt;Index3&gt;(std::forward&lt;Tuple&gt;(tuple))), // move here
+    ...
+}
+</code></pre>
+
+<p>However, I know <code>std::get</code> is a friendly function and so there's should be no problem in doing this. There's an alternative way to do it "safely", but it involves using <code>std::tuple_element</code> and it's more complicated.</p>
+    </div>

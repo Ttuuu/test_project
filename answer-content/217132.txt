@@ -1,0 +1,156 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First, thumbs-up for providing a test suit, although I couldn't make it work (copy-and-paste on <a href="http://wandbox.org" rel="nofollow noreferrer">wandbox</a>, it might be the reason why).</p>
+
+<p>Now on to the not so good:</p>
+
+<ul>
+<li>Your code is quite long; the longer it is, the harder it is to read. That's why you must always try to be as concise as possible. In this case I strongly believe that you could have cut out a lot. It isn't even hard to do: let me give you a very trivial example:</li>
+</ul>
+
+<p>Ex:</p>
+
+<pre><code>// original code
+auto idx = i;
+idx *= ARITY;
+idx += 1;
+if (idx &gt;= ssize()) {
+  return {false, 0};
+}
+return {true, idx};
+
+// concise version:
+auto index = i * ARITY + 1;
+return index &lt; ssize() ? { true, index } : { false, 0 };
+
+// or with C++17, localized variable
+if (auto index = i * ARITY + 1; index &lt; ssize())
+     return { true, index };
+else return { false, 0 };
+</code></pre>
+
+<ul>
+<li>Your code is cluttered with variables that have short, more or less obscure or arbitrary names (<code>i</code>, <code>j</code>,  <code>jj</code>, <code>vs</code>, etc.). Variable names introduce meaning, it's a great way to document your code and make it easier to read and understand:</li>
+</ul>
+
+<p>Ex (continued):</p>
+
+<pre><code>// now we know what it is the index of
+if (auto child_index = parent_index * ARITY + 1; child_index &lt; ssize())
+     return { true, child_index };
+else return { false, 0 };
+</code></pre>
+
+<ul>
+<li><p>Another reason why your code is too long for what it does is that it is overly defensive. I assume you thought that <code>assert</code>s are free because they can be toggled off. But they're not because it can obscure your error-handling strategy: why are there <code>assert</code>s in some places, <code>if</code> clauses in others, or even exceptions? I can't give you a hard rule about this, but generally it's good to check the error as locally as possible, and handle it as centrally as possible. It's not good to do it everywhere.</p></li>
+<li><p>Your "signed size" gymnastic is dangerous. I understand where it comes from, but look where it goes to:</p></li>
+</ul>
+
+<p><em>How dangerous is:</em></p>
+
+<pre><code>constexpr ssize_type ssize() const noexcept {
+    return static_cast&lt;ssize_type&gt;(storage.size());
+}
+</code></pre>
+
+<p>Well, tell me what happens if <code>storage.size()</code> is greater than <code>std::numeric_limits&lt;ssize_type&gt;::max()</code>? Well, you've got a negative size (I don't consider the theoretically possible case where the overflow could lead to a positive but false size -&gt; good luck finding the bug). And your code full of asserts doesn't even check this!!</p>
+
+<ul>
+<li><p>returning a <code>std::pair&lt;bool, index&gt;</code> is a bit cumbersome. Depending on the version of C++ you can use, you can return a <code>std::optional</code> or simply an iterator (when an iterator points past the last element, it indicates failure). NB: if you have access to C++17, structured bindings make for a more elegant syntax when assigning a pair: <code>auto [success, child_index] = get_smallest_child(parent_index);</code></p></li>
+<li><p>the distinction between the implementation and the "front" class is weird. What did you want to achieve with this? If it's about re-compilation and the "pimpl idiom", then you need to use a pointer to <code>heap_impl</code> inside <code>heap</code>. A pointer allows you to refer to an incomplete type, and define the type somewhere else.</p></li>
+<li><p>do you really want to provide random access to the elements of your heap? There might be scenarios where you need this (or are there? heaps aren't completely sorted, the children of a given parent can be in any order, so why would you get the 3rd, and not the 2nd or the 4th?), but you generally use heaps as a kind of priority queue. You only need to provide access to the "top" element. It will simplify your code and get you closer to the principle: make an interface that is easy to use and hard to misuse (out of bond access is harder this way).</p></li>
+<li><p>your <code>noexcept</code> policy is incoherent and a bit tedious also. You tag almost everything but not <code>begin()</code> or <code>end()</code>, for some reason. <code>noexcept(false)</code> isn't really necessary, in the sense that no one (neither compiler nor client) will expect to be protected from exceptions unless there's a <code>noexcept</code> tag at the end of the signature.</p></li>
+<li><p>I think you should have offered to customize the comparison operator. It's really useful when the element doesn't provide a comparison operator, of if you want to compare the elements in a different order, or a projection of the elements.</p></li>
+<li><p>there are probably other little things that can be improved, but I feel like they'll become more obvious when you work further on the initial code. With that in mind, here's a quick, more modern, iterator based implementation of a heap to give you a comparison point and some hints:</p></li>
+</ul>
+
+<p>Ex:</p>
+
+<pre><code>#include &lt;vector&gt;
+#include &lt;functional&gt;
+#include &lt;optional&gt;
+#include &lt;iostream&gt;
+
+template &lt;typename T, typename Pred = std::less&lt;T&gt;, std::size_t ARITY = 2&gt;
+class heap {
+
+    using Iterator = std::vector&lt;T&gt;::iterator;
+
+    public: std::vector&lt;T&gt; storage; private: // for testing purpose
+    Iterator root = storage.begin();
+    Iterator last_element = root;
+
+    Pred predicate;
+
+    Iterator get_parent(Iterator child) {
+        const auto parent_index = (std::distance(root, child) - 1) / ARITY;
+        return std::next(root, parent_index);
+    }
+
+    std::pair&lt;Iterator, Iterator&gt; get_children(Iterator parent) {
+        const auto children_index = std::distance(root, parent) * ARITY + 1;
+        if (children_index &gt;= storage.size()) return { last_element, last_element };
+        const auto children_number = std::min(storage.size() - children_index, ARITY);
+        return { std::next(root, children_index), std::next(root, children_index + children_number) };
+    }
+
+    void restore_up(Iterator child);
+    void restore_down(Iterator parent);
+
+    public:
+
+    heap() = default;
+
+    template &lt;typename Iter&gt;
+    heap(Iter first, Iter last);
+
+    std::optional&lt;T&gt; pop() { // simplification. You need to provide both T top() and void pop() to be exception safe
+        if (storage.empty()) return {};
+        auto result = std::exchange(*root, *last_element--);
+        storage.pop_back();
+        restore_down(root);
+        return result;
+    }
+
+};
+
+template &lt;typename T, typename Pred, std::size_t ARITY&gt;
+void heap&lt;T, Pred, ARITY&gt;::restore_up(Iterator child) {
+    while (child != root) {
+        auto parent = get_parent(child);
+        if (!predicate(*child, *parent)) return;
+        std::iter_swap(child, parent);
+        child = parent;
+    }
+}
+
+template &lt;typename T, typename Pred, std::size_t ARITY&gt;
+void heap&lt;T, Pred, ARITY&gt;::restore_down(Iterator parent) {
+    while (true) {
+        auto [first, last] = get_children(parent);
+        if (first == last) return;
+        auto top_child = std::min_element(first, last, predicate);
+        if (!predicate(*top_child, *parent)) return;
+        std::iter_swap(top_child, parent);
+        parent = top_child;
+    }
+}
+
+template &lt;typename T, typename Pred, std::size_t ARITY&gt;
+template &lt;typename Iter&gt;
+heap&lt;T, Pred, ARITY&gt;::heap(Iter first, Iter last) 
+    : storage(first, last) {
+        if (first == last) return;
+        last_element = std::prev(storage.end());
+        auto last_parent = get_parent(last_element);
+        do {
+            restore_down(last_parent);
+        } while (last_parent-- != root);
+}
+
+int main() {
+    std::vector&lt;int&gt; data {3,5,7,9,4,1,6,8};
+    heap&lt;int, std::greater&lt;int&gt;&gt; test(data.begin(), data.end());
+    for (auto i : test.storage) std::cout &lt;&lt; i &lt;&lt; ' ';
+}
+</code></pre>
+    </div>

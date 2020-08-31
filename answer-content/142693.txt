@@ -1,0 +1,97 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>In addition to <a href="https://codereview.stackexchange.com/a/142674/13424">t3schb0t's answer</a> I'd also change your parsing logic. Your code is just few lines and it's already too complicate to read. After you moved code into a separate class then it's time for refactoring!</p>
+
+<p>Abstract away read/write/log logic. You already have <code>StreamReader</code>, <code>StreamWriter</code>, <code>Console</code> and <code>TcpClient</code>. <strong>Current implementation is hard to test</strong> (because you need a TCP server and you must read data to/from streams.) More than that: it's almost impossible to test in isolation...let's introduce few more classes.</p>
+
+<p>Abstract <code>IrcServerConnection</code> to handle connection (with its implementation <code>TcpIrcServerConnection</code> and probably a mock to test all the other logic without a true remote IRC server).</p>
+
+<p>Now you have to abstract input stream, let's introduce a <code>IrcDataPipe</code> (here I'd avoid to call it <em>channel</em> because it may cause confusion with IRC channel but a better name is required...) It may expose <code>ReadLines()</code> (which returns <code>IEnumerable&lt;string&gt;</code>, an <em>infinite</em> loop until connection is closed may be appropriate), <code>WriteLine()</code> for generic write operations and <code>Send()</code> to explicitly write a command (see later.) If required you may want to introduce two <em>views</em> of this pipe accessible through two properties like <code>Request</code> and <code>Response</code> (but I'd not go too far at the beginning.)</p>
+
+<p>Also note that <code>NetworkStream</code> is not buffered then you do not need to call <code>Flush()</code> after each write.</p>
+
+<p>You may want to introduce a <code>Log</code> class with its <code>LogWriter</code> (which may be console by default). In this way you may also differentiate between errors and informative messages. Console output may be, for example, colored and you may want a different format for file log (note that command line redirection is always possible.) </p>
+
+<p><code>inputLine.Split(new Char[] {' '});</code> may be simplified to <code>inputLine.Split(' ');</code></p>
+
+<p>Be consistent with variable naming, <code>PongReply</code> should be <code>pongReply</code>.</p>
+
+<p>I'd suggest to remove all those <em>magic constants</em>. If you do not want to introduce an <code>IrcCommand</code> class you may at least use constants. Here is how I'd like to see it (at first step):</p>
+
+<pre><code>pipe.Send(new PongCommand(splitLine[1]));
+</code></pre>
+
+<p>I'd simplify parsing. For commands for which you have a mandatory response you may use a dictionary (or Reflection...) For example a generic <code>IrcCommand</code> derived class may be something like this:</p>
+
+<pre><code>[InResponseTo(IrcServerMessages.Ping)]
+sealed class PongCommand : IrcCommand {
+    public override string GetResponse(IrcServerMessage message) {
+        return message.Parameters.Single();
+    }
+}
+</code></pre>
+
+<p>As you can see I introduced an <code>IrcServerMessage</code> class which both hide parsing and encapsulate parameters. Your <em>processing loop</em> will be as simple as:</p>
+
+<pre><code>using (var connection = CreateConnection().Open())
+using (var pipe = connection.OpenPipe())
+{
+    LogIn(pipe);
+
+    foreach (var message in pipe.ReadLines().Select(x =&gt; new IrcServerMessage(x))
+        ProcessKnownMessages(message);
+}
+</code></pre>
+
+<p>Where <code>LogIn(pipe)</code> is something like this:</p>
+
+<pre><code>private static void LogIn(IrcPipe pipe) {
+    pipe.Send(
+        new NickCommand(_nick),
+        new UserCommand(_nick)
+    );
+}
+</code></pre>
+
+<p>Note multiple commands on the same line (<code>Send(params IrcCommand[] commands)</code>) to denote a <em>batch</em> which I want to fail/succeed all together.</p>
+
+<p>Now let's move connection into a separate method to use your class like this:</p>
+
+<pre><code>using (var connection = new IrcConnection(CreateConnection))
+using (var bot = new IrcBot(connection) {
+    connection.Open();
+    bot.StartChatting();
+}
+</code></pre>
+
+<p>You may automatically start bot when connection is open (just add a <code>ConnectionStateChanged</code> event in your <code>IrcConnection</code> class and automatically call <code>LogIn()</code> there) Now your chat loop will simply be:</p>
+
+<pre><code>using (var pipe = Connection.OpenPipe()) {
+    foreach (var message in pipe.ReadLines().Select(x =&gt; new IrcServerMessage(x))
+        ProcessKnownMessages(message);
+}
+</code></pre>
+
+<p>Now that your bot has <em>state</em> you may want to encapsulate those status into an <code>IrcClient</code> class (to handle basic log-in, keep track of open channels and so on.) In this way you will even be able to operate on multiple channels (or with multiple bots). Again a proof of concept:</p>
+
+<pre><code>using (var connection = new IrcConnection(CreateConnection))
+using (var client = new IrcClient(connection) {
+using (var bot = new IrcBot(client) {
+    client.Open(); // Client will open connection if required
+    bot.StartChatting();
+}
+</code></pre>
+
+<p>As you can see if you <strong>name things</strong> your code will be more clear, easy to extend and feature-rich...</p>
+
+<p>Also note that you should never catch <code>Exception</code> if you want to perform any recovery logic. Will you attempt a new server connection if you get <code>OutOfMemoryException</code>? What if you have <code>AccessViolationException</code>? Note that for logging purposes you may also want to <em>flatten</em> aggregate exceptions (and some others with an <code>InnerExceptions</code> - note it's plural - property.)</p>
+
+<p>To retry at this outer level may be useful but you should carefully choose which exceptions you may ignore. For example:</p>
+
+<pre><code>try {
+}
+catch (Exception e) when (IsNotCriticalException(e)) {
+}
+</code></pre>
+
+<p>Also note that in some circumstances you may want to ignore some exceptions (let's also introduce parsing exceptions like <code>ServerMessageFormatException</code>) but you have to <em>know</em> them otherwise you will not have a reliable software but a software that reliably repeatedly fails. Having specific exceptions will also help you to test failure scenarios: if your test will pass with <code>[ExpectedException(typeof(Exception))]</code> you will never be sure if it passed because you correctly handled that scenario or because your code is faulty and it generated <code>NullReferenceException</code>...</p>
+    </div>

@@ -1,0 +1,103 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I tried a few variations on your code. I was surprised at how performant the groupby approach really was!</p>
+
+<p>I changed your test data to use more values -- this amortizes the overhead a bit more. Surprisingly, the overhead is a lot of the difference. When I pushed the array length too high, the differences got very small for the groupby-based alternatives.</p>
+
+<p>That said, there are some things you can do to speed things up:</p>
+
+<pre><code>original:        18.022180362
+org_prefill:     14.969489811999996
+unique_keys:     23.526526202000007
+groupby_return:  15.557421341999998
+groupby_prefill: 15.846651952999991
+shifty:           9.605120361000004
+</code></pre>
+
+<p>I tried moving away from <code>groupby</code> by iterating over the distinct key values, but that didn't pay off: the performance got worse (<code>unique_keys</code>). I tried playing games with the return value from groupby, hoping to eliminate some duplicated effort. I eventually got that in <code>groupby_return</code>. For small sizes, where the overhead is more of a factor, I got a tiny speed boost by pre-filling the result column before running the groupby. That's <code>groupby_prefill</code> and then <code>org_prefill</code> where I back-ported it. You can see that it pays off versus the original code, but not against the <code>groupby_return</code> code. </p>
+
+<p>Finally, I eliminated the groupby entirely, by figuring out how to detect the start of a group using <code>.shift()</code>. Then I computed a shifted-by-one series and did the subtract operation as a single expression. That's <code>shifty</code> and it's the most performant by a bunch. W00t!</p>
+
+<pre><code>import sys
+import timeit
+
+import numpy as np
+import pandas as pd
+
+def make_df():
+    n = 10_000
+    df = pd.DataFrame({'id': ['a']*(n//2) + ['b']*(n//2),
+                    'x': np.random.randn(n)})
+    return df
+
+def original(df):
+    def my_func(group):
+        group['diff'] = (group['x'] - group['x'].shift(
+            1, fill_value=group['x'].iat[0]))
+        return group
+
+    df.groupby('id').apply(my_func)
+
+def org_prefill(df):
+    def my_func(group):
+        group['diff'] = (group['x'] - group['x'].shift(
+            1, fill_value=group['x'].iat[0]))
+        return group
+
+    df['diff'] = df['x']
+    df.groupby('id').apply(my_func)
+
+def unique_keys(df):
+    #print("DF:\n", df)
+    df['diff'] = 0
+    for key in df.id.unique():
+        matches = (df.id == key)
+        #df.loc[matches, 'diff'] = df.loc[matches, 'x'] - df.loc[matches, 'x'].shift(1, fill_value=df.loc[matches, 'x'].iat[0])
+        df_lmx = df.loc[matches, 'x']
+        df.loc[matches, 'diff'] = df_lmx - df_lmx.shift(1, fill_value=df_lmx.iat[0])
+
+def groupby_iter(df):
+    for key, subset in df.groupby('id'):
+        subset['diff'] = subset.x - subset.x.shift(1,
+                fill_value=subset.x.iat[0])
+
+def groupby_return(df):
+    def my_func2(group):
+        gx = group['x']
+        result = gx - gx.shift(1, fill_value=gx.iat[0])
+        return result
+
+    res = df.groupby('id').apply(my_func2)
+    df['diff'] = res.values
+
+def groupby_prefill(df):
+    def my_func2(group):
+        gx = group['x']
+        result = gx - gx.shift(1, fill_value=gx.iat[0])
+        return result
+
+    df['diff'] = df['x']
+    res = df.groupby('id').apply(my_func2)
+    df['diff'] = res.values
+
+def shifty(df):
+    shifted = df['x'].shift(fill_value=df['x'].iat[0])
+    shifted.loc[(df.id != df.id.shift())] = df['x']
+    df['diff'] = df['x'] - shifted
+
+if __name__ == '__main__':
+    kwargs = {
+        'globals': globals(),
+        'number': 1000,
+        'setup': 'df = make_df()',
+    }
+
+    print("original:", timeit.timeit('original(df)', **kwargs))
+    print("org_prefill:", timeit.timeit('org_prefill(df)', **kwargs))
+
+    print("unique_keys:", timeit.timeit('unique_keys(df)', **kwargs))
+    #print("groupby_iter:", timeit.timeit('groupby_iter(df)', **kwargs))
+    print("groupby_return:", timeit.timeit('groupby_return(df)', **kwargs))
+    print("groupby_prefill:", timeit.timeit('groupby_prefill(df)', **kwargs))
+    print("shifty:", timeit.timeit('shifty(df)', **kwargs))
+</code></pre>
+    </div>

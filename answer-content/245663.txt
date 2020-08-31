@@ -1,0 +1,169 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You’ve already noted that this could be done better without macros, so I won’t belabour the point. I will note, though, that your goal—“to refresh [your] skills at writing good solid macros”—makes about as much sense as refreshing your skills at writing code on punch cards. You are exercising an archaic practice that is dying out, and is unwelcome in any modern project.</p>
+<pre><code>enum MsgTy {
+    OK = 0,
+    WARNING,
+    ERROR,
+    CRITICAL,
+};
+</code></pre>
+<p>In modern C++, you should use a strong <code>enum</code>—an <code>enum class</code>. That way your enumerators won’t pollute the namespace.</p>
+<p>Speaking of polluting the namespace, the almost universal convention in C++ is that all-caps identifiers are used for preprocessor defines. By using them in this case, you run the risk of someone else’s macro definitions fuggering up your <code>enum</code>. And given that having a macro named something like <code>ERROR</code> is <em>highly</em> likely in large enough projects, you’re really cruising for a bruising here. (Actually, POSIX reserves everything starting with <code>E</code> followed by a digit or uppercase letter… so you’re <em>REALLY</em> asking for trouble with that in particular.)</p>
+<p>I’m also not keen on the name <code>MsgTy</code>. Seems a little ugly and obtuse. I get that you want it to be short but… this seems a bit much.</p>
+<pre><code>class FileWriter {
+    std::string filename_;
+    std::ostringstream msg_;
+public:
+    FileWriter(const std::string&amp; filename, std::ostringstream&amp; msg) 
+      : filename_{ filename } {
+        operator()(msg);
+    }
+
+    void operator()(std::ostringstream&amp; msg) {
+        std::ofstream out("log.txt", std::ios::app);
+        out &lt;&lt; msg.str();        
+    }
+};
+</code></pre>
+<p>Oi, this class is….</p>
+<p>First off… what is the point of the data members? You don’t use either of them.</p>
+<p>Second… what’s the point of the function call operator? You could just as well do all the work in the constructor. You never use the function call operator anywhere else.</p>
+<p>Third… what’s the point of taking the argument as a string stream when you just go ahead and re-format it through a file stream? You’re double-formatting it.</p>
+<p>This entire class could boil down to:</p>
+<pre><code>struct FileWriter
+{
+    FileWriter(std::string_view filename, std::string_view msg)
+    {
+        auto out = std::ofstream{filename, std::ios_base::app};
+        out &lt;&lt; msg;
+    }
+};
+</code></pre>
+<p>But even then, I’m not sure this is a great idea, because you’re reopening the file every time you’re writing a new log line, then closing it after. That doesn’t seem like a great idea, efficiency-wise.</p>
+<p>A better idea would be to open the file once, and keep it open. Then just syncronize your writes (assuming you care about concurrency, which it sure doesn’t look like it), and flush after every log line. Normally <code>std::endl</code> is a terrible idea… but flushing after every line is <em>exactly</em> the singular use case it’s actually intended for.</p>
+<pre><code>static std::map&lt;MsgTy, std::string&gt; msg_id{
+    {MsgTy::OK, {"OK: "}},
+    {MsgTy::WARNING, {"WARNING: "}},  
+    {MsgTy::ERROR, {"ERROR: "}},
+    {MsgTy::CRITICAL, {"CRITICAL: "}}
+};
+</code></pre>
+<p>As far as mapping enumerators to strings, this isn’t really the best way to go about it. It’s astoundingly inefficient and clunky for what should be a trivial task. A <code>std::map</code> is a <em>heavyweight</em> object… using it for literally 4 elements is… not a good usage.</p>
+<p>A better solution is to either implement a <code>to_string()</code> function:</p>
+<pre><code>constexpr auto to_string(MsgTy mt)
+{
+    using namespace std::string_view_literals;
+
+    switch (mt)
+    {
+    case MsgTy::OK:
+        return "OK"sv;
+    case MsgTy::WARNING:
+        return "WARNING"sv;
+    case MsgTy::ERROR:
+        return "ERROR"sv;
+    case MsgTy::CRITICAL:
+        return "CRITICAL"sv;
+    }
+}
+</code></pre>
+<p>or to implement a stream inserter for the type:</p>
+<pre><code>template &lt;typename CharT, typename Traits&gt;
+auto operator&lt;&lt;(std::basic_ostream&lt;CharT, Traits&gt;&amp; o, MsgTy mt)
+    -&gt; std::basic_ostream&lt;CharT, Traits&gt;&amp;
+{
+    switch (mt)
+    {
+    case MsgTy::OK:
+        o &lt;&lt; "OK";
+    case MsgTy::WARNING:
+        o &lt;&lt; "WARNING";
+    case MsgTy::ERROR:
+        o &lt;&lt; "ERROR";
+    case MsgTy::CRITICAL:
+        o &lt;&lt; "CRITICAL";
+    }
+
+    return o;
+}
+</code></pre>
+<p>or both.</p>
+<p>Either option will be hundreds, if not thousands of times faster than using a <code>std::map</code>.</p>
+<pre><code>#define messaging(MsgTy, msg, log2file)
+</code></pre>
+<p>Okay, this is where the meat of the code is, and this is what you really want the focus to be on. Unfortunately, this is all wrong. This is exactly the way you should <em>NEVER</em> write a macro.</p>
+<p>First let’s get the initial stuff out of the way. As I mentioned above, the convention in C++ (and even in C) is that macros should be in all caps. That’s not just for style, it’s because the unconstrained text replacement of the preprocessor is so dangerous. <code>messaging</code> isn’t exactly an uncommon word; it’s quite likely that it could be used for another identifer… with disastrous consequences. Using all caps accomplishes two things:</p>
+<ol>
+<li>it alerts people to what they’re messing with; and</li>
+<li>the only way it could every be used again is via a redefinition… which will trigger at least a warning.</li>
+</ol>
+<p>The other problem with this preamble is that you’re using the message type enumeration’s type name as the parameter name. I can’t imagine why you’d think that’s a good idea. The only reason it works in this case is that you’re using an old-style <code>enum</code>. If you tried using a modern <code>enum class</code>, this whole macro would break.</p>
+<p>There’s another issue buried in there: if the message type is <code>ERROR</code> or <code>CRITICAL</code>, you throw an exception. Okay, but the problem is the exception you throw is a <code>std::string</code>. If you run your program, it’s going to crash, because you catch a <code>std::exception</code>… but a <code>std::string</code> is not a <code>std::exception</code>. You probably want to either throw a <code>std::runtime_error</code> or, better, a custom exception type depending on whether it’s a <code>ERROR</code> or <code>CRITICAL</code> message.</p>
+<p>Finally, you’ve made a critical macro error: you have repeated the argument(s). You have correctly wrapped them in parentheses, which helps prevent unexpected interactions with the surrounding code when expanded… but doesn’t help with the fact they they’re expanded multiple times. If you use an expression that changes the first argument in particular, who knows what could happen.</p>
+<p>Overall, this is a terrible macro, for a number of reasons. First of all, it’s needlessly long. It injects almost <em>30 lines of code</em> every time it’s used! In your <code>main()</code>, that <code>try</code> block that looks like it only has 4 lines in fact expands to <em>well over 100 lines</em>. That’s just ridiculous.</p>
+<p>It’s also absurdly complex. Putting control flow in a macro is not just a “eh, it’s a thing you do”… it’s an absolute last resort. That’s really the golden rule of macros: keep them as simple as possible. That’s because they’re not only so hard to debug, but also because they’re expanded everywhere. They’re also exceptionally dangerous, so they should be written as simple as possible to avoid the need to ever tweak it in the future… as it is now, any time the requirements for how to log change, you have to mess with the macro code… which is playing with fire.</p>
+<p>And a macro this complex just destroys your performance. Firstly, it will just absolutely trash your cache because all that machine code gets dumped everywhere the macro is used. (Although, if you’re lucky, and the macro is <em>always</em> used as you demonstrate, the compiler can probably remove most of those <code>if</code>s.) But also, there are other side effects, too: for example, if <code>messaging()</code> were a function, profile-guided optimization would almost certainly mark the <code>OK</code> path as the hot path, and optimize the code accordingly… but that’s because there’s one <code>if</code> in one place; as a macro, that <code>if</code> gets repeated everywhere the macro is used, and it’s a different <code>if</code> every time, so PGO won’t help you much.</p>
+<p>As it is, the macro’s code is in dire need of a rewrite, because it’s so repetitive, and there’s so much hard-coded in there (specifically the file name, over and over and over). But screwing with a macro is always a dangerous proposition; it’s <em>MUCH</em> riskier than refactoring a function. (It’s also sometimes much more frustrating, because the moment you touch a macro, you have to recompile <em>everything</em>, whereas a function can (sometimes!) be tweaked in isolation.)</p>
+<p>And not only is it dodgy to use, hard to maintain, and inefficient… it’s also a terrible interface! Why is it necessary to specify whether you want the message written to the file or not on <em>EVERY</em> call? Isn’t assuming <code>true</code> a good default? With a function you could use an overload or a defaulted parameter for that, no problem.</p>
+<p>At a bare minimum, to improve this macro, you should refactor as much as possible into functions:</p>
+<pre><code>#define MESSAGING(mt, msg, log_to_file) do { \
+    auto const mt_ = (mt);
+
+    if (mt_ == MsgTy::ok) \
+        messaging_ok((msg), (log_to_file)); \
+    else if (mt_ == MsgTy::warning) \
+        messaging_warning((msg), (log_to_file)); \
+    else if (mt_ == MsgTy::error) \
+        messaging_error((msg), (log_to_file)); \
+    else if (mt_ == MsgTy::critical) \
+        messaging_critical((msg), (log_to_file)); \
+} while (false)
+</code></pre>
+<p>Now you can fuss with the logic of each option safely.</p>
+<p>Even better would be use static dispatch for this kind of thing. You could create a few types (<code>ok_t</code>, <code>warning_t</code>) and instances of those types (<code>ok</code>, <code>warning</code>), and then dispatch based on those:</p>
+<pre><code>struct ok_t {};
+inline constexpr auto ok = ok_t{};
+// etc. for the other message types
+
+auto messaging(ok_t, std::string_view msg, bool log_to_file = true)
+{
+    std::cout &lt;&lt; "OK: " &lt;&lt; msg &lt;&lt; std::endl; // endl to flush
+    
+    if (log_to_file)
+    {
+        auto out = std::ofstream{"log.txt", std::ios_base::app};
+        out &lt;&lt; "OK: " &lt;&lt; msg;
+        
+        // or better yet, have a class that keeps the log file open
+        // and just appends to it, rather than opening and closing
+        // it repeatedly.
+    }
+}
+// etc. for the other message types
+
+messaging(ok, "Everything is good!");
+messaging(warning, "Something isn't quite right!", false);
+messaging(error, "Something went wrong!");
+messaging(critical, "Something horribly went wrong!");
+</code></pre>
+<p>But that’s just one of dozens of techniques you can use to <em>AVOID</em> the use of macros… which is a much more useful skill to have in 2020.</p>
+<p>In other words, all this has brought us back to the original point I wasn’t going to belabour. The best macro is the one you don’t write.</p>
+<h1>Questions</h1>
+<h2>Are there any apparent issues with how I implemented the macro?</h2>
+<p>Yes, it is needlessly long and complex. Even for a <em>non</em> macro function, this is unnecessarily long and complex. It should be refactored into smaller functions for each of the four different behaviours.</p>
+<h2>Can there be any improvements made to it?</h2>
+<p>The best way to write a macro is: don’t.</p>
+<p>I can’t conceive of why anyone would <em>want</em> to write a macro in 2020. Macros were a dirty hack when they were first created back in the 1970s. There may be a few very rare cases where you still need them, but by and large, if you can possibly solve a problem <em>without</em> macro, then <em>THAT</em> is the skill you should be exercising.</p>
+<h2>Is the intent clear on its usage?</h2>
+<p>Eeeh? Not really.</p>
+<p>Is this the intended usage:</p>
+<pre><code>messaging(MsgTy::OK, 42, true);
+</code></pre>
+<p>Is this:</p>
+<pre><code>// won't work, but is it intended to?
+messaging(MsgTy::OK, "a" &lt;&lt; "b" &lt;&lt; "c", true);
+</code></pre>
+<h2>I'm also interested in any other feedback.</h2>
+<p>Don’t waste your time honing skills that nobody wants. Macros are old tech that are only, at best, tolerated, and only when there is absolutely no other option. The best skills you can learn regarding macros are ways to <em>NOT</em> use them. A programmer who is a master at writing macros, but because they don’t know all the ways they can avoid them always falls back to writing them, is less than useless to me on my projects.</p>
+<p>Bottom line: Don’t waste your time. Getting good at writing macros helps no one. Instead, learn the techniques for <em>AVOIDING</em> macros. <em>THOSE</em> are skills that are actually useful in 2020 and beyond.</p>
+    </div>

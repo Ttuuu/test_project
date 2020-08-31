@@ -1,0 +1,686 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I mainly decoupled the states from the bots putting a handler_list method inside each state.</p>
+
+<p>Briefly I comment some suggestions and good points Gareeth Reese made:</p>
+
+<ol>
+<li>Cutting source code lines to 80 chars. <em>Still pending. I'm doing it the next time I post</em></li>
+<li>The use of self.states and the index method to choose a next state is inefficient (proportional to number of states). The antipattern here is over-encapsulation, the co-ordination needs to be handled at a higher level,for example in a state machine class like your Progress class. <em>Still pending</em></li>
+<li><p>The data structure that's needed is a mapping from state to next state, for example, in the Progress class you could have:</p>
+
+<pre><code>_state_order = [NoneState(), DepState(), NodeState(), ...]
+_next_state = dict(zip(_state_order[:-1], _state_order[1:]))
+</code></pre></li>
+</ol>
+
+<p>and then in the Progress.next_state method you'd write:</p>
+
+<pre><code>self.state = self._next_state[self.state]
+</code></pre>
+
+<ol start="4">
+<li><p>The message method is only used in the context</p>
+
+<pre><code>self.message(update).reply_text(...)
+</code></pre></li>
+</ol>
+
+<p>The duplicated code could be eliminated like this:</p>
+
+<pre><code>def reply_text(self, update, *args, *kwargs):
+"""Reply to a Telegram update ..."""
+    if update.callback_query:
+        message = update.callback_query.message
+    else:
+        message = update.message
+    message.reply_text(*args, **kwargs)
+</code></pre>
+
+<p>And since this does not use self, it does not need to be a method on a class, it could be a @staticmethod or, better, an ordinary function. <em>Tried it but some parameter was giving an error</em></p>
+
+<ol start="5">
+<li><p>Borg pattern is unnecessary and its machinery can be dropped from the StepState class. <em>Still thinking about it</em></p></li>
+<li><p>After removing all these attributes and methods, the only attribute remaining is progress. This is only used in the handle method, and so it would make sense to pass it as a parameter to that method and avoid the need for the attribute. <em>Still thinking about it</em></p></li>
+<li><p><em>Still pending as well</em>. After removing the progress attribute, none of the remaining methods use self, so there's no need to create state objects, you can just use the state classes as namespaces for the draw_ui and handle functions:</p>
+
+<pre><code>_state_order = [NoneState, DepState, NodeState, ...]
+</code></pre></li>
+</ol>
+
+<p>I evolved a little bit the code until I came to this below. I know that many changes are still pending and DRY principle is broken, but the main things are done:</p>
+
+<p><strong>step_states</strong>:</p>
+
+<pre><code>class StepState(metaclass=ABCMeta):
+    """
+    This is a Borg class which shares state and methods so all the instances created for it are different references
+    but containing the same values. This is also true for children of the same class, so:
+
+        Children1() == Children1()  #  False, because references are different, but the values are the same.
+                                        Also if you change one, you change the other
+        Children1() == Children2()  # False, references are different and you can change anyone without affecting others
+    """
+    states = []
+
+    # State is a Borg design pattern class
+    __shared_state = {}
+
+    def __init__(self):
+        self.__dict__ = self.__shared_state
+
+
+    @staticmethod
+    def message(update):
+        """
+        Returns the object holding the info coming from Telegram with the methods for replying
+        and looking into this info
+        :param update: the Telegram update, probably a text message
+        :return: the update or query object
+        """
+        if update.callback_query:
+            return update.callback_query.message
+        else:
+            return update.message
+
+    @abstractmethod
+    def draw_ui(self, bot, update):
+        """
+        Draws the UI in Telegram (usually a custom keyboard) for the user to input data
+        :param bot: the Telegram bot
+        :param update: the Telegram update, probably a text message
+        """
+        pass
+
+    @abstractmethod
+    def handle(self, bot=None, update=None):
+        """
+        Handles all the input info into the Progress object and transitions to the next state
+        :param bot: the Telegram bot
+        :param update: the Telegram update, probably a text message
+        """
+        logger.info('Handling state {} in parent'.format(self.__class__.__name__))
+        self.progress = Progress()
+        if update and update.callback_query:
+            query = update.callback_query
+            if query.data == CANCEL:
+                return self.cancel(bot, update)
+
+    @abstractmethod
+    def handler_list(self):
+        """
+        Returns the list with the handlers for managing the events for this state
+            Example: return [ CallbackQueryHandler(callbackFunc), CommandHandler('cmd', commandFunc)]
+
+            Will apply the callbackFunc for managing a query-like update, but if not,
+            will try to apply commandFunc for an incoming command /cmd
+        :return: the handlers list
+        """
+        pass
+
+    def next_state(self, new_state=None):
+        """
+        Inherited method which decides to move to the next state, or to the specified state if any
+        :param new_state: the next state, if any
+        :return: the next state
+        """
+        # TODO Check if the transition is allowed?
+        next_new_state = None
+        if new_state is None:
+            default_next_state_index = (self.index + 1) % len(self.states)
+            next_new_state = self.states[default_next_state_index]
+        else:
+            next_new_state = new_state
+        logger.info('Actual state: {} =&gt; switched to new state {}'.format(self, next_new_state))
+        return next_new_state
+
+    @staticmethod
+    def skip(bot, update):
+        """
+        Skips this step in the wizard process
+        :param bot: the Telegram bot
+        :param update: the Telegram update, probably a text message
+        :return: the next state skipping the present one
+        """
+        logger.info('Skipping state {}'.format(Progress().state))
+        update.message.reply_text("Se salta este paso.")
+
+        # If we don't cancel at the end, we should remove any keyboard which could be present
+
+        Progress().next_state()
+        Progress().state.draw_ui(bot, update)
+
+        return Progress().state
+
+    @staticmethod
+    def cancel(bot, update):
+        """
+        Cancels the whole wizard process
+        :param bot: the Telegram bot
+        :param update: the Telegram update, probably a text message
+        :return: the END state for he ConversationHandler
+        """
+        Progress().clear()
+
+        user = StepState.message(update).from_user
+        logger.info("{} canceled the process.".format(user.first_name))
+        StepState.message(update).reply_text('Proceso finalizado.', reply_markup=ReplyKeyboardRemove())
+
+        return ConversationHandler.END
+
+    def validate_input(self, input_data):
+        """
+        Validates the input data for this step/state
+        :param input_data: the input data
+        :return: True if input data is valid, otherwise False
+        """
+        return True
+
+    @property
+    def index(self):
+        """
+        Returns the index of this state within the list with all states
+        :return: the index as an int
+        """
+        return StepState.states.index(self)
+
+    def __eq__(self, other):
+        return self.__hash__() == other.__hash__()
+
+    def __hash__(self):
+        return hash(self.__class__.__name__)
+
+    def __str__(self):
+        return self.__class__.__name__
+
+
+class DepState(StepState):
+    def draw_ui(self, bot, update):
+        reply_keyboard = [
+        ]
+        num_cols = 3
+        current_row = []
+
+        # Think of SEARCH_INDEXES as a list with objects having two strings: spanish_description and browse_node_id
+        for dep in SEARCH_INDEXES:
+            current_row.append(InlineKeyboardButton(dep.spanish_desc,
+                                                    callback_data="{}={}".format(dep.browse_node_id, dep.spanish_desc)))
+            if len(current_row) &gt;= num_cols:
+                reply_keyboard.append(current_row)
+                current_row = []
+        reply_markup = InlineKeyboardMarkup(reply_keyboard)
+
+        self.message(update).reply_text('Enter the *departament*, do /skip or /cancel',
+                                            parse_mode='Markdown', reply_markup=reply_markup)
+
+    def handle(self, bot=None, update=None):
+        parent_result = super().handle(bot, update)
+        if parent_result is not None:
+            return parent_result
+        query = update.callback_query
+        if query.data:
+            current_input_dep, text = query.data.split('=')
+            bot.edit_message_text(text="Departament chosen: {}".format(text), chat_id=query.message.chat_id,
+                                  message_id=query.message.message_id)
+
+            # We optionally log anything
+
+            Progress().input_dep = current_input_dep
+
+            Progress().next_state()
+            Progress().state.draw_ui(bot, update)
+
+            return Progress().state
+
+class NodeState(StepState):
+    def draw_ui(self, bot, update):
+        reply_keyboard = [
+            [InlineKeyboardButton('Delete', callback_data=DELETE)],
+            [InlineKeyboardButton(str(number), callback_data=str(number)) for number in range(5)],
+            [InlineKeyboardButton(str(number), callback_data=str(number)) for number in range(5, 10)],
+            [InlineKeyboardButton('Accept', callback_data=OK),
+             InlineKeyboardButton('Cancel', callback_data=CANCEL)],
+        ]
+        reply_markup = InlineKeyboardMarkup(reply_keyboard)
+        self.message(update).reply_text('Input numbers for the node, do /skip or /cancel',
+                                        parse_mode='Markdown', reply_markup=reply_markup)
+        # We get the reference to the message we will use to update the value and set into Progress
+        Progress().tracking_message = self.message(update).reply_text("Typed data : {}".format(''))
+
+    def handle(self, bot=None, update=None):
+        parent_result = super().handle(bot, update)
+        if parent_result is not None:
+            return parent_result
+        query = update.callback_query
+        if hasattr(query, 'data'):
+            if query.data == OK:
+                if self.validate_input(self.progress.input_node):
+                    bot.edit_message_text(text="Chosen node: {}".format(self.progress.input_node),
+                                          chat_id=query.message.chat_id, message_id=query.message.message_id)
+
+                    bot.delete_message(chat_id=Progress().tracking_message.chat_id,
+                                       message_id=Progress().tracking_message.message_id)
+                    Progress().next_state()
+                else:
+                    no_keywords = self.progress.input_keywords is None or not self.progress.input_keywords.strip()
+
+                    if self.progress.input_node:
+                        self.message(update).reply_text('Not allowed value')
+                        self.progress.input_node = ''
+                    elif no_keywords:
+                        # If there are no keywords, then the node is mandatory
+                        self.message(update).reply_text('This input is mandatory. Enter an allowed value')
+                    Progress().next_state(self)
+
+                Progress().state.draw_ui(bot, update)
+            return Progress().state
+        else:
+            if not self.progress.input_node:
+                self.progress.input_node = ''
+
+            if query.data == DELETE:
+                if len(self.progress.input_node):
+                    self.progress.input_node = self.progress.input_node[:-1]
+            else:
+                self.progress.input_node += query.data
+
+            # We update the output so the user sees if he types correctly
+            bot.edit_message_text(text="Input data:  {}".format(self.progress.input_node),
+                                  chat_id=query.message.chat_id,
+                                  message_id=Progress().tracking_message.message_id)
+        else:
+            if update.message.text and self.validate_input(update.message.text):
+                self.progress.input_node = update.message.text
+                Progress().next_state()
+                Progress().state.draw_ui(bot, update)
+            elif not self.validate_input(update.message.text):
+                self.message(update).reply_text('Valor no admitido')
+                self.message(update).reply_text('Este dato es obligatorio. Introduzca un valor valido')
+                self.progress.input_node = ''
+                Progress().next_state(self)
+                Progress().state.draw_ui(bot, update)
+            return Progress().state
+
+    @staticmethod
+    def skip(bot, update):
+        logger.info('Skipping state {}'.format(Progress().state))
+
+        # If we don't cancel at the end, we should remove any keyboard which could be present
+        if Progress().input_keywords is None or not Progress().input_keywords.strip():
+            update.message.reply_text('Este dato es obligatorio. Introduzca un valor valido')
+        else:
+            Progress().input_node = ''
+            Progress().next_state()
+            update.message.reply_text("Se salta este paso.")
+
+        Progress().state.draw_ui(bot, update)
+        return Progress().state
+
+    def validate_input(self, input_data):
+        data = input_data
+        if type(input_data) is str:
+            data = int(data.strip())
+
+        response = requests.get('https://www.amazon.es/exec/obidos/tg/browse/-/{}'.format(data))
+        return response.status_code == 200
+
+    def handler_list(self):
+        return [RegexHandler('^(\d+)$', self.handle),
+                CallbackQueryHandler(self.handle), CommandHandler('skip', self.skip)]
+
+
+class BlogState(StepState):
+    def draw_ui(self, bot, update):
+
+        reply_keyboard = [
+            [InlineKeyboardButton(blog, callback_data='{}={}'.format(blog, bid)) for blog, bid in sorted(get_blogs().items())]
+        ]
+        reply_markup = InlineKeyboardMarkup(reply_keyboard)
+        self.message(update).reply_text('Choose an option, /skip or  /cancel', parse_mode='Markdown',reply_markup=reply_markup)
+
+    def handle(self, bot=None, update=None):
+        parent_result = super().handle(bot, update)
+        if parent_result is not None:
+            return parent_result
+        query = update.callback_query
+        if query.data:
+            bname, bid = query.data.split('=')
+            bot.edit_message_text(text="Chosen option: {}".format(bname), chat_id=query.message.chat_id,
+                                  message_id=query.message.message_id)
+
+            # We optionally log anything
+
+            # We text the user the requirements for next state
+            # query.message.reply_text('Departamento elegido. ', reply_markup=ReplyKeyboardRemove())
+
+            Progress().input_blog = (bname,bid)
+
+            if bname == 'xxx':
+                Progress().input_dep = HEALTH.browse_node_id
+                Progress().next_state(KeywordsState())
+            elif bname == 'books':
+                Progress().input_dep = BOOKS.browse_node_id
+                Progress().next_state(KeywordsState())
+            else:
+                Progress().next_state()
+
+            Progress().state.draw_ui(bot, update)
+
+            return Progress().state
+
+    def handler_list(self):
+        return [CallbackQueryHandler(self.handle), CommandHandler('skip', self.skip)]
+
+
+class StartTimeState(StepState):
+    def draw_ui(self, bot, update):
+        reply_keyboard = [
+            [InlineKeyboardButton('Delete', callback_data=DELETE)],
+            [InlineKeyboardButton(str(number), callback_data=str(number)) for number in range(5)],
+            [InlineKeyboardButton(str(number), callback_data=str(number)) for number in range(5, 10)],
+            [InlineKeyboardButton(':', callback_data=':')],
+            [InlineKeyboardButton('Accept', callback_data=OK),
+             InlineKeyboardButton('Cancel', callback_data=CANCEL)],
+        ]
+        reply_markup = InlineKeyboardMarkup(reply_keyboard)
+        self.message(update).reply_text('Input start time or /cancel', 
+                                        parse_mode='Markdown', reply_markup=reply_markup)
+        # We get the reference to the message we will use to update the value and set into Progress
+        Progress().tracking_message = self.message(update).reply_text("Start time: {}".format(''))
+
+    def handle(self, bot=None, update=None):
+        parent_result = super().handle(bot, update)
+        if parent_result is not None:
+            return parent_result
+        query = update.callback_query
+
+        if hasattr(query, 'data'):
+            if query.data == OK:
+                bot.delete_message(chat_id=query.message.chat_id, message_id=query.message.message_id)
+
+                Progress().next_state()
+                Progress().state.draw_ui(bot, update)
+
+                return Progress().state
+            else:
+                if not self.progress.input_start_time:
+                    self.progress.input_start_time = ''
+                if query.data == DELETE:
+                    if len(self.progress.input_start_time):
+                        self.progress.input_start_time = self.progress.input_start_time[:-1]
+                else:
+                    self.progress.input_start_time += query.data
+
+                # We update the output so the user sees if he types correctly
+                bot.edit_message_text(text="Start time: {}".format(self.progress.input_start_time),
+                                      chat_id=query.message.chat_id,
+                                      message_id=Progress().tracking_message.message_id)
+        else:
+            if update.message.text and self.validate_input(update.message.text):
+                self.progress.input_start_time = update.message.text
+                Progress().next_state()
+                Progress().state.draw_ui(bot, update)
+            elif not self.validate_input(update.message.text):
+                self.message(update).reply_text('Valor no admitido')
+                self.message(update).reply_text('Este dato es obligatorio. Introduzca un valor valido')
+                self.progress.input_start_time = ''
+                Progress().next_state(self)
+                Progress().state.draw_ui(bot, update)
+            return Progress().state
+
+    def handler_list(self):
+        return [RegexHandler(TIME_REGEX, self.handle),
+                CallbackQueryHandler(self.handle), CommandHandler('skip', self.skip)]
+
+
+# ... more states
+# ... more and more states
+# ...and so on, you can imagine
+
+
+class KeywordsState(StepState):
+    name = 'KeywordsState'
+
+    def draw_ui(self, bot, update):
+        self.message(update).reply_text('Enter keywords', parse_mode='Markdown', 
+                                        reply_markup=ReplyKeyboardRemove())
+
+    def handle(self, bot=None, update=None):
+        parent_result = super().handle(bot, update)
+        if parent_result is not None:
+            return parent_result
+
+        keywords = update.message.text.strip()
+
+        if keywords:
+            Progress().input_keywords = keywords
+            update.message.reply_text('Thanks. The keywords are: {}'.format(keywords))
+            # When SearchIndex equals All, BrowseNode cannot be present
+            if Progress().input_dep is None:
+                Progress().next_state(StartTimeState())
+            else:
+                Progress().next_state()
+        else:
+            update.message.reply_text('No ha introducido palabras. Introdúzcalas, haga /skip o /cancel')
+            Progress().next_state(self)
+
+        Progress().state.draw_ui(bot, update)
+
+        return Progress().state
+
+    @staticmethod
+    def skip(bot, update):
+        logger.info('Skipping state {}'.format(Progress().state))
+
+        # If we don't cancel at the end, we should remove any keyboard which could be present
+        if Progress().input_dep is None:
+            update.message.reply_text('Este dato es obligatorio. Introduzca un valor valido')
+        else:
+            Progress().input_keywords = None
+            Progress().next_state()
+            update.message.reply_text("Skipping this step.")
+
+        Progress().state.draw_ui(bot, update)
+        return Progress().state
+
+    def handler_list(self):
+        return [MessageHandler(Filters.text, self.handle), CommandHandler('skip', self.skip)]
+
+class ConfirmState(StepState):
+
+    def draw_ui(self, bot, update):
+        self.message(update).reply_text('Confirm all this info: {!s}'.format(Progress()))
+        reply_keyboard = [
+            [InlineKeyboardButton('Accept', callback_data=OK),
+             InlineKeyboardButton('Cancel', callback_data=CANCEL)],
+        ]
+        reply_markup = InlineKeyboardMarkup(reply_keyboard)
+        self.message(update).reply_text('Accept or cancel (/cancel)', reply_markup=reply_markup)
+
+        # This returns a generator with a data list to consume
+        self.generator = search_asins(Progress().input_dep, Progress().input_node, Progress().input_keywords)
+
+    def handle(self, bot=None, update=None):
+        parent_result = super().handle(bot, update)
+        if parent_result is not None:
+            return parent_result
+        # OK granted, CANCEL is managed in parent
+        query = update.callback_query
+
+        # We finished with the wizard and launch everything
+        # Launching stuff here...
+        # ...
+
+        # Progress should be reset
+        self.progress.clear()
+        Progress().next_state(NoneState())
+        return ConversationHandler.END
+
+    def handler_list(self):
+        return [CallbackQueryHandler(self.handle)]
+
+
+# This is intended for setting the steps in an ordered-sorted way
+StepState.states = [
+    NoneState(), BlogState(), DepState(), KeywordsState(), NodeState(), StartTimeState(),
+    IntervalState(), EndTimeState(), RepeatsState(), ConfirmState()
+]
+
+
+class Progress(object):
+    """
+    This singleton class contains the whole information collected along all the wizard process
+    """
+    __instance = None
+
+    def __new__(cls):
+        if Progress.__instance is None:
+            Progress.__instance = object.__new__(cls)
+            Progress.__instance.input_blog = None
+            Progress.__instance.state = NoneState()
+            Progress.__instance.tracking_message = None
+            Progress.__instance.input_dep = None
+            Progress.__instance.input_node = None
+            Progress.__instance.input_minutes = '60'
+            Progress.__instance.input_start_time = None
+            Progress.__instance.input_end_time = None
+            Progress.__instance.input_keywords = None
+            Progress.__instance.input_repeats = None
+        return Progress.__instance
+
+    def clear(self):
+        """
+        Resets the progress
+        """
+        self.input_blog = None
+        self.state = NoneState()
+        self.tracking_message = None
+        self.input_dep = None
+        self.input_node = None
+        self.input_minutes = '60'
+        self.input_start_time = None
+        self.input_end_time = None
+        self.input_keywords = None
+
+    def next_state(self, new_state=None):
+        """
+        Moves to the next state or to the specified state if any
+        :param new_state: the next state to move to
+        :return: the next state, already set to the Progress object
+        """
+        if new_state is not None:
+            if self.state:
+                self.state = self.state.next_state(new_state)
+            else:
+                self.state = NoneState
+                logger.info("It was impossible o move to the next state")
+        else:
+            self.state = self.state.next_state()
+
+    def __str__(self):
+        return "{}: blog={}, dep={}, node={}, start={}, " \
+               "interval={}', end={}, repeats={}, keywords={}".format(self.__class__.__name__,self.input_blog[0],self.input_dep,self.input_node,self.input_start_time,self.input_minutes,self.input_end_time,self.input_repeats,self.input_keywords)
+</code></pre>
+
+<p><strong>bot.py</strong>:</p>
+
+<pre><code>#!/usr/bin/python3
+
+from telegram.ext import (Updater, Filters, CommandHandler, ConversationHandler, MessageHandler)
+
+from my_package.step_states import Progress, StepState
+from environments import get_bot_token, getLogger
+
+# Enable logging
+logger = getLogger(__name__)
+
+updater = Updater(get_bot_token())
+
+
+def start(bot, update):
+    """
+    Sends a message when the command /start is issued.
+    :param bot: the bot
+    :param update: the update info from Telegram for this command
+    """
+    update.message.reply_text('Bot started')
+
+def error(bot, update, error):
+    """
+    Logs errors
+    :param bot: the Telegram bot
+    :param update: the Telegram update, probably a text message
+       """
+    logger.error('Update "%s" caused error "%s"', update, error)  
+
+
+def restricted(my_handler):
+    """
+    Decorates a handler for restricting its use
+    :param my_handler: the handler to be restricted
+    :return: the restricted handler
+    """
+    @wraps(my_handler)
+    def wrapped(bot, update, *args, **kwargs):
+        user_id, user_name = update.effective_user.id, update.effective_user.first_name
+        if user_id not in get_allowed_users():
+            update.message.reply_text("Unauthorized access {} con id {}.\n".format(user_name, user_id))
+            return
+        logger.info('Entering {} '.format(my_handler.__name__))
+        return my_handler(bot, update, *args, **kwargs)
+    return wrapped
+
+
+@restricted
+def plan(bot, update):  #, blog_id=get_blog_id(), interval=60, dep_param_id=None):
+    """
+    Starts the wizard for scheduling item posts
+    :param bot: the bot
+    :param update: the update info from Telegram for this command
+    """
+    p = Progress()
+
+    p.next_state()
+    p.state.draw_ui(bot, update)
+
+    return p.state
+
+
+def main():
+    """Start the bot."""
+    # Create the EventHandler and pass it your bot's token.
+    global updater
+
+    # Get the dispatcher to register handlers
+    dp = updater.dispatcher
+
+    # on different commands - answer in Telegram
+    dp.add_handler(CommandHandler('start', start))
+
+    # Add conversation handler with the states
+    # The telegram conversation handler needs a handler_list with functions
+    # so it can execute desired code in each state/step
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('plan', plan)],
+        # We enter all the states and all the configured handlers for each state
+        states={state: state.handler_list() for state in StepState.states},
+        fallbacks=[CommandHandler('cancel', StepState.cancel)]
+    )
+
+    dp.add_handler(conv_handler)
+
+    # log all errors
+    dp.add_error_handler(error)
+
+    # Start the Bot
+    updater.start_polling()
+
+    # Run the bot until you press Ctrl-C or the process receives SIGINT,
+    # SIGTERM or SIGABRT. This should be used most of the time, since
+    # start_polling() is non-blocking and will stop the bot gracefully.
+    updater.idle()
+
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+    </div>

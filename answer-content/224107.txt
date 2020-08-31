@@ -1,0 +1,184 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Most of your variables should be <code>static readonly</code></h1>
+
+<p>There is no reason to new up a brand new copy of the arrays of characters each time you run this function. Instead:</p>
+
+<pre><code>public static readonly ReadOnlyCollection&lt;char&gt; AllowedLower = ReadOnlyCollection&lt;char&gt;("abcdefghijklmnopqrstuvwxyz");
+public static readonly ReadOnlyCollection&lt;char&gt; AllowedUpper = new ReadOnlyCollection&lt;char&gt;(AllowedLower.Select(x =&gt; char.ToUpper(x)));
+public static readonly ReadOnlyCollection&lt;char&gt; AllowedDigits = new ReadOnlyCollection&lt;char&gt;("0123456789");
+</code></pre>
+
+<p>Note that for static, read only lists of things, we use <a href="https://docs.microsoft.com/en-us/dotnet/api/system.collections.objectmodel.readonlycollection-1" rel="nofollow noreferrer"><code>ReadOnlyCollection</code></a> to prevent modification at run time. There are some alternative implementations of read only collections in .NET depending on your version; any of them is also fine.</p>
+
+<p>While we're at it, we can greatly improve readability by passing just one string, which implements <code>IEnumerable&lt;char&gt;</code>.</p>
+
+<h1>Randomness problems</h1>
+
+<p>You have two incredibly major problems with randomness:</p>
+
+<ol>
+<li>The first is that you create a new instance of <code>Random</code> each time you invoke the function. That is <strong><em>wrong</em></strong>. You <em>must reuse</em> the same instance of a random number generator when generating many random numbers to ensure that it is sufficiently random.</li>
+<li>You're using <code>Random</code> which doesn't meet the level of randomness required for security algorithms. You need this level of randomness for generating passwords. You should use <a href="https://docs.microsoft.com/en-us/dotnet/api/system.security.cryptography.rngcryptoserviceprovider" rel="nofollow noreferrer"><code>RNGCryptoServiceProvider</code></a>.</li>
+</ol>
+
+<pre><code>public static readonly RNGCryptoServiceProvider SecureRNG = new RNGCryptoServiceProvider();
+</code></pre>
+
+<h1>Selecting random characters</h1>
+
+<p>Once the minimum requirements for each group of characters is met, you use a two stage random selection to choose the remaining characters. Because each group is not of the same length, this actually reduces the randomness. Any single digit has a higher probability of being selected than any single letter.</p>
+
+<p>To resolve this, combine all of the characters into a single collection:</p>
+
+<pre><code>public static readonly ReadOnlyCollection&lt;char&gt; PasswordAlphabet = new ReadOnlyCollection&lt;char&gt;(AllowedLower.Concat(AllowedUpper).Concat(AllowedDigits));
+</code></pre>
+
+<p>And then select from that:</p>
+
+<pre><code>generatedPassword += PasswordAlphabet[randomIndex]
+</code></pre>
+
+<h1>Use a more standard shuffle algorithm</h1>
+
+<p>Since we can't use <code>Random</code> and <code>RNGCryptoServiceProvider</code> doesn't provide a <code>Next()</code>, using <code>OrderBy</code> to shuffle the password becomes more difficult. We need to ensure that our shuffling doesn't have biases in the order, and we need to do so without using <code>double</code>s.</p>
+
+<p>Luckily, this is a <a href="https://stackoverflow.com/a/1262619/1394393">solved problem</a>. We'll use that solution.</p>
+
+<h1>Selecting a random character from the lists</h1>
+
+<p>You may have noticed that we skipped over how to generate <code>randomIndex</code> in the code above that selects a random character. That is because <code>RNGCryptoServiceProvider</code> does not readily implement a means of doing so. We'll need to implement the ability to randomly select from a range of values.</p>
+
+<p>The typical way of generating a random integer in a range is to <a href="https://stackoverflow.com/a/16907577/1394393">first calculate a random <code>double</code> and then multiply it by the range's length</a>. We can do this with a couple extension methods that we'll implement later.</p>
+
+<h1>Prefer LINQ to loops</h1>
+
+<p>We don't need a <code>for</code> loop here. We can use LINQ:</p>
+
+<pre><code>generatedPassword += String.Join(
+    "",
+    Enumerable.Range(0, length - 3).Select(i =&gt; /* Get a random character */)
+);
+</code></pre>
+
+<h1>Don't silently replace inputs</h1>
+
+<p>While it's good that you restricted your method to require at least an 8 character password, it's <em>not</em> good to return something that the caller did not ask for. Instead of replacing the length, throw an error:</p>
+
+<pre><code>if (length &lt; 8)
+{
+    throw new ArgumentException(paramName: nameof(length), message: "must be at least 8");
+}
+</code></pre>
+
+<p>Higher levels of code may choose to replace user input, but that kind of logic belongs there in the caller, not here in the depths of the implementation.</p>
+
+<h1>What about dependency injection?</h1>
+
+<p>Should any of this be written in the dependency injection style?</p>
+
+<p>Firstly, I would say that the secure RNG instance should <strong>not</strong> be injected. A random number generator is one of the few elements of code where doing so is a bad idea. The reason is the very mistake you made in your code: you need a single, permanent instance of the RNG reused over and over. The secure version is <a href="https://stackoverflow.com/q/10525521/1394393">notably thread safe</a>, so it's fine to have just a single instance. In fact, I would go so far as to say that if other classes need an RNG, then it should be move out of this class and into a global <code>static</code> one if possible. (It's possible performance requirements may override this advice, but in general, the fewer instances of RNGs you have and the more they're shared, the better.)</p>
+
+<p>Whether the method you're writing needs to be an instance that can be injected will depend on your requirements and the code base surrounding it. I don't see any particular harm in doing so, and I don't have enough context to know whether there's any benefit. The password generator I will present can be trivially converted into a stateless instance that could be injected, though.</p>
+
+<h1>Combining everything</h1>
+
+<p>First let's put our randomizing utilities in a separate class:</p>
+
+<pre><code>public static class SecureRandom
+{
+    // We should only ever have one instance of this.
+    // Other classes can use this freely, or methods can be added here.
+    public static readonly RNGCryptoServiceProvider SecureRNG = new RNGCryptoServiceProvider();
+
+    // NextDouble and Next based on https://stackoverflow.com/a/16907577
+
+    public static double NextDouble(this RNGCryptoServiceProvider secureRNG)
+    {
+        var data = new byte[sizeof(uint)];
+        secureRNG.GetBytes(data);
+        var randUint = BitConverter.ToUInt32(data, 0);
+        return randUint / (uint.MaxValue + 1.0);
+    }
+
+    public static int Next(this RNGCryptoServiceProvider secureRNG, int minValue, int maxValue)
+    {
+        if (minValue &gt; maxValue)
+        {
+            throw new ArgumentOutOfRangeException();
+        }
+
+        return minValue + (int)((maxValue - minValue) * secureRNG.NextDouble());
+    }
+
+    public static int Next(this RNGCryptoServiceProvider secureRNG, int maxValue)
+    {
+        return secureRNG.Next(0, maxValue);
+    }
+
+    private static T SelectElement&lt;T&gt;(this RNGCryptoServiceProvider secureRNG, IList&lt;T&gt; choices)
+    {
+        return choices[SecureRNG.Next(choices.Count)];
+    }
+
+    // Based on https://stackoverflow.com/a/1262619
+    private static void ToRandomOrder&lt;T&gt;(this RNGCryptoServiceProvider secureRNG, IEnumerable&lt;T&gt; sequence)
+    {
+        var workingList = new List&lt;T&gt;(sequence);
+
+        int n = workingList.Count;
+        while (n &gt; 1)
+        {
+            byte[] box = new byte[1];
+            do SecureRNG.GetBytes(box);
+            while (!(box[0] &lt; n * (Byte.MaxValue / n)));
+            int k = (box[0] % n);
+            n--;
+            T value = workingList[k];
+            workingList[k] = workingList[n];
+            workingList[n] = value;
+        }
+
+        return workingList;
+    }
+}
+</code></pre>
+
+<p>With our extension methods above, now we can write the full method:</p>
+
+<pre><code>using static SecureRandom;
+
+public static class SimplePasswordGenerator
+{
+    public static readonly ReadOnlyCollection&lt;char&gt; AllowedLower = ReadOnlyCollection&lt;char&gt;("abcdefghijklmnopqrstuvwxyz");
+    public static readonly ReadOnlyCollection&lt;char&gt; AllowedUpper = new ReadOnlyCollection&lt;char&gt;(AllowedLower.Select(x =&gt; char.ToUpper(x)));
+    public static readonly ReadOnlyCollection&lt;char&gt; AllowedDigits = new ReadOnlyCollection&lt;char&gt;("0123456789");
+
+    public static readonly ReadOnlyCollection&lt;char&gt; PasswordAlphabet = new ReadOnlyCollection&lt;char&gt;(
+        AllowedLower
+        .Concat(AllowedUpper)
+        .Concat(AllowedDigits)
+    );
+
+    public static string GenerateSimplePassword(int length = 8)
+    {
+        if (length &lt; 8)
+        {
+            throw new ArgumentException(paramName: nameof(length), message: "must be at least 8");
+        }
+
+        IEnumerable&lt;char&gt; passwordCharacters = new [] { 
+            // At least one from each list
+            SecureRNG.SelectElement(AllowedLower),
+            SecureRNG.SelectElement(AllowedUpper),
+            SecureRNG.SelectElement(AllowedDigits)
+        }
+
+        passwordCharacters = passwordCharacters.Concat(
+            Enumerable.Range(0, length - 3)
+            .Select(i =&gt; SecureRNG.SelectElement(PasswordAlphabet))
+        );
+
+        return String.Join("", SecureRNG.ToRandomOrder(passwordCharacters));
+    }
+</code></pre>
+    </div>

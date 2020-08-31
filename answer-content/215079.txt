@@ -1,0 +1,216 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>General/Style</h2>
+
+<ul>
+<li><p><strong>Line up instructions and operands in vertical columns to improve readability</strong> (like you've done with the comments); e.g.:</p>
+
+<pre><code>mov    var6, WINDOWS_NULL              ; put pointer to template handle into parameter slot 6
+call   CreateFile                      ; create file handle
+cmp    rax, WINDOWS_INVALID_HANDLE     ; validate file handle
+je     exitMain                        ; skip to exit point if create validation failed
+mov    var5, rax                       ; save a reference to the file handle for later (taking advantage of the unused parameter slot 5)
+jmp    readFileHeader                  ; skip to read file header
+; &lt;snip&gt;
+mov    rcx, var6                       ; put pointer to actual number of bytes that were read into rcx
+mov    edx, TRUE                       ; assume that body should be processed by storing TRUE in edx
+test   eax, eax                        ; validate file read operation (non-zero == no errors)
+cmovz  edx, eax                        ; store zero in edx if file read operation failed
+test   ecx, ecx                        ; check for end of file (non-zero == more data)
+cmovz  edx, ecx                        ; store zero in edx if end of file reached
+test   edx, edx                        ; test edx for zero
+</code></pre></li>
+<li><p>This is totally subjective and dependent on your preferred coding style, so you're free to ignore it, but I like to <strong>write assembler directives in all uppercase</strong> to make them easier to distinguish from instruction opcodes and registers. So, I'd write <code>PROC</code>, <code>END</code>, <code>TEXTEQU</code>, <code>ALIGN</code>, and so on in all caps.</p></li>
+<li><p>You've defined a series of <code>var*</code> constants like so:</p>
+
+<pre><code>var0 textequ &lt;rcx&gt;
+var1 textequ &lt;rdx&gt;
+var2 textequ &lt;r8&gt;
+var3 textequ &lt;r9&gt;
+var4 textequ &lt;qword ptr [(rsp + 20h)]&gt;
+var5 textequ &lt;qword ptr [(rsp + 28h)]&gt;
+var6 textequ &lt;qword ptr [(rsp + 30h)]&gt;
+</code></pre>
+
+<p>Presumably, these are intended to encapsulate the Windows x64 calling convention for argument passing. But if that's the case, they are misnamed. They're not <em>var</em>iables at all—they're <em>arg</em>uments. If you must define these, I suggest calling them <code>arg*</code>.</p>
+
+<p>But <strong>I'd really suggest just not defining them at all. If you're going to program in assembly, you need to know your standard calling conventions like the back of your hand.</strong> Maintenance programmers who don't know them or can't recall them need to stop and look them up. They're not going to change, so there's little point in trying to hide them away behind constants. That just obfuscates the code, in my opinion. It also hides the fact that some uses of <code>var*</code> access memory (dereferencing an address to obtain a value), while others are just reading an enregistered value. There's a big difference between the two, both in semantics and performance, so good code should make that difference obvious to the reader.</p>
+
+<p>Also, if you are going to keep them, your <strong>capitalization is inconsistent</strong>. Other constants (e.g., <code>TRUE</code>) are written in all-caps (which is a good convention). Why aren't these constants also written in all-caps?</p>
+
+<p>Finally, if you're going to keep them, use them consistently. You forgot to use <code>var0</code> when calling the <code>ExitProcess</code> function:</p>
+
+<pre><code>xor ecx, ecx                         ; set return value to zero
+call ExitProcess                     ; return control to Windows
+</code></pre></li>
+<li><p>Although <code>JE</code> == <code>JZ</code>, and <code>JNE</code> == <code>JNZ</code>, <strong>prefer to use the mnemonic with the most appropriate semantic meaning</strong>. After a <code>CMP</code> instruction, when you're checking for equality, either <code>JE</code> or <code>JNE</code> makes the most sense. But after a <code>TEST</code> instruction, where you're ANDing a register with itself just to set the zero flag, a <code>JZ</code> or <code>JNZ</code> makes the most sense. For example, I would rewrite:</p>
+
+<pre><code>test edx, edx                        ; test edx for zero
+jne readFileBody                     ; skip to read file body if edx was not zero
+</code></pre>
+
+<p>as</p>
+
+<pre><code>test  edx, edx
+jnz   readFileBody
+</code></pre>
+
+<p>(You did this already with <code>TEST</code>+<code>CMOVZ</code>.)</p></li>
+<li><p>Instead of packing the information about how you arrived at a magic number in a comment, <strong>write the arithmetic out explicitly</strong>. The assembler will fold the operations at assembly-time, so there won't be any cost. It's just more self-documenting for people looking at the code. In particular, this instruction:</p>
+
+<pre><code> sub  rsp, 1048h                       ; align with 16 while simultaneously making room on the stack for the "home space", some parameters, and a 4096 byte buffer
+</code></pre></li>
+<li><p>Some of your comments are a bit too verbose. This is subjective, and it's ironic for me to be the one saying this, because I tend to like to write long, descriptive comments, but you do have to maintain the right balance. Per-line comments that I write in "real" code are much shorter than the ones I regularly write in Stack Overflow and Code Golf answers, since those are intended more for expository purposes than real documentation. They're also intended to be understandable by people who aren't assembly-language programmers, but your assembly-language code shouldn't necessarily be targeting that same audience.</p></li>
+<li><p>You know that the <code>ExitProcess</code> function <em>should</em> not ever return control to your code, but I (and compilers) like to assert that by placing a trap immediately after the call. A simple <code>int 3</code> will do; it's a simple, one-byte opcode (0xCC) that causes either a break into the debugger (if one is attached) or a crash.</p>
+
+<pre><code>exitMain:
+    xor   ecx, ecx       ; process exit code is 0
+    call  ExitProcess    ; return control to Windows
+    int   3              ; trap if control ever reaches here
+</code></pre></li>
+</ul>
+
+<h2>Danger, Will Robinson!</h2>
+
+<p>You are allocating more than 4K bytes on the stack, which may be larger than the size of a page. Given the way the virtual memory manager works, you need to touch every 4Kth byte in order to force the stack to grow to the requested size. Otherwise, you risk getting access violations from hitting an uncommitted page.</p>
+
+<p>Microsoft's compiler automatically inserts stack-walking code that does this for you whenever you allocate more than 4K bytes of local variables inside of a function. This comes in the form of a call to the <code>__chkstk</code> function, which just reads every 4Kth byte from the previous stack top to the new stack top, ensuring that all of the necessary stack-reserved pages have actually been committed. (If there is no more memory available to commit the pages, then <code>__chkstk</code> fails.)</p>
+
+<p>So, in this case, the compiler would generate prologue code like the following:</p>
+
+<pre><code>Main PROC
+    mov   eax, 1048h
+    call  __chkstk
+    sub   rsp, rax
+    ; ...
+</code></pre>
+
+<p>See also: <a href="https://stackoverflow.com/questions/4123609/allocating-a-buffer-of-more-a-page-size-on-stack-will-corrupt-memory">Allocating a buffer of more a page size on stack will corrupt memory?</a> and <a href="https://stackoverflow.com/questions/8400118/what-is-the-purpose-of-the-chkstk-function">What is the purpose of the _chkstk() function?</a> on Stack Overflow.</p>
+
+<h2>Peephole Optimization</h2>
+
+<ul>
+<li><p><strong>Don't use <code>LEA</code> when <code>MOV</code> will do.</strong> The mnemonic suggests that <code>LEA</code> is the way to load an address, and indeed it will do that, but so will <code>MOV</code>, as long as you use the <code>OFFSET</code> operator. Substitute:</p>
+
+<pre><code>lea  var0, filePath
+</code></pre>
+
+<p>with</p>
+
+<pre><code>mov  var0, OFFSET filePath
+</code></pre>
+
+<p>Honestly, the biggest use of <code>LEA</code> in assembly code is as a fancy way to do general-purpose  integer arithmetic on non-address values, since it can perform addition with multiple operands, add <em>and</em> scale (by limited powers of two), simulate a three-operand instruction, and not clobber the flags. You will need it for scaled loads of addresses, but again, there, you're using its fancy address-calculation machinery, not simply to load an offset.</p></li>
+<li><p><strong>Use the non-volatile registers</strong> (<code>RBX</code>, <code>RBP</code>, <code>RDI</code>, <code>RSI</code>, and <code>R12</code> through <code>R15</code>) <strong>to store temporary values that you need to persist across function calls.</strong> The calling convention requires the contents of these registers to be persisted across calls, so anything you have in them will be safe. This abundance of registers on x64 allows you to avoid storing to the stack, and gain a bit more speed. So, replace:</p>
+
+<pre><code>mov var5, rax                        ; save a reference to the file handle for later (taking advantage of the unused parameter slot 5)
+</code></pre>
+
+<p>with something like:</p>
+
+<pre><code>mov  r15, rax
+</code></pre></li>
+<li><blockquote>
+  <p>there seemed to be some conflicting information about the cmov instruction and I still don't quite understand if I "should've" gone with an alternative that involves a jump or two.</p>
+</blockquote>
+
+<p>I'm not sure what the conflicting information was, but I can make it pretty simple for you:</p>
+
+<ul>
+<li>If the branch is <strong><em>predictable</em></strong>, then use an actual branch (jump). That will be faster (less overhead). Trust the branch predictor to do its job.</li>
+<li>If the branch is <strong><em>not predictable</em></strong> (because you have completely random input, or because it oscillates back and forth), then it is <em>probably</em> better to write branchless code using something like <code>CMOVcc</code> or <code>SETcc</code>. This will avoid the possibility of branch misprediction, at the cost of executing additional code each time.</li>
+</ul>
+
+<p>That's a good enough rule of thumb. Correctly-predicted branches are virtually free; mispredicted branches are extremely slow (relatively speaking). If you want more information, see <a href="https://stackoverflow.com/questions/40991778/an-expensive-jump-with-gcc-5-4-0/40993519#40993519">this answer</a>.</p>
+
+<p>Also keep in mind, though, that it is generally pointless to optimize code that is not a performance hotspot (like an inner loop). The branching code is shorter and simpler to write, so that should be your first instinct.</p>
+
+<p><strong>Branching code is especially appropriate for error handling code like what you have here</strong>, since:</p>
+
+<ul>
+<li>Error handling is (almost) never a performance hotspot, and</li>
+<li>Errors should be rare occurrences, and thus the direction of execution in an error check will be correctly predicted by the CPU's built-in branch predictor.</li>
+</ul>
+
+<p>In fact, optimizing C and C++ compilers even go so far as to explicitly put error-handling code on a cold path, and <a href="https://stackoverflow.com/questions/30130930/is-there-a-compiler-hint-for-gcc-to-force-branch-prediction-to-always-go-a-certa/30138565#30138565">there are annotations you can use to request this</a> if the optimizer isn't smart enough to do it on its own.</p>
+
+<p>Your current code is something like:</p>
+
+<pre><code>    call   ReadFile
+    mov    rcx, var6     ; rcx &lt;= count of bytes read
+    mov    edx, TRUE     ; assume success
+    test   eax, eax      ; read failed?
+    cmovz  edx, eax      ; edx = ((eax == 0) ? 0 : edx
+    test   ecx, ecx      ; reached EOF?
+    cmovz  edx, ecx      ; edx = ((ecx == 0) ? 0 : ecx
+    test   edx, edx      ; read succeeded and not at EOF?
+    jnz    readFileBody  ; if so, keep reading
+ readFileFooter:
+</code></pre>
+
+<p>…wait—is that even right? Stop and write a spec:</p>
+
+<ul>
+<li>If read operation failed (<code>ReadFile</code> returns 0 in <code>EAX</code>), stop and fall through to close the handle.</li>
+<li>If there are no more bytes to read (we've reached the EOF, indicated by the byte count in <code>ECX</code> being 0), stop and fall through to close the handle.</li>
+<li>Otherwise, keep looping and reading bytes from the file body.</li>
+</ul>
+
+<p>In C:</p>
+
+<pre><code>if   ((eax == 0) || (ecx == 0))  { break;    }
+else                             { continue; }
+</code></pre>
+
+<p>Right? Well, let me first take my own advice and write it as a series of branches:</p>
+
+<pre><code>   call   ReadFile
+   mov    rcx, var6       ; rcx &lt;= count of bytes read
+   test   eax, eax        ; read failed?
+   jz     readFileFooter  ; if so, abort
+   test   ecx, ecx        ; reached EOF?
+   jnz    readFileBody    ; if not, keep reading
+readFileFooter:
+</code></pre>
+
+<p>That's extremely simple and easy to understand. It's also going to be quite efficient, because branch prediction is going to be on your side.</p>
+
+<p>If you insisted upon writing it branchlessly, the first draft would be something like:</p>
+
+<pre><code>   call   ReadFile
+   mov    rcx, var6     ; rcx &lt;= count of bytes read
+   test   eax, eax      ; \ dl = 1 if read failed;
+   setz   dl            ; / dl = 0 if read succeeded
+   test   ecx, ecx      ; \ dh = 1 if reached EOF;
+   setz   dh            ; / dh = 0 if not at EOF
+   or     dl, dh        ; \ if read succeeded and not at EOF,
+   jnz    readFileBody  ; /  keep reading; otherwise, bail
+readFileFooter:
+</code></pre>
+
+<p>That is similar to your <code>CMOVcc</code> code, except that it uses <code>TESTcc</code> instead. It elides one instruction, but does risk a performance decrease on some microarchitectures where <a href="https://stackoverflow.com/questions/45660139/how-exactly-do-partial-registers-on-haswell-skylake-perform-writing-al-seems-to">partial registers are not renamed separately</a> (because we're using <code>DL</code> and <code>DH</code>, the two byte-accessible portions of the <code>EDX</code> register). We could solve this problem by rewriting as:</p>
+
+<pre><code>   call   ReadFile
+   mov    rcx, var6     ; rcx &lt;= count of bytes read
+   test   eax, eax      ; \ dl = 1 if read failed;
+   setz   dl            ; / dl = 0 if read succeeded
+   test   ecx, ecx      ; \ al = 1 if reached EOF;
+   setz   al            ; / al = 0 if not at EOF
+   or     al, dl        ; \ if read succeeded and not at EOF,
+   jnz    readFileBody  ; /  keep reading; otherwise, bail
+readFileFooter:
+</code></pre>
+
+<p>This clobbers <code>EAX</code> (or, at least, the low 8 bytes of it), but we don't care at this point, because we've already gotten the information we need from the <code>ReadFile</code> function's return value. It still isn't extremely performant code, though. The <code>SETcc</code> instructions have a relatively high latency, and there is a long dependency chain in these instructions. Your original <code>CMOVcc</code> version isn't much better on either of those fronts. I personally find the <code>SETcc</code> version more idiomatic and therefore more readable, but not strongly so; choose whichever you like better.</p>
+
+<p>Your revised <code>CMOVcc</code> version is better. Or, at least, it is <em>shorter</em>. Whether it's actually better is a matter for a profiler to decide. Shorter code is not necessarily "better" or faster.</p>
+
+<pre><code>   call  ReadFile
+   mov   ecx, -1       ; NOTE: prefer to write constant as -1, not 0FFFFFFFFh
+   test  eax, eax
+   cmovz ecx, eax
+   and   rcx, var6
+   jnz   readFileBody
+readFileFooter:
+</code></pre></li>
+</ul>
+    </div>

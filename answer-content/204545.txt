@@ -1,0 +1,94 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I ended up using <code>bytearray</code> as an input and output buffer. If found that if the output was something that doesn't buffer output (like a socket), then writing 77 bytes at a time would be very slow. Also my original code rounded the read size to be advantageous for base64, but not advantageous for MongoDB. It's better for the read size to match the MongoDB chunk size exactly. So the input is read into a <code>bytearray</code> with the exact size passed in, but then read in smaller base64 size chunks.</p>
+
+<pre><code>def chunked_encode(
+        input, output, read_size=DEFAULT_READ_SIZE, write_size=(base64.MAXLINESIZE + 1) * 64):
+    """
+    Read a file in configurable sized chunks and write to it base64
+    encoded to an output file.
+
+    Args:
+        input (file): File like object (implements ``read()``).
+        output (file): File like object (implements ``write()``).
+        read_size (int): How many bytes to read from ``input`` at
+            a time. More efficient if in increments of 57.
+        write_size (int): How many bytes to write at a time. More efficient
+            if in increments of 77.
+    """
+    # 57 bytes of input will be 76 bytes of base64
+    chunk_size = base64.MAXBINSIZE
+    base64_line_size = base64.MAXLINESIZE
+    # Read size needs to be in increments of chunk size for base64
+    # output to be RFC 3548 compliant.
+    buffer_read_size = max(chunk_size, read_size - (read_size % chunk_size))
+
+    input.seek(0)
+
+    read_buffer = bytearray()
+    write_buffer = bytearray()
+
+    while True:
+        # Read from file and store in buffer until we have enough data
+        # to meet buffer_read_size
+        while input and len(read_buffer) &lt; buffer_read_size:
+            s = input.read(read_size)
+            if s:
+                read_buffer.extend(s)
+            else:
+                # Nothing left to read
+                input = None
+
+        if not len(read_buffer):
+            # Nothing in buffer to read, finished
+            break
+
+        # Base 64 encode up to buffer_read_size and remove the trailing
+        # line break.
+        data = memoryview(b2a_base64(read_buffer[:buffer_read_size]))[:-1]
+        # Put any unread data back into the buffer
+        read_buffer = read_buffer[buffer_read_size:]
+
+        # Read the data in chunks of base64_line_size and append a
+        # linebreak
+        for pos in xrange(0, len(data), base64_line_size):
+            write_buffer.extend(data[pos:pos + base64_line_size])
+            write_buffer.extend('\n')
+
+            if len(write_buffer) &gt;= write_size:
+                # Flush write buffer
+                output.write(write_buffer)
+                del write_buffer[:]
+
+    if len(write_buffer):
+        output.write(write_buffer)
+        del write_buffer[:]
+</code></pre>
+
+<p>For 10 iterations of a 10 MB file (<a href="https://gist.github.com/six8/77a2ba0ef25216c6618a572d43555f06" rel="nofollow noreferrer">complete test</a>), this version is up to 5 times faster than standard base64 with large buffer sizes (&gt;969) when reading a file without buffering (like a socket). For small buffer sizes (~100) it is about the same or worse than standard base64.</p>
+
+<pre><code>--- bufsize 4096
+standard_base64_encode 5.70770692825 seconds for 10 iterations
+original_chunked_encode 2.07641100883 seconds for 10 iterations
+latest_chunked_encode  1.44510507584 seconds for 10 iterations
+--- bufsize 2048
+standard_base64_encode 5.71355605125 seconds for 10 iterations
+original_chunked_encode 2.17808198929 seconds for 10 iterations
+latest_chunked_encode  1.5746011734 seconds for 10 iterations
+--- bufsize 1024
+standard_base64_encode 5.7339630127 seconds for 10 iterations
+original_chunked_encode 2.35343503952 seconds for 10 iterations
+latest_chunked_encode  1.83091807365 seconds for 10 iterations
+--- bufsize  969
+standard_base64_encode 5.87562203407 seconds for 10 iterations
+original_chunked_encode 2.3832950592 seconds for 10 iterations
+latest_chunked_encode  1.81391692162 seconds for 10 iterations
+--- bufsize  100
+standard_base64_encode 5.84305310249 seconds for 10 iterations
+original_chunked_encode 6.96859192848 seconds for 10 iterations
+latest_chunked_encode  6.85651683807 seconds for 10 iterations
+--- bufsize   57
+standard_base64_encode 5.72181987762 seconds for 10 iterations
+original_chunked_encode 6.98394799232 seconds for 10 iterations
+latest_chunked_encode  8.28728795052 seconds for 10 iterations
+</code></pre>
+    </div>

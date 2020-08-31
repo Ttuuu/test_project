@@ -1,0 +1,114 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You have a typedef for <code>weight_pair</code> but only use it in main to fill the map.</p>
+
+<p><code>node::children</code> should be unique_ptr. That way you don't need delete_tree. However you will need at most 2*n nodes to be allocated so you can preallocate those in a <code>std::vector&lt;node&gt;</code> and avoid calling make_unique on each new node.</p>
+
+<p>In <code>build_tree</code> you pull that map apart to build a <code>node*</code> array so you may as well have just passed a <code>std::vector&lt;weight_pair&gt;</code>.</p>
+
+<p>You can avoid using the <code>std::deck</code> by reverse sorting a <code>std::vector</code> (so the lowest elements end up at the back ready to get popped of). </p>
+
+<pre><code>while (nodes.size() &gt; 1) {
+    std::sort(nodes.begin(), nodes.end(), reverseCompareNodeWeights);
+
+    unique_ptr&lt;node&gt; new_node = std::make_unique&lt;node&gt;(); 
+    //or node* new_node = allocated_nodes[next++]; // if preallocated.
+    unique_ptr&lt;node&gt;&amp; back1 = nodes[nodes.size()-1];
+    unique_ptr&lt;node&gt;&amp; back2 = nodes[nodes.size()-2];
+    new_node -&gt; weight = back1 -&gt; weight + back2 -&gt; weight;
+    new_node -&gt; content = back2 -&gt; content + back2 -&gt; content;
+    back1-&gt;parent = new_node;
+    back2-&gt;parent = new_node;
+    new_node -&gt; children[0] = std::move(back1);
+    new_node -&gt; children[1] = std::move(back2);
+
+    nodes.pop_back();
+    nodes.back(std::move(new_node));
+
+}
+</code></pre>
+
+<p>Or you could use the std::heap operations</p>
+
+<pre><code>std::make_heap(nodes.begin(), nodes.end(), compareNodeWeights);
+
+while (nodes.size() &gt; 1) {
+    std::pop_heap(nodes.begin(), nodes.end(), compareNodeWeights);
+    std::pop_heap(nodes.begin(), nodes.end()-1, compareNodeWeights);
+
+    //identical to above
+
+    nodes.pop_back();
+    nodes.back() = std::move(new_node);
+    std::push_heap(nodes.begin(), nodes.end(), compareNodeWeights);
+}
+</code></pre>
+
+<hr>
+
+<p>Compressing or decompressing bit by bit using this tree is going to be very slow. It will result in  a cache miss per bit of output.</p>
+
+<p>instead you can make a lookup table. For compression this is straightforward it will be a <code>std::array&lt;compress_value&gt;</code> where <code>compress_value</code> is </p>
+
+<pre><code>struct compress_value {
+    uint code;
+    uint code_size;
+}
+</code></pre>
+
+<p>and the compression main loop will be:</p>
+
+<pre><code>std::vector&lt;uint8&gt; output;
+
+uint64 outputbuff; //filled from least significant bit first
+uint filled;
+for(char c : input){
+    compress_value value = compress_table[c];
+    outputbuff |= value.code &lt;&lt; filled;
+    filled += value.code_size;
+    while(filled &gt; 8){
+        output.pushback(outputbuff &amp; 0xff);
+        outputbuff  = outputbuff &gt;&gt; 8;
+        filled -= 8;
+    }
+}
+</code></pre>
+
+<hr>
+
+<p>Decompressing will be similar. But instead you will have a lookup table that is as large as <span class="math-container">\$ 2^{\text{max code size}}\$</span></p>
+
+<p>Each entry in the decompression table will contain at index i the character where <code>i &amp; mask</code> is the code for the value.</p>
+
+<p>That is</p>
+
+<pre><code>for(table_value value : table){
+    for(uint c = value.code; c &lt; table_size; c += 1&lt;&lt;value.code_size){
+        decompress_table[c].ch = value.ch;
+        decompress_table[c].code_size = value.code_size;
+    }
+}
+</code></pre>
+
+<p>The decompression main loop will be:</p>
+
+<pre><code>uint64 input_buff = read_up_to_8_bytes(input, end); //reads least significant byte first
+uint filled = 64;
+while(input &lt; end){
+    decompress_value value = decompress_table[input_buff &amp; decompress_mask];
+    output.push_back(value.ch);
+    input_buff = input_buff &gt;&gt; value.code_size;
+    filled -= value.code_size;
+    if(filled &lt; max_code_size){
+         while(filled &lt; 56 &amp;&amp; (input != end)){
+             input++;
+             filled += 8;
+         }
+         input_buff = read_up_to_8_bytes(input, end);
+         if(filled != 0)
+             input_buff = input_buff &gt;&gt; (64-filled);
+    }
+}
+</code></pre>
+
+<p>instead of all those explicit bounds checks you can add a new symbol that signifies the end of the bit stream and overallocate the input buffer by at least 8 bytes. Though that requires that the stream was not corrupted. The compromise is to only have the bounds check on the outer loop.</p>
+    </div>

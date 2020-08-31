@@ -1,0 +1,143 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Unneeded complexity</h2>
+
+<p>There is unnecessary complexity because of two reasons: the unit of work wants to be a <strong>repository locator</strong> and because the repositories are <strong>generic</strong> on the wrong side.</p>
+
+<p>Remove the repositories references from the <code>UoW</code> and you will be fine. Let's see now a way to have a better generic way for your CRUD.</p>
+
+<pre><code>public interface IRepositoryBase
+{
+     IList&lt;T&gt; FindAll&lt;T&gt;();
+     T FindByCondition&lt;T&gt;(Expression&lt;Func&lt;T, bool&gt;&gt; expression);
+     void Create&lt;T&gt;(T entity);
+     void Update&lt;T&gt;(T entity);
+     void Delete&lt;T&gt;(T entity);
+}
+</code></pre>
+
+<p>So what did I just do here was to make the interface non-generic and move the generic type to the methods. Imagine now how easy is to do following</p>
+
+<pre><code>    public class RemindersService
+    {
+       private readonly IRepositoryBase _repository;
+       private readonly IUnitOfWork _unitOfWork;
+       public RemindersService(IRepositoryBase repository, IUnitOfWork uow) 
+       { 
+          _repository = repository; 
+          _uow = uow
+       }
+
+       public Reminder AddNewReminder(DateTime moment, string note, Guid receiver, string name)
+       {
+            var user = _repository.FindById(receiver);
+            var reminder = new Reminder {ReceiverId = receiver, Moment = momoent, Note = note };
+            _repository.Create(reminder);
+
+            _uow.Save();
+       }
+    }
+</code></pre>
+
+<p>The main gain here is for very simplistic CRUD operations you don't need to create an interface and an implementation for each of entity in the DbContext.</p>
+
+<p>The downside of this approach is that now suddenly all the entities will have this generic way for the CRUD operations. Maybe you don't what that, but I consider this a non-issue in most of the applications. One potential issue is when you want to implement here and there let's say a soft-delete and the generic method does a hard delete. There are ways to overcome that.</p>
+
+<h2>Use the valuable API from DbContext</h2>
+
+<p>I used  in the <code>RemindersService.AddNewReminder</code> a new method, <code>FindById</code>, that was not in the original <code>IRepositoryBase</code> definition. This can be easily added and dispatched to <code>dbContext.Find(id)</code>. This method returns so you'll probably have to check for that in your Application Services.</p>
+
+<h2>Simplify abstractions, remove duplication</h2>
+
+<p>Let's move next to the more specific repository. With the non-generic <code>IRepositoryBase</code> it will look like this:</p>
+
+<pre><code>public interface IReminderRepository : IRepositoryBase
+        {
+        IList&lt;Reminder&gt; GetAllReminders();
+        Reminder GetReminderById(Guid id);    
+        Reminder GetReminderByName(string name);    
+        void CreateReminder(Reminder reminder);    
+        void UpdateReminder(Reminder reminder);    
+        void DeleteReminder(Reminder reminder);    
+    }
+</code></pre>
+
+<p>The first issue with this interface is the abstraction duplication: you have two ways to create a Reminder: <code>CreateReminder</code> and <code>Create&lt;Reminder&gt;</code> (or Create in the original). Same for Update, Delete and for FindAll. As an API consumer I would have a hard time to pick one because I will feel insecure about the fact I might have picked the wrong one. As an Implementation developer I will have to implement the same functionality twice or to just delegate to the base class.</p>
+
+<p>You have two options: either remove the interface inheritance or remove the the <code>CreateReminder</code>. If you remove the inheritance and keep the <code>CreateXXX</code> methods then you transmit the idea that the those <code>XXX</code>s are not handled as everything else by the repository, but the have a custom logic. I doubt that, since the repositories need to take care only for the store access. So remove these methods and let only the <code>GetByName</code> in the <code>IReminderRepository</code>. You might also decide to remove the interface inheritance and <code>IRepositoryBase&lt;Reminder&gt;</code> when you need those generic methods and <code>IReminderRepository</code> when you need the <code>GetByName</code> method.</p>
+
+<p>Like I said you don't need to tie the UoW with the repositories interfaces. Follow this convention with the Repository suffix and you'll be fine to discover the repositories you need. Once you have that, there is no need to transform the UoW into a ServiceLocator - Repositories Factory.</p>
+
+<h2>Avoid newing dependencies</h2>
+
+<p>Which brings the next: use an <code>IoC</code> for you dependencies. .Net Core? - built in. .Net Framework: a bunch of them. Still WebForms? Use Property Injection. </p>
+
+<h2>Avoid disposing what you didn't create</h2>
+
+<pre><code>public class UnitOfWork : IUnitOfWork, IDisposable
+</code></pre>
+
+<p>Did UnitOfWork create the DbContext? Then don't dispose. Let the creator of the DbContext to decide when and if wants to dispose it.</p>
+
+<h2>Naming:</h2>
+
+<pre><code>void Create(T entity);
+void Update(T entity);
+void Delete(T entity);
+</code></pre>
+
+<p>It's a repository, by defintion: <em>Mediates between the domain and data mapping layers using a <strong>collection-like</strong> interface for accessing domain objects.</em>
+Take a look at the <code>IList</code> API and you'll find better naming:</p>
+
+<pre><code>void Add(T entity);
+void Remove(T entity);
+</code></pre>
+
+<p>A list doesn't have an <em>Update</em> method so frankly you don't need this method because of this:</p>
+
+<pre><code>{
+  var reminder = _repository.FindById(reminderId);
+  reminder.AddNote(note); // probably AddNote will do something like this.Notes.Add(note);
+  uow.Save();
+}
+</code></pre>
+
+<p>See? No <code>Update</code> method. The <code>DbContext</code> takes care of the changes made to the returned reminder and will commit them when <code>uow.Save</code> is called.</p>
+
+<h2>Async - Await</h2>
+
+<p>Use this API as EntityFramework provides the asynchronous way to handle the databases. You'll be scalable, your threads you will be free to do something else (like handling new requests) and won't be blocked until the SQL Server decides to returns its results.</p>
+
+<h2>Big performance issue</h2>
+
+<pre><code>public class ReminderRepository : RepositoryBase&lt;Reminder&gt;, IReminderRepository
+{
+    public ReminderRepository(DBContext dbContext)
+    : base(dbContext)
+    {
+        _dbContext = dbContext;
+    }
+    //other methods removed
+    public Reminder GetReminderByName(string name)
+    {
+        return FindAll()
+            .OrderByDescending(r =&gt; r.Name)
+            .FirstOrDefault(r =&gt; r.Name == name);
+
+        //return FindByCondition(r =&gt; r.Name == name);
+    }
+}
+</code></pre>
+
+<p>The <code>FindAll</code> returns an <code>IList</code> which means the <code>DbContext</code> will send the query to the SQL server and then will map the results to the Reminder objects. After that the <code>ReminderRepository</code> object will search this in memory collection for the first reminder. What if you have 100.000 reminders? Probably you don't want to do that, but to generate the SQL that will have in it the WHERE clause. So avoid ToList().FirstOrDefault() or any indirection to that if you know you will need just a subset of these records/objects.</p>
+
+<h2>More about API</h2>
+
+<pre><code>IList&lt;T&gt; FindAll();
+</code></pre>
+
+<p>IList has methods like Remove, Clear etc. Most likely the repository clients won't need that and even if they use them, the outcome won't be the expected one. The FindAll should return something that with they can only iterate/read. So use <code>IReadonlyCollection</code>.</p>
+
+<h2>How generic should be?</h2>
+
+<p>The <code>FindByCondition</code> has the drawback that you'll lose some encapsulation and abstraction and you open the gate for code duplication. I personally like it, but if I see that I tend to copy the predicate in a new place, then I'll add a new method in the repository, like you just did with <code>FindByName</code>. People are usually lazy (including myself) and sooner or later you'll get in trouble with it.</p>
+    </div>

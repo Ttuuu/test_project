@@ -1,0 +1,57 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>Simplify loop</h3>
+<p>Let's examine your main loop (minus the commented out part):</p>
+<blockquote>
+<pre><code>        for (int sampleIndex = 0; sampleIndex &lt; blockSize; sampleIndex++) {
+            // update output value
+            double value = blockStartAmp + (blockStep * blockDeltaAmp);
+            values[sampleIndex] = (bp0 * value + bp1);
+
+            // next phase
+            blockStep += rate;
+        }
+</code></pre>
+</blockquote>
+<p>You are filling the <code>values</code> array with some computed value, and it requires 3 adds and 2 multiplies per iteration.  But if you expand the computation:</p>
+<pre><code>bp0 * value + bp1
+= bp0 * (blockStartAmp + (blockStep * blockDeltaAmp)) + bp1
+= bp0 * blockStartAmp + bp0 * blockStep * blockDeltaAmp + bp1
+</code></pre>
+<p>Note that from one iteration of the loop to the next, the only variable that changes is <code>blockStep</code>, and it changes by <code>rate</code> per iteration.  Therefore, the whole value changes by <code>bp0 * rate * blockDeltaAmp</code> per iteration.  So if we precompute that delta, we can reduce your loop to this:</p>
+<pre><code>        double value = bp0 * ((blockStartAmp + (blockStep * blockDeltaAmp)) + bp1;
+        double delta = bp0 * rate * blockDeltaAmp;
+        for (int sampleIndex = 0; sampleIndex &lt; blockSize; sampleIndex++) {
+            values[sampleIndex] = value;
+            value += delta;
+        }
+</code></pre>
+<p>Now your loop only has one addition per iteration, instead of 3 additions and 2 multiplies.</p>
+<h3>Unnecessary Copy</h3>
+<p>Currently, you create a temp array, fill it in, then copy to the final destination:</p>
+<blockquote>
+<pre><code>        double values[PLUG_MAX_PROCESS_BLOCK];
+        for (int sampleIndex = 0; sampleIndex &lt; blockSize; sampleIndex++) {
+            // ...
+            values[sampleIndex] = (bp0 * value + bp1);
+        }
+        std::memcpy(envelope.mValue[voiceIndex], values, PLUG_MAX_PROCESS_BLOCK);
+</code></pre>
+</blockquote>
+<p>Instead, you could just write to the final destination directly:</p>
+<pre><code>        double *values = envelope.mValue[voiceIndex];
+        for (int sampleIndex = 0; sampleIndex &lt; blockSize; sampleIndex++) {
+            // ...
+            values[sampleIndex] = (bp0 * value + bp1);
+        }
+</code></pre>
+<p>This saves doing the <code>memcpy</code>, which could potentially save a lot of time.  If you don't fill the whole buffer and need to zero the part you didn't fill, you can add a call to <code>memset</code> to zero out the rest of the buffer.</p>
+<h3>Is 3% CPU too much?</h3>
+<p>You haven't told us what CPU you are using.  But here is a rough calculation:</p>
+<ul>
+<li>Your host sends 48k samples per second in blocks of 256, so it calls your function <code>48000 / 256 = 188</code> times per second</li>
+<li>Within your function, you loop <code>256 * 16 * 10 = 40960</code> times. So every second, your inner loop runs <code>188 * 40960 = 7700480</code> times.</li>
+<li>If your inner loop takes 5 clock cycles to run (which is fast), then it will take <code>7.7M * 5 = 38.5M</code> cycles per second.</li>
+<li>If your CPU is a 2 GHz processor, this will be 1.925% of your CPU time.</li>
+</ul>
+<p>But in the above, the 5 cycle per inner loop number was something I just estimated as a goal to strive for.  You are doing one floating point add and one memory write per iteration, and I'm guessing that memory bandwidth might be the limiting factor and not the floating point adds.  If that is true, then switching from <code>double</code> to <code>float</code> should really help you because you will be writing half as much memory.</p>
+    </div>

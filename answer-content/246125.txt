@@ -1,0 +1,163 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Sorry for taking so long with this review despite being the one to prompt you to post your code here, but I hope you (and others) may still find it useful.</p>
+<p>Now, although I do have a number of more general points to talk about, as Matt says I think it'd be nice to dive into the "meat" of your code and dissect the approach you've taken, then hopefully include some of the general points along the way.</p>
+<hr>
+<p>Let's remind ourselves first of the "standard approach", as you referred to it in the GitHub repository, which is more or less the approach Matt uses in the question I linked (minus a nice constructor and some other OOP stuff), and looks something like this:</p>
+<pre><code>Property Get ObjectFromPtr() As Object
+    Dim result As Object
+    CopyMemory result, ByVal this.ptr, LenB(ptr) 'De-reference cached ptr into temp object
+    Set ObjectFromPtr = result                   'IUnknown::AddRef once for the return value
+    ZeroMemory result, LenB(ptr)                 'Manually clear the temp reference so IUnknown::Release isn't called when it goes out of scope
+End Property
+</code></pre>
+<p>For the sake of having something to compare to, what's good and bad about this code?</p>
+<p>Pros:</p>
+<ul>
+<li>Quite simple technique; only requires basic knowledge of pointers and reference types</li>
+<li>Short clear code</li>
+<li>Minimal number of API calls</li>
+<li>Small instance memory footprint (only 1 cached LongPtr)</li>
+</ul>
+<p>Cons:</p>
+<ul>
+<li>Fairly slow API used for most performance critical part</li>
+<li>If parent has been nulled and cached pointer references a bit of memory that no longer represents a real object instance, Excel will likely crash when the returned Object is inspected</li>
+<li>If parent has been nulled, but the memory has been overwritten with a <em>valid</em> but different object instance, then this approach will appear to succeed, yet return an incorrect/unintended object, since <code>Object</code> is effectively weakly typed in VBA</li>
+</ul>
+<hr>
+<p>So how does your approach differ (ideally maintaining or adding to the pros while reducing the cons)? I see 3 key areas where your underlying approach is different:</p>
+<ol>
+<li>You use modified ByRef variants to do the memory manipulation in the performance critical area*</li>
+<li>Rather than creating a temporary Object instance and filling it with the Object pointer, you toggle the VarType flag of a Variant to create the temporary Object</li>
+<li>You partially circumvent the weak typing of the Object return type by caching the parent's VTable pointer in the <code>Let</code> method and then manually checking it still matches the referenced object instance every time <code>Get</code> is called</li>
+</ol>
+<p>Let's take a look at these 3 differences in turn to see what they bring to the implementation as a whole</p>
+<p>*<sub>well, if you don't count the <code>Let</code> procedure as performance critical, which it probably isn't in the typical use case. It's called once at the Child's birth, while the <code>Get</code> is potentially called many times in the Child's lifetime. However best not to make assumptions on how users will interact with your code, especially something as fundamental as this</sub></p>
+<h3>1) ByRef Variants for moving memory</h3>
+<p>You set up these <em>"remote variables"</em> by manually modifying the VarType of a Variant:</p>
+<pre><code>CopyMemory ByVal VarPtr(m_fake.vTableByRef), m_fake.vbLongPtr + VT_BYREF, 2
+</code></pre>
+<p>I haven't seen this before, impressive to come up with a totally new approach, well done! At a glance it seems to offer a number of benefits:</p>
+<ul>
+<li>Make use of super-fast native VBA code to do the pointer dereference + memory overwrite for you instead of an API call</li>
+<li>Simplify call sites by interacting with native VBA variants</li>
+<li>Avoid the VBA interpreter trying to reclaim the same bit of memory twice by using ByRef</li>
+</ul>
+<p>However there are some issues with all of these arguments...</p>
+<hr>
+<p>To begin with, I'm not sure reclaiming memory was ever really a concern; value types aren't reference counted so there was never any risk of double reclaiming. The real risk to watch out for is where the variable that owns the memory goes out of scope before the remote variable does. This leaves the remote variable pointing to a section of memory that has been reclaimed.</p>
+<p>In the case of reading memory like with your <code>vTableByRef</code>, it's sufficient to know that the value it reads could be anything. However when you set up a variable to <em>write</em> memory, then you have to be very careful you don't end up corrupting memory you don't own. This isn't too much of a risk for your code, since <code>reference</code> and <code>remoteVarType</code> are in the same scope, however if the Child_Terminate code runs after the parent's, and the child attempts to access its parent's reference at this point, then in some circumstances I'll discuss later the <code>remoteVarType</code> will allow writing to an un-owned bit of memory, which is, needless to say, a bad thing!</p>
+<p>So accessing memory with remote variables doesn't do much to protect you compared to an API call.</p>
+<hr>
+<p>Secondly, does using ByRef variants really help to simplify call sites compared to an API?</p>
+<blockquote>
+<pre><code>'*******************************************************************************
+'Utility. Changes the data type for the reference Variant while preserving the
+'   level of redirection of remoteVarType
+'*******************************************************************************
+Private Property Let VarType(ByRef v As Variant, newType As Integer)
+    v = newType
+End Property
+
+'*******************************************************************************
+'Returns the value of a Variant that has the VT_BYREF flag set
+'*******************************************************************************
+Private Function GetRemoteAddress(ByRef memAddress As Variant) As MEM_ADDRESS
+    GetRemoteAddress.ptr = memAddress
+End Function
+</code></pre>
+</blockquote>
+<p>The fact that you need these 2 methods to interact with the remote variables is itself a warning sign. It would be great if you could simplify your calling sites to this:</p>
+<pre><code>m_fake.isValid = (m_fake.vTableByRef = m_fake.vTable) 'check live value against the cache
+</code></pre>
+<p>Or</p>
+<pre><code>m_fake.remoteVarType = vbObject                'toggle the VarType flag
+</code></pre>
+<p>... which would be a big improvement over accessing the memory the old way:</p>
+<pre><code>CopyMemory m_fake.remoteVarType, vbObject, 2   'much less clear
+</code></pre>
+<p>But in fact the call sites are not nearly that clear:</p>
+<blockquote>
+<pre><code>VarType(m_fake.remoteVarType) = vbObject
+m_fake.isValid = (GetRemoteAddress(m_fake.vTableByRef).ptr = m_fake.vTable.ptr)
+</code></pre>
+</blockquote>
+<p><code>VarType</code> and <code>GetRemoteAddress</code> indicate that storing Variants ByRef beyond their typical function argument scope is not something VBA is happy about, hence the additional redirection required to get around VBA's complaints.</p>
+<hr>
+<p>Final point regarding these remote variables is performance. Low level APIs are always risky and VBA's complaints haven't stopped me in the past, so maybe this technique's speed will make it worthwhile? While it's true that native is native, Variant is not Integer, and using variants for dereferencing brings overhead as they are essentially dynamically sized variables. Since we know dynamic sizing isn't something to worry about (the memory these remote variables work with is fixed in size), it is more efficient to move memory around in pre-defined chunks. Fortunately the VB6 (msvbvm60.dll) runtime exposes a <a href="http://www.xbeat.net/vbspeed/i_VBVM6Lib.html#Runtime" rel="nofollow noreferrer">family of undocumented methods</a> to do just that, let's compare everything for speed:</p>
+<p><a href="https://i.stack.imgur.com/rge9N.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/rge9N.png" alt="Comparison of integer dereferencing techniques"></a></p>
+<p>Here I've run an integer dereference (read 2 bytes from one variable and write to another) many times (x axis) and calculated the average time per call (y axis) for the standard, ByRef and GetMem2 techniques, and the latter comes out on top.</p>
+<p>All things considered, the remote variable technique you use doesn't in fact improve readability, safety or performance, and requires additional knowledge of COM Variants that means people looking at your code for the first time (myself included) may need a couple of takes to understand what's going on - ultimately hindering maintainability and accessibility of the approach. So should you scrap the remote variables? Well there is still one important advantage over the faster Get/PutMem functions which is that I can't seem to find any examples of using them on Mac! I'm fairly certain it has to be possible since they should ship with VBA, but I haven't found them in Office's <code>VBE7.dll</code>, only Windows' <code>msvbvm60.dll</code> so I'm not so sure. So maybe on Mac you could fall-back to ByRef Variants as they still outperform MoveMem, but if anyone has better suggestions do drop them in the comments.</p>
+<h3>2) Object References</h3>
+<p>So while the standard code has this for creating an object from a pointer</p>
+<pre><code>CopyMemory result, ByVal ptr, LenB(ptr)
+Set ObjectFromPtr = result
+ZeroMemory result, LenB(ptr)
+</code></pre>
+<p>Yours has</p>
+<blockquote>
+<pre><code>VarType(m_fake.remoteVarType) = vbObject
+Set Object = m_fake.reference
+VarType(m_fake.remoteVarType) = m_fake.vbLongPtr
+</code></pre>
+</blockquote>
+<p>I think the only drawback of your approach over the standard (ignoring the dereferencing technique discussed above) is the conceptual one; the standard method requires understanding of Object pointers, the method you've used also requires additional knowledge of COM Variants, so is just a slightly steeper learning curve. In terms of performance, both have 2 dereferencing steps and one native <code>Set</code> call, so probably nothing in it (although you could time it to see if copying 2 bytes is faster than 4). Some better naming might help with the conceptual difficulties:</p>
+<pre><code>Private Declare PtrSafe Sub SetVariantType Lib "msvbvm60" Alias "PutMem2" (ByRef target As Variant, ByVal varTypeFlag As Integer)
+
+'Toggle the varType flag on the variant to create a temporary, non reference-counted Object
+SetVariantType m_fake.reference, vbObject
+Set Object = m_fake.reference
+SetVariantType m_fake.reference, vbLongPtr
+</code></pre>
+<p>Renaming imports introduces a simple layer of abstraction that clarifies the intent of the code, reducing the need for comments (in fact, you could even declare <code>varTypeFlag As VbVarType</code> - a Long with intellisense, since Longs are stored little-endian in VBA so the first 2 bytes at the pointer to a Long are the same as an Integer with the same decimal value). It also allows for type checking of parameters which is nice.</p>
+<h3>3) VTable check</h3>
+<p>Finally we come to it, what I think is the most innovative part of your code. As I mentioned at the start of this post, one of the downsides of the standard approach is that if the parent instance goes out of scope, and its memory is overwritten, then 2 things can happen:</p>
+<ul>
+<li>It can be overwritten with a valid object instance, perhaps even a separate instance of the same Class as the parent! That's really bad and will lead to a successful dereference but undefined behaviour and nasty hard to diagnose bugs.</li>
+<li>More likely (purely by probability) the memory will be re-allocated to an invalid object instance (i.e. something that's not an object, or maybe a load of zeros). This will likely lead to a crash - which seems nasty for the developer but is actually the best course of action when dealing with a bad pointer - at least you know something's definitely wrong.</li>
+</ul>
+<p>Your approach vastly reduces the number of headaches for developers by eliminating most of the false positives, so really well done for that. There are still a few exceptions I can see:</p>
+<ul>
+<li>If the parent instance is overwritten with another, different instance of the same class, it will have the same VTable so your check will not catch this. I don't know how likely this is to happen, but it may be worth investing in an additional interface for parent classes that exposes something like a GUID, so that once you successfully dereference the Object, you cast it to an <code>IGUID</code> interface and check it has a GUID that matches what you expect, if so then return the parent Object. This will bring false positives from this mode of failure down to zero (or as good as)</li>
+<li>If there parent instance has been overwritten with an invalid object, but it so happens that the first 4/8 bytes of the memory have been reused to store a string of binary that coincidentally matches the VTable pointer exactly, then once again your class will not catch this. What's worse is that rather than crashing, everything will plow on but with random data you don't own populating an imaginary instance of the parent class! Who knows what will happen... *</li>
+</ul>
+<p>What I'm trying to say is that the behavior of pointer dereferencing once the thing they point to has gone out of scope is undefined, so while returning <code>Nothing</code> is very nice for a developer and cuts down many of the false positives, it doesn't mean that the <code>Something</code> can be trusted any more than before, they will still need to perform other checks or employ other measures like carefully handling scope to ensure bugs don't creep in.</p>
+<p>*<sub>Well... IUnknown::AddRef will attempt to increase the class' reference count, incrementing the random chunk of memory at <code>ObjPtr + 4</code>. You may then cast to the <code>IGUID</code> interface, incrementing some other memory - which might actually succeed because the IUnknown methods are the real ones from a valid VTable and don't know the instance data isn't from a real object. If you get this far then it should be obvious the GUIDs don't match, but then what? It's possible you'll be able to undo all of the effects if you do work out that the instance you started with doesn't match the one you currently have, but it most likely assumes a lot about the layout of classes in memory which may be true generally, but what if the parent class isn't user defined, but a COM object from another library?
+</sub></p>
+<h3>D) Misc</h3>
+<blockquote>
+<pre><code>m_fake.vbLongPtr
+</code></pre>
+</blockquote>
+<p>This should not be linked to the class instance, it should be defined with conditional compilation</p>
+<pre><code>#If Win64 Then
+    Const vbLongPtr As Long = vbLongLong
+#Else
+    Const vbLongLong As Long = 20
+    Const vbLongPtr As Long = vbLong
+#End If
+</code></pre>
+<p>Or if you don't trust <code>#Win64</code> and prefer to keep <code>VBA.VarType(ObjPtr(Nothing))</code> then put it in a standard module or a static class instance perhaps</p>
+<hr>
+<blockquote>
+<pre><code>CopyMemory ByVal VarPtr(m_fake.remoteVarType), vbInteger + VT_BYREF, 2
+</code></pre>
+</blockquote>
+<p>should be</p>
+<pre><code>CopyMemory m_fake.remoteVarType, vbInteger + VT_BYREF, 2
+</code></pre>
+<p><code>ByVal VarPtr(blah)</code> is like telling the function that the argument it is receiving "has a value equal to the pointer to blah" rather than "is the pointer to blah". No difference</p>
+<hr>
+<blockquote>
+<pre><code>vTable As MEM_ADDRESS
+</code></pre>
+</blockquote>
+<p>I'd probably rename to <code>cachedVTablePointer</code> and get rid of <code>MEM_ADDRESS</code> altogether, just put the conditional compilation inside the <code>FAKE_REFERENCE</code> type</p>
+<p>Also you could simplify the vtable check potentially. Right now you dereference the original objptr and cache it. You then have the remote variable which essentially dereferences the objptr again, live, to see if the vtable pointer is still there. Finally you compare these two dereferenced variables for equality. You could instead check for equality in place without any explicit dereferencing using <a href="https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/nf-wdm-rtlcomparememory" rel="nofollow noreferrer">RtlCompareMemory</a> which can be imported from <code>kernel32</code> or <code>ntdll</code>
+e.g.</p>
+<pre><code>Private Declare Function EqualMemory Lib "ntdll" Alias "RtlCompareMemory" (Destination As Any, Source As Any, ByVal Length As LongPtr) As LongPtr
+</code></pre>
+<p>might be faster, maybe a bit clearer</p>
+<hr>
+<p><em>Overall, nice job, I've enjoyed reading through it and thinking about it</em></p>
+    </div>

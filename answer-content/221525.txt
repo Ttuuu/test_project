@@ -1,0 +1,137 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Thank you for the answers that have been posted so far. Each contributed something that I wanted to incorporate in my second iteration of this problem.</p>
+
+<p>Thank you specifically for solutions by</p>
+
+<ul>
+<li><a href="https://codereview.stackexchange.com/a/221474/75659">dfhwze</a> - using a single backing collection instead of one for each event</li>
+<li><a href="https://codereview.stackexchange.com/a/221477/75659">Henrik Hansen</a> - using reference counting to avoid needing a proxy <code>List</code> for each handler.</li>
+<li><a href="https://codereview.stackexchange.com/a/221485/75659">VisualMelon</a> - separating proxy management logic as its own object.</li>
+</ul>
+
+<p>I've compiled my own approach that pulls from each of these answers</p>
+
+<hr>
+
+<h1>A Utility for Managing the event proxies</h1>
+
+<p>I'm realizing that this is a very specific use case - A single <code>Action&lt;T&gt;</code> event that should also fire as <code>Action&lt;object&gt;</code> and <code>Action</code> depending on what the listener needs - that I could see using in a few areas, and so chose to implement it as a separate utility class.</p>
+
+<p>As was pointed out by <a href="https://codereview.stackexchange.com/a/221477/75659">Henrik Hansen</a>, C#'s <code>EventHandler</code> is arguably preferable but its use would require changing the signature of the events and therefore the signature of any event handler functions that are Added to them, which in this specific case I am trying to avoid.</p>
+
+<p>My implementation of the Event Proxy Utility object is:</p>
+
+<pre class="lang-cs prettyprint-override"><code>public struct EventProxyContainer&lt;T&gt;
+{
+    private struct EventProxy
+    {
+        public Action&lt;T&gt; proxy;
+        public int count;
+    }
+    private Dictionary&lt;object, EventProxy&gt; handlerProxies;
+
+    public Action&lt;T&gt; Add(object handler) { /* See Below */ }
+
+    public Action&lt;T&gt; Remove(object handler) { /* See Below */ }
+}
+
+</code></pre>
+
+<p>Instead of performing the type check in the Invoke, I chose to handle that in the <code>Add</code> function itself. My intuition is that we will be invoking events more than adding them so this should give a bit of performance benefit.</p>
+
+<p>This also means we can actually avoid having to construct a proxy at all for <code>Action&lt;T&gt;</code> handlers.</p>
+
+<h2><code>Add</code> Implementation</h2>
+
+<pre class="lang-cs prettyprint-override"><code>public Action&lt;T&gt; Add(object handler)
+{
+    if(!(handler is Action&lt;object&gt;) &amp;&amp; !(handler is Action)) return (Action&lt;T&gt;)handler;
+    handlerProxies = handlerProxies ?? new Dictionary&lt;object, EventProxy&gt;();
+
+    EventProxy entry;
+    if(handlerProxies.TryGetValue(handler, out entry))
+    {
+        entry.count += 1;
+        handlerProxies[handler] = entry;
+    }
+    else
+    {
+        entry = new EventProxy() { count = 1 };
+        if(handler is Action&lt;object&gt;)
+            entry.proxy = (v) =&gt; ((Action&lt;object&gt;)handler).Invoke(v);
+        else if (handler is Action)
+            entry.proxy = (v) =&gt; ((Action)handler).Invoke();
+        handlerProxies.Add(handler, entry);
+    }
+    return entry.proxy;
+}
+</code></pre>
+
+<h2><code>Remove</code> implementation</h2>
+
+<p>Again we early out if the handler is <code>Action&lt;T&gt;</code></p>
+
+<pre><code>public Action&lt;T&gt; Remove(object handler)
+{
+    if(!(handler is Action&lt;object&gt;) &amp;&amp; !(handler is Action)) return (Action&lt;T&gt;)handler;
+    handlerProxies = handlerProxies ?? new Dictionary&lt;object, EventProxy&gt;();
+
+    EventProxy entry;
+    if(handlerProxies.TryGetValue(handler, out entry))
+    {
+        entry.count -= 1;
+        if(entry.count == 0) 
+            handlerProxies.Remove(handler);
+        else
+            handlerProxies[handler] = entry;
+    }
+    return entry.proxy;
+}
+</code></pre>
+
+<hr>
+
+<h1><code>Foo&lt;T&gt;</code> Implementation</h1>
+
+<p>This really cleans up the <code>Foo&lt;T&gt;</code> implementation quite nicely:</p>
+
+<pre class="lang-cs prettyprint-override"><code>public class Foo&lt;T&gt; : IFoo&lt;T&gt;
+{
+    private EventProxyContainer&lt;T&gt; changeProxy;
+
+    public event Action&lt;T&gt; ChangeValue = delegate {};
+
+    public event Action&lt;object&gt; ChangeObject 
+    { 
+        add =&gt; ChangeValue += changeProxy.Add(value); 
+        remove =&gt; ChangeValue -= changeProxy.Remove(value); 
+    }
+
+    public event Action ChangeEmpty 
+    { 
+        add  =&gt; ChangeValue += changeProxy.Add(value); 
+        remove =&gt; ChangeValue -= changeProxy.Remove(value);
+    }
+
+    public void InvokeChange(T value) 
+    {
+        ChangeValue.Invoke(value);
+    }
+}
+</code></pre>
+
+<hr>
+
+<p>I like this approach because</p>
+
+<ul>
+<li>It still satisfies all the original requirements, and produces the same output as my original examples.</li>
+<li>It can be retrofitted in any case where you have an event of type <code>Action&lt;T&gt;</code> where you also want event listeners to be able to use it as <code>Action&lt;object&gt;</code> and <code>Action</code> instead.</li>
+<li>The proxy handling logic is well contained to a single utility object and separate from whatever else might exist in <code>IFoo</code>.</li>
+<li>Reference counting our proxies allows us to limit one memory allocation per Unique Handler</li>
+<li>We only construct a proxy for <code>Action&lt;object&gt;</code> and <code>Action</code> handlers - <code>Action&lt;T&gt;</code> handlers are added to the backing event object as normal.</li>
+<li><code>Add</code> and <code>Remove</code> whitelist only <code>Action&lt;object&gt;</code> and <code>Action</code>, and return null in all other cases, which <code>event +=</code> and <code>event -=</code> handles gracefully.</li>
+</ul>
+
+<p>The updated code with examples can be found <a href="https://dotnetfiddle.net/UHbNpD" rel="nofollow noreferrer">as a DotNetFiddle here</a>, and <a href="https://gist.github.com/JohannesMP/dc6b8c1461167fa8eae3a092872b8b9a" rel="nofollow noreferrer">as a gist here</a>.</p>
+    </div>

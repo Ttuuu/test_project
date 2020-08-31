@@ -1,0 +1,202 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Observations:</h2>
+<p>I must say I was never very fond of <code>std::bind</code> and since the advent of lambdas I don't really see much need for it.</p>
+<pre><code>        job_queue.add(std::move(std::bind(short_job, k)));
+        job_queue.add(std::move(std::bind(middle_job, k)));
+        job_queue.add(std::move(std::bind(long_job, k)));
+</code></pre>
+<p>I would write:</p>
+<pre><code>        job_queue.add([k](){short_job(k);});
+        job_queue.add([k](){middle_job(k);});
+        job_queue.add([k](){long_job(k);});
+</code></pre>
+<hr>
+<p>Don't see the need for a start/stop paradigm:</p>
+<pre><code>{
+    Job_Queue job_queue;
+    job_queue.start();
+    // STUFF
+    job_queue.stop();
+}
+</code></pre>
+<p>That is what we have constructor/destructor for.</p>
+<pre><code>{
+    Job_Queue job_queue;   // Started by constructor.
+    // STUFF
+}                          // Stopped by destructor
+</code></pre>
+<p>The advantage of this is that the user can't accidentally forget to call start/stop. It is done automatically for you.</p>
+<hr>
+<p>Why do these user functions have accesses to the queues lock?</p>
+<pre><code>void short_job(std::size_t i)
+{
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    std::unique_lock&lt;std::mutex&gt; lock(Job_Queue::job_mutex);     // WHY !!!!!! 
+                                                                 // After reading the code
+                                                                 // it is not used by the class
+                                                                 // just the external functions
+                                                                 // So it should not be a
+                                                                 // member of the class it should
+                                                                 // simply defined before these
+                                                                 // functions.
+
+
+    std::cout &lt;&lt; "Finished S job: " &lt;&lt; i &lt;&lt; " on thread: " &lt;&lt; std::this_thread::get_id() &lt;&lt; "\n" &lt;&lt; std::flush;
+}
+</code></pre>
+<hr>
+<h2>Code Review</h2>
+<p>You seem to have forgotten your namespace!!!</p>
+<hr>
+<p>I would not have made the mutex static.</p>
+<pre><code>    static std::mutex job_mutex;
+</code></pre>
+<p>Make it a normal member of the class.
+Otherwise all your queues will be waiting on other queues to finish using the lock.</p>
+<hr>
+<p>Why are these static.</p>
+<pre><code>static bool                         is_running;
+static unsigned int                 n_cores;
+</code></pre>
+<p>I can't have more than one job queue?</p>
+<hr>
+<p>As mentioned above I would not have an explicit start stop.</p>
+<pre><code>    void start();
+    void stop();
+</code></pre>
+<p>This is likely to cause issues with incorrect usage.</p>
+<hr>
+<p>Just have the move version of add.</p>
+<pre><code>    void add(const std::function&lt;void()&gt;&amp; f);
+    void add(std::function&lt;void()&gt;&amp;&amp; f);
+</code></pre>
+<hr>
+<p>Why can't I have multiple queues?</p>
+<pre><code>    if( is_running )
+    {
+        std::cerr &lt;&lt; "Error: Another JobQueue is currently running. Please end it first.\n";
+
+        // Does not actually stop you having multiple queues!
+        // Just seems to print a warning message.
+        // The code is still running
+        return;
+    }
+</code></pre>
+<hr>
+<pre><code>void Job_Queue::add(std::function&lt;void()&gt;&amp;&amp; f)
+{
+    job_queue.emplace(f);
+    thread_cv.notify_all();     // There is only one new job.
+                                // You don't need to wake all the threads.
+                                // Simply notify one thread.
+}
+</code></pre>
+<hr>
+<p>Why are you using the copy constructor!</p>
+<pre><code>: queue_mutex(std::mutex())
+</code></pre>
+<p>This is the same as:</p>
+<pre><code>: queue_mutex()
+</code></pre>
+<hr>
+<p>Why are you doing this here?</p>
+<pre><code>{
+    if ( Job_Queue::n_cores == 0)
+    {
+        n_cores = std::thread::hardware_concurrency();
+    }
+}
+</code></pre>
+<p>Why not simply do this when you declare <code>c_cores</code>?</p>
+<pre><code>    unsigned int Job_Queue::n_cores = std::thread::hardware_concurrency();
+</code></pre>
+<hr>
+<p>Is this an actual issue?</p>
+<pre><code>        if (n_cores == 0)
+        {
+            std::cerr &lt;&lt; "Error: Could not find number of available cores.\n";
+        }
+</code></pre>
+<p>Will this ever return 0?<br>
+Can it return 0? Will a machine not always have at least one core? If it had zero cores can you run the code?</p>
+<hr>
+<p>This is pointless:</p>
+<pre><code>    {
+        std::unique_lock&lt;std::mutex&gt; mu(Job_Queue::job_mutex);
+    }
+</code></pre>
+<hr>
+<p>You are declaring a variable outside the lambda. Passing it in by reference. Then just using it like a local variable in the lambda.</p>
+<pre><code>    bool job_q_empty = false;
+</code></pre>
+<p>Why? Just declare <code>job_q_empty</code> boolean inside the lambda!</p>
+<p>Your current lambda looks like this:</p>
+<pre><code>bool job_q_empty = false;
+[this, &amp;job_q_empty]()
+{
+    job_q_empty = job_queue.empty();
+    return !job_queue.empty() || 
+            terminate_after_current_job || 
+            stop_when_queue_is_empty;
+}
+</code></pre>
+<p>You could have simply done this:</p>
+<pre><code>[this]()
+{
+    bool job_q_empty = job_queue.empty();      // Notice the bool here.
+    return !job_queue.empty() || 
+            terminate_after_current_job || 
+            stop_when_queue_is_empty;
+}
+</code></pre>
+<hr>
+<p>You are locking/unlocking/re-locking/unlocking the queue. The problem is that the check used in the <code>test()</code> includes <code>job_queue.empty()</code> and you release the lock and thus allow other threads to be released from the queue before this thread has extracted its job from the queue.</p>
+<p><strong>THIS IS A SERIOUS BUG</strong></p>
+<pre><code>        {
+            std::unique_lock&lt;std::mutex&gt; lock(queue_mutex);
+            thread_cv.wait(lock, test());
+        }
+        if( !job_q_empty )
+        {
+            std::function&lt;void()&gt; f;
+            {
+                std::unique_lock&lt;std::mutex&gt; lock(queue_mutex);
+                f = job_queue.front();
+                job_queue.pop();
+                std::cout &lt;&lt; "jobs left in Q: " &lt;&lt; job_queue.size() &lt;&lt; "\n";
+            }
+            f();
+        }
+</code></pre>
+<p>I would do this:</p>
+<pre><code>void Job_Queue::thread_loop()
+{
+   if (!terminated)
+   {
+        std::function&lt;void()&gt; nextJob = getNextJob();
+        // Either get a job.
+        // Or a do nothing empty job. Simply run it either way.
+        nextJob();
+   }
+}
+
+
+std::function&lt;void()&gt; Job_Queue::getNextJob()
+{
+    std::unique_lock&lt;std::mutex&gt; lock(queue_mutex);
+    thread_cv.wait(lock, [&amp;job_queue](){return !job_queue.empty() || terminated;});
+
+    std::function&lt;void()&gt; result = [](){}; // default empty job.
+    if (!terminated) {
+        // If its not terminated then we know there is a job
+        // in the job_queue to get the front one.
+        result = job_queue.front();
+        job_queue.pop();
+    }
+    return result;
+}
+</code></pre>
+<hr>
+<p>You can check out my attempt here:</p>
+<p><a href="https://codereview.stackexchange.com/q/47122/507">A simple Thread Pool</a></p>
+    </div>

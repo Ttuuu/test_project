@@ -1,0 +1,127 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>It can be helpful to run <code>hlint</code> to see if it spots some improvements.  In this case, it notes that:</p>
+
+<ul>
+<li>you can replace <code>concat $ map</code> with <code>concatMap</code> on line 13</li>
+<li>you can replace <code>flip (,) $ index</code> with <code>(,index)</code> on line 14 if you enable the <code>TupleSections</code> extension, or at least drop the dollar sign if you don't</li>
+</ul>
+
+<p>A few additional things it misses are:</p>
+
+<ul>
+<li>you can drop the <code>in let</code> on line 25</li>
+<li>you can replace <code>sortBy (compare `on` snd)</code> with <code>sortOn snd</code> in line 26</li>
+</ul>
+
+<p>It's also generally accepted as good practice to put type signatures on top-level functions.  You may feel it looks cluttered, but it really helps others understand your programs.  For example, I had to add them before I started working on your program, just so I could figure out what was going on.</p>
+
+<p>A larger stylistic issue is that idiomatic Haskell code typically doesn't create a lot of bindings for intermediate results that are only used once.  I suspect that you've gone this route (labelling <code>untabbedLines</code> and <code>wordsedLines</code>, etc.) for two reasons -- first, you're probably more used to an imperative programming style that lays out an algorithm as a series ordered steps, and all these bindings are helping you think through the process ("first, I remove the tabbed comments, second I make the lines into words, third I number them, etc., etc.); second, you may be using it as a kind of self-documenting coding style, but I think comments make better documentation than awkward camelcase pseudonouns like <code>wordsedLines</code>.</p>
+
+<p>So, a more usual way of writing your <code>preprocess</code> would be:</p>
+
+<pre><code>preprocess input
+  = concatMap indexDown
+  $ flip zip [1..]
+  $ map words
+  $ map (takeWhile (/= '\t'))  -- comments start with tab
+  $ lines input
+  where
+    -- number each word on the line with the index
+    indexDown (words', index) = map (,index) words'
+</code></pre>
+
+<p>Howoever, it's also pretty standard replace the pattern <code>foo x = f $ g $ h $ k x</code> with the point-free form <code>foo = f . g . h . k</code>.  It's possible to get carried away with point-free code, but this particular transformation is pretty routine.  Some people might prefer to collapse the <code>map</code> over the lines, too:</p>
+
+<pre><code>preprocess
+  = concatMap indexDown
+  . flip zip [1..]
+  . map (words . takeWhile (/= '\t'))
+  . lines
+  where
+    -- number each word on the line with the index
+    indexDown (words', index) = map (,index) words'
+</code></pre>
+
+<p>Also, in situations like this with maps at multiple levels (lines and words), it's worth considering if a list comprehension might not be easier to understand:</p>
+
+<pre><code>preprocess' :: String -&gt; [(String, Int)]
+preprocess' input =
+  [ (w, i)
+  -- get each numbered line of words
+  | (i, ws) &lt;- zip [1..]
+               $ map (words . takeWhile (/= '\t'))
+               $ lines input
+  -- and process each word
+  , w &lt;- ws ]
+</code></pre>
+
+<p>A similar consideration applies to <code>findDupes</code>.  It would be more usual to collapse it into a single functional pipeline in point-free form:</p>
+
+<pre><code>findDupes :: [(String, Int)] -&gt; Map.Map String [Int]
+findDupes = Map.filter ((&gt;1) . length)
+          . Map.fromListWith (flip (++))
+          . map (fmap (:[]))
+</code></pre>
+
+<p>However, I think <code>map (fmap (:[]))</code> is probably too clever by half.  At the very least, it would be clearer to import <code>second</code> from <code>Data.Bifunctor</code> and write <code>map (second (:[]))</code>, though even better would be to just use a lambda which makes the intended transformation clear at a glance:</p>
+
+<pre><code>map (\(w,i) -&gt; (w,[i]))
+</code></pre>
+
+<p>A rewrite of <code>printDupes</code> would probably look like:</p>
+
+<pre><code>printDupes :: Map.Map String [Int] -&gt; IO ()
+printDupes dupes =
+  forM_ (sortOn snd $ Map.assocs dupes) $ \(w, idxs) -&gt;
+    putStrLn $ "Duplicated element " ++ w ++
+               " found on positions: " ++
+               (intercalate ", " $ map show idxs)
+</code></pre>
+
+<p>(Here, <code>forM_</code> comes from <code>Control.Monad</code> and is just a flipped version of <code>mapM_</code>.)</p>
+
+<p>One additional stylistic issue regards your handling of IO.  Here, the <code>main</code> function is responsible for actually performing input and then calls on a pure function to perform the processing.  When it comes time to generate output, though, it passes off that responsibility to another function.  Haskell programs are usually carefully organized around their IO, with a clear division of responsibility between the IO and the pure processing, and it's usual to have input and output all handled at the same "level".  I realize that sounds a little fuzzy and hand-wavy, but it boils down to this -- it would be more usual to localize input <em>and</em> output in <code>main</code> and have the remainder of the program (including <code>printDupes</code>) be pure.  So, <code>printDupes</code> would instead look something like:</p>
+
+<pre><code>printDupes :: Map.Map String [Int] -&gt; String
+printDupes =
+  unlines . map render . sortOn snd . Map.assocs
+  where render (w,idxs)
+          = "Duplicated element " ++ w ++
+            " found on positions: " ++
+            intercalate ", " (map show idxs)
+</code></pre>
+
+<p>I also personally find it a little odd that <code>findDups</code> takes a list <code>[(String,Int)]</code> but then returns a <code>Map String [Int]</code>.  The <code>Map</code> seems like an implementation detail, and it "feels" like the function ought to return a <code>[(String,[Int])]</code>, and it might as well sort this list while it's at it.</p>
+
+<p>Anyway, with all those changes and some renaming of functions, the final program might look like:</p>
+
+<pre><code>{-# OPTIONS_GHC -Wall #-}
+
+import qualified Data.Map as Map
+import Data.List
+
+main :: IO ()
+main = interact (renderDups . findDups . getWords)
+
+getWords :: String -&gt; [(String, Int)]
+getWords input =
+  [ (w, i)
+  | (i, ws) &lt;- zip [1..]
+               $ map (words . takeWhile (/= '\t'))
+               $ lines input
+  , w &lt;- ws ]
+
+findDups :: [(String, Int)] -&gt; [(String, [Int])]
+findDups = sortOn snd . Map.assocs
+         . Map.filter ((&gt;1) . length)
+         . Map.fromListWith (flip (++))
+         . map (\(w,i) -&gt; (w,[i]))
+
+renderDups :: [(String, [Int])] -&gt; String
+renderDups = unlines . map render
+  where render (w,idxs)
+          = "Duplicated element " ++ w ++
+            " found on positions: " ++
+            intercalate ", " (map show idxs)
+</code></pre>
+    </div>

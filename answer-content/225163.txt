@@ -1,0 +1,120 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I would like to share some observations about your main concerns given at the end of the question. Let's start from the back:</p>
+
+<h2>5. <code>extend_col</code>/<code>reduce_row</code></h2>
+
+<p>From what I can see, the "trick" here is to bring the points into a <a href="https://en.wikipedia.org/wiki/Homogeneous_coordinates" rel="nofollow noreferrer">homogenous coordinate system</a> and back. Therefore, I would propose to change the name of both functions to <code>to_homogeneous</code> and <code>from_homogeneous</code> or something similar. I also would propose a more straightforward implementation of <code>from_homogeneous</code>:</p>
+
+<pre><code>def to_homogeneous(array):
+    """Extend `array` adding a last columns of ones"""
+    # alternatively:
+    # rows, cols = array.shape
+    # arr = np.empty((rows, cols+1))
+    # arr[:, :-1] = array
+    # arr[:, -1] = 1
+    # or:
+    # arr = np.ones((rows, cols+1))
+    # arr[:, :-1] = array
+    return np.hstack((array, np.ones((array.shape[0], 1))))
+
+
+def from_homogeneous(array):
+    """Divide the array by the last column and return all but the last one"""
+    return array[:, :-1] / array[:, -1, np.newaxis]
+</code></pre>
+
+<p>Since <span class="math-container">\$(A\cdot B)^T=B^T\cdot A^T\$</span> you can get rid of some of the transpositions in <code>image_warp</code>:</p>
+
+<pre><code>rxc = np.array(list(product(range(shape[0]), range(shape[1]))))
+uv = from_homogeneous(to_homogeneous(rxc) @ la.inv(M).T)
+</code></pre>
+
+<p>I'm also relatively sure that there has to be a better way other than <code>itertools.product</code> here, but I haven't found it yet ;-)</p>
+
+<h2>4. <code>clip</code> vs. <code>np.clip</code></h2>
+
+<p>As you rightfully suspected, you could use <code>np.clip</code> for the task directly. If you look at its <a href="https://docs.scipy.org/doc/numpy/reference/generated/numpy.clip.html" rel="nofollow noreferrer">documentation</a>, you'll see, that you can pass array-like arguments as upper and lower bounds.</p>
+
+<pre><code>uv_neigh = np.clip(
+    uv_neigh,
+    [lower_u, lower_u, lower_v, lower_v],
+    [upper_u, upper_u, upper_v, upper_v]
+)
+</code></pre>
+
+<p>Please verify this yourself, for what I've seen it always delivers the same results as your original implementation.</p>
+
+<h2>3. Rotating and flipping the results in <code>image_warp</code></h2>
+
+<p>Maybe later.</p>
+
+<h2>2. Reducing conversions and transpositions</h2>
+
+<p>While talking about the 5th point, I already presented a first step towards reducing the amount of transpositions. The part where <code>uv_neigh</code> is computed is another candidate to cut some transpositions. Rewriting it to make use of the full power of numpy will help as a first step:</p>
+
+<pre><code>def neighboring_points(points):
+    """Return the neighbor points of given uv"""
+    neigh_np = np.empty((points.shape[0], 4))
+    neigh_np[:, 0::2] = np.floor(points)
+    neigh_np[:, 1::2] = np.ceil(points)
+    return neigh_np
+</code></pre>
+
+<p>This implementation creates a numpy array of the right size and then fills its 1st and 3rd column with the floored coordinates  and the 2nd and 4th column with the ceiled coordinates of the points. Again, this should be fully compatible with your original implementation, but without all the transpositions and converting back and forth between Python and numpy.</p>
+
+<p>With this change also in place, <code>image_warp</code> now looks much friendlier:</p>
+
+<pre><code>def image_warp(M, img, shape):
+    rxc = np.array(list(product(range(shape[0]), range(shape[1]))))
+    uv = from_homogeneous(to_homogeneous(rxc) @ la.inv(M).T)
+
+    uv_neigh = neighboring_points(uv)
+
+    # you could also move this into a function as before
+    lower_u, upper_u, lower_v, upper_v = 0, img.shape[1]-1, 0, img.shape[0]-1
+    uv_neigh = np.clip(
+        uv_neigh,
+        [lower_u, lower_u, lower_v, lower_v],
+        [upper_u, upper_u, upper_v, upper_v]
+    )
+    coords = np.hstack((uv, uv_neigh))
+
+    return np.flip(np.rot90(interpolate(coords, img).reshape(shape), 3), 1).astype('uint8')
+</code></pre>
+
+<h2>1. List comprehension in <code>bilinear_interp</code></h2>
+
+<p>Indeed, the list comprehension here seems to be the biggest bottleneck of the code. Since I wasn't fully able to decipher all the cryptic variable names in your code and not had so much time at hand to really wrap my head around the problem, I took the lazy approach and threw the just-in-time compiler <a href="https://numba.pydata.org/" rel="nofollow noreferrer">numba</a> (i.e. it compiles plain Python/numpy code to a faster platform-specific code) at the problem to see how it went. This is the code I ended up with:</p>
+
+<pre><code>from numba import jit
+
+
+@jit(nopython=True)
+def _bilinear_core(xx, q, yy):
+    n = xx.shape[1]
+    zz = np.empty((n, ))
+    xx = xx.T
+    q = q.T
+    yy = yy.T
+    for i in range(n):
+        zz[i] = xx[i, :] @ q[i, :] @ yy[i, :].T
+    return zz
+
+
+def bilinear_interp(x, y, x0, x1, y0, y1, q00, q01, q10, q11):
+    """Do bilinear interpolation given a point, a box and
+    values on box vetices"""
+    q = np.array([[q00, q01], [q10, q11]])
+    xx = np.array([(x1 - x), (x - x0)])
+    yy = np.array([(y1 - y), (y - y0)])
+    return _bilinear_core(xx, q, yy)
+</code></pre>
+
+<p>As you can see, I had to make some changes to use numba's faster <a href="http://numba.pydata.org/numba-doc/latest/user/jit.html#nopython" rel="nofollow noreferrer">nopython mode</a>. The biggest change is that you cannot use <code>zip(...)</code> in that mode, as well as some other convenient functions available in Python. Splitting the code up in two functions was likely not necessary, but I like to do it nevertheless to keep numba-specific modifications contained to a small scope. Other than this, the code is almost unchanged and it's still written in pure Python/numpy.</p>
+
+<p>But what are the benefits of these extra hoops you now have to jump through? Ignoring all the plotting and OpenCV's reference implementation, your <code>main</code> function runs in about <span class="math-container">\$10s\$</span> on my old laptop. Using numba and all the changes presented here in this answer to this point, the same main function now runs in <span class="math-container">\$3.2s\$</span>*. Not bad, isn't it?</p>
+
+<hr>
+
+<p>* When timing functions that (try to) use numba JIT, you have to take care to run the code at least twice and ignore the first measurement, since the first measurement would otherwise include the time numba needs to compile the function. In this example here, the first run takes about <span class="math-container">\$4.3s\$</span>, which means that round about <span class="math-container">\$1.1s\$</span> are spent on the compilation process.</p>
+    </div>

@@ -1,0 +1,99 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The block size shouldn't be 12 (more like 1 to 2 orders of magnitude bigger), but I don't know exactly what it <em>should</em> be and it's easier to try some values and see how they work out than trying to predict it.. Likely the blocks shouldn't be square either (and therefore, not all three the same shape), because the eventual kernel will "prefer" a certain direction over the other.</p>
+
+<p>There are inherent inefficiencies in <code>multiplyMatrices</code> due to its "shape" and we can calculate in advance what shape it <em>should</em> have. The Intel(R) Xeon(R) E5-2695 v3 has the Haswell micro-architecture, which has these key properties:</p>
+
+<ul>
+<li>Vector FMA per cycle: 2</li>
+<li>Vector FMA latency: 5</li>
+<li>Vector loads per cycle: 2</li>
+<li>Vector size: 256bit (4 doubles)</li>
+</ul>
+
+<p>This means that, in order to max out the amount of arithmetic that happens, we will need at least 2*5=10 (the throughput-latency product) independent vector accumulators. Unrolling by 2 was a good start, but not close to what is required. Just unrolling more would be easy but there is more to it.</p>
+
+<p>The limited number of loads, only a 1:1 ratio with FMAs at most (otherwise it starts to eat into the arithmetic throughput), means that we must somehow re-use data within a single iteration of the inner loop. Having two loads for each FMA (loading elements from each matrix) is twice the budget, that's definitely out.</p>
+
+<p>So the inner loop itself needs to have a somewhat rectangular footprint to enable data re-use, and that rectangle needs to have an area of at least 10 4-wide vectors. For example it could be 2x5, 5x2, 3x4, 4x3.. that's about it. It can't really be bigger, then we would run out of registers, and spilling accumulators is <em>super</em> out. 3x5 seems like it could be possible, but it does not only require 15 accumulators but also some extra registers to hold the values from the input matrixes and it won't fit. By the way an other way to view the "rectangular footprint" is unrolling the <em>outer two</em> loops. The above sizes are all in numbers of vectors, so in a scalar view one of the directions gets 4 times as big again.</p>
+
+<p>As an example (consider this mainly clarificational as in "how to put all of the above abstract-sounding considerations together into code" and not so much "copy&amp;paste code") I'll pick 5x2 (20x2 scalars). That means the main part of the code would look something like this:</p>
+
+<pre><code>#include &lt;x86intrin.h&gt;
+
+// must be multiple of 20
+#define BLOCK_H 120
+
+// must be multiple of 2
+#define BLOCK_W 128
+
+// this is the number of columns of mat1 and the number of rows of mat2
+// has no relation to the size of the result block
+// can be whatever
+#define BLOCK_K 128
+
+void matmulBlock(double *result, double *mat1, double *mat2) {
+    size_t i, j, k;
+    __m256d sum0, sum1, sum2, sum3, sum4;
+    __m256d sum5, sum6, sum7, sum8, sum9;
+    __m256d tmp0, tmp1, tmp2, tmp3, tmp4;
+    __m256d m1, m2;
+    size_t N = BLOCK_H;
+    for (i = 0; i &lt; BLOCK_W; i += 2) {
+        for (j = 0; j &lt; BLOCK_H; j += 20) {
+            sum0 = _mm256_load_pd(&amp;result[i * N + j]);
+            sum1 = _mm256_load_pd(&amp;result[i * N + j + 4]);
+            sum2 = _mm256_load_pd(&amp;result[i * N + j + 8]);
+            sum3 = _mm256_load_pd(&amp;result[i * N + j + 12]);
+            sum4 = _mm256_load_pd(&amp;result[i * N + j + 16]);
+
+            sum5 = _mm256_load_pd(&amp;result[i * N + j + N]);
+            sum6 = _mm256_load_pd(&amp;result[i * N + j + N + 4]);
+            sum7 = _mm256_load_pd(&amp;result[i * N + j + N + 8]);
+            sum8 = _mm256_load_pd(&amp;result[i * N + j + N + 12]);
+            sum9 = _mm256_load_pd(&amp;result[i * N + j + N + 16]);
+
+            for (k = 0; k &lt; BLOCK_K; k++) {
+                m1 = _mm256_set1_pd(mat2[i * N + k]);
+                m2 = _mm256_set1_pd(mat2[i * N + k + N]);
+
+                tmp0 = _mm256_load_pd(&amp;mat1[k * N + j]);
+                tmp1 = _mm256_load_pd(&amp;mat1[k * N + j + 4]);
+                tmp2 = _mm256_load_pd(&amp;mat1[k * N + j + 8]);
+                tmp3 = _mm256_load_pd(&amp;mat1[k * N + j + 12]);
+                tmp4 = _mm256_load_pd(&amp;mat1[k * N + j + 16]);
+
+                sum0 = _mm256_fmadd_pd(m1, tmp0, sum0);
+                sum1 = _mm256_fmadd_pd(m1, tmp1, sum1);
+                sum2 = _mm256_fmadd_pd(m1, tmp2, sum2);
+                sum3 = _mm256_fmadd_pd(m1, tmp3, sum3);
+                sum4 = _mm256_fmadd_pd(m1, tmp4, sum4);
+
+                sum5 = _mm256_fmadd_pd(m2, tmp0, sum5);
+                sum6 = _mm256_fmadd_pd(m2, tmp1, sum6);
+                sum7 = _mm256_fmadd_pd(m2, tmp2, sum7);
+                sum8 = _mm256_fmadd_pd(m2, tmp3, sum8);
+                sum9 = _mm256_fmadd_pd(m2, tmp4, sum9);
+            }
+
+            _mm256_store_pd(&amp;result[i * N + j], sum0);
+            _mm256_store_pd(&amp;result[i * N + j + 4], sum1);
+            _mm256_store_pd(&amp;result[i * N + j + 8], sum2);
+            _mm256_store_pd(&amp;result[i * N + j + 12], sum3);
+            _mm256_store_pd(&amp;result[i * N + j + 16], sum4);
+
+            _mm256_store_pd(&amp;result[i * N + j + N], sum5);
+            _mm256_store_pd(&amp;result[i * N + j + N + 4], sum6);
+            _mm256_store_pd(&amp;result[i * N + j + N + 8], sum7);
+            _mm256_store_pd(&amp;result[i * N + j + N + 12], sum8);
+            _mm256_store_pd(&amp;result[i * N + j + N + 16], sum9);
+        }
+    }
+}
+</code></pre>
+
+<p>By the way I didn't test this, I converted it from code that <em>is</em> tested, but it was single precision and row-major and some miscellaneous differences, I may have made some errors in changing it just now. Even if its works, this is ultimately not the most efficient code, this is just step 1: writing code to fit the basic parameters of the machine - it's not optimized beyond that.</p>
+
+<p>Some assumptions are made: <code>result</code> and <code>mat1</code> both 32-aligned, and zero padding in empty areas (same block size always).</p>
+
+<p>GCC 4.8.5 needs <code>-mfma</code> to compile this but cannot take <code>-march=haswell</code> yet.</p>
+    </div>

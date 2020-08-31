@@ -1,0 +1,116 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First let's mention a bug / issue:</p>
+
+<ul>
+<li>Your <code>passwords</code> variable is accessed (read and modified) from multiple goroutines without any syncronization: this is a race condition!</li>
+</ul>
+
+<h3>Primary problem</h3>
+
+<p>Your memory problem arises from launching a tremendous amount of goroutines. For example when you call <code>compute()</code> with <code>n = 6</code> (to try passwords with a length of 6), it will create:</p>
+
+<pre><code>36^5 = pow(36, 5) = 60466176
+</code></pre>
+
+<p>(36 is the length of your alphabet; <code>5</code> is the <code>prefix</code> value for the condition <code>prefix == n-1</code> when <code>compute()</code> stops spawning new goroutines)</p>
+
+<p><strong>60 million goroutines!</strong></p>
+
+<p>Goroutines are lightweight, but not <em>that</em> lightweight! Even if managing 1 goroutine would cost only 1 KB memory (it has its own stack etc.), this would require 60 GB memory! Understandable you run out of it. Your code spawns goroutines at a much quicker rate than they complete. (It should be noted that nothing in your code prevents spawning these new goroutines before any would be completed, so this is kind of worst case but still...)</p>
+
+<h3>An easy fix!</h3>
+
+<p>But the good news is that there is a really easy fix to this tremendous number of goroutines: simply do not spawn many goroutines.</p>
+
+<p>A trivial way to limit spawning goroutines is that when you would spawn them, bind it to a condition to keep them at bay. For example launch 36 goroutines to process passwords starting with the different letters, but after that let 1 goroutine try all the combinations with that starting letter.</p>
+
+<p>We can test this "first letter" condition by comparing <code>prefix</code> to <code>0</code>:</p>
+
+<pre><code>for i := range alfabeto {
+    wgFather.Add(1)
+    if prefix == 0 {
+        go compute(prefix+1, n, fmt.Sprintf("%s%c", a, alfabeto[i]), wgFather)
+    } else {
+        compute(prefix+1, n, fmt.Sprintf("%s%c", a, alfabeto[i]), wgFather)
+    }
+}
+</code></pre>
+
+<p>By inserting this condition and the <code>else</code> branch just calling <code>compute()</code> on the <em>same</em> goroutine, you keep your goroutine number and memory usage at bay! But still, you utilize multiple goroutines and multiple CPU cores.</p>
+
+<p>There is a minor "downside": you have no control how these 36 goroutines finish compared to each other, there may be a "relaxed" period when only 1 or 2 goroutines are running and others are finished, in this relaxed period CPU utilization will not be 100%. More formally CPU utilization will be &lt; 100% if # of goroutines is less than # of CPU cores.</p>
+
+<h3>Optimization tips</h3>
+
+<p>Here are some optimization tips:</p>
+
+<ul>
+<li><p>You do unnecessary round-trips: you build potential passwords as <code>string</code>, then when your <code>searchPassword()</code> function computes its MD5, it has to convert it to <code>[]byte</code>. Best would be to build password in a <code>[]byte</code>. Go stores strings as UTF-8 encoded sequences (see blog post <a href="https://blog.golang.org/strings" rel="noreferrer">Strings, bytes, runes and characters in Go</a> for details), and all your alphabet letters map to bytes one-to-one in UTF-8 encoding, so you could just use their byte value for faster building.</p></li>
+<li><p>In your <code>searchPassword()</code> when you have the MD5 of the potential password, you always iterate over all crackable MD5 strings and you compare to all. This is a waste, you could sort the crackable MD5 values and use binary search to find if the potential is in it (sorting and binary search is implemented in the <a href="https://golang.org/pkg/sort/" rel="noreferrer"><code>sort</code></a> package). Or even better: you could build a map from the crackable MD5 strings, and just check if the candidate is in the map (now this check would be <code>O(1)</code> complexity instead of <code>O(log n)</code> of the binary search).</p></li>
+<li><p>It is also an unnecessary round-trip to convert a calculated MD5 to <code>string</code> in order to check if it is a crackable one. Best would be to convert the crackable MD5 values to a byte <strong>array</strong> (note: <strong>array</strong> and not slice), and when you have the MD5 of a potential password as an <strong>array</strong>, you can check if it is a crackable one without converting it to <code>string</code>. Arrays are comparable in Go (unlike slices!), so you could also build a map from the MD5 arrays to check if a potential MD5 is in the map.</p></li>
+<li><p>Also note that your algorithm generates passwords multiple times. For example if you want to check passwords with a length of 3, these 3-letter passwords are essentially all the 2-letter passwords +1. But you don't make use of this, you always generate all passwords with a given length from "scratch".</p></li>
+</ul>
+
+<p>Utilizing these tips would speed up your algorithm big time; not just because we got rid of lots of needless computation / conversion, but also because much less "garbage" will be generated for the GC.</p>
+
+<h3>Alternative</h3>
+
+<p>An alternative way of implementing this brute-force cracker would be to use the <a href="https://en.wikipedia.org/wiki/Producer%E2%80%93consumer_problem" rel="noreferrer">producer-consumer pattern</a>. You could have a designated <em>producer</em> goroutine that would generate the possible passwords, and send them on a channel. You could have a fixed pool of <em>consumer</em> goroutines (e.g. 5 of them) which would loop over the channel on which generated passwords are delivered, and each would do the same: receive passwords, hash them (MD5) and check if it matches a crackable one.</p>
+
+<p>The <em>producer</em> goroutine could simply close the channel when all combinations were generated, properly signalling <em>producers</em> that no more passwords will be coming. The <code>for ... range</code> construct on a channel handles the "close" event and terminates properly.</p>
+
+<p>This would result in a clean design, would result in fixed number of goroutines, and it would always utilize 100% CPU. It also has the advantage that it can be "throttled" with the proper selection of the channel capacity (buffered channel) and the number of <em>consumer</em> goroutines.</p>
+
+<p>Here is how this producer-consumer could look like in Go if someone wants to play with it (also note that I elaborated this with full examples and much deeper explanation in StackOverflow question <a href="https://stackoverflow.com/a/38172204/1705598">Is this an idiomatic worker thread pool in Go?</a>):</p>
+
+<pre><code>var wg sync.WaitGroup
+
+func produce(ch chan&lt;- []byte) {
+    // Now generate all passwords:
+    for {
+        if noMore { // If no more passwords
+            close(ch)
+            break
+        }
+        pass := ...   // Here generate next password
+        ch &lt;- pass    // send it for processing
+    }
+}
+
+func consume(ch &lt;-chan []byte) {
+    defer wg.Done()
+    for pass := range ch {
+        // Hash, check
+    }
+}
+
+func main() {
+    ch := make(chan []byte, 100) // Buffered channel
+
+    // Start consumers:
+    for i := 0; i &lt; 5; i++ { // 5 consumers
+        wg.Add(1)
+        go consume(ch)
+    }
+
+    // Start producing: we can run this in the main goroutine
+    produce(ch)
+
+    wg.Wait() // Wait all consumers to finish processing passwords
+}
+</code></pre>
+
+<p>This blog post is an excellent introduction to parallel computation in Go using goroutines and channels: </p>
+
+<p><a href="https://blog.golang.org/pipelines" rel="noreferrer">Go Concurrency Patterns: Pipelines and cancellation</a></p>
+
+<h3>Further optimization tip</h3>
+
+<p>Now if you go with this <em>producer-consumer</em> goroutine model, another optimization becomes available.</p>
+
+<p>The <a href="https://golang.org/pkg/crypto/md5/#Sum" rel="noreferrer"><code>md5.Sum()</code></a> function (which takes a <code>[]byte</code> and returns the MD5 checksum of its content) always creates a new, internal <code>md5.digest</code> value which is used to do the MD5 hashing. Then it is discarded.</p>
+
+<p>Now if we have a small, fixed pool of <em>consumer</em> goroutines, we can now create and it is profitable to create a designated MD5 hasher for each with the <a href="https://golang.org/pkg/crypto/md5/#New" rel="noreferrer"><code>md5.New()</code></a> function. To what end? We can use the returned hasher (which is of type <a href="https://golang.org/pkg/hash/#Hash" rel="noreferrer"><code>hash.Hash</code></a>) to compute MD5 hashes, but what's cool is that we can <em>reuse</em> it to compute hashes of multiple byte slices.</p>
+
+<p><code>hash.Hash</code> implements <a href="https://golang.org/pkg/io/#Writer" rel="noreferrer"><code>io.Writer</code></a> so we can write any <code>[]byte</code> into it of which we want to compute the MD5 hash, and it also has a <code>Hash.Sum()</code> method which returns the MD5 hash, giving the option to <em>not</em> create a new array return value which will hold the calculated MD5, but we can pass <em>our</em> slice to it in which we want the result. We can also create prepared arrays (<code>[16]byte</code>) and slice them to obtain a slice <code>[]byte</code>, and do this for all of the <em>consumer</em> goroutines. As a result, we can further suppress "memory-garbage" generation and reduce GC work. Once we queried the MD5 sum of a password, we can simply call <code>Hash.Reset()</code> to re-initiaze the hasher for the next password.</p>
+    </div>

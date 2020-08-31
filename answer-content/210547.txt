@@ -1,0 +1,158 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Well done. Overall, there are no big flaws, just some minor issues.</p>
+
+<h1>Type annotations</h1>
+
+<p>While it's great that all top-level functions have proper type signatures, the local bindings <em>inside</em> those functions usually don't. After all, their types should get inferred, e.g.</p>
+
+<pre><code>example :: [Int] -&gt; [Int]
+example = map inc
+  where
+    inc x = 1 + x
+</code></pre>
+
+<p>doesn't need a type signature since <code>x</code>'s type is already fixed to <code>Int</code>. It makes refactoring also a lot easier if we change the type later. If we started with</p>
+
+<pre><code>example :: [Int] -&gt; [Int]
+example = map inc
+  where
+    inc :: Int -&gt; Int
+    inc x = 1 + x
+</code></pre>
+
+<p>and later want to generalize, we might forget the second type signature and end up with an error message:</p>
+
+<pre><code>example :: Num a =&gt; [a] -&gt; [a]
+example = map inc
+  where
+    inc :: Int -&gt; Int -- whoops, GHC will yell about that
+    inc x = 1 + x
+</code></pre>
+
+<p>Therefore, type signatures for local functions are usually not written out. There are some instances where they're necessary, but that's usually with <code>RankNTypes</code> or other extensions.</p>
+
+<h1>The tape</h1>
+
+<p>The tape works well, and is pretty much how you would expect it. </p>
+
+<h2>Infinite tapes and debugging</h2>
+
+<p>That being said, an infinite tape has the slight inconvenience that you can never inspect it for debugging purposes. </p>
+
+<p>Also, if you ever create a module from your code, you must not export the <code>Tape</code> data constructor, as it would enable <code>Tape [] 0 []</code> and therefore break assertions.</p>
+
+<p>A finite tape circumvents those issues, but needs slightly more effort in the <code>move</code>ments.</p>
+
+<h2>Working on the current value</h2>
+
+<p>In <code>runBf</code> we can find several spots where we <code>advance</code> the program after we worked on the current value, e.g.:</p>
+
+<pre><code>        Increment -&gt; advance prog (Tape ls (x+1) rs)
+        Decrement -&gt; advance prog (Tape ls (x-1) rs)
+</code></pre>
+
+<p>That's now a possible source of errors, since we could have used</p>
+
+<pre><code>        Increment -&gt; advance prog (Tape ls (x+1) ls)
+        Decrement -&gt; advance prog (Tape ls (x-1) ls)
+</code></pre>
+
+<p>by accident. A small helper can prevent that issue:</p>
+
+<pre><code>onCurrent :: (a -&gt; a) -&gt; Tape a -&gt; Tape a
+onCurrent f (Tape ls x rs) = Tape ls (f x) rs
+
+current   :: Tape a -&gt; a
+current (Tape _ x _ ) = x
+</code></pre>
+
+<p>Then we end up with</p>
+
+<pre><code>        MovLeft   -&gt; advance prog (moveLeft tape)
+        MovRight  -&gt; advance prog (moveRight tape)
+        Increment -&gt; advance prog (onCurrent (+1) tape)
+        Decrement -&gt; advance prog (onCurrent (subtract 1) tape)
+        Input     -&gt; do 
+            char &lt;- getChar 
+            advance prog (onCurrent (const (fromEnum char)) tape)
+</code></pre>
+
+<h1>Naming and scope</h1>
+
+<p>As neither <code>advance</code> nor <code>getLoop</code> use any of the bindings in their scope, they're candidates for top-level functions.</p>
+
+<p><code>runBf'</code> can be called <code>go</code> or another short name. Calling the inner worker just <code>go</code> is really common and won't alienate other readers.</p>
+
+<h1>Make interfaces hard to use wrong</h1>
+
+<p><code>getLoop</code> uses an <code>Int</code> as first argument that's not properly documented. Types only go so far as documentation, and we could accidentally use <code>getLoop 0</code> in <code>BeginLoop</code>.</p>
+
+<p>Instead, we should make it impossible to misuse <code>getLoop</code>:</p>
+
+<pre><code>getLoop :: BfProgram -&gt; BfProgram
+getLoop = go 1
+  where
+    go _ [] = error "Mismatched brackets in BF program"
+    go 1 (EndLoop:ps) = [] 
+    go n (p:ps) = p:case p of 
+        BeginLoop -&gt; go (n + 1) ps 
+        EndLoop   -&gt; go (n - 1) ps 
+        _         -&gt; go n ps
+</code></pre>
+
+<p>Similarly, <code>runBf</code> should probably take a <code>BfProgram</code>, not an arbitrary <code>String</code>, as this doesn't decrease the strength of your program, we can recreate the previous behaviour with</p>
+
+<pre><code>runBf . parseBf
+</code></pre>
+
+<p>However, speaking of parsing…</p>
+
+<h1>Loop validation</h1>
+
+<p>A drawback with our current <code>BfProgram</code> is that we might end up with mismatched brackets, e.g.</p>
+
+<pre><code>parseBf "]["
+</code></pre>
+
+<p>parses fine and leads to a runtime error. However, we could easily detect that during parsing. Our <code>parseBf</code> needs a way to report errors:</p>
+
+<pre><code>type ParserError = String
+
+parseBf :: String -&gt; Either ParserError BfProgram
+parseBf = go
+  where 
+    go []     = Right []
+    go (x:xs) = case x of
+        '&lt;' -&gt; MovLeft &lt;$:&gt; go xs
+        '&gt;' -&gt; MovRight &lt;$:&gt; go xs
+        '+' -&gt; Increment &lt;$:&gt; go xs
+        '-' -&gt; Decrement &lt;$:&gt; go xs
+        ',' -&gt; Input &lt;$:&gt; go xs
+        '.' -&gt; Output &lt;$:&gt; go xs
+        '[' -&gt; -- exercise ; use `getLoop`-like function
+        ']' -&gt; -- exercise ; easier if previous one done correctly.
+        x   -&gt; go xs
+   x &lt;$:&gt; xs = fmap (x:) xs
+</code></pre>
+
+<p>but afterwards, we can be sure that <code>parseBf</code> only returns <code>BfProgram</code>s with valid brackets.</p>
+
+<p>Unfortunately, we still need to use <code>getLoop</code>, as <code>BeginLoop</code> and <code>EndLoop</code> are still in our instruction set. If we change the instruction set, we can get rid of that too:</p>
+
+<pre><code>data BfInstruction 
+    = MovLeft
+    | MovRight
+    | Increment
+    | Decrement
+    | Output
+    | Input 
+    | Loop BfProgram
+    deriving (Show, Eq)  
+</code></pre>
+
+<p>I go into more details in some of my <a href="https://codereview.stackexchange.com/questions/174330/haskell-brainfck-interpreter-runtime-error-handling/174341#174341">previous Bf reviews</a>, feel free to <a href="https://codereview.stackexchange.com/questions/128833/charmander-brainfuck-interpreter-in-haskell/128841#128841">read them</a> if you get stuck on <code>Loop</code>.</p>
+
+<h1>Final remarks</h1>
+
+<p>Other than the usual re-evaluation of loops (which is a common scenario in Haskell Bf interpreters), your code was fine, so all the issues are really minor. Again: well done.</p>
+    </div>

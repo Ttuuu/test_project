@@ -1,0 +1,183 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Welcome to Code Review. Your code is understandable, so we can, more or less, figure out what it does, but it is always nice for reviewers to hear you say what you use a piece of code for, what its purpose is, what the code itself specifically does, and to have some usage examples. This also helps you to reflect on the choices you made.</p>
+
+<p>I couldn't get your <code>getClassTotal()</code> and <code>getMethodTotal()</code> to work. They assume that all the files are PHP files, and in my test directory they are not. You should have checked the PHP file extension before tokenizing the file content.</p>
+
+<p>From what I can see this looks like a class that wraps four independent function. That only doesn't justify the existence of this class. Is there nothing common to these functions? I think we can agree that the <code>RecursiveDirectoryIterator</code> and <code>RecursiveIteratorIterator</code> are present in all four, so I made that part of the class.</p>
+
+<p>There are also some simplifications I added in the file and bytes counter. </p>
+
+<p>Using the build-in PHP tokenizer was a good idea, but clearly the way that classes and methods are counted is very similar. So I created a new method which will count either. I don't see the point of checking for a class name, so I left that bit out.</p>
+
+<p>In your code a counter is the second argument to all four method. I fail to see why this is a good thing. I dropped it.</p>
+
+<p>This gives me the following code:</p>
+
+<pre><code>&lt;?php
+
+class DirectoryScanner
+{
+    private $files;
+
+    public function __construct($path)
+    {
+        $dirIterator = new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS);
+        $this-&gt;files = new RecursiveIteratorIterator($dirIterator);
+    }
+
+    public function getFileCount()
+    {
+        return iterator_count($this-&gt;files);
+    }
+
+    public function getBytesUsed()
+    {
+        $bytes = 0;
+        foreach ($this-&gt;files as $file) {
+            $bytes += $file-&gt;getSize();
+        }
+        return $bytes;
+    }
+
+    private function getPhpTokenCount($token)
+    {
+        $counter = 0;
+        foreach ($this-&gt;files as $file) {
+            if ($file-&gt;getExtension() == 'php') {
+                $contents = file_get_contents($file);
+                $tokens   = token_get_all($contents);
+                $values   = array_count_values(array_column($tokens, 0));
+                $counter += isset($values[$token]) ? $values[$token] : 0;
+            }
+        }
+        return $counter;
+    }
+
+
+    public function getPhpClassCount()
+    {
+        return $this-&gt;getPhpTokenCount(T_CLASS);
+    }
+
+    public function getPhpFunctionCount()
+    {
+        return $this-&gt;getPhpTokenCount(T_FUNCTION);
+    }
+}
+
+?&gt;
+</code></pre>
+
+<p>I left out all the comments to save some space. This code can be tested like this:</p>
+
+<pre><code>$path = $_SERVER['DOCUMENT_ROOT'];
+$test = new DirectoryScanner($path);
+
+echo 'getFileCount: ' . $test-&gt;getFileCount() . '&lt;br&gt;';
+echo 'getBytesUsed: ' . $test-&gt;getBytesUsed() . '&lt;br&gt;';
+echo 'getPhpClassCount: ' . $test-&gt;getPhpClassCount() . '&lt;br&gt;';
+echo 'getPhpFunctionCount: ' . $test-&gt;getPhpFunctionCount() . '&lt;br&gt;';
+</code></pre>
+
+<p>In my code I take advantage of what a class is: An piece of code in which you share fields and methods in a local scope. I made <code>$files</code> and <code>getPhpTokenCount()</code> private intentionally to stress this point.</p>
+
+<p>I think the first two methods have little in common with the last three. So I would split this up in two classes, like so:</p>
+
+<pre><code>class DirectoryScanner
+{
+    protected $files;
+
+    public function __construct($path)
+    {
+        $dirIterator = new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS);
+        $this-&gt;files = new RecursiveIteratorIterator($dirIterator);
+    }
+
+    public function getFileCount()
+    {
+        return iterator_count($this-&gt;files);
+    }
+
+    public function getBytesUsed()
+    {
+        $bytes = 0;
+        foreach ($this-&gt;files as $file) {
+            $bytes += $file-&gt;getSize();
+        }
+        return $bytes;
+    }
+}
+
+
+class PhpFilesScanner extends DirectoryScanner
+{
+
+    public function getPhpTokenCount($token)
+    {
+        $counter = 0;
+        foreach ($this-&gt;files as $file) {
+            if ($file-&gt;getExtension() == 'php') {
+                $contents = file_get_contents($file);
+                $tokens   = token_get_all($contents);
+                $values   = array_count_values(array_column($tokens, 0));
+                $counter += isset($values[$token]) ? $values[$token] : 0;
+            }
+        }
+        return $counter;
+    }
+
+
+    public function getPhpClassCount()
+    {
+        return $this-&gt;getPhpTokenCount(T_CLASS);
+    }
+
+    public function getPhpFunctionCount()
+    {
+        return $this-&gt;getPhpTokenCount(T_FUNCTION);
+    }
+}
+
+?&gt;
+</code></pre>
+
+<p>It just makes more sense this way. Note that <code>PhpFilesScanner</code> does rely on <code>DirectoryScanner</code> for the iterator functionality.</p>
+
+<p>I think, depending on your usage, that result buffering would be a nice addition to these classes. For instance, by once buffering alle the token counts, the <code>PhpFilesScanner</code> class can return multiple requests for counts of certain tokens much quicker. Especially if you expand it to include more types of tokens. Buffering would make the class look something like this:</p>
+
+<pre><code>class PhpFileScanner extends DirectoryScanner
+{
+    private $tokenCounts = [];
+
+    public function __construct($path)
+    {
+        parent::__construct($path);
+        foreach ($this-&gt;files as $file) {
+            if ($file-&gt;getExtension() == 'php') {
+                $contents = file_get_contents($file);
+                $tokens   = token_get_all($contents);
+                $counts   = array_count_values(array_column($tokens, 0));
+                foreach ($counts as $token =&gt; $count) {
+                    if (!isset($this-&gt;tokenCounts[$token])) {
+                        $this-&gt;tokenCounts[$token] = 0;
+                    }
+                    $this-&gt;tokenCounts[$token] += $count;
+                }
+            }
+        }
+    }
+
+    public function getPhpClassCount()
+    {
+        return $this-&gt;tokenCounts[T_CLASS] ?? 0;
+    }
+
+    public function getPhpFunctionCount()
+    {
+        return $this-&gt;tokenCounts[T_FUNCTION] ?? 0;
+    }
+}
+</code></pre>
+
+<p>The <code>??</code> is the new <a href="https://www.php.net/manual/en/migration70.new-features.php#migration70.new-features.null-coalesce-op" rel="nofollow noreferrer">Null coalescing operator</a> of PHP 7.</p>
+    </div>

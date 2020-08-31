@@ -1,0 +1,253 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Formatting</h2>
+
+<p>There are some statements with non-standard format in here that I'm not too bothered by, but this one makes my eye twitch:</p>
+
+<pre><code>EXCLUDED_TYPES = ( 
+    WrapperDescriptorType, # e.g. __repr__ and __lt__
+    MethodDescriptorType, # e.g. __dir__, __format__, __reduce__, __reduce_ex__
+    BuiltinFunctionType, # e.g. __new__
+                 ) 
+HIDE_METHODS = {
+    '__init_subclass__',             # error warning, can't get signature
+    '_abc_impl', '__subclasshook__', # why see this?
+    '__abstractmethods__',
+               }
+</code></pre>
+
+<p>Ending parens and braces should be at the level of indentation of the beginning of the first line of the statement, not the level of indentation of the opening paren/brace. If you run <code>pylint</code> on your code, it will produce this:</p>
+
+<pre class="lang-none prettyprint-override"><code>C0330: Wrong hanging indentation.
+      )
+|   | ^ (bad-continuation)
+</code></pre>
+
+<p>In other words,</p>
+
+<pre><code>EXCLUDED_TYPES = ( 
+    WrapperDescriptorType, # e.g. __repr__ and __lt__
+    MethodDescriptorType, # e.g. __dir__, __format__, __reduce__, __reduce_ex__
+    BuiltinFunctionType, # e.g. __new__
+) 
+HIDE_METHODS = {
+    '__init_subclass__',             # error warning, can't get signature
+    '_abc_impl', '__subclasshook__', # why see this?
+    '__abstractmethods__',
+}
+</code></pre>
+
+<h2>Bug</h2>
+
+<p>This line:</p>
+
+<pre><code>        if name in abstractmethods:
+</code></pre>
+
+<p>references <code>name</code> before it has been defined. Below I assume that you meant <code>attr.name</code>.</p>
+
+<h2>False positives</h2>
+
+<p>I do not think that <code>MethodDescriptorType</code> should be included in <code>EXCLUDED_TYPES</code>. When I passed <code>str</code> in, all but one of its instance methods were this type and were erroneously excluded.</p>
+
+<h2>Confusing signature defaults</h2>
+
+<p>When you fail to get a signature you display it as <code>()</code>, but that's misleading because it is a valid signature. Instead consider something like <code>(?)</code>.</p>
+
+<h2>Mutable defaults</h2>
+
+<p>Don't assign <code>hide_override</code> a default of <code>set()</code>, because that does not create a new set every time - it reuses the same set. If your function were to modify it it would contaminate future calls. For this reason many linters flag this and instead recommend that you give it a default of <code>None</code> and assign an empty set in the method itself.</p>
+
+<h2>Templating</h2>
+
+<p>Looking at your <code>node_label</code>, you could get a lot of mileage out of a templating engine like <a href="https://jinja.palletsprojects.com/en/2.11.x/" rel="nofollow noreferrer">Jinja</a>. From their documentation,</p>
+
+<blockquote>
+  <p>Jinja is a general purpose template engine and not only used for HTML/XML generation. For example you may generate LaTeX, emails, CSS, JavaScript, or configuration files.</p>
+</blockquote>
+
+<p>So you should be able to handle GraphViz markup just fine. This will provide you with a cleaner way to separate your presentation layer.</p>
+
+<p>Here is some example code of what this could look like. First, the Python:</p>
+
+<pre><code>from html import escape
+from inspect import (
+    isabstract,
+    classify_class_attrs,
+    signature,
+)
+from jinja2 import Template, FileSystemLoader, Environment
+from types import (
+    WrapperDescriptorType,
+    BuiltinFunctionType,
+)
+from typing import Type, Optional, Set
+
+
+EXCLUDED_TYPES = (
+    WrapperDescriptorType,  # e.g. __repr__ and __lt__
+    # This does NOT only apply to functions like __dir__, __format__, __reduce__, __reduce_ex__
+    # MethodDescriptorType,
+    BuiltinFunctionType,    # e.g. __new__
+)
+
+
+def load_template(filename: str) -&gt; Template:
+    # See https://stackoverflow.com/a/38642558/313768
+    loader = FileSystemLoader(searchpath='./')
+    env = Environment(loader=loader, autoescape=True)
+    return env.get_template(filename)
+
+
+TEMPLATE = load_template('class.jinja')
+
+
+def node_label(
+    cls: Type,
+    show_all: bool = False,
+    hide_override: Optional[Set[str]] = None,
+) -&gt; str:
+    if hide_override is None:
+        hide_override = set()
+
+    attributes, methods = [], []
+    abstract_methods = set(getattr(cls, "__abstractmethods__", ()))
+
+    for attr in classify_class_attrs(cls):
+        if (
+            (
+                show_all
+                or attr.name[0] != '_'
+                or attr.name in abstract_methods
+            )
+            and not isinstance(attr.object, EXCLUDED_TYPES)
+            and attr.name not in hide_override
+        ):
+            is_abstract = attr.name in abstract_methods
+
+            if attr.kind in {'property', 'data'}:
+                attributes.append((attr.name, is_abstract))
+            else:
+                try:
+                    args = escape(str(signature(attr.object)))
+                except (ValueError, TypeError) as e:
+                    print(f'unable to get signature for {attr}, {repr(e)}')
+                    args = '(?)'
+                methods.append((attr.name, args, is_abstract))
+
+    attributes.sort()
+    methods.sort()
+
+    return TEMPLATE.render(
+        name=cls.__name__,
+        is_abstract=isabstract(cls),
+        attributes=attributes,
+        methods=methods,
+    )
+
+
+from abc import ABC, abstractmethod
+class NodeBase(ABC):
+    __slots__ = 'slota', 'slotb'
+    @abstractmethod
+    def abstract_method(self, bar, baz=True):
+        raise NotImplementedError
+    def implemented_method(self, bar, baz=True):
+        return True
+    @property
+    @abstractmethod
+    def abstract_property(self):
+        raise NotImplementedError
+    @property
+    def property(self):
+        return False
+
+
+print(node_label(AbstractExample))
+</code></pre>
+
+<p>And the template:</p>
+
+<pre class="lang-html prettyprint-override"><code>&lt;
+  &lt;table border="1" cellborder="0" cellpadding="2" cellspacing="0" align="left"&gt;
+    &lt;tr&gt;
+      &lt;td align="center"&gt;
+        &lt;b&gt;
+          {%- if is_abstract -%}
+            &lt;i&gt;{{name}}&lt;/i&gt;
+          {%- else -%}
+            {{name}}
+          {%- endif -%}
+        &lt;/b&gt;
+      &lt;/td&gt;
+    &lt;/tr&gt;
+    &lt;hr/&gt;
+
+    &lt;tr&gt;
+      &lt;td align="left" balign="left"&gt;
+        {% for a_name, a_abstract in attributes %}
+          {%- if a_abstract -%}
+            &lt;i&gt;{{a_name}}&lt;/i&gt;
+          {%- else -%}
+            {{a_name}}
+          {%- endif -%}
+          &lt;br/&gt;
+        {% endfor %}
+      &lt;/td&gt;
+    &lt;/tr&gt;
+    &lt;hr/&gt;
+
+    &lt;tr&gt;
+      &lt;td align="left" balign="left"&gt;
+        {% for m_name, m_args, m_abstract in methods %}
+          {%- if m_abstract -%}
+            &lt;i&gt;{{m_name}}{{m_args}}&lt;/i&gt;
+          {%- else -%}
+            {{m_name}}{{m_args}}
+          {%- endif -%}
+          &lt;br/&gt;
+        {% endfor %}
+      &lt;/td&gt;
+    &lt;/tr&gt;
+    &lt;hr/&gt;
+
+  &lt;/table&gt;
+&gt;
+</code></pre>
+
+<p>This outputs:</p>
+
+<pre class="lang-html prettyprint-override"><code>&lt;
+  &lt;table border="1" cellborder="0" cellpadding="2" cellspacing="0" align="left"&gt;
+    &lt;tr&gt;
+      &lt;td align="center"&gt;
+        &lt;b&gt;&lt;i&gt;NodeBase&lt;/i&gt;&lt;/b&gt;
+      &lt;/td&gt;
+    &lt;/tr&gt;
+    &lt;hr/&gt;
+
+    &lt;tr&gt;
+      &lt;td align="left" balign="left"&gt;
+        &lt;i&gt;abstract_property&lt;/i&gt;&lt;br/&gt;
+        property&lt;br/&gt;
+        slota&lt;br/&gt;
+        slotb&lt;br/&gt;
+
+      &lt;/td&gt;
+    &lt;/tr&gt;
+    &lt;hr/&gt;
+
+    &lt;tr&gt;
+      &lt;td align="left" balign="left"&gt;
+        &lt;i&gt;abstract_method(self, bar, baz=True)&lt;/i&gt;&lt;br/&gt;
+        implemented_method(self, bar, baz=True)&lt;br/&gt;
+
+      &lt;/td&gt;
+    &lt;/tr&gt;
+    &lt;hr/&gt;
+
+  &lt;/table&gt;
+&gt;
+</code></pre>
+
+<p>The template has been written in a simple, "dumb" fashion so there is some repetition, for example in the <code>td</code> definitions and the conditional italics. There are ways to reduce this that I will leave as an exercise to you.</p>
+    </div>

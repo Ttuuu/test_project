@@ -1,0 +1,238 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Congratulations. For a first try of Fortran that looks overall quite good, 
+but of course there are some things to improve.</p>
+
+<h1>General architecture</h1>
+
+<p>If you assume, that all chunks have always the same size, you could simply use a 2D character array. 
+Since you have an array of chunks you can make the chunks unequally sized, then you can simply print them in the end without thinking about the different size of the last chunk.
+You don't need the chunkptr type, but you are right in your understanding that you need a derived type, to have an array of pointers.
+In addition if you use allocatables and not pointers, you can use automatic deallocation when variables go out of scope. 
+Then you can get rid of your explicit deallocations.
+As a general rule of thumb: Allocatable is always preferred over pointers for three reasons:</p>
+
+<ol>
+<li>Allocatables have exclusive ownership unless you add the <code>target</code> qualifier. This makes it easier to reason about code.</li>
+<li>Since the compiler can assume exclusive ownership, you get automatic deallocation when variables go out of scope. </li>
+<li>Since the compiler can assume exclusive ownership, it can do some performance optimizations that are only possible for non-aliased memory.</li>
+</ol>
+
+<p>If you have an allocatable variable in the main scope. The compiler might rely on the automatic cleanup by the operating system, which will lead to memory leaks reported by valgrind. If you want to get rid of these false-positives you can simply wrap them in a <code>block</code>.</p>
+
+<h2>Associate statement</h2>
+
+<p>Apart from dynamic memory there is another use-case where one could think that pointers are necessary when coming e.g. from C.
+That is defining short names for nested component access like: <code>chunks(num_chunks)%ptr%chunk_array</code>.
+This is best done with the <code>associate</code> statement</p>
+
+<pre><code>associate(M =&gt; chunks(num_chunks)%ptr%chunk_array)
+    M(j)
+    ! instead of 
+    chunks(num_chunks)%ptr%chunk_array(j)
+end associate
+</code></pre>
+
+<p>Note that you can associate with variables and parts of arrays; then your association can be a lhs and rhs value.
+You can even associate with expressions, then your association can only be a rhs value and you get type deduction for free. So it is far more useful than a pointer.</p>
+
+<h2>Error handling</h2>
+
+<p>Regarding error handling there is a nice rule of thumb (if you use a reasonably modern Fortran compiler).
+If you don't query the exit status of a call with
+<code>allocate(..., stat=ierr)</code> the runtime library will kill your process if allocation fails. If you query the exit status, you are responsible yourself to kill it, or do whatever you want.
+Since in your case I don't see any necessary logging or cleanup operations, it is actually absolutely valid to not ask for the allocation status.
+<strong>But</strong> since you ask for the error stat of the read command, you have to catch errors, that are not EOFs yourself. That was still missing.</p>
+
+<h2>Explicit imports</h2>
+
+<p><code>use some_module_name</code> is like <code>import *</code> in Python and bad for the same reasons.
+Since you only need three identifiers from <code>iso_fortran_env</code> I would import them explicitly. Additionally I would add the <code>intrinsic</code> qualifier to make it explicit for the human and the compiler that you are using the intrinsic module.</p>
+
+<h2>Require explicit interfaces</h2>
+
+<p>It is good that you use <code>implicit none</code>. If your compiler supports it, I would additionally write <code>implicit none(type, external)</code>.
+This will require interfaces for all called procedures. You can read it as "no undeclared variables and no undeclared external procedures".</p>
+
+<h2>Intents and pure/elemental</h2>
+
+<p>You have <code>intent(inout)</code> at some procedure arguments.
+One should always add intents to all arguments. 
+Additionally I would separate the declaration of arguments from declaration of local variables.
+If a procedure is pure, I would write it explicitly. The compiler will check it for you and it is great to know (code correctness, parallelisation etc.) if a procedure is pure.</p>
+
+<h2>Default initialisation</h2>
+
+<p>Pointers should be always initialized. If you don't yet know their target, initialize them to <code>null()</code>. If they are not initialized, they are undefined, which is worse than unassociated. If they are a component of a type, you can use default initialization like:</p>
+
+<pre><code>type :: ptr_type
+    type(my_type), pointer :: x =&gt; null()
+end type
+</code></pre>
+
+<p>(Although in your case we could get rid of pointers anyway.)</p>
+
+<h2>Consistent spacing</h2>
+
+<p>There were some inconsistencies in spacing.
+<code>endtype</code> vs <code>end type</code></p>
+
+<pre><code>        do i = num_chunks, 1, -1
+            do j=j, 1, -1
+</code></pre>
+
+<h2>Comments</h2>
+
+<p>There were some very redundant comments.
+<code>!!! constants</code> at parameter variables or <code>!!! type definitions</code> at type definitions should be omitted.
+You have good names for your procedures, which is always better than comments.</p>
+
+<h2>Naming of types</h2>
+
+<p>Since Fortran is not case sensitive, it is impossible to have a <code>chunk</code> instance of type <code>Chunk</code>. I like the PEP08 guidelines (this is definetely opinion based) from python and you can more or less carry them over. Name types with CamelCase and append <code>_t</code>. Then you can have a <code>chunk</code> instance of type <code>Chunk_t</code>.</p>
+
+<h2>File units</h2>
+
+<p>It is generally a bad idea to have a constant for file units. Usually you determine at runtime a free unit and use this one for file opening. Reasonably modern Fortran compilers give you a <code>freeunit</code> keyword argument for <code>open</code> which does this automatically.</p>
+
+<h2>Open Close pairing</h2>
+
+<p>I would indent between pairs of <code>open</code> and <code>close</code>.</p>
+
+<h2>Loop in normal order</h2>
+
+<p>Unless necessary I would always loop in normal order (your deallocation).</p>
+
+<h1>Inquire</h1>
+
+<p>You only need to inquire at the end of reading.</p>
+
+<h1>Exit from loop</h1>
+
+<p>It is generally better to refactor a <code>do</code> loop with exit into a <code>do while</code> loop where the condition can be seen in the header of the loop.</p>
+
+<h1>Declaration and initialisation</h1>
+
+<p>There is a big surprise in Fortran. A variable that get initialised at declaration becomes automatically save (static if you use C jargon).</p>
+
+<pre><code>integer :: n = 0
+! is equivalent to
+integer, save :: n = 0
+</code></pre>
+
+<p>Unless you really want it to be a save variable (and then I would write it explicitly) it is unfortunately bad to initialise at declaration.</p>
+
+<h1>Size of tmp</h1>
+
+<p>In your <code>ensure_capacity</code> procedure, the tmp variable was unnecessary large. It is better to have <code>tmp</code> with the same size as the <code>chunks</code> before it is grown larger</p>
+
+<h2>Alternative new code</h2>
+
+<pre><code>! take a file and output it to stdout in reverse
+
+program reverse_file_main
+    use, intrinsic :: iso_fortran_env, only: iostat_end, error_unit, output_unit
+    implicit none(type, external)
+
+    integer, parameter :: CHUNK_SIZE = 1024, MIN_CHUNKS = 1, IOSTAT_OK = 0
+
+    type :: Chunk_t
+        character, allocatable :: chunk_array(:)
+    end type
+
+    block
+        character(len=1024) :: path, io_msg
+        integer :: num_chunks, status, file_id, total_bytes
+        type(Chunk_t), allocatable :: chunks(:)
+
+
+        call get_command_argument(1, path, status=status)
+        if (status /= 0) then
+            write (error_unit, *) "usage: ./reverse &lt;file&gt;"
+            call exit(1)
+        end if
+
+        ! open, slurp file and close
+        open(newunit=file_id, file=path, access="stream", &amp;
+             iostat=status, iomsg=io_msg, status="old")
+            if (status /= 0) then
+                write (error_unit, *) trim(io_msg)
+                call exit(1)
+            end if
+
+            allocate(chunks(MIN_CHUNKS))
+            call slurp_file(file_id, num_chunks, total_bytes, chunks)
+        close(file_id)
+
+        ! output in reverse, and print debug info
+        call print_reversed(num_chunks, chunks)
+        write (error_unit, *) "reversed ", total_bytes, "bytes"
+    end block
+
+contains
+    subroutine slurp_file(fid, num_chunks, total_bytes, chunks)
+        integer, intent(in) :: fid
+        integer, intent(out) :: num_chunks, total_bytes
+        type(Chunk_t), allocatable, intent(inout) :: chunks(:)
+
+        integer :: io_status
+        character, allocatable :: tmp(:)
+
+        num_chunks = 0
+        io_status = 0
+
+        do while (io_status /= iostat_end)
+            num_chunks = num_chunks + 1
+            call ensure_capacity(num_chunks, chunks)
+
+            allocate(chunks(num_chunks)%chunk_array(CHUNK_SIZE))
+
+            read(fid, iostat=io_status) chunks(num_chunks)%chunk_array
+            if (all(io_status /= [IOSTAT_OK, iostat_end])) then
+                write(error_unit, *) 'Error in read'
+                call exit(1)
+            end if
+
+        end do
+
+        inquire(fid, pos=total_bytes)
+        total_bytes = total_bytes - 1
+        tmp = chunks(num_chunks)%chunk_array(: modulo(total_bytes, CHUNK_SIZE))
+        chunks(num_chunks)%chunk_array = tmp
+    end subroutine slurp_file
+
+
+    pure subroutine ensure_capacity(capacity, chunks)
+        integer, intent(in) :: capacity
+        type(Chunk_t), allocatable, intent(inout) :: chunks(:)
+
+        real, parameter :: grow_factor = 2.0
+        type(Chunk_t), allocatable :: tmp(:)
+
+        if (capacity &gt; size(chunks)) then
+            tmp = chunks
+            deallocate(chunks)
+            allocate(chunks(int(grow_factor * size(tmp))))
+            chunks(: size(tmp)) = tmp
+        end if
+    end subroutine ensure_capacity
+
+
+    subroutine print_reversed(num_chunks, chunks)
+        integer, intent(in) :: num_chunks
+        type(Chunk_t), intent(in) :: chunks(:)
+
+        integer :: i, j
+
+        do i = num_chunks, 1, -1
+            associate(M =&gt; chunks(i)%chunk_array)
+                do j = size(M), 1, -1
+                    call fputc(output_unit, M(j))
+                end do
+            end associate
+        end do
+    end subroutine print_reversed
+
+end program reverse_file_main
+
+</code></pre>
+    </div>

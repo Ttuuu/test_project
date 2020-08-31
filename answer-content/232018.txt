@@ -1,0 +1,284 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>As implied from the comments under OP, it means that VarA is completly unrelated to VarB, they do completly different things.</p>
+
+<p>If that is true, then it is all entirely obscured way of saying that based on some integer you need to do some arbitrary stuff. Arbitrary except that in all cases it returns a string.</p>
+
+<p>Then all you need is encapsulate each callback in an interface:</p>
+
+<pre><code>interface StringGenerator
+{
+  public function getTheString(): string;
+}
+</code></pre>
+
+<p>Whether each implementation has the right dependencies that arise from bits that are set in the flags which drive which StringGenerator implementation is used is an implementation detail.</p>
+
+<pre><code>class GeneratorABX implements StringGenerator
+{
+   private $serviceA;
+   private $serviceB;
+   private $serviceX;
+
+   public function __construct($serviceA, $serviceB, $serviceX)
+   {
+     $this-&gt;serviceA = $serviceA;
+     $this-&gt;serviceB = $serviceB;
+     $this-&gt;serviceX = $serviceX;
+   }
+
+   public function getTheString(): string
+   {
+      return $this-&gt;serviceA-&gt;doStuff() . $this-&gt;serviceB-&gt;doOtherStuff() . $this-&gt;serviceX-&gt;toStuffWithB($this-&gt;serviceB);
+   }
+}
+</code></pre>
+
+<p>Use a DI container to handle the instantiation of all the implementations of StringGenerator.</p>
+
+<pre><code>function setupContainer(): \Psr\Container\ContainerInterface
+{
+  $container = new ContainerBuilder();
+  $container-&gt;addService('serviceA', ServiceA::class);
+  $container-&gt;addService('serviceB', ServiceB::class);
+  $container-&gt;addService('serviceX', ServiceX::class);
+  //...
+  $prefix = 'stringGenerator';
+  $container-&gt;addService($prefix . '1', GeneratorA::class);
+  $container-&gt;addService($prefix . '3', GeneratorAB::class);
+  $container-&gt;addService($prefix . '5', GeneratorAC::class);
+  $container-&gt;addService($prefix . '35', GeneratorABX::class);
+
+  $container-&gt;addService('test', Test::class, ['prefix' =&gt; $prefix]);
+  return $container-&gt;buildContainer();
+}
+</code></pre>
+
+<p>To compute flags from array of bools you can use this:</p>
+
+<pre><code>private static function getFlags(bool ...$values): int
+{
+  $flags = 0;
+  $flag = 1;
+  foreach ($values as $value) {
+    if ($value) {
+      $flags |= $flag; // or $flags += $flag;
+    }
+    $flag = $flag &lt;&lt; 1; // or $flags *= 2;
+  }
+  return $flags;
+}
+</code></pre>
+
+<p>And to get the right generator:</p>
+
+<pre><code>private function getGenerator($flags): StringGenerator
+{
+  return $this-&gt;container-&gt;get($this-&gt;prefix . $flags);
+}
+</code></pre>
+
+<p>Final result:</p>
+
+<pre><code>class Test
+{
+  private $container;
+  private $prefix;
+
+  public function __construct(\Psr\Container\CotainerInterface $container, string $prefix)
+  {
+     $this-&gt;container = $container;
+     $this-&gt;prefix = $prefix;
+  }
+
+  public function aMethod($values)
+  {
+     $flags = self::getFlags(...$values);
+
+     return $this-&gt;getGenerator()-&gt;getTheString();
+  }
+
+  // and the private methods mentioned earlier
+}
+</code></pre>
+
+<p>And call it like this:</p>
+
+<pre><code>$container = setupContainer();
+$result = $container-&gt;get(Test::class)-&gt;aMethod($values);
+</code></pre>
+
+<p>EDIT: Altogether it is a bit analogous to a router. Router is first setup with a bunch of routes. Upon request, the router choses which controller is to be invoked based on the request and the set of routes. Then the appropriate controller is invoked and response is returned to the caller. The Test class is the router. The setup is done via DI container. The StringGenerators are the controllers. The flags are the request. And the resulting string is the response.</p>
+
+<p>EDIT2: To avoid having a lot of StringGenerator implementations, we can instead have one method per each of the generators. Let me show a way how to do that:</p>
+
+<pre><code>class Test
+{
+  private $map = [
+    1 =&gt; ServiceA::class,
+    2 =&gt; ServiceB::class,
+    32 =&gt; ServiceX::class,
+    // ...
+  ];
+
+  private $container;
+
+  public function __construct(\Psr\Container\ContainerInterface $container)
+  {
+    $this-&gt;container = $container;
+  }
+
+  public function aMethod(array $values): string
+  {
+    $services = $this-&gt;getServices(...$values);
+    return $this-&gt;getTheString($services);
+  }
+
+  private function getServices(bool ...$values): array
+  {
+    $services = [];
+    $flag = 1;
+    foreach ($values as $value) {
+      if ($value) {
+        $services[$flag] = $this-&gt;container-&gt;get($this-&gt;map[$flag]);
+      }
+      $flag = $flag &lt;&lt; 1; // or $flags *= 2;
+    }
+    return $services;
+  }
+
+  private function getTheString(array $services): string
+  {
+    $flags = \array_sum(\array_keys($services));
+    $method = 'generate' . $flags;
+    if (!method_exists($this, $method)) {
+      throw new Exception('invalid combination of flags ' . $flags);
+    }
+    return $this-&gt;$method(...array_values($services));
+  }
+
+  private function generate1(ServiceA $a): string {}
+  private function generate2(ServiceB $b): string {}
+  private function generate35(ServiceA $a, ServiceB $b, ServiceX $x): string {}
+}
+
+function setupContainer(): \Psr\Container\ContainerInterface
+{
+  $container = new ContainerBuilder();
+  $container-&gt;addService(ServiceA::class);
+  $container-&gt;addService(ServiceB::class);
+  $container-&gt;addService(ServiceX::class);
+  //...
+  return $container-&gt;buildContainer();
+}
+
+$container = setupContainer();
+$test = new Test($container);
+$result = $test-&gt;aMethod($values);
+</code></pre>
+
+<p>Or the same in a more general, more SOLID, although more verbose version:</p>
+
+<pre><code>interface ServiceProviderInterface
+{
+  public function getServices(bool ...$values): array;
+}
+
+class Services implements ServiceProviderInterface
+{
+  private $map = [
+    1 =&gt; ServiceA::class,
+    2 =&gt; ServiceB::class,
+    32 =&gt; ServiceX::class,
+    // ...
+  ];
+
+  private $container;
+
+  public function __construct(\Psr\Container\ContainerInterface $container)
+  {
+    $this-&gt;container = $container;
+  }
+
+  public function getServices(bool ...$values): array
+  {
+    $services = [];
+    $flag = 1;
+    foreach ($values as $value) {
+      if ($value) {
+        $services[$flag] = $this-&gt;container-&gt;get($this-&gt;map[$flag]);
+      }
+      $flag = $flag &lt;&lt; 1; // or $flags *= 2;
+    }
+    return $services;
+  }
+}
+
+interface StringGeneratorInterface
+{
+  public function getTheString(array $services): string;
+}
+
+class Methods
+{
+  public function generate1(ServiceA $a): string {}
+  public function generate2(ServiceB $b): string {}
+  public function generate35(ServiceA $a, ServiceB $b, ServiceX $x): string {}
+}
+
+class StringGenerator implements StringGeneratorInterface
+{
+  private $methods;
+
+  public function __construct(object $methods)
+  {
+    $this-&gt;method = $methods;
+  }
+
+  public function getTheString(array $services): string
+  {
+    $flags = \array_sum(\array_keys($services));
+    $method = 'generate' . $flags; // could be a method name inflector responsibility
+    if (!method_exists($this-&gt;methods, $method)) {
+      throw new Exception('invalid combination of flags ' . $flags);
+    }
+    return $this-&gt;methods-&gt;$method(...array_values($services));
+  }
+}
+
+class Test
+{
+  private $services;
+  private $generator;
+
+  public function __construct(ServiceProviderInterface $services, StringGeneratorInterface $generator)
+  {
+     $this-&gt;services = $services;
+     $this-&gt;generator = $generator;
+  }
+
+  public function aMethod(array $values): string
+  {
+    $services = $this-&gt;services-&gt;getServices(...$values);
+    return $this-&gt;generator-&gt;getTheString($services);
+  }
+}
+
+function setupContainer(): \Psr\Container\ContainerInterface
+{
+  $container = new ContainerBuilder();
+  $container-&gt;addService(ServiceA::class);
+  $container-&gt;addService(ServiceB::class);
+  $container-&gt;addService(ServiceX::class);
+  //...
+  $container-&gt;addService(Services::class);
+  $container-&gt;addService(Methods::class);
+  $container-&gt;addService(StringGenerator::class, ['methods' =&gt; Methods::class]);
+  $container-&gt;addService(Test::class);
+  return $container-&gt;buildContainer();
+}
+
+$container = setupContainer();
+$result = $container-&gt;get(Test::class)-&gt;aMethod($values);
+<span class="math-container">```</span>
+</code></pre>
+    </div>

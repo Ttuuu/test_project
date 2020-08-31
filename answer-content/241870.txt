@@ -1,0 +1,171 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You say this is common in all handlers:</p>
+
+<pre><code>client, _ := mongo.NewClient(options.Client().ApplyURI("mongodb://127.0.0.1:27017"))
+ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
+err := client.Connect(ctx)
+if err != nil {
+    panic(err)
+}
+
+defer client.Disconnect(ctx)
+collection := client.Database("myapp").Collection("questions")
+</code></pre>
+
+<p>So this means you're connecting and disconnecting to MongoDB <em>for each request</em>. That's incredibly wasteful. The MongoDB client is safe for concurrent use, so you can reuse the connection. Because I see code like this:</p>
+
+<pre><code>question.HandleFunc("", handler.PostQuestion).Methods("POST")
+</code></pre>
+
+<p>I know your handler functions are methods, so why not add the client to your handler type:</p>
+
+<pre><code>type yourHandler struct {
+    coll   *mongo.Collection
+}
+</code></pre>
+
+<p>Then, in your handlers you can simply access:</p>
+
+<pre><code>func (h *yourHandler) PostQuestion(w http.ResponseWriter, r *http.Request) {
+    if err := h.coll.InsertOne(r.Context(), ...); err != nil {
+        // write error response
+        return
+    }
+}
+</code></pre>
+
+<p>Now your main function will look a bit different, seeing as we're not disconnecting the mongo client in the handler anymore, and we're not using a context with an arbitrary timeout. I suggest something like this:</p>
+
+<pre><code>func main() {
+    // create the base context, the context in which your application runs
+    ctx, cfunc := context.WithCancel(ctx.Background())
+    defer cfunc()
+    client, err := mongo.NewClient(
+        options.Client().ApplyURI("mongodb://127.0.0.1:27017"))
+    if err != nil {
+        log.Fatalf("Error creating mongo client: %+v", err)
+    }
+    defer client.Disconnect(ctx) // add disconnect call here
+    if err := client.Connect(ctx); err != nil {
+        log.Fatalf("Failed to connect to MongoDB: %+v", err)
+    }
+    // set collection on handler
+    handler.coll = client.Database("myapp").Collection("questions")
+    // rest of the code here
+}
+</code></pre>
+
+<p>So now, whenever the main function returns, the application context is cancelled (which is used to connect the client), and <code>client.Disconnect</code> is called. The handler has access to the collection you're using, removing a lot of duplicate code, and removing the overhead of constantly connecting and disconnecting to MongoDB.</p>
+
+<p>Inside your handler, I'm not using <code>context.WithTimeout(context.Background(), 10*time.Second)</code>. Instead I'm using the request context, which means once the request context is cancelled, the query context is. You could still set a time-limit if you want:</p>
+
+<pre><code>func (h *yourHandler) PostQuestion(w http.ResponseWriter, r *http.Request) {
+    // context expires if request context does, or times out in 3 seconds
+    ctx, cfunc := context.WithTimeout(r.Context(), time.Second * 3)
+    defer cfunc() // good form to add this
+    if err := h.coll.InsertOne(ctx, ...); err != nil {
+        // error response etc...
+        return
+    }
+    // success response
+}
+</code></pre>
+
+<p>Currently our handler requires the field <code>coll</code> to be of the type <code>*mongo.Collection</code>, which makes it harder to test your code. Instead, you might want to change that field to take an interface:</p>
+
+<pre><code>//go:generate go run github.com/golang/mock/mockgen -destination mocks/collection_interface_mock.go -package mocks your.module.io/path/to/handler/package Collection
+type Collection interface{
+    InsertOne(ctx context.Context, document interface{}, opts ...*options.InsertOneOptions) (*mongo.InsertOneResult, error)
+    Name() string
+    // all methods you need
+}
+</code></pre>
+
+<p>In your unit tests, you can now inject a mock collection interface, that you can control, allowing you to simulate error returns, etc...</p>
+
+<p>Instead of exposing the <code>coll</code> field on your handler, then, you'll also want to create a constructor function to inject the dependencies of what I have in the main function above (<code>handler.coll = ...</code>):</p>
+
+<pre><code>package service
+
+type Collection interface{} // interface as above, with go generate comment
+
+type handler struct {
+    coll Collection
+}
+
+func NewHandler(c Collection) *handler {
+    return &amp;handler{
+        coll: c,
+    }
+}
+</code></pre>
+
+<p>I'll leave you with this as a starting point. Just one thing I've not yet mentioned: you're using <code>log.Fatalf</code> when <code>http.ListenAndServe</code> returns an error. That's fine. Why are you using <code>panic(err)</code> when <code>client.Connect(ctx)</code> fails?</p>
+
+<p>Panic is something you should avoid as much as possible. Especially here: it adds very little (to no) value: the only information a panic dump will yield is whereabouts in the mongo package something went awry. You don't control that package, so just <code>log.Fatalf("Mongo error: %+v", err)</code> is to be preferred.</p>
+
+<hr>
+
+<h3>More details</h3>
+
+<p>Seeing as your handler functions are actually functions in a package, rather than methods (which I initially thought they were):</p>
+
+<p>I'd refactor the <code>handler</code> package to contain a constructor, and have the actual handler functions as methods on a type. Something like:</p>
+
+<pre><code>package handler
+
+type Collection interface{
+    InsertOne(ctx context.Context, document interface{}, opts ...*options.InsertOneOptions) (*mongo.InsertOneResult, error)
+    Name() string
+    // and so on
+}
+
+// main handler type
+type Handler struct {
+    coll Collection
+}
+
+// New returns the handler
+func New(c Collection) *Handler {
+    return &amp;Handler{
+        coll: c,
+    }
+}
+
+func (h *Handler) PostQuestion(w http.ResponseWriter, r *http.Request) {
+    if err := h.coll.InsertOne(r.Context(), ...); err != nil {
+        log.Errorf("Insert question error: %+v", err)
+        // write response
+        return
+    }
+    // success response
+}
+</code></pre>
+
+<p>From your <code>main</code> package, this will look like this:</p>
+
+<pre><code>func main() {
+    ctx, cfunc := context.WithCancel(ctx.Background())
+    defer cfunc()
+    client, err := mongo.NewClient(
+        options.Client().ApplyURI("mongodb://127.0.0.1:27017"))
+    if err != nil {
+        log.Fatalf("Error creating mongo client: %+v", err)
+    }
+    defer client.Disconnect(ctx) // add disconnect call here
+    if err := client.Connect(ctx); err != nil {
+        log.Fatalf("Failed to connect to MongoDB: %+v", err)
+    }
+    // create handler with collection injected
+    myHandler := handler.New(client.Database("myapp").Collection("questions"))
+
+    // configure router to call methods on myHandler as handler functions
+    // the handlers will now have access to the collection we've set up here
+    r := mux.NewRouter()  
+
+    question := r.PathPrefix("/question").Subrouter()
+    question.HandleFunc("", myHandler.PostQuestion).Methods("POST")
+    // and so on
+}
+</code></pre>
+    </div>

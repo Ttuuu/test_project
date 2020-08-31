@@ -1,0 +1,92 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The functions cheat their benchmarks by allocating their auxiliary storage outside of the timing loop.  That's not reasonable unless you can arrange for the "real life" versions to have their own (per-thread?) long-lived auxiliary storage.</p>
+<p>I think there's a problem with the <code>vector&lt;bool&gt;</code> version that's masked by the test data (which always keeps the element values between 0 and <code>test_data.max_possible_size</code>.  Perhaps that's how the real-life input data are naturally distributed, but the constraint needs to be clearly specified.  For a more general case, we would need to arrange bool storage from the min to max values of all the inputs (and memory exhaustion becomes much more likely).</p>
+<p>I did manage to improve the inplace-merge version by using a heap to identify the current lowest iterator among all inputs, for about 20% speedup:</p>
+<pre><code>#include &lt;queue&gt;
+
+template&lt;typename Container&gt;
+using QueueItem = std::pair&lt;typename Container::const_iterator,
+                            typename Container::const_iterator&gt;;
+
+static void merge_with_heap_merge(benchmark::State&amp; state)
+{
+    const auto&amp; test_data = get_test_data();
+
+    for (auto _ : state) {
+
+        auto compare = [](auto a, auto b) { return *(a.first) &lt; *(b.first); };
+        std::priority_queue&lt;QueueItem&lt;std::vector&lt;int&gt;&gt;,
+                            std::vector&lt;QueueItem&lt;std::vector&lt;int&gt;&gt;&gt;,
+                            decltype(compare)&gt;
+            heap(compare);
+
+        std::vector&lt;int&gt; result;
+        result.reserve(test_data.max_possible_size);
+
+        for (auto const&amp; r: test_data.ranges) {
+            heap.emplace(r.begin(), r.end());
+        }
+
+        while (!heap.empty()) {
+            auto item = heap.top();
+            heap.pop();
+            if (!result.empty() &amp;&amp; result.back() != *(item.first))
+                result.push_back(*(item.first));
+            if (++item.first != item.second) {
+                heap.emplace(item);
+            }
+        }
+
+        // return dump_results(result);
+
+        benchmark::DoNotOptimize(result);
+    }
+}
+</code></pre>
+<p>The speedup comes primarily from avoiding repeated copying, and in particular, the final deduplication pass.</p>
+<hr>
+<h2>Style and other issues</h2>
+<p>Equality comparisons with boolean constants are usually redundant:</p>
+<blockquote>
+<pre><code>            if (sorted_distinct_numbers[i] == true)
+</code></pre>
+</blockquote>
+<p>can be simply <code>if (sorted_distinct_numbers[i])</code></p>
+<p><code>gen_random_range()</code> doesn't need an lvalue <code>RndGen</code>, so we can simplify a lot:</p>
+<pre><code>template&lt;typename T&gt;
+std::vector&lt;T&gt; gen_random_range(std::size_t count, T start, T end) {
+    std::vector&lt;T&gt; vec(count);
+    std::generate(vec.begin(), vec.end(), RndGen&lt;T&gt;{start, end});
+    std::sort(vec.begin(), vec.end());
+
+    return vec;
+}
+</code></pre>
+<p>The <code>RndGen</code> doesn't need to store a random device:</p>
+<pre><code>template&lt;typename T&gt;
+class RndGen {
+public:
+    RndGen(T start, T end)
+        : mersenne_engine{std::random_device{}()},
+          dist{start, end}
+    {
+    }
+
+    T operator()()
+    {
+        return dist(mersenne_engine);
+    }
+
+private:
+    std::mt19937 mersenne_engine;
+    std::uniform_int_distribution&lt;T&gt; dist;
+};
+</code></pre>
+<p>If we make <code>reversed()</code> accept argument by value, that means we don't need to explicitly copy it:</p>
+<pre><code>template&lt;typename T&gt;
+std::vector&lt;T&gt; reversed(std::vector&lt;T&gt; v) {
+    std::reverse(v.begin(), v.end());
+    return v;
+}
+</code></pre>
+    </div>

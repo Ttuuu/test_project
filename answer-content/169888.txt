@@ -1,0 +1,134 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This might be a bit nitpicky, but <code>Asc</code> and <code>Desc</code> aren't that good of names for classes. Granted, they are in your <code>detail</code> namespace, so it should be fine, but why not just write out the names <code>Ascending</code> and <code>Descending</code>?</p>
+
+<p>I do find <code>Asc</code> more ambiguous than <code>Desc</code>, because I see "desc" as shorthand for "descending" more often.</p>
+
+<hr>
+
+<p>Both <code>Desc</code> and <code>Asc</code> are <code>struct</code>s, which means that your <code>public:</code> is redundant. You probably want to make them <code>class</code>es, as it seems you want to hide the <code>fn</code> member variable.</p>
+
+<hr>
+
+<p>Why restrict the sort-by function to being by member variables? You could easily let it work for any callable object:</p>
+
+<pre><code>template &lt;class F&gt;
+class Asc {
+    F fn;
+public:
+    Asc(F fn) : fn(std::move(fn)) {}
+
+    template &lt;typename Lhs, typename Rhs&gt;
+    bool operator()(Lhs&amp;&amp; a, Rhs&amp;&amp; b) {
+        // by separating the types like this, we gain a little bit
+        // of generality. Not that it matters if we are using it
+        // with std::sort only. However, really what the overall
+        // utility is doing is defining a comparator, so you might
+        // want to keep it more general
+        return fn(std::forward&lt;Lhs&gt;(a)) &lt; fn(std::forward&lt;Rhs&gt;(b));
+    }
+};
+</code></pre>
+
+<p>I know that, at this point, this removes the ability to use member functions at all, but we can use <a href="http://en.cppreference.com/w/cpp/utility/functional/invoke" rel="nofollow noreferrer"><code>std::invoke</code></a> to remedy that:</p>
+
+<pre><code>    template &lt;typename Lhs, typename Rhs&gt;
+    bool operator()(Lhs&amp;&amp; a, Rhs&amp;&amp; b) {
+        return std::invoke(fn, std::forward&lt;Lhs&gt;(a)) &lt; std::invoke(fn, std::forward&lt;Rhs&gt;(b));
+    }
+</code></pre>
+
+<p>Although <code>std::invoke</code> does require C++17. If you don't want to require C++17, <a href="https://stackoverflow.com/q/32918679/1896169">this Stack Overflow question</a> discusses how to get the behavior of <code>std::invoke</code> in C++11. In particular, you can use <a href="http://en.cppreference.com/w/cpp/utility/functional/ref" rel="nofollow noreferrer"><code>std::ref</code></a>:</p>
+
+<pre><code>    template &lt;typename Lhs, typename Rhs&gt;
+    bool operator()(Lhs&amp;&amp; a, Rhs&amp;&amp; b) {
+        return std::ref(fn)(std::forward&lt;Lhs&gt;(a)) &lt; std::ref(fn)(std::forward&lt;Rhs&gt;(b));
+    }
+</code></pre>
+
+<p>Although you may want to wrap the <code>std::ref(callable)(args...)</code> into a utility function to make the code more self-documenting</p>
+
+<hr>
+
+<p>There's also a small problem, where if the field we are sorting by is a pointer, you can have undefined behavior. <a href="https://stackoverflow.com/a/1099080/1896169">Comparing pointers with <code>operator&lt;</code> is only allowed if the pointers are from the same array</a>. So it would be better to use <code>std::less</code>:</p>
+
+<pre><code>    template &lt;typename Lhs, typename Rhs&gt;
+    bool operator()(Lhs&amp;&amp; a, Rhs&amp;&amp; b) {
+        return std::less&lt;&gt;()(std::ref(fn)(std::forward&lt;Lhs&gt;(a)), std::ref(fn)(std::forward&lt;Rhs&gt;(b)));
+    }
+</code></pre>
+
+<p>But if you don't have C++14, you'd have to write something like this instead:</p>
+
+<pre><code>    template &lt;typename T&gt;
+    bool operator()(T const&amp; a, T const&amp; b) {
+        auto cmp = std::less&lt;
+            std::decay_t&lt;decltype(std::ref(fn)(a))&gt;
+        &gt;();
+        return cmp(std::ref(fn)(a), std::ref(fn)(b));
+    }
+</code></pre>
+
+<hr>
+
+<p>Also, we can actually combine both <code>Asc</code> and <code>Desc</code>. Currently, the only difference is that you call <code>operator&lt;</code> with the arguments in the other order.</p>
+
+<p>Instead, what we can do is take a comparator in our class:</p>
+
+<pre><code>template &lt;class F, class Compare = std::less&lt;&gt;&gt;
+class SortBy {
+    F fn;
+    Compare cmp;
+public:
+    SortBy(F fn, Compare cmp = {})
+        : fn(std::move(fn))
+        , cmp(std::move(cmp))
+    {}
+
+    template &lt;typename Lhs, typename Rhs&gt;
+    bool operator()(Lhs&amp;&amp; a, Rhs&amp;&amp; b) {
+        return cmp(
+            std::invoke(fn, std::forward&lt;Lhs&gt;(a)),
+            std::invoke(fn, std::forward&lt;Rhs&gt;(b))
+        );
+    }
+};
+</code></pre>
+
+<p>Then, you can reduce your <code>ascending</code> and <code>descending</code> functions down to a single function:</p>
+
+<pre><code>template&lt;typename F, typename Compare = std::less&lt;&gt;&gt;
+SortBy&lt;F, Compare&gt; sort_by(F fn, Compare cmp = {}) {
+    // by using uniform initialization, we don't have to repeat the
+    // type of SortBy&lt;...&gt;
+    return { std::move(fn), std::move(cmp) };
+}
+</code></pre>
+
+<p>If the user wanted to sort descending, they'd have to use <code>sort_by(..., std::greater&lt;&gt;)</code>. That does require that an <code>operator&gt;</code> is defined for their type, but they can always define their own comparator that defines a greater-than by using <code>operator&lt;</code></p>
+
+<hr>
+
+<p>Orthogonally, splitting the <code>Lhs</code> and <code>Rhs</code> arguments for the <code>operator()</code> makes our <code>SortBy</code> a <a href="https://stackoverflow.com/q/20317413/1896169">transparent comparator</a>, so we should indicate this by adding a <code>is_transparent</code> typedef:</p>
+
+<pre><code>template &lt;class F, class Compare = std::less&lt;&gt;&gt;
+class SortBy {
+    F fn;
+    Compare cmp;
+public:
+    using is_transparent = void;
+
+    SortBy(F fn, Compare cmp = {})
+        : fn(std::move(fn))
+        , cmp(std::move(cmp))
+    {}
+
+    template &lt;typename Lhs, typename Rhs&gt;
+    bool operator()(Lhs&amp;&amp; a, Rhs&amp;&amp; b) {
+        return cmp(
+            std::invoke(fn, std::forward&lt;Lhs&gt;(a)),
+            std::invoke(fn, std::forward&lt;Rhs&gt;(b))
+        );
+    }
+};
+</code></pre>
+    </div>

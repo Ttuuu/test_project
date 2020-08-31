@@ -1,0 +1,197 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Some quick caveats:</p>
+
+<ol>
+<li>Linked Lists are a rarely useful data structure, outside of a learning exercise you should almost never use them.</li>
+<li>The techniques for implementing typical rust code (which primarily uses already crafted data structures) is quite different from rust code which is actually implementing said data structures. You won't get a real handle on the flavor of rust by implementing things like linked lists.</li>
+</ol>
+
+<p>Having said that, let's look at your code.</p>
+
+<pre><code>impl&lt;T: Debug&gt; Debug for List&lt;T&gt; {
+    fn fmt(&amp;self, f: &amp;'_ mut Formatter) -&gt; Result&lt;(), Error&gt; {
+        writeln!(f, "List size: {:?}", self.size);
+</code></pre>
+
+<p>Your output here doesn't look much like the typical <code>Debug</code> output. I would define my own function with its own name for something that's not really compatible with the spirit of <code>Debug</code>.</p>
+
+<pre><code>        if let Some(ref h) = self.head {
+            let mut node = Rc::clone(h);
+
+            loop {
+                let prev = match node.borrow().prev {
+                    None =&gt; None,
+                    Some(ref p) =&gt; Some(p.upgrade().unwrap())
+                };
+</code></pre>
+
+<p><code>Option</code> has a handy map method, which lets you write this as</p>
+
+<pre><code> let prev = node.borrow().prev.map(|p| p.upgrade().unwrap())
+</code></pre>
+
+<p><code>map</code> effectively handles the common case where <code>None</code> maps to <code>None</code>, but you want to do something with the <code>Some</code> case.</p>
+
+<pre><code>                let next = match node.borrow().next {
+                    None =&gt; None,
+                    Some(ref n) =&gt; Some(Rc::clone(n))
+                };
+</code></pre>
+
+<p>You could use <code>map</code> again here. But there is an even simpler option:</p>
+
+<pre><code>let next = node.borrow().next.clone()
+</code></pre>
+
+<p>All you are doing is clone a Optional Rc, which is handled by the clone method.</p>
+
+<pre><code>                let p_val = match prev {
+                    None =&gt; None,
+                    Some(ref t) =&gt; Some(Rc::clone(&amp;t.borrow().value))
+                };
+</code></pre>
+
+<p>Rather then fetching <code>prev</code> and then <code>p_val</code> it'll more succinct if you do it all in one.</p>
+
+<pre><code> let p_val = node.borrow().prev.map(|p| Rc::clone(p.upgrade().unwrap().value))
+</code></pre>
+
+<p>Moving on:</p>
+
+<pre><code>                let n_val = match next {
+                    None =&gt; None,
+                    Some(ref t) =&gt; Some(Rc::clone(&amp;t.borrow().value))
+                };
+</code></pre>
+
+<p>There is a function called <code>Ref::map</code> which maps a reference (returned from <code>RefCell</code> <code>borrow</code> into a computed value. This allow the following:</p>
+
+<pre><code>           let n_val = next.as_ref().map(|t| Ref::map(t.borrow(), |s| &amp;s.value));
+</code></pre>
+
+<p>This is somewhat harder to follow, but the benefit is that we avoid calling <code>clone</code> on the value. </p>
+
+<pre><code>                let c_val = Rc::clone(&amp;node.borrow().value);
+</code></pre>
+
+<p>This clone is simply unnecessary. it can be removed.</p>
+
+<pre><code>                writeln!(f, "{:?} &lt;&lt;--prev--&lt;&lt; {:?} &gt;&gt;--next--&gt;&gt; {:?}", p_val, c_val, n_val);
+</code></pre>
+
+<p><code>writeln</code> returns an error that you should be checking for and returning on failure.</p>
+
+<pre><code>                match next {
+                    None =&gt; break,
+                    Some(ref t) =&gt; node = Rc::clone(t),
+                }
+            }
+</code></pre>
+
+<p><code>break</code> at the end of a loop is usually a sign that there is a better way to structure your loop. In particular, something like this:</p>
+
+<pre><code>        let mut next_node = self.head.clone();
+        while let Some(node) = next_node {
+            next_node = node.borrow().next.clone()
+
+            // do whatever you need to
+        }
+</code></pre>
+
+<p>If you do this, you can skip checking for a <code>None</code> head pointer and avoid the break. Your loop will be much simpler.</p>
+
+<pre><code>        }
+
+        return Ok(());
+    }
+}
+
+#[derive(Debug)]
+struct Node&lt;T&gt; {
+    next: Option&lt;NextNode&lt;T&gt;&gt;,
+    prev: Option&lt;PrevNode&lt;T&gt;&gt;,
+    value: Rc&lt;T&gt;,
+}
+</code></pre>
+
+<p>In response to question about <code>Box</code> vs <code>Rc</code>, the answer is neither. Just store a T. One of the performance advantages of Rust is that it can often store data directly inline with other data, not via indirections like Box and Rc. </p>
+
+<pre><code>impl&lt;T&gt; List&lt;T&gt; {
+    pub fn new() -&gt; List&lt;T&gt; {
+        return List {
+            head: None,
+            tail: None,
+            size: 0,
+        };
+    }
+
+    pub fn push_head(&amp;mut self, value: T) {
+        let boxed_value = Rc::new(value);
+        let new_node = Node::new_unlinked(boxed_value);
+
+        let back_link = Some(Rc::downgrade(&amp;new_node));
+
+        match self.head {
+            None =&gt; {
+                self.tail = back_link;
+            }
+            Some(ref mut h) =&gt; {
+                h.borrow_mut().prev = back_link;
+                new_node.borrow_mut().next = Some(Rc::clone(h));
+            }
+        }
+</code></pre>
+
+<p>I'd do this more like</p>
+
+<pre><code> let node = Rc::new(Node {
+     next: self.head.clone(),
+     prev: None,
+     value: Rc::new(value)
+ })
+
+ if let Some(head) = self.head {
+     head.borrow_mut().prev = Some(Rc::downgraph(&amp;node));
+ }
+</code></pre>
+
+<p>Which I think simplifies it a bit.</p>
+
+<pre><code>        self.head = Some(new_node);
+        self.size += 1;
+    }
+
+    pub fn push_tail(&amp;mut self, value: T) {
+        let boxed_value = Rc::new(value);
+        let new_node = Node::new_unlinked(boxed_value);
+        let weak_link = Some(Rc::downgrade(&amp;new_node));
+
+        match self.tail {
+            None =&gt; {
+                self.head = Some(new_node);
+            }
+
+            Some(ref t) =&gt; {
+                new_node.borrow_mut().prev = Some(Weak::clone(t));
+
+                let next_ref = t.upgrade().unwrap();
+                next_ref.borrow_mut().next = Some(new_node);
+            }
+        }
+
+        self.tail = weak_link;
+        self.size += 1;
+    }
+}
+
+impl&lt;T&gt; Node&lt;T&gt; {
+    fn new_unlinked(value: Rc&lt;T&gt;) -&gt; NextNode&lt;T&gt; {
+        return Rc::new(RefCell::new(Node {
+            next: None,
+            prev: None,
+            value,
+        }));
+    }
+}
+</code></pre>
+    </div>

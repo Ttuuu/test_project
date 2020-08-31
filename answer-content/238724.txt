@@ -1,0 +1,98 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Seems like you have as many filing_dates as you have URLs, so you should have those together and handle them similarly.</p>
+
+<p>Your problem seems to come from the fact that you're losing the intel of which row comes from which URL, and so your only option becomes to set one date for the full dataframe.</p>
+
+<p>Here's an updated version saving the dates at the same time as the URLs and using and using a new <code>res_df</code> dataframe in <code>scrape_document</code> to aggregate the dataframes retrieved from each URL.</p>
+
+<pre><code>import pandas as pd
+from urllib.parse import urljoin
+from bs4 import BeautifulSoup, SoupStrainer
+import requests
+
+class Scraper:
+    BASE_URL = "https://www.sec.gov"
+    FORMS_URL_TEMPLATE = "/cgi-bin/browse-edgar?action=getcompany&amp;CIK={cik}&amp;type=13F"
+
+    def __init__(self):
+        self.session = requests.Session()
+
+    def get_holdings(self, cik):
+        """
+        Main function that first finds the most recent 13F form and then passes
+        it to scrapeForm to get the holdings for a particular institutional investor.
+        """
+        # get the form urls
+        forms_url = urljoin(self.BASE_URL, self.FORMS_URL_TEMPLATE.format(cik=cik))
+        parse_only = SoupStrainer('a', {"id": "documentsbutton"})
+        soup = BeautifulSoup(self.session.get(forms_url).content, 'lxml', parse_only=parse_only)
+        urls = soup.find_all('a', href=True)
+
+        # get form document URLs
+        form_urls = []
+        filing_dates = []
+        for url in urls:
+            url = url.get("href")
+            url = urljoin(self.BASE_URL, str(url))
+
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            page = requests.get(url, headers=headers)
+            soup = BeautifulSoup(page.content, 'html.parser')
+
+            # Get filing date and "period date"
+            dates = soup.find("div", {"class": "formContent"})
+            filing_date = dates.find_all("div", {"class": "formGrouping"})[0]
+            filing_date = filing_date.find_all("div", {"class": "info"})[0]
+            filing_date = filing_date.text
+
+            # get form table URLs
+            parse_only = SoupStrainer('tr', {"class": 'blueRow'})
+            soup = BeautifulSoup(self.session.get(url).content,'lxml', parse_only=parse_only)
+            form_url = soup.find_all('tr', {"class": 'blueRow'})[-1].find('a')['href']
+            if ".txt" in form_url:
+                pass
+            else:
+                form_url = urljoin(self.BASE_URL, form_url)
+                # print(form_url)
+                form_urls.append(form_url)
+                # Save the filing date too
+                filing_dates.append(filing_date)
+
+        # Pass the dates list rather than the last one
+        return self.scrape_document(form_urls, cik, filing_dates)
+
+    def scrape_document(self, urls, cik, filing_dates):
+        """This function scrapes holdings from particular document URL"""
+
+        cols = ['nameOfIssuer', 'titleOfClass', 'cusip', 'value', 'sshPrnamt',
+                'sshPrnamtType', 'putCall', 'investmentDiscretion',
+                'otherManager', 'Sole', 'Shared', 'None']
+
+        res_df = pd.DataFrame(columns=cols+["Filing Date"])
+
+        # Iterate over both list at the same time
+        for url, date in zip(urls, filing_dates):
+            data = []
+            soup = BeautifulSoup(self.session.get(url).content, 'lxml')
+
+            for info_table in soup.find_all(['ns1:infotable', 'infotable']):
+                row = []
+                for col in cols:
+                    d = info_table.find([col.lower(), 'ns1:' + col.lower()])
+                    row.append(d.text.strip() if d else 'NaN')
+                data.append(row)
+            url_df = pd.DataFrame(data, columns=cols)
+            url_df["Filing Date"] = date
+            res_df = res_df.append(url_df, ignore_index=True)
+
+        # CIK seems common to the whole DF, if not follow the example of dates
+        res_df['cik'] = cik
+
+        return res_df
+
+holdings = Scraper()
+holdings = holdings.get_holdings("0000846222")
+print(holdings)
+<span class="math-container">```</span>
+</code></pre>
+    </div>

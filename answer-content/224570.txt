@@ -1,0 +1,147 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p><em>I'm trying to balance the code readability/size with the performance
+  benefits, ..</em></p>
+</blockquote>
+
+<p>Your code could be optimized for readability and object-oriented design without introducing a performance penalty.</p>
+
+<hr>
+
+<p>The entropy generation could be written more elegantly.</p>
+
+<p>original code   </p>
+
+<blockquote>
+<pre><code>for (char a = '0'; a &lt;= '9'; a++) {
+    for (char b = '0'; b &lt;= '9'; b++) {
+        for (char c = '0'; c &lt;= '9'; c++) {
+            for (char d = '0'; d &lt;= '9'; d++) {
+                yield return new[] { (byte) a, (byte) b, (byte) c, (byte) d };
+            }
+        }
+    }
+}
+</code></pre>
+</blockquote>
+
+<p>refactored</p>
+
+<pre><code>static class EntropyGenerator
+{
+    public static IEnumerable&lt;byte&gt; ValidChars =&gt; Enumerable.Range('0', 10).Select(c =&gt; (byte)c).ToList();
+
+    public static IEnumerable&lt;byte[]&gt; GenerateEntropy()
+    {
+        return (from a in ValidChars
+                from b in ValidChars
+                from c in ValidChars
+                from d in ValidChars
+                select new[] { a, b, c, d });
+    }
+}
+</code></pre>
+
+<hr>
+
+<p><code>GetPasswordFromHash</code> has repeating code and an ugly switch that could be refactored into a strategy pattern.</p>
+
+<p>First, we should create an enum and interface for the strategies. It would have helped if this API came with its own interface. </p>
+
+<pre><code>interface IHashProvider
+{
+    byte[] ComputeDerivedKey(byte[] key, byte[] salt, int derivedKeyLength);
+}
+
+enum HashProviderAlgorithm
+{
+    SCrypt,
+    Pbkdf2
+}
+</code></pre>
+
+<p>We can then implement both strategies.</p>
+
+<pre><code>class ScryptHashProvider : IHashProvider
+{
+    private const byte BlocksCount = 8;
+    private const ushort IterationsCount = 8192;
+
+    public byte[] ComputeDerivedKey(byte[] key, byte[] salt, int derivedKeyLength)
+    {
+        return SCrypt.ComputeDerivedKey(key, salt, IterationsCount, BlocksCount, 1, null, derivedKeyLength);
+    }
+}
+
+class Pbkdf2HashProvider : IHashProvider
+{
+    private const ushort IterationsCount = 10000;
+
+    public byte[] ComputeDerivedKey(byte[] key, byte[] salt, int derivedKeyLength)
+    {
+        using (var hmac = new HMACSHA1(key))
+        {
+            return Pbkdf2.ComputeDerivedKey(hmac, salt, IterationsCount, derivedKeyLength);
+        }
+    }
+}
+</code></pre>
+
+<p>So the password recovery mechanism can be written much more elegantly.</p>
+
+<pre><code>class PasswordRecovery
+{
+    IEnumerable&lt;byte[]&gt; Entropy { get; }
+    IDictionary&lt;HashProviderAlgorithm, IHashProvider&gt; Providers { get; }
+
+    public PasswordRecovery(IEnumerable&lt;byte[]&gt; entropy)
+    {
+        Entropy = entropy ?? throw new ArgumentNullException(nameof(entropy));
+        Providers = new Dictionary&lt;HashProviderAlgorithm, IHashProvider&gt;
+        {
+            { HashProviderAlgorithm.SCrypt, new ScryptHashProvider() },
+            { HashProviderAlgorithm.Pbkdf2, new Pbkdf2HashProvider() }
+        };
+    }
+
+    public string RecoverPassword(byte[] passwordHash, byte[] salt, HashProviderAlgorithm algorithm = default)
+    {
+        if (passwordHash == null)
+            throw new ArgumentNullException(nameof(passwordHash));
+        if (salt == null)
+            throw new ArgumentNullException(nameof(salt));
+
+        var entropy = Entropy.AsParallel();
+        var provider = Providers[algorithm];
+        var password = entropy.FirstOrDefault(
+            pwd =&gt; passwordHash.SequenceEqual(provider.ComputeDerivedKey(pwd, salt, passwordHash.Length)));
+
+        if (password == null)
+            throw new ArgumentException("Unable to recover password given the specified entropy, hash and salt");
+
+        return Encoding.UTF8.GetString(password);
+    }
+}
+</code></pre>
+
+<p>And our verification test:</p>
+
+<pre><code>// arrange
+var salt = new byte[7];
+using (var crypto = new RNGCryptoServiceProvider())
+{
+    crypto.GetNonZeroBytes(salt);
+}
+var password = new [] { (byte)'1', (byte)'3', (byte)'3', (byte)'7' };
+var passwordHash = SCrypt.ComputeDerivedKey(password, salt, 8192, 8, 1, null, 32);
+
+// act
+var entropy = EntropyGenerator.GenerateEntropy();
+var passwordRecovery = new PasswordRecovery(entropy);
+var generatedPassword = passwordRecovery.RecoverPassword(passwordHash, salt);
+
+// assert
+var recovered = Encoding.UTF8.GetBytes(generatedPassword).SequenceEqual(password);
+Assert.IsTrue(recovered);
+</code></pre>
+    </div>

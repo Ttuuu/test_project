@@ -1,0 +1,322 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>Position.Set</strong>  </p>
+
+<p>This</p>
+
+<blockquote>
+<pre><code>long delta = value - position;
+if (delta == 0)
+    return;
+</code></pre>
+</blockquote>
+
+<p>isn't understandable at first glance. You should switch it to  </p>
+
+<pre><code>if (position == value) { return; }
+long delta = value - position;
+</code></pre>
+
+<p>You declare <code>long delta</code> for the above <code>substraction</code> but later on you will at least 2 times cast it to <code>int</code>. It would be better to do it the other way.  </p>
+
+<pre><code>if (position == value) { return;}
+int delta = (int)(value - position);  
+</code></pre>
+
+<p><s><strong>Potential "bug"</strong>  </s></p>
+
+<p>Assume the user of this class will call either <code>Seek()</code> or <code>Position.Set()</code> your code will throw an exception because <code>stream == null</code>. </p>
+
+<p>You should extract the initializing/opening of the stream to a separate method which you call from the constructor, and if needed (<code>cacheRemaining == 0</code>) from the <code>Read()</code> method.  </p>
+
+<pre><code>private void OpenStream(int count = 0)
+{
+    if (stream != null) { resp.Close(); }
+
+    HttpWebRequest req = HttpWebRequest.CreateHttp(Url);
+
+    cacheRemaining = (int)Math.Min(Length - Position, Math.Max(count, cachelen));
+    req.AddRange(Position, Position + cacheRemaining - 1);
+
+    resp = req.GetResponse();
+    stream = resp.GetResponseStream();
+
+}
+</code></pre>
+
+<p><strong>Stream.Close()</strong>  </p>
+
+<p>The call to <code>Stream.Close</code> is not neccessary if you are closing the <code>WebResponse</code> as this is automatically closing the underlaying stream.  </p>
+
+<p><strong>Naming</strong>  </p>
+
+<p>Shortening variable names to <code>resp</code> does not help for readability. Simply name it <code>response</code>.  </p>
+
+<p>Variables should be named using <code>camelCase</code> casing which you do except for <code>cachelen</code> which should be <code>cacheLen</code> or <code>cacheLength</code>.  </p>
+
+<p><strong>General</strong>  </p>
+
+<p>What I don't see in your code is the caching. You are using <code>cacheRemaining</code> and <code>cachelen</code> but you don't cache anything.   </p>
+
+<p>The <code>Read()</code> method shows unexpected behaviour. Passing in an array with <code>Length == 10</code> and an <code>offset == 5</code> then with <code>count == 6</code> this should throw an exception.  </p>
+
+<p><strong>Using more of the built-in features of .NET</strong>  </p>
+
+<p>For sure that can be done, but as there is no seekable Network or HTTP stream you need to write some amount of code, but I don't see where this should matter, as you only do this once.      </p>
+
+<p>What would I do different to your implementation ?  </p>
+
+<ul>
+<li>copy the responsestream to a <code>MemoryStream</code> to take advantage of using the <code>Seek()</code> method.  </li>
+<li>overwrite the <code>Close()</code> method instead of implementing <code>IDisposable</code> as the <code>Stream</code>'s <code>Dispose()</code> method only calls the <code>Close()</code> method.  </li>
+<li>make the <code>cacheLength</code> adjustable, at least by using a constructor parameter.  </li>
+<li>Ensure that the behaviour of my implementation is the same as of the abstract <code>Stream</code> class<br>
+<ul>
+<li>Each method/property should throw an <code>ObjectDisposedException</code> if the stream is disposed  </li>
+<li><code>Read()</code> method 
+<ol>
+<li>If <code>buffer</code> is null throw an <code>ArgumentNullException</code>  </li>
+<li>If <code>offset</code> or <code>count</code> is negativ throw an <code>ArgumentOutOfRangeException</code>  </li>
+<li>If <code>buffer.Length - offset &lt; count</code> throw an <code>ArgumentException</code></li>
+</ol></li>
+</ul></li>
+</ul>
+
+<p>But as always code does tell more than just words  </p>
+
+<pre><code>class PartialHTTPStream : Stream
+{
+    private readonly Int64 cacheLength = 1024;
+    private const Int32 noDataAvaiable = 0;
+    private MemoryStream stream = null;
+    private Int64 currentChunkNumber = -1;
+    private Int64? length;
+    private Boolean isDisposed = false;
+
+    public PartialHTTPStream(String url)
+        : this(url, 1024) { }
+
+    public PartialHTTPStream(String url, Int64 cacheLength)
+    {
+        if (cacheLength &gt; 0) { this.cacheLength = cacheLength; }
+        Url = url;
+    }
+
+    public String Url { get; private set; }
+
+    public override Boolean CanRead
+    {
+        get
+        {
+            EnsureNotDisposed();
+            return true;
+        }
+    }
+
+    public override Boolean CanWrite
+    {
+        get
+        {
+            EnsureNotDisposed();
+            return false;
+        }
+    }
+
+    public override Boolean CanSeek
+    {
+        get
+        {
+            EnsureNotDisposed();
+            return true;
+        }
+    }
+
+    public override Int64 Length
+    {
+        get
+        {
+            EnsureNotDisposed();
+            if (length == null)
+            {
+                HttpWebRequest request = HttpWebRequest.CreateHttp(Url);
+                request.Method = "HEAD";
+                length = request.GetResponse().ContentLength;
+            }
+            return length.Value;
+        }
+    }
+
+    public override Int64 Position
+    {
+        get
+        {
+            EnsureNotDisposed();
+            Int64 streamPosition = (stream != null) ? stream.Position : 0;
+            Int64 position = (currentChunkNumber != -1) ? currentChunkNumber * cacheLength : 0;
+
+            return position + streamPosition;
+        }
+        set
+        {
+            EnsureNotDisposed();
+            EnsurePositiv(value, "Position");
+            Seek(value);
+        }
+    }
+
+    public override Int64 Seek(Int64 offset, SeekOrigin origin)
+    {
+        EnsureNotDisposed();
+        switch (origin)
+        {
+            case SeekOrigin.Begin:
+                break;
+            case SeekOrigin.Current:
+                offset = Position + offset;
+                break;
+            default:
+                offset = Length + offset;
+                break;
+        }
+
+        return Seek(offset);
+    }
+
+    private Int64 Seek(Int64 offset)
+    {
+        Int64 chunkNumber = offset / cacheLength;
+
+        if (currentChunkNumber != chunkNumber)
+        {
+            ReadChunk(chunkNumber);
+            currentChunkNumber = chunkNumber;
+        }
+
+        offset = offset - currentChunkNumber * cacheLength;
+
+        stream.Seek(offset, SeekOrigin.Begin);
+
+        return Position;
+    }
+
+    private void ReadNextChunk()
+    {
+        currentChunkNumber += 1;
+        ReadChunk(currentChunkNumber);
+    }
+
+    private void ReadChunk(Int64 chunkNumberToRead)
+    {
+        Int64 rangeStart = chunkNumberToRead * cacheLength;
+
+        if (rangeStart &gt; Length) { return; }
+
+        Int64 rangeEnd = rangeStart + cacheLength - 1;
+        if (rangeStart + cacheLength &gt; Length)
+        {
+            rangeEnd = Length - 1;
+        }
+
+        if (stream != null) { stream.Close(); }
+        stream = new MemoryStream((int)cacheLength);
+
+        HttpWebRequest request = HttpWebRequest.CreateHttp(Url);
+        request.AddRange(rangeStart, rangeEnd);
+
+        using (WebResponse response = request.GetResponse())
+        {
+            response.GetResponseStream().CopyTo(stream);
+        }
+
+        stream.Position = 0;
+    }
+
+    public override void Close()
+    {
+        EnsureNotDisposed();
+
+        base.Close();
+        if (stream != null) { stream.Close(); }
+        isDisposed = true;
+    }
+
+    public override Int32 Read(Byte[] buffer, Int32 offset, Int32 count)
+    {
+        EnsureNotDisposed();
+
+        EnsureNotNull(buffer, "buffer");
+        EnsurePositiv(offset, "offset");
+        EnsurePositiv(count, "count");
+
+        if (buffer.Length - offset &lt; count) { throw new ArgumentException("count"); }
+
+        if (stream == null) { ReadNextChunk(); }
+
+        if (Position &gt;= Length) { return noDataAvaiable; }
+
+        if (Position + count &gt; Length)
+        {
+            count = (Int32)(Length - Position);
+        }
+
+        Int32 bytesRead = stream.Read(buffer, offset, count);
+        Int32 totalBytesRead = bytesRead;
+        count -= bytesRead;
+
+        while (count &gt; noDataAvaiable)
+        {
+            ReadNextChunk();
+            offset = offset + bytesRead;
+            bytesRead = stream.Read(buffer, offset, count);
+            count -= bytesRead;
+            totalBytesRead = totalBytesRead + bytesRead;
+        }
+
+        return totalBytesRead;
+
+    }
+
+    public override void SetLength(Int64 value)
+    {
+        EnsureNotDisposed();
+        throw new NotImplementedException();
+    }
+
+    public override void Write(Byte[] buffer, Int32 offset, Int32 count)
+    {
+        EnsureNotDisposed();
+        throw new NotImplementedException();
+    }
+
+    public override void Flush()
+    {
+        EnsureNotDisposed();
+    }
+
+    private void EnsureNotNull(Object obj, String name)
+    {
+        if (obj != null) { return; }
+        throw new ArgumentNullException(name);
+    }
+    private void EnsureNotDisposed()
+    {
+        if (!isDisposed) { return; }
+        throw new ObjectDisposedException("PartialHTTPStream");
+    }
+    private void EnsurePositiv(Int32 value, String name)
+    {
+        if (value &gt; -1) { return; }
+        throw new ArgumentOutOfRangeException(name);
+    }
+    private void EnsurePositiv(Int64 value, String name)
+    {
+        if (value &gt; -1) { return; }
+        throw new ArgumentOutOfRangeException(name);
+    }
+    private void EnsureNegativ(Int64 value, String name)
+    {
+        if (value &lt; 0) { return; }
+        throw new ArgumentOutOfRangeException(name);
+    }
+} 
+</code></pre>
+    </div>

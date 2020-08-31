@@ -1,0 +1,168 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I see some things that may help you improve your code.</p>
+
+<h2>Use a <code>void *</code> for generic arguments</h2>
+
+<p>As I'm sure you know, it's somewhat unusual in modern C++ to use a <code>void *</code>, but this is one of those situations in which it's helpful because it removes the need for awkward casts on the part of the caller.  I'd change the signature of the function to this:</p>
+
+<pre><code>std::ostream&amp; hex_dump(std::ostream&amp; os, const void *buffer, std::size_t bufsize, bool showPrintableChars = true)
+</code></pre>
+
+<h2>Make sure not to invoke undefined behavior</h2>
+
+<p>As noted in the comments already, undefined behavior can arise if the the value passed to <code>std::isprint</code> cannot be represented as an <code>unsigned char</code> and does not have the value of <code>EOF</code>.  We can avoid this by making a convenience cast within the function if, as per the previous point, we've passed in a <code>const void *</code>:</p>
+
+<pre><code>const unsigned char *buf{reinterpret_cast&lt;const unsigned char *&gt;(buffer)};
+</code></pre>
+
+<h2>Check for <code>nullptr</code> when dealing with raw pointers</h2>
+
+<p>I'd suggest that for safety, any pointers passed into a function should be tested for <code>nullptr</code> before they're dereferenced.  In this case, I'd suggest the first few lines of the function could be this:</p>
+
+<pre><code>if (buffer == nullptr) {
+    return os;
+}
+</code></pre>
+
+<h2>Eliminate "magic numbers"</h2>
+
+<p>If I wanted the line length to be 16 instead of 8, I'd have to work hard to change each instance of <code>8</code> in the code and make sure only the relevant points were changed.  Instead, I'd advocate using a named constant like this:</p>
+
+<pre><code>constexpr std::size_t maxline{8};
+</code></pre>
+
+<h2>Avoid passing over data twice</h2>
+
+<p>There's not really a need to pass over the data twice.  As each character is read, it can be processed in both hex and printable form.  To assist with this, I'd suggest creating a small local buffer for the printable version since we know it's only as long as <code>maxline</code> plus one for a terminating <code>NUL</code> char:</p>
+
+<pre><code>char renderString[maxline+1];
+</code></pre>
+
+<h2>Use existing variables where appropriate</h2>
+
+<p>The <code>bufsize</code> variable already contains the size of the array, so there's really not much need to introduce another variable <code>i</code> to track it.  Because it's passed by value, we essentially have a local copy that we can use directly in the loop:</p>
+
+<pre><code>for (std::size_t linecount=std::min(maxline, bufsize) ;bufsize; --bufsize, ++buf) {
+</code></pre>
+
+<h2>Results</h2>
+
+<p>Using all of these suggestions, we get a simpler, smaller, safer interface in a single function.  Here is the alternative version:</p>
+
+<pre><code>std::ostream&amp; hex_dump(std::ostream&amp; os, const void *buffer, 
+                       std::size_t bufsize, bool showPrintableChars = true)
+{
+    if (buffer == nullptr) {
+        return os;
+    }
+    auto oldFormat = os.flags();
+    auto oldFillChar = os.fill();
+    constexpr std::size_t maxline{8};
+    // create a place to store text version of string
+    char renderString[maxline+1];
+    char *rsptr{renderString};
+    // convenience cast
+    const unsigned char *buf{reinterpret_cast&lt;const unsigned char *&gt;(buffer)};
+
+    for (std::size_t linecount=maxline; bufsize; --bufsize, ++buf) {
+        os &lt;&lt; std::setw(2) &lt;&lt; std::setfill('0') &lt;&lt; std::hex 
+           &lt;&lt; static_cast&lt;unsigned&gt;(*buf) &lt;&lt; ' ';
+        *rsptr++ = std::isprint(*buf) ? *buf : '.';
+        if (--linecount == 0) {
+            *rsptr++ = '\0';  // terminate string
+            if (showPrintableChars) {
+                os &lt;&lt; " | " &lt;&lt; renderString;
+            } 
+            os &lt;&lt; '\n';
+            rsptr = renderString;
+            linecount = std::min(maxline, bufsize);
+        }
+    }
+    // emit newline if we haven't already
+    if (rsptr != renderString) {
+        if (showPrintableChars) {
+            for (*rsptr++ = '\0'; rsptr != &amp;renderString[maxline+1]; ++rsptr) {
+                 os &lt;&lt; "   ";
+            }
+            os &lt;&lt; " | " &lt;&lt; renderString;
+        }
+        os &lt;&lt; '\n';
+    }
+
+    os.fill(oldFillChar);
+    os.flags(oldFormat);
+    return os;
+}
+</code></pre>
+
+<p>Example use:</p>
+
+<pre><code>int main()
+{
+    const char test[] = "abcdef123456\0zyxwvu987654Edward";
+    const std::string s(test,sizeof(test));
+    const std::wstring s2{L"A wide string."};
+    const double not_really_pi{22.0/7};
+
+    std::cout &lt;&lt; "\nbasic string:\n";
+    hex_dump(std::cout, s.data(), s.length()*sizeof(s.front()));
+    std::cout &lt;&lt; "\nwide string:\n";
+    hex_dump(std::cout, s2.data(), s2.length()*sizeof(s2.front()));
+    std::cout &lt;&lt; "\na double\n";
+    hex_dump(std::cout, &amp;not_really_pi, sizeof(not_really_pi));
+    std::cout &lt;&lt; '\n';
+}
+</code></pre>
+
+<p>Example output:</p>
+
+<pre><code>basic string:
+61 62 63 64 65 66 31 32  | abcdef12
+33 34 35 36 00 7a 79 78  | 3456.zyx
+77 76 75 39 38 37 36 35  | wvu98765
+34 45 64 77 61 72 64 00  | 4Edward.
+
+wide string:
+41 00 00 00 20 00 00 00  | A... ...
+77 00 00 00 69 00 00 00  | w...i...
+64 00 00 00 65 00 00 00  | d...e...
+20 00 00 00 73 00 00 00  |  ...s...
+74 00 00 00 72 00 00 00  | t...r...
+69 00 00 00 6e 00 00 00  | i...n...
+67 00 00 00 2e 00 00 00  | g.......
+
+a double
+49 92 24 49 92 24 09 40  | I.$I.$.@
+</code></pre>
+
+<h2>Further enhancements</h2>
+
+<p>It would be nice to be able to use this functionality like this:</p>
+
+<pre><code>int main()
+{
+    const char test[] = "abcdef123456\0zyxwvu987654Edward";
+    const std::string s(test,sizeof(test));
+    const std::wstring s2{L"A wide stringy."};
+    const double not_really_pi{22.0/7};
+
+    std::cout &lt;&lt; "\nbasic string:\n" &lt;&lt; hexDump(s.data(), s.length()*sizeof(s.front())) 
+              &lt;&lt; "\nwide string:\n" &lt;&lt; hexDump(s2.data(), s2.length()*sizeof(s2.front()))
+              &lt;&lt; "\nraw char array:\n" &lt;&lt; hexDump(test, sizeof(test))
+              &lt;&lt; "\na double\n" &lt;&lt; hexDump(&amp;not_really_pi, sizeof(not_really_pi)) &lt;&lt; '\n';
+
+}
+</code></pre>
+
+<p>This can be effected by just a few additional lines of code:</p>
+
+<pre><code>struct hexDump {
+    const void *buffer;
+    std::size_t bufsize;
+    hexDump(const void *buf, std::size_t bufsz) : buffer{buf}, bufsize{bufsz} {}
+    friend std::ostream &amp;operator&lt;&lt;(std::ostream &amp;out, const hexDump &amp;hd) {
+        return hex_dump(out, hd.buffer, hd.bufsize, true);
+    }
+};
+</code></pre>
+    </div>

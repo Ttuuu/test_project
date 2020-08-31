@@ -1,0 +1,122 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First of all I'd like to recommend shellcheck (<a href="https://www.shellcheck.net/#" rel="nofollow noreferrer">online</a>, <a href="https://github.com/koalaman/shellcheck" rel="nofollow noreferrer">GitHub</a>) as a very useful tool to detect errors (even small misspellings of variables) and possible misbehaviours, etc.. With this you would have been warned about double-quoting your variables to prevent accidental splitting.</p>
+
+<pre><code>#! /bin/bash
+</code></pre>
+
+<p>There is no need to export these variables, since they won't be used after the termination of the script.<br>
+I'd personally stay clear from all caps variable names, if they are not environment variables. (By this convention, shellcheck will not complain for these variables if they are unset, as it assumes these to be provided by the shell.)<br>
+In principle, there is no need to double-quote a subshell, but it does not hurt.</p>
+
+<pre><code>timestamp="$( date '+%Y.%m.%d.%H%M' )"
+verpath='.verpath'
+</code></pre>
+
+<p>Since you have just set the variable, this if clause will never trigger, as it is never empty. You probably would like to check whether the file exists (and is readable).  </p>
+
+<blockquote>
+<pre><code>if [ -z $VERPATH ]
+then
+  # Complain and exit
+  echo "ERROR: Path to files with versions to update must be provided in {repo root}/.verpath"
+  echo " "
+  exit 1
+fi
+</code></pre>
+</blockquote>
+
+<p>I second switching to the bash built-in test <code>[[ expression ]]</code>.<br>
+For debugging purposes I try to stick with positive evaluations, usually inserting a statement that it works as intended.<br>
+While in a simple script like this, echo is perfectly fine, I still recommend looking at <code>printf</code> for more complex things. I'd probably use something like the following:</p>
+
+<pre><code>if [[ -f "$verpath" &amp;&amp; -r "$verpath" ]] ; then
+  :  # do nothing (or give a debug statement)
+else
+  # complain and exit
+  printf 'ERROR: Paths to files with versions to update should be provided in %s.\n\n' "$verpath"
+  exit 1
+fi
+</code></pre>
+
+<p>Be aware that <code>read</code> without the option <code>-r</code> will mangle backslashes (see <a href="https://github.com/koalaman/shellcheck/wiki/SC2162" rel="nofollow noreferrer">SC2162</a>). If for whatever reason the carriage return is missing from the last line, it will be ignored, better use the following while loop, where <code>-n</code> tests for a non-zero length string:</p>
+
+<pre><code>while read -r verfile || [[ -n "$verfile" ]] ; do
+  : # do something
+done &lt; "$verpath"
+</code></pre>
+
+<p>Like in the other answer suggested, I also prefer to keep track of temporary files, instead of assuming they have been created as intended. This will also spare you of reading in the file again.<br>
+Since you are making backups, I would also switch to a different ending like <code>.bak</code>. Initialise the array first:</p>
+
+<pre><code>declare -a backups
+</code></pre>
+
+<p>I'd again check whether the file exists and is readable.<br>
+Since these are backups, I'd also use the <code>-a</code> option to <code>cp</code> to archive them. I'd advise on exiting if the command fails. You might also want to consider checking whether the target backup file does already exist and exit if it does.<br>
+The inline substitution with <code>sed</code> might have a catch, if there are fewer of more spaces in the search pattern. I think you could be a bit more greedy.</p>
+
+<pre><code>if [[ -f "$varfile" &amp;&amp; -r "$varfile" ]] ; then 
+  printf 'INFO: Updating %s.\n' "$varfile"
+  # Add backup file to array
+  backups+=( "$varfile.bak" )
+  [[ -e "${backups[-1]} ]] &amp;&amp; { printf 'WARNING: backup %s exists.\n' "${backups[-1]}" ; exit 1 ; }
+  cp -a -- "$varfile" "${[backups[-1]}" || { printf 'ERROR: backup of %s failed.\n' "$varfile" ; exit 1 ; }
+  sed -i "s/^__version__.*$/__version__ = '$timestamp'/" "$verfile"
+  git add "$verfile" || { printf 'ERROR: adding %s to repository failed\n' "$verfile" ; exit 1 ; }
+  printf '\n'
+else
+  printf 'INFO: file %s not found.\n\n' "$verfile"
+fi
+
+# So user can see what was updated
+sleep 2s
+</code></pre>
+
+<p>The bash built-in <code>$@</code> is an array, it needs to be double-quoted to prevent resplitting. On the other hand, <code>$*</code> is a string, i.e. it looses the elements of an array. Unquoted, it will also be resplit, which is hardly ever anything you would want.<br>
+Always check the exit state of a command directly to prevent it being overwritten.</p>
+
+<pre><code># Actually do the commit, passing through any parameters
+if git commit "$@"
+then
+# Commit succeeded: tag HEAD with $timestamp and delete backup file(s).
+  git tag -f "$TIMESTAMP" || { printf 'WARNING: Adding tag failed.\n' ; }
+  rm -f -- "${backups[@]}"
+else
+# Commit failed: restore the backups to its original location.
+  for file in "${backups[@]}" ; do
+    mv -- "$file" "${file%.bak}" &amp;&amp; git reset HEAD "$file" &amp;&gt; /dev/null 
+  done
+fi
+</code></pre>
+
+<hr>
+
+<p>Generally I do all file handlings much more verbose, wrapping everything into a function and switch off the output of that function as necessary, i.e.</p>
+
+<pre><code>#! /bin/bash
+mybackup ()
+{
+  while [[ -n $1 ]] ; do
+    : # Things to do
+    source="$1"
+    shift
+    target="$source.bak"
+    cp -vp "$source" "$target" &gt;&amp;3 2&gt;&amp;3
+  done
+  : # more things to do ...
+}
+
+if [[ "$1" == "-s" ]] ; then
+  exec 3&gt; /dev/null
+  shift
+else
+  exec 3&gt;&amp;1
+fi
+
+mybackup "$@"
+</code></pre>
+
+<p>This would also make things simpler if you were to create logfiles of your script, but that is beyond this review.</p>
+
+<p>Right now your versioning depends on an auxiliary file, that you probably create manually. I don't know how large your repositories are and how often you are using the versioning statements. It might be better to either check every file, or hardcode the ones that need to be checked into the script, instead of an external file. </p>
+    </div>

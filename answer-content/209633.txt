@@ -1,0 +1,178 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>About 'is'</h3>
+
+<p>I see four different uses of <code>is</code> in your code:</p>
+
+<ol>
+<li><code>item is T</code>, for filtering on item type, such as weapons-only or potions-only.</li>
+<li><code>item is Armor</code> and <code>item is Weapon</code>, for creating type-specific effect descriptions.</li>
+<li><code>item is IStackable</code>, for descriptions and special inventory handling of stackable items.</li>
+<li><code>case IEquipable eq</code> and <code>case IUsable us</code>, for handling of equipment and consumption logic that applies to certain item 'categories' (both weapons and armors are equippable, only potions are consumable).</li>
+</ol>
+
+<hr>
+
+<p>Number 1, selecting items of a specific type from a collection of different types (which is a very natural way to represent a player's inventory) seems fine. Note that this can be simplified by using Linq's <code>OfType&lt;T&gt;</code> extension method. An alternative such as using separate lists will likely introduce more problems than that they solve.</p>
+
+<hr>
+
+<p>Number 2 is problematic. You can easily end up with several checks like these in multiple places, which makes updating description or other item-specific logic more difficult and error-prone than it needs to be. A better solution is to add a virtual <code>EffectsDescription</code> property to <code>Item</code>, so each item type can generate its own effects description, using actual effect values. Adding a new item type no longer requires changes in various other parts of the code, because type-specific description logic is kept in a single place, the item class itself.</p>
+
+<hr>
+
+<p>Number 3, stackable item handling, looks ok at first sight, but it's not very flexible. A class either implements an interface or it does not, so each item type is either stackable or it's not. A two-handed broadsword isn't stackable, but what about a set of throwing knives? The current design does not allow for special cases like that. I would use a data-driven approach here instead of encoding this in C#'s type system. The easiest solution would be to make all items stackable, with a max stack size of 1 for unstackable items.</p>
+
+<hr>
+
+<p>Number 4, equippable and consumable item handling, can sometimes be useful, but in this case I think it indicates a suboptimal design choice. A call like <code>SpecificInventoryItems&lt;Weapon&gt;</code> is intended to let the player select a weapon, but because <code>SpecificInventoryItems</code> is a generic method it has to resort to type-checks to determine how to use the selected item - something that could easily (and unambiguously) have been decided by the caller. I would split this up into a generic <code>SelectItem&lt;T&gt;</code> method and several type-specific methods such as <code>EquipWeapon</code>.</p>
+
+<hr>
+
+<h3>Other notes</h3>
+
+<ul>
+<li>Pattern matching isn't limited to <code>switch</code> statements: <code>if (item is Armor) ...item as Armor</code> can be rewritten as <code>if (item is Armor armor) ...armor</code>. That also reduces the number of type checks to one.</li>
+<li><code>SpecificInventoryItems</code> is doing too many things. Splitting it up into smaller functions that each perform a single task not only makes the code easier to understand, it also enables you to reuse functionality in different contexts.</li>
+<li><code>Item.Description</code> is used inconsistently: potions use it to describe their effects, but weapons and armor do not. Note how potion descriptions can easily become incorrect if you change the value of <code>HPRestored</code> but forget to update <code>Description</code> accordingly.</li>
+<li>The <code>T : class</code> constraint does not prevent unrelated interfaces and types. A top-level <code>IItem</code> interface that is implemented by both <code>Item</code> and the various equippable/usable interfaces allows for a more specific constraint, which makes the intent of the method more clear. Renaming <code>T</code> to <code>TItem</code> would also help.</li>
+<li>If you're using <code>options</code> the way you do to reduce the number of <code>Console.WriteLine</code> calls, and if that's because of a concern for performance, then you should know that using a <code>StringBuilder</code> is more efficient than concatenating lots of strings. Not that I'm expecting performance problems here, but just in case you didn't know.</li>
+<li>All <code>Item</code> properties have public setters. This allows any code to modify them, with the risk of putting an item in an invalid state, with the result that a modification in one part of the program can cause another unrelated part to break.</li>
+</ul>
+
+<hr>
+
+<h3>Alternative implementation</h3>
+
+<p>Here's what the code could look like after applying some of the above suggestions:</p>
+
+<pre><code>// Top-level item-specific methods:
+static void EquipWeapon(Character player)
+{
+    var selectedWeapon = AskUserToSelectItem&lt;Weapon&gt;(player, "weapon");
+    if (selectedWeapon == null)
+        return;
+
+    // NOTE: Unequipping current weapon left out.
+    selectedWeapon.TakeOn(player);
+    Console.WriteLine($"{selectedWeapon.Name} has been equipped.");
+}
+
+static void EquipArmor(Character player)
+{
+    var selectedArmor = AskUserToSelectItem&lt;Weapon&gt;(player, "armor");
+    if (selectedArmor == null)
+        return;
+
+    // NOTE: Unequipping current armor left out.
+    selectedArmor.TakeOn(player);
+    Console.WriteLine($"{selectedArmor.Name} has been equipped.");
+}
+
+static void ConsumeUsableItem(Character player)
+{
+    var selectedUsableItem = AskUserToSelectItem&lt;IUsable&gt;(player, "consumable");
+    if (selectedUsableItem == null)
+        return;
+
+    RemoveFromInventory(player, selectedUsableItem, 1);
+    selectedUsableItem.Use(player);
+    Console.WriteLine($"{selectedUsableItem.Name} has been consumed.");
+}
+
+// Displays all items of the specified type.
+// Returns the selected item, or null if no item was selected.
+static TItem AskUserToSelectItem&lt;TItem&gt;(Character player, string itemDisplayName) where TItem : IItem
+{
+    var items = player.Inventory.OfType&lt;TItem&gt;().ToArray();
+    if (items.Length == 0)
+    {
+        Console.WriteLine($"Your inventory contains no {itemDisplayName}.");
+        return default;
+    }
+
+    Console.WriteLine($"{itemDisplayName}:");
+    for (int i = 0; i &lt; items.Length; i++)
+    {
+        Console.WriteLine($"[{i}] - {FullItemDescription(items[i])}");
+    }
+    var selectedIndex = AskUserForIntegerInRange($"Please select an item or go [[B]ack]:", 0, items.Length - 1);
+    return selectedIndex.HasValue ? items[selectedIndex.Value] : default;
+}
+
+static void RemoveFromInventory(Character player, IItem item, int quantity)
+{
+    // NOTE: Ownership and quantity sanity check left out for brevity's sake:
+    if (item.Quantity &gt; quantity)
+        item.Quantity -= quantity;
+    else
+        player.Inventory.Remove(item);
+}
+
+static string FullItemDescription(IItem item)
+{
+    var description = new StringBuilder();
+    description.Append(item.Name);
+
+    if (item.StackSize &gt; 1)
+        description.Append($" ({item.Quantity}/{item.StackSize})");
+
+    description.Append($": {item.Description} -&gt; {item.EffectsDescription}");
+    return description.ToString();
+}
+
+// Asks the user to enter a number within the given range.
+// Returns null if the user entered 'b' or 'back'.
+static int? AskUserForIntegerInRange(string prompt, int minValue, int maxValue)
+{
+    while (true)
+    {
+        Console.WriteLine(prompt);
+        var input = Console.ReadLine().ToLower();
+        if (input == "b" || input == "back")
+        {
+            return null;
+        }
+        else if (int.TryParse(input, out var index))
+        {
+            if (index &gt;= minValue &amp;&amp; index &lt;= maxValue)
+                return index;
+
+            Console.WriteLine($"Please enter a number between {minValue} and {maxValue}.");
+        }
+        else
+        {
+            Console.WriteLine("Please enter a valid number, or 'b' or 'back'.");
+        }
+    }
+}
+</code></pre>
+
+<p>With the following changes to the <code>Item</code> class hierarchy (not including everything, but the rest should be obvious):</p>
+
+<pre><code>public interface IItem
+{
+    int Id { get; }
+    string Name { get; }
+    string Description { get; }
+    string EffectsDescription { get; }
+    int Quantity { get; set; }
+    int StackSize { get; }
+}
+
+public abstract class Item : IItem
+{
+    ...
+    public virtual string EffectsDescription { get; }
+}
+
+public interface IEquippable : IItem { ... }
+
+public class Weapon : Item, IEquippable
+{
+    ...
+    public override string EffectsDescription =&gt; $"Attack: {Attack}";
+}
+</code></pre>
+
+<p>Perhaps not all of these changes will make sense for what you have in mind with your game, but I hope you'll find some of this useful.</p>
+    </div>

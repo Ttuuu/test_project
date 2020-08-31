@@ -1,0 +1,99 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Optimization</h1>
+
+<p>Getting the best performance for any operation is the Holy Grail for any programmer - but is this always required?</p>
+
+<p>There's this famous quote by Donald Knuth:</p>
+
+<blockquote>
+  <p>Premature optimization is the root of all evil.</p>
+</blockquote>
+
+<p>While this is sometimes taken out of context, he basically wanted to express that you shouldn't worry about small inefficiencies in the code, <strong>unless you know that extra performance is needed</strong> (e.g. by profiling performance afterwards, or by design requirements beforehand). The extra complexity added by those optimizations usually makes debugging and maintaining the code much harder.</p>
+
+<p>And this can be observed in the implementation: There is an optimization to allow for \$\mathcal{O}(1)\$ tail insertion by storing a <code>tail</code> pointer. As other answers have pointed out, that <code>tail</code> pointer isn't updated correctly in all places.</p>
+
+<p>After getting OP's reasoning for the optimization (i.e. none), it seems like this one had been done prematurely.</p>
+
+<h3>Know thy data structures</h3>
+
+<blockquote>
+  <p>Note: In the following, I'm assuming a forward singly linked list (<code>head</code> and <code>next</code> pointers). Similar arguments apply for reverse singly linked lists (<code>tail</code> and <code>prev</code> pointers).</p>
+</blockquote>
+
+<p>Operations on a singly linked lists tail are usually one of its worst case ones, as finding the tail requires a full traversal of the list.</p>
+
+<p>If it is known beforehand that operations on the tail will be critical, you'd normally not consider a singly linked list (other than maybe the reverse one), as other data structures like a doubly linked list or even a dynamically growing array (<code>std::vector</code>) inherently provide better performance characteristics for that use case.</p>
+
+<blockquote>
+  <p>The only special case I can think of where this <strong>might</strong> be useful is that the program</p>
+  
+  <ul>
+  <li><p>runs on a platform with heavy memory constraints</p></li>
+  <li><p>and has lots of tail insertions, but few to none tail deletions,</p></li>
+  </ul>
+  
+  <p>like a queue for an embedded device (where the extra memory overhead of a doubly linked list is too much) - but even then I'd still want to know why this is better than a circular buffer (which has even less memory overhead, as it needs no <code>next</code> pointers).</p>
+</blockquote>
+
+<h1>Design</h1>
+
+<p>Currently, the <code>SingleLinkedList</code> allows for move- and copy-constructable types, but doesn't provide any support for types that aren't (like <code>std::mutex</code>). If <code>SingleLinkedList</code> should also support those types (which require in-place construction), I'd suggest adding <code>emplace</code>, <code>emplace_front</code> and <code>emplace_back</code> member functions (corresponding to <code>insert</code>, <code>push_front</code> and <code>push_back</code> respectively).</p>
+
+<blockquote>
+  <p>Note that this will require an additional <code>Node</code> constructor:</p>
+
+<pre><code>template&lt;typename... Args, typename = std::enable_if_t&lt;std::is_constructible_v&lt;T, Args&amp;&amp;...&gt;&gt;&gt;
+Node(std::unique_ptr&lt;Node&gt;&amp;&amp; next, Args&amp;&amp;... args) noexcept(std::is_nothrow_constructible_v&lt;T, Args&amp;&amp;...&gt;)
+ : data{std::forward&lt;Args&gt;(args)...}, next{std::move(next)} {}
+</code></pre>
+  
+  <p>Some necessary changes:</p>
+  
+  <ul>
+  <li><p><code>next</code> cannot be at the end of the parameter list (<a href="https://stackoverflow.com/q/14768951/6467688">explanation</a>)</p></li>
+  <li><p><code>next</code> cannot have a default value (since it isn't at the end of the parameter list), nor can the constructor be overloaded regarding the presence of <code>next</code> (it either has to always be there or always be absent, anything else would result in ambiguities). I chose "It has to be there", YMMV.</p>
+  
+  <p>(Technically not the whole truth, as you could e.g. use tag types to choose the correct overload. This was meant as a <em>simple</em> example.)</p></li>
+  <li><p>This requires the <code>&lt;type_traits&gt;</code> header for, well, type traits.</p>
+  
+  <p>The type traits help constricting the constructor to only accept arguments that are valid for <code>T</code>, so instantiation fails as early as possible (the <code>std::make_unique&lt;Node&gt;(...)</code> call). As a bonus, the constructor is automatically gets the same exception specification as the internally called <code>T</code> constructor.</p></li>
+  </ul>
+  
+  <p>This constructor can replace the existing ones in cases where <code>next != nullptr</code>. For consistency, I'd suggest dropping the <code>next</code> parameter from those constructors so there is only one order of parameters to pass a <code>next</code> node (having both <code>(value, node)</code> and <code>(node, value)</code> work can be confusing).</p>
+</blockquote>
+
+<p>An implementation of <code>emplace_front</code> can be as simple as this:</p>
+
+<pre><code>template &lt;class T&gt;
+template &lt;typename... Args&gt;
+void SingleLinkedList&lt;T&gt;::emplace_front(Args&amp;&amp;... args) {
+    head = std::make_unique&lt;Node&gt;(std::move(head), std::forward&lt;Args&gt;(args)...);
+    if(!tail) tail = head.get(); // update tail if list was empty before
+}
+</code></pre>
+
+<blockquote>
+  <p>This has been carefully crafted to have the same strong exception guarantee as the original <code>push_front</code>:</p>
+  
+  <ul>
+  <li><p>If the allocation fails in <code>std::make_unique</code>, the <code>head</code> isn't changed (because it is passed as <code>std::unique_ptr&lt;Node&gt;&amp;&amp;</code>).</p></li>
+  <li><p>Inside the <code>Node</code>, <code>data</code> gets constructed first. If that throws, <code>next</code> (in this case <code>head</code>) will not be moved from yet, i.e. it's still valid.</p></li>
+  </ul>
+  
+  <p>It's subtleties like these that makes writing code with a strong exception guarantee hard to get right. You can simply adapt the original <code>push_front</code> implementation if that makes you more comfortable, as it's more robust regarding other changes (e.g. changing the constructors <code>next</code> parameter's type to <code>std::unique_ptr&lt;Node&gt;</code>, or reordering <code>Node::data</code> after <code>Node::next</code>).</p>
+</blockquote>
+
+<p>Of course, <code>push_front</code> can now be reimplemented in terms of <code>emplace_front</code>:</p>
+
+<pre><code>template &lt;class T&gt;
+void SingleLinkedList&lt;T&gt;::push_front(const T &amp;theData) {
+    emplace_front(theData);
+}
+
+template &lt;class T&gt;
+void SingleLinkedList&lt;T&gt;::push_front(T&amp;&amp; theData) {
+    emplace_front(std::move(theData));
+}
+</code></pre>
+    </div>

@@ -1,0 +1,79 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1><code>lock_guard</code></h1>
+<ul>
+<li><p>The destructor never checks if <code>mtx == nullptr</code>, which will cause problems if <code>lock_guard</code> got default-constructed.</p>
+</li>
+<li><p>The <code>lock_guard(M&amp;)</code> constructor cannot be <code>noexcept</code>, as <code>lock</code> on a standard library compatible mutex class is allowed to throw.</p>
+<p>However, it could be made conditionally <code>noexcept</code> in case <code>M::lock</code> is <code>noexcept</code> itself</p>
+<pre><code> lock_guard(M&amp; m) noexcept(noexcept(std::declval&lt;M&gt;().lock())) : mtx{&amp;m} { mtx-&gt;lock(); }`
+</code></pre>
+</li>
+<li><p><code>lock_guard(M&amp;)</code> should be made <code>explicit</code> in order to prevent unwanted conversions.</p>
+</li>
+</ul>
+<p>Any specific reasons why <code>std::lock_guard</code> or <code>std::unique_lock</code> couldn't be used?</p>
+<h1><code>queue</code></h1>
+<ul>
+<li><p><strong>Memory leak</strong>: <code>push(const T&amp;)</code> never <code>delete</code>s <code>new_elem</code>.</p>
+<p>Actually, why allocate <code>new_elem</code> at all? The whole first 4 lines could be simplified to:</p>
+<pre><code> auto node = new queue_node{ elem, nullptr };
+</code></pre>
+</li>
+<li><p><code>push(const T&amp;)</code> and <code>pop()</code> may cause undefined behavior by calling <code>one_elem_mtx.unlock()</code> if it hasn't been locked before.</p>
+</li>
+<li><p><code>pop()</code> doesn't update <code>tail</code> in case the last element got removed and lets it dangle instead.</p>
+<p>This will cause undefined behavior upon the next call to <code>push(const T&amp;)</code>.</p>
+<p>This also means that <code>one_elem_mtx</code> will not be locked in calls to <code>push(const T&amp;)</code> or <code>pop()</code>, since <code>head != tail</code> while the queue is empty again.</p>
+</li>
+<li><p><strong>Race condition</strong>: <code>one_elem_mtx</code> needs to be acquired after the lock on <code>pop_mtx</code>/<code>push_mtx</code>.</p>
+<p>Reason: Assume we have a queue with two elements in it, and two threads A and B who both want to execute <code>pop</code>. Thread A executes until just after <code>if(head == tail)</code> (which of course right now evaluates to <code>false</code>) and then gets interrupted by the OS. Thread B runs <code>pop()</code> to completion in the meantime, leaving the queue at one object. Now, assuming the missing <code>tail</code> update mentioned above gets added, we have a potential data race on access to <code>tail</code> if another Thread C were to run <code>push(const T&amp;)</code>.</p>
+</li>
+<li><p><strong>Thread starvation</strong>: Once the race condition is fixed, if <code>pop()</code> gets called much more frequently than <code>push(const T&amp;)</code>, threads waiting on <code>pop()</code> might starve threads trying to <code>push(const T&amp;)</code> from getting access to <code>one_elem_mtx</code>. Maybe make <code>pop</code> a blocking operation (using a <code>std::condition_variable</code> to notify if new elements got inserted)?</p>
+</li>
+<li><p>For a production ready queue, you might want to think about adding a maximum capacity (so the queue doesn't grow too large if elements get added faster than they get removed).</p>
+</li>
+<li><p>An overload <code>push(T&amp;&amp;)</code> might be nice.</p>
+</li>
+</ul>
+<h1><code>log_task</code></h1>
+<ul>
+<li><code>operator()(const char*)</code> is not thread safe: access to the <code>static</code> <code>log_id</code> isn't synchronized. Maybe add a lock, or make <code>log_id</code> a <code>std::atomic&lt;std::size_t&gt;</code>?</li>
+</ul>
+<h1><code>main</code></h1>
+<ul>
+<li><p>Waiting for some hundred milliseconds on such a simple task that might otherwise take nanoseconds (or microseconds at most) to execute? This might make the whole "test" obsolete, especially since the chance of finding race conditions is pretty much zero.</p>
+</li>
+<li><p><code>t.value()</code> checks again whether the <code>std::optional</code> contains a value (and throws an exception if not). Since at that point <code>t</code> has already been checked for emptiness, why not use <code>*t</code> to access the value directly?</p>
+</li>
+</ul>
+<h1>General stuff</h1>
+<ul>
+<li><p>Any specific reason for not using <code>std::unique_ptr</code>?</p>
+</li>
+<li><p><code>auto</code> could be used more often.</p>
+</li>
+<li><p>There's no way to stop the program other than forcefully terminating the process. This might surprise some people trying it.</p>
+</li>
+</ul>
+<h1>Q &amp; A</h1>
+<ol>
+<li><p>See above.</p>
+</li>
+<li><p>I can't see any right now.</p>
+</li>
+<li><p>It is a performance penalty, yes, though that might not matter if <code>push</code> and <code>pop</code> don't get called too frequently (e.g. because task creation and task execution take some time). It also makes reasoning about the whole set of operations a lot easier: If all access to <code>head</code> and <code>tail</code> is secured behind one single mutex, there are some advantages:</p>
+<ul>
+<li><p>No race condition on either can occur.</p>
+</li>
+<li><p>No deadlock based upon locking order can occur (unless you make recursive calls).</p>
+</li>
+<li><p>No special care needed for edge cases (empty/full queue, or off by one element).</p>
+</li>
+</ul>
+<p><br>This makes it much easier to verify and trust that such a queue is working correctly.</p>
+<blockquote>
+<p>Now, if this performance penalty is too much, often mutexes get skipped entirely in favor of lock-free queues. These require some more expert knowledge, though.</p>
+</blockquote>
+</li>
+</ol>
+    </div>

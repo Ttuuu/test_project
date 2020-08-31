@@ -1,0 +1,110 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'll ignore questions 1 and 5 regarding hashing, because you don't need a hash function at all.</p>
+
+<h1>Storing image data</h1>
+
+<p>A <code>std::vector&lt;std::vector&lt;int&gt;&gt;</code> is, in general, not a good way to store an image. For every pixel lookup this requires finding the column in one array, then following a pointer to another part of the memory where the pixel data for the column is stored, and finding the indexed value there. That is, there are two memory lookups involved. Furthermore, pixels are potentially stored non-consecutively, which is harder on the cache. Note also that allocating a small image of 1k x 1k pixels requires 1k + 1 allocations.</p>
+
+<p>It is always best to keep things together in memory. Use a single memory block for your image: <code>std::vector&lt;int&gt;</code>. Here, allocating a small image of 1k x 1k pixels requires 1 allocation.</p>
+
+<p>Instead of indexing <code>image[x][y]</code>, you now need to do <code>image[x+y*width]</code>. This simple computation seems expensive, but it is not at all expensive compared to the additional memory fetch that you do in a vector of vectors. Since you have a nice <code>Point</code> class, you can make a method <code>Point::index(step)</code> that performs this computation. Now indexing is <code>image[pt.index(width)]</code>, which is quite nice for code like the following:</p>
+
+<pre><code>Point pt_n{curr_point.x(), curr_point.y() - 1};
+if(check_point(pt_n, x_dim, y_dim) &amp;&amp; image[curr_point.x()][curr_point.y() - 1] == old_val &amp;&amp; visited[pt_n] == false)
+   // ...
+</code></pre>
+
+<p>where you write the neighbor's location <code>(x,y-1)</code> twice. This is error-prone. With the new method you can write:</p>
+
+<pre><code>Point pt_n{curr_point.x(), curr_point.y() - 1};
+if(check_point(pt_n, x_dim, y_dim) &amp;&amp; image[pt_n.index(witdh)] == old_val &amp;&amp; visited[pt_n] == false)
+   // ...
+</code></pre>
+
+<p>Another advantage is that we can now use pointer arithmetic to access neighbors. Given a pixel at <code>p = image.data() + pt.index(width)</code>, the neighbor to the left is <code>*(p-1)</code>, the neighbor to the top is <code>*(p-width)</code>, etc. This can significantly simplify the logic for flood filling and many other algorithms that depend on neighborhood relations between pixels (see below).</p>
+
+<h1>Pixel type</h1>
+
+<p>Consider if <code>int</code> is the pixel type you really want. <code>int</code> has a fixed meaning in all modern 32-bit and 64-bit computers that I know of, but the standard only says it should have at least 16 bits. I would suggest being more specific, and using e.g. <code>std::uint8_t</code> or <code>std::uint32_t</code> depending on what you want your pixels to look like.</p>
+
+<h1>Recording visited pixels</h1>
+
+<p>Instead of a hash function, you can very simply use a second image to record this information. When you access a pixel in the image you know its index. Looking up a value at the same index in a second array is trivial compared to computing a hash function and doing the hash lookup. Basically, an image is the ideal data structure to map an integer coordinate to a value. There will never be any hash collision here, each point has a unique location. Yes, this takes up more space, but an array of a few million bytes is trivial. Plus, you can use the same array for another speedup. Read on.</p>
+
+<h1>Testing for neighbors</h1>
+
+<p>The <code>check_point</code> function is called 4 times for every pixel being processed, but it returns false for neighbors of only a very small subset of them (the pixels at the edge of the image). Most pixels have 4 neighbors. However, this test is a significant part of the execution time.</p>
+
+<p>If you could test a pixel not being on the image edge, you could skip testing if its 4 neighbors exist for most pixels in the image. In my experience, the best way to do so, rather than testing for coordinates, is to use another boolean image where the edge pixels are set, and the rest are not.</p>
+
+<p>Since you already use a <code>visited</code> image, you could add this neighborhood information to it. For example,</p>
+
+<pre><code>visited[i] &amp; 1     // true if visited
+visited[i] &amp; 2     // true if pixel on left edge of image (doesn't have a neighbor to the left)
+visited[i] &amp; 4     // true if pixel on right edge of image
+visited[i] &amp; 8     // true if pixel on top edge of image
+visited[i] &amp; 16    // true if pixel on bottom edge of image
+</code></pre>
+
+<p>Now the logic in <code>get_neighbors</code> becomes:</p>
+
+<pre><code>if(!(visited[i] &amp; 2) &amp;&amp; image[i-1] == old_val &amp;&amp; !(visited[i-1] &amp; 1)) {
+   q.push(i);
+   visited[i] |= 1;
+}
+if(!(visited[i] &amp; 4) &amp;&amp; image[i+1] == old_val &amp;&amp; !(visited[i+1] &amp; 1))
+   // ...
+if(!(visited[i] &amp; 8) &amp;&amp; image[i-width] == old_val &amp;&amp; !(visited[i-width] &amp; 1))
+   // ...
+if(!(visited[i] &amp; 16) &amp;&amp; image[i+width] == old_val &amp;&amp; !(visited[i+width] &amp; 1))
+   // ...
+</code></pre>
+
+<p>It would be nice to encapsulate some of that into helper functions for readability:</p>
+
+<pre><code>inline bool has_left_neighbor(ImgUInt8 const&amp; visited, int i) {
+   return !(visited[i] &amp; 2);
+}
+inline int left_neighbor(int i) {
+   return i-1;
+}
+// etc.
+
+inline bool is_visited(ImgUInt8 const&amp; visited, int i) {
+   return visited[i] &amp; 1;
+}
+</code></pre>
+
+<p>Now it's more difficult to make mistakes:</p>
+
+<pre><code>if(has_left_neighbor(visited, i) &amp;&amp; image[left_neighbor(i)] == old_val
+                                 &amp;&amp; !is_visited(visited, left_neighbor(i))) {
+   //...
+}
+</code></pre>
+
+<p>Note that in the code above we don't use coordinates at all any more. The whole flood fill operation can be written using only 1D indices to pixels.</p>
+
+<h1>Code smells</h1>
+
+<ol>
+<li><p>Your function <code>check_point</code> does:</p>
+
+<pre><code>if(condition) {
+   return true;
+}
+return false;
+</code></pre>
+
+<p>This can be better written as:</p>
+
+<pre><code>return condition;
+</code></pre></li>
+<li><p>You default constructor for <code>Point</code> has an empty body. Prefer to write:</p>
+
+<pre><code>Point() = default;
+</code></pre></li>
+<li><p>The function <code>get_neighbors</code> declares a <code>std::vector&lt;Point&gt; neighbors</code> that you don't use. The compiler should have given you a warning for this. Make sure that you always compile with all possible warnings turned on, and that you fix all warnings reported.</p></li>
+<li><p>Your <code>main</code> function catches exceptions, writes out <code>what()</code>, then returns 0. On POSIX systems, it is customary for a program to return with a different exit value if there was an error. Furthermore, an uncaught exception will cause the <code>what()</code> message to be written and a non-zero exit value to be used. So it is better in general to not catch exceptions at all. <code>return 0;</code> is also superfluous, as the compiler will generate that one for you. <code>main</code> is the only function that returns a value but needs no <code>return</code> statement.</p></li>
+</ol>
+    </div>

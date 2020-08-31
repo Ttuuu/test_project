@@ -1,0 +1,123 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I made some changes to your code (see below). You can check the code for what I've done so far: I added some comments on it so you can compare it with your version.  I'll note some important points in here. Please ask if you have any questions; I will try to explain or we can improve the code together.</p>
+
+<ul>
+<li>Propagating error to the main function from a spawned thread is not possible. It's only possible after joined to the main thread (you can use join handler then propagate your anonymous function's return value to the main).</li>
+<li>Created <code>ConnectionsSync</code> struct as helper to get rid of <code>Arc&lt;RwLock&lt;HashMap&lt;</code> initialization: it was looking too messy; also with this way you can add behaviors like (<code>add_user</code>, <code>broadcast_message</code>, <code>remove_user</code>, ... )</li>
+<li><code>Incoming</code> has <code>Iterator</code> implementation so I can use it as iterator and I used <code>try_for_each</code> to tell that I am going to apply fallible function, then it will be propagated to main.</li>
+</ul>
+
+<h2>Code</h2>
+
+<pre><code>use std::collections::HashMap;
+use std::env;
+use std::io;
+use std::io::{BufRead, BufReader, LineWriter, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, RwLock};
+use std::thread;
+
+type User = Arc&lt;String&gt;;
+struct ConnectionsSync(Arc&lt;RwLock&lt;HashMap&lt;User, LineWriter&lt;TcpStream&gt;&gt;&gt;&gt;);
+impl ConnectionsSync {
+    fn new() -&gt; Self {
+        ConnectionsSync(Arc::new(RwLock::new(HashMap::new())))
+    }
+}
+
+fn main() -&gt; io::Result&lt;()&gt; {
+    let port = env::args().nth(1).unwrap_or("8080".to_string()); //default port 8080
+    let connections = ConnectionsSync::new();
+
+    TcpListener::bind(&amp;format!("localhost:{}", port))?
+        .incoming()
+        .try_for_each(|socket| -&gt; io::Result&lt;()&gt; {
+            let socket = socket?;
+            let connections = connections.0.clone(); //increases ref count
+
+            thread::spawn(move || {
+                let (mut reader, writer) = socket
+                    .try_clone()
+                    .map(|socket1| (BufReader::new(socket1), LineWriter::new(socket)))
+                    .unwrap();
+
+                // read nick
+                let mut nick = String::new();
+                reader
+                    .read_line(&amp;mut nick)
+                    .and_then(|_| Ok(nick.pop()))
+                    .expect("Not able to read user nick");
+
+                let current_user = Arc::new(nick);
+                //add user
+                connections
+                    .write()
+                    .unwrap()
+                    .insert(current_user.clone(), writer);
+
+                //read user input
+                reader.lines().into_iter().for_each(|line| {
+                    let line = line.expect("Not able to read user input");
+                    connections
+                        .write()
+                        .unwrap()
+                        .iter_mut()
+                        .filter(|(other_user, _)| **other_user != current_user)
+                        .for_each(|(_, peer)| {
+                            writeln!(peer, "{} \t-&gt; {}", current_user, line);
+                        })
+                });
+
+                //discard user
+                connections.write().unwrap().remove(&amp;current_user);
+            });
+
+            Ok(())
+        })
+}
+</code></pre>
+
+<h2>Edit for questions in comment section</h2>
+
+<blockquote>
+  <p>Can we get rid of nick.clone() and keep a simple reference? I guess not because cannot move out of borrowed content despite nick being
+  immutable.</p>
+</blockquote>
+
+<p>Actually <strong>cannot move out of borrowed content</strong> error is not related being immutable or mutable. Consider this; Your friend <strong>borrowed</strong> a phone from you and <strong>moved</strong> it's battery out physically to use somewhere else. Then your friend gave it your phone back to you without a battery. You would probably give an instant error. So due to safety, Rust watches your friend and warns: <strong><em>"Hey your friend is going to need that part in the future, so stop it!"</em></strong> </p>
+
+<p>Besides the error you mentioned, another error will be occurred if we get rid of nick.clone() and keep a simple reference: We'll face with <strong>"borrowed value does not live long enough"</strong>. This happens because we have a HashMap which it's reference counted, so we don't exactly know when it is going to die. If we put our nick's simple reference into HashMap, the compiler will tell that: <strong><em>"Hey HasMap is the owner of nick's reference but nick is gonna die in that block and HashMap will live after that, so what i am gonna do with this reference in the future ? "</em></strong>. We can solve this problem with 2 solution.</p>
+
+<ul>
+<li>With cloning because we have 2 ownership of nick (HashMap, Thread Block). I believe you don't want this solution due to overhead of copying String.</li>
+<li>With Smart Pointers Like Rc(Reference Counted), we will give nick's ownership to the Rc and share it across the HashMap and Thread. But Rc is not thread safe so we need to use Arc instead of it.i updated code with Arc version, there will be still cloning in code but it will just increase the reference count instead of copying the whole String.</li>
+</ul>
+
+<blockquote>
+  <p>Can we filter on value references instead of key objects?</p>
+</blockquote>
+
+<p>Sure you can do it simply you need to change your code like this:</p>
+
+<pre><code>.filter(|(_other_user, other_users_value)| other_users_value != current_users_value)
+</code></pre>
+
+<p>But in our case this will not work because <a href="https://doc.rust-lang.org/std/cmp/trait.Eq.html" rel="nofollow noreferrer">Eq</a> is not implemented for TCPStream, if you implement it by yourself it will work.</p>
+
+<hr>
+
+<h2>Edit: Added unsafe version with raw pointers instead of clone</h2>
+
+<pre><code>let mut users = HashMap::new();
+
+let nick = "SomeInput".to_string();
+let nick_ptr = &amp;nick as *const String;
+
+users.insert(nick, "SomeValue".to_string());
+
+unsafe {
+    users.remove(&amp;*nick_ptr);
+    println!("{:?}", users.get(&amp;*nick_ptr)); //output None
+}
+</code></pre>
+    </div>

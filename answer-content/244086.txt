@@ -1,0 +1,164 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>"My program is slow!"</strong></p>
+<p>You want an estimate for <span class="math-container">\$P\$</span> different graph-sizes, each of which is the average of <span class="math-container">\$S\$</span> samples of <code>connected_edge_count</code>. We assume <code>connected_edge_count</code> will run through it's <code>while</code> loop <span class="math-container">\$n\log n\$</span> times (approximately). What's the asymptotic complexity of <code>Partition.find()</code>? I'll wildly guess it's <span class="math-container">\$\log n\$</span>. So taking <span class="math-container">\$N\$</span> as the maximum requested <span class="math-container">\$n\$</span>, your <em>overall program</em> is <span class="math-container">\$O(P S N (\log N)^2)\$</span>.</p>
+<p>So broadly speaking, there's just a lot of work to do. Local improvements to the <em>implementation details</em> can help, but I think your biggest problem (at least until you start increasing <span class="math-container">\$n\$</span>) is <span class="math-container">\$S\$</span>. 100 is way too big. Playing around with some values, 15 seems to give somewhat stable results, although possibly you'll want more as you deal with larger <span class="math-container">\$n\$</span> values.</p>
+<p>On the other hand, how often are you planning on running this? Ninety seconds isn't really that long. It feels like a long time when you're trying to iterate on the program. So one thing you might want to work on is the way the functions are nested. Rather than having each function in the stack call the next, let them take the prior result as an argument. This way you'll have better access to intermediate results, and won't have to re-run everything every time.</p>
+<p>I spent some time squishing around parts of the code to make sure I understood it, and then because I couldn't get the details out of my head. I haven't checked if it's faster or now, mostly it's just denser. For an academic POC, it goes up to 10K without any problems. (My <code>main</code> takes about three minutes to run. I still can't get <code>connected_edge_count(10 * 1000 * 1000)</code> to work; it crashes after a few minutes.) I'll post my version below in case there are any differences in it you find useful.</p>
+<p><strong>"What other improvement can I make on my codes?"</strong><br>
+All the usual stuff. Better variable names, less mutation of state and variables, type-hints. Once I got a sense of what your code did I quite liked it; the tree system is clever. (But is it <em>accurate</em>? How do you <em>know</em>? If you're hoping to publish results, adding a few unit tests isn't going to be good enough.)</p>
+<p>In your comments you talked about not needing to build an explicit graph; you claimed to do it virtually. But notice that you <em>do</em> need to keep track of all the edges so that you can count them.</p>
+<p>Because performance is an issue, and we want to be able to handle large numbers of items, I made some optimizations that may make the code harder to read. For example, for the task at hand a <code>List[int]</code> (array) can serve the purpose of a <code>Dict[int, int]</code> with a lot less machine overhead. But it ties you representing your nodes as <code>int</code>s.</p>
+<p><strong>As for further research steps, it depends on your goals. My intuition is that this kind of sampling may be an easy way of checking if your hypothesis is viable, and you've done that. If you want to <em>prove</em> it, then you need to actually prove it. Maybe a programmatic proof system like agda or coq can help, maybe not; I haven't learned them yet!</strong></p>
+<pre class="lang-py prettyprint-override"><code>import matplotlib
+matplotlib.use('TkAgg')
+
+from itertools import count, dropwhile, takewhile
+import random
+from math import exp, log
+import matplotlib.pyplot as plt
+from scipy.special import lambertw
+from typing import Callable, Dict, Iterable, List, NamedTuple, Set, Tuple
+
+from time import sleep
+
+
+class Partition(NamedTuple):
+    parents: List[int]
+    weights: List[int]
+    edges: Set[Tuple[int, int]]  # The tuple members must be storted! frozensets would be harder to screw up, and maybe slightly faster, but they take more ram, which I think is the bottleneck.
+
+    @staticmethod
+    def atomic(node_count: int):
+        return Partition(
+            parents=list(range(node_count)),
+            weights=[1 for node in range(node_count)],
+            edges=set()
+        )
+
+    def _node_to_str(self, node: int) -&gt; str:
+        if not node &lt; len(self.parents):
+            raise Exception(f"{node} is not in the range 0 - {len(self.parents)}.")
+        return "{n}: &lt;{c}&gt;".format(
+            n=node,
+            c=", ".join(self._node_to_str(n) for (n, p) in enumerate(self.parents) if p == node and n != node)
+        )
+
+    def display(self) -&gt; str:
+        if 100 &lt; len(self.parents):
+            raise NotImplementedError("Refusing to pretty-print a large forest.")
+        return "\n".join(self._node_to_str(n) for (n, p) in enumerate(self.parents) if p == n)
+
+    def find_root(self, item: int) -&gt; int:
+        parent = self.parents[item]
+        if parent == item:
+            return item
+        else:  # find the root and recursively set all parents to it
+            root = self.find_root(parent)
+            self.parents[item] = root
+            return root
+
+    def add_edge(self, item1: int, item2: int) -&gt; int:
+        """returns the number of edges added to the graph (1, or 0 if the edge was already there)"""
+        edge = (item1, item2) if item1 &lt; item2 else (item2, item1)
+        if edge in self.edges:
+            return 0
+        else:
+            self.edges.add(edge)
+            root1 = self.find_root(item1)
+            root2 = self.find_root(item2)
+            if root1 != root2:
+                weight1 = self.weights[root1]
+                weight2 = self.weights[root2]
+                heavier, lighter, lesser_weight = (root2, root1, weight1) if weight1 &lt; weight2 else (root1, root2, weight2)
+                self.parents[lighter] = heavier  # reset parent of lighter to heavier
+                self.weights[heavier] += lesser_weight  # also update the weight of the tree the heavier node
+            return 1
+
+    def is_single_group(self) -&gt; bool:
+        # we can start with any node for the task at hand
+        return len(self.parents) == self.weights[self.find_root(self.parents[0])]
+
+
+def connected_edge_count(n: int) -&gt; int:
+    forest = Partition.atomic(n)
+    nodes = range(n)  # not the _real_ nodes, just an external thing to sample from.
+    while not forest.is_single_group():
+        edge = random.sample(nodes, 2)
+        forest.add_edge(*edge)
+    return len(forest.edges)
+
+
+def mean_of(trial: Callable[..., int], *trial_args, sample_size: int, **trial_kwargs) -&gt; float:
+    return sum(trial(*trial_args, **trial_kwargs) for _ in range(sample_size)) / sample_size
+
+
+def nlogn(x):
+    return x * log(x)
+
+
+def inverse(x):
+    return abs(x / lambertw(x))
+
+
+def plt_vs_nlogn(*samples: Tuple[int, float]):
+    x_values = [nlogn(n) for (n, v) in samples]
+    plt.xlabel("n⋅log(n)")
+    y_values = [v for (n, v) in samples]
+    plt.ylabel("mean edges to connect n-graph")
+    plt.plot(x_values, y_values, '.')
+
+
+def nlogn_range(start: int, stop: int, starting_step: float = 100) -&gt; Iterable[int]:
+    """This is rediculious overkill."""
+    return [
+        int(inverse(x))
+        for x
+        in takewhile(lambda _x: inverse(_x) &lt; stop,
+                     dropwhile(lambda _x: inverse(_x) &lt; start,
+                               count(1, nlogn(starting_step))))
+    ]
+
+
+def main():
+    ns = list(nlogn_range(10, 10 * 1000, 500))
+    results = {
+        n: mean_of(
+            connected_edge_count,
+            n,
+            sample_size=int(5 * log(n))
+        )
+        for n in ns
+    }
+    plt_vs_nlogn(*results.items())
+
+
+def agrees_with_original(i: int) -&gt; bool:
+    import cr_243594_original
+    mine = mean_of(connected_edge_count, i, sample_size=i)
+    theirs = cr_243594_original.mean_edge_count(i, i)
+    print(mine)
+    print(theirs)
+    return abs(mine - theirs) &lt; (i/10)  # this is totally made up and prone to failure because of the randomness.
+
+def verbose_random_add(tree: Partition) -&gt; None:
+    edge = random.sample(range(len(tree.parents)), 2)
+    print(sorted(edge))
+    print(sorted(tree.edges))
+    print(tree.add_edge(*edge))
+    print(tree.display())
+    print(tree.is_single_group())
+    print(sorted(tree.edges))
+    assert all(((a,b) not in tree.edges) or (tree.find_root(a) == tree.find_root(b))
+               for a in range(len(tree.parents))
+               for b in range(a+1, len(tree.parents)))
+    print("===========================================")
+
+
+assert agrees_with_original(40)
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+<p><a href="https://i.stack.imgur.com/weewe.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/weewe.png" alt="output of my program"></a></p>
+    </div>

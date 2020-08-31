@@ -1,0 +1,161 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First thing that bother me is why <code>let SSG</code>? Why is it an object? If you're using ES6+ (as you do), I'd go with making this a class. It's more obvious and more readable. Note that while doing this, you'll have to alter the function signature, i.e. <code>generateHtmlFile: async function (file) { ... }</code> becomes <code>async generateHtmlFile(file) { ... }</code>.</p>
+
+<p>Since you have folder names stored as a properties of your object (<code>outputFolder</code>, <code>contentFolder</code> and <code>assetsFolder</code>), they should be moved now to the constructor. There is also a good candidate for another new property on line 51: <code>../templates/</code> should be also extracted. This is because there are no properties in JS class ATM. Also, while we're on the topic of class properties, I'd suggest that you should pass an object with folder names as a constructor argument. That way you can easily change the folders you're using by just instantiating an object with another folder names. When we sum up the info about properties, here's what it should look like:</p>
+
+<pre><code>class SGG {
+  constructor(folders = {}) {
+    this.outputFolder = folders.outputFolder || '../output/'
+    this.contentFolder = folders.contentFolder || '../content/'
+    this.assetsFolder = folders.assetsFolder || '../assets/'
+    this.templates = folders.templates || '../templates/'
+  }
+}
+</code></pre>
+
+<p>The second thing that I didn't notice when I looked at the code here is that you have a some implicit variables: <code>files</code> on line 19 and <code>it</code> on line 45. So just add <code>const</code> in front of those two and you'll be fine.</p>
+
+<p>At line 49, there is a <code>require</code>. I'd move it to the top of the file because that way you know right on what are the dependencies of your file. And it's more cleaner code without some unexpected turns.</p>
+
+<p>Now, to the methods. First one is <code>contentFiles</code> which is just a recursive call to find out all the files in a <code>contentFolder</code> directory. I see that you are probably confused with promises because you use <code>async</code> and <code>new Promise</code> in the same function. When making function an <code>async</code>, you should know that whatever you return from the function, it will be wrapped inside a promise and it also gives you the ability to use <code>await</code> inside it. But since you don't have <code>await</code> here, then there is no need for making this function an <code>async</code> one. You are already returning a promise. But, I think that you don't need a promise at all! You are using these <code>fs-extra</code> methods that are not returning a promise nor have a callback, so they are perfectly synchronous functions. Also, the <code>.forEach</code> got all of this tangled a bit, so if you remove it and use <code>for..of</code>, you can untangle yourself and get a cleaner code.</p>
+
+<p>The next method, <code>generateHTMLFile</code> has similar issue with promises as the one above. From ejs' github, I noticed that if you don't pass the callback function, it will return a promise. So what should be done here is to remove <code>new Promise...</code> thing and keep <code>async</code> and rewrite the <code>ejs.renderFiles</code> not to use the callback function.</p>
+
+<p>The method <code>saveHTML</code> is confusing a bit: you're using <code>sync</code> methods everywhere, but here you decided to go with <code>mkdir</code> instead of <code>mkdirSync</code> or <code>writeFileSync</code>.</p>
+
+<p>Once you apply all of what I've said, you should get something like this:</p>
+
+<pre><code>const yaml = require('js-yaml');
+const fs = require('fs-extra');
+const ejs = require('ejs');
+const md = require('markdown-it')({
+    html: true,
+    linkify: true,
+    typographer: true,
+});
+const funs = require('./functions.js');
+
+class SSG {
+    constructor(folders = {}) {
+        this.outputFolder = folders.output || '../output/'
+        this.contentFolder = folders.contentFolder || '../content/'
+        this.assetsFolder = folders.assetsFolder || '../assets/'
+        this.templateFolder = folders.templateFolder || '../templates/'
+    }
+
+    contentFiles(dir, filelist) {
+        const files = fs.readdirSync(dir)
+        filelist = filelist || []
+        for (const file of files) {
+            if (fs.statSync(dir + '/' + file).isDirectory()) {
+                contentFiles(dir + '/' + file, filelist)
+            } else {
+                filelist.push(file)
+            }
+        }
+        return filelist
+    }
+
+    async generateHTMLFile(file) {
+        const fstream = fs.readFileSync(file, 'utf8');
+        let params = fstream.match(/\+Params\+([\s\S]*?)\+\+\+/g);
+        let content = fstream.match(/(\+Content[0-9]*\+|\+Content\+)([\s\S]*?)*(\+\+\+)/g);
+        let contents = [];
+
+        params = params[0].replace('+Params+', '').replace('+++', '');
+        content = content[0].split('+++');
+
+        try {
+            params = yaml.safeLoad(params, 'utf8');
+            for (let it of content) {
+                it = it.replace('+++', '').replace(/(\+Content[0-9]*\+|\+Content\+)/g, '');
+                contents.push(md.render(it));
+            }
+
+             const html = await ejs.renderFile(this.templateFolder + params.template + '.ejs', {
+                funs: funs,
+                params: params,
+                content: contents,
+            }, {})
+
+            return {
+                html, 
+                url: params.url,
+            }
+
+        } catch (e) {
+            console.log(e);
+        }
+    }
+
+    async saveHTML(html, url) {
+        if (!fs.existsSync(this.outputFolder)) {
+            await fs.mkdirSync(this.outputFolder, {recursive: true});
+        }
+        await fs.writeFileSync(this.outputFolder + url + '.html', html);
+    }
+
+    saveStaticAssets() {
+        fs.copySync(this.assetsFolder, this.outputFolder);
+    }
+
+    async start() {
+        try {
+            let time = Date.now();
+            console.log('Génération des fichiers HTML...');
+
+            const files = this.contentFiles(this.contentFolder);
+
+            for (const file of files) {
+                await this.generateHTMLFile(this.contentFolder + file).then(({html, url}) =&gt; {
+                    this.saveHTML(html, url);
+                });
+            }
+
+            this.saveStaticAssets();
+
+            console.log('Généré en ' + (Date.now() - time) + 'ms');
+        } catch (e) {
+            console.error(e.message);
+        }
+    }
+};
+
+(async () =&gt; {
+    const ssg = new SSG()
+    await ssg.start();
+})();
+</code></pre>
+
+<p>Last note that I'd like to make is that Node already has a pretty decent file system utilities. The only thing that I've noticed that is different from <code>fs-extra</code> is that <code>sync</code> functions do not return promises, but they rather act as a regular functions. Anyhow, I'd argue that you don't need <code>fs-extra</code> and use <code>fs</code> instead. But it's up to you.</p>
+
+<p>I maybe missed something or maybe got into details and nitpicking more than needed, but this is a basic refactor that I would do to your code. I hope that I didn't break some things while doing this :)</p>
+
+<hr>
+
+<p><strong>Edit:</strong>
+While looking at the code for the second time, I noticed that I've missed this line in <code>start</code>:</p>
+
+<pre><code>await this.generateHTMLFile(this.contentFolder + file).then(({html, url}) =&gt; {
+    this.saveHTML(html, url);
+});`
+</code></pre>
+
+<p>It's maybe just me, but I don't like this mixture of <code>await</code> and <code>then</code>.
+I'd just suggest that if you're going with <code>await</code>, keep it that way.
+My suggestion here would be to go with something like this:</p>
+
+<pre><code>const {html, url} = await this.generateHTMLFile(this.contentFolder + file)
+await this.saveHTML(html, url)
+</code></pre>
+
+<p>I've also just noticed that you can optimize the solution for speed by awaiting on multiple promises:</p>
+
+<pre><code>await Promise.all(files.map(async (file) =&gt; {
+    const {html, url} = await this.generateHTMLFile(this.contentFolder + file)
+    await this.saveHTML(html, url)
+}))
+</code></pre>
+
+<p>This way you start multiple promises <em>in parallel</em> (again, not a true parallelization since JS is single threaded) and await on all of them to finish before moving on. This way you'll get a bit faster execution. Note that if one promise throws and error, this line will also throw an error before waiting on the other promises to end.</p>
+    </div>

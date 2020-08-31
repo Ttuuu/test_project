@@ -1,0 +1,194 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Optimising the functional approach</h2>
+
+<blockquote>
+  <p>Iterative vs functional approach: Is it possible to use the (existing) functional methods without losing performance?</p>
+</blockquote>
+
+<p>I don't think it's possible to use the standard library's <em>existing</em> collection methods without losing performance here – as I go onto investigate, there are quite a few inefficiencies with them. We can however make quite a few improvements by defining methods of our own to bring the performance close to the iterative approach.</p>
+
+<p>For your implementation of the mutable version of <code>permute()</code> that uses the existing standard library collection methods:</p>
+
+<blockquote>
+<pre><code>extension Array where Element: Comparable {
+
+    mutating func permute2() -&gt; Bool {
+
+        // Nothing to do for empty or single-element arrays:
+        if count &lt;= 1 {
+            return false
+        }
+
+        // L2: Find last j such that self[j] &lt;= self[j+1]. Terminate if no such j
+        // exists.
+        guard let j = indices.reversed().dropFirst()
+            .first(where: { self[$0] &lt;= self[$0 + 1] })
+        else { return false }
+
+        // L3: Find last l such that self[j] &lt;= self[l], then exchange elements j and l:
+        let l = indices.reversed()
+            .first(where: { self[j] &lt;= self[$0] })!
+        swap(&amp;self[j], &amp;self[l])
+
+        // L4: Reverse elements j+1 ... count-1:
+        replaceSubrange(j+1..&lt;count, with: self[j+1..&lt;count].reversed())
+        return true
+    }
+}
+</code></pre>
+</blockquote>
+
+<p>This gives me a benchmark time down of ~2.65 seconds (running it with a Swift 3.1 -O build). Here's some improvements we can make to reduce this time...</p>
+
+<h3>Reversing a slice</h3>
+
+<p>The first thing that stands out to me is the line:</p>
+
+<pre><code>replaceSubrange(j+1..&lt;count, with: self[j+1..&lt;count].reversed())
+</code></pre>
+
+<p>The problem with this is that <code>self[j+1..&lt;count].reversed()</code> returns a reversed <em>view</em> onto the <code>ArraySlice</code> – which in turn has a view onto the array's buffer. Therefore when you come to call <code>replaceSubrange</code>, the array's buffer is not uniquely referenced. This therefore forces a copy of the array, which is a costly operation to be doing at every call of <code>permute()</code>.</p>
+
+<p>One nice syntactic (and a slight performance) improvement over this would be to instead call <code>reverse()</code> on the <code>ArraySlice</code> itself:</p>
+
+<pre><code>self[j + 1 ..&lt; count].reverse()
+</code></pre>
+
+<p>Note that I've added whitespace around the binary operators, which I think makes it much more readable.</p>
+
+<p>Performance-wise this is slightly better because we're now mutating (a temporary) <code>ArraySlice</code>, before re-assigning it to back to <code>Array</code>'s subscript – therefore now <em>only</em> the slice itself needs to be copied (not the entire array).</p>
+
+<p>This brings my benchmark time down from ~2.65 seconds to ~2.06 seconds.</p>
+
+<p>However, we're still doing an unnecessary copy (although really I think the compiler should be able optimise this away and mutate the array directly – but this doesn't currently appear to be the case).</p>
+
+<p>One way in order to allow us to mutate the array directly, rather than going through <code>ArraySlice</code> is to simply define a method to reverse the elements of an array between two given indices:</p>
+
+<pre><code>extension Array {
+
+    /// Reverses the elements of the collection within a given range of indices.
+    ///
+    /// - Parameter indices: A range of valid indices of the collection,
+    ///  the elements of which will be reversed.
+    ///
+    mutating func reverse(indices: Range&lt;Index&gt;) {
+
+        if indices.isEmpty { return }
+
+        var low = indices.lowerBound
+        var high = index(before: indices.upperBound)
+
+        while low &lt; high {
+            swap(&amp;self[low], &amp;self[high])
+            formIndex(after: &amp;low)
+            formIndex(before: &amp;high)
+        }
+    }
+}
+</code></pre>
+
+<p>This implementation is based off <a href="https://github.com/apple/swift/blob/master/stdlib/public/core/Reverse.swift#L13" rel="noreferrer">the standard library's own <code>reverse()</code> method</a>. Note that it may be more natural to express the <code>indices</code> parameter as a <code>ClosedRange</code>, due to the fact that the range should never be empty – however for increased interoperability, I would simply suggest adding this as another overload for this, if desired.</p>
+
+<p>It's also worth noting that in practise, I would consider defining this as an extension of<br> <code>MutableCollection where Self : BidirectionalCollection</code>, rather than <code>Array</code>. However, unfortunately, it appears to compiler is unable to specialise its implementation when doing so, which leads to reduced performance.</p>
+
+<p>But regardless of these details, now we can say:</p>
+
+<pre><code>reverse(indices: j + 1 ..&lt; count)
+</code></pre>
+
+<p>Which brings my benchmark time down from ~2.06 seconds to ~1.46 seconds.</p>
+
+<p>If we're going for maximal performance here, we can also use <code>Range</code>'s <a href="https://developer.apple.com/reference/swift/range/1785569-init" rel="noreferrer"><code>init(unchecked​Bounds:​)</code></a> initialiser to skip the precondition check that <code>lowerBound &lt;= upperBound</code>, given that we know<br> <code>j + 1 &lt; count</code> (as the maximum value of <code>j</code> is <code>count - 2</code>).</p>
+
+<pre><code>reverse(indices: Range(uncheckedBounds: (lower: j + 1, upper: count)))
+</code></pre>
+
+<p>This brings my benchmark time down from ~1.46 seconds to ~1.45 seconds. However, we're still <em>way</em> off the target benchmark time of ~0.02 seconds for your original mutating version of <code>permute()</code>.</p>
+
+<h3>Optimising <code>first(where:)</code></h3>
+
+<p>The major bottleneck here appears to be with <code>Sequence</code>'s <code>first(where:)</code> method. If we take a look at <a href="https://github.com/apple/swift/blob/master/stdlib/public/core/Sequence.swift#L1125" rel="noreferrer">its implementation</a>, we can see it's implemented as:</p>
+
+<pre><code>internal enum _StopIteration : Error {
+  case stop
+}
+
+// ...
+
+extension Sequence {
+
+  public func first(
+    where predicate: (Iterator.Element) throws -&gt; Bool
+  ) rethrows -&gt; Iterator.Element? {
+
+    var foundElement: Iterator.Element?
+    do {
+      try self.forEach {
+        if try predicate($0) {
+          foundElement = $0
+          throw _StopIteration.stop
+        }
+      }
+    } catch is _StopIteration { }
+    return foundElement
+  }
+}
+</code></pre>
+
+<p>As first glance, this looks insane. Using <code>forEach(_:)</code> and a throwing a dummy <code>Error</code> type to exit the loop?</p>
+
+<p>Turns out this is an attempted optimisation by the standard library team in order to allow for sequences to implement their own version of <code>forEach(_:)</code> in a more efficient manner than iterating over their iterator. This is discussed in both <a href="https://bugs.swift.org/browse/SR-3166" rel="noreferrer">SR-3166</a> and <a href="https://github.com/apple/swift/pull/5867" rel="noreferrer">this (closed) pull request</a>.</p>
+
+<p>However, unfortunately, this implementation of <code>first(where:)</code> is causing a big performance bottleneck for our implementation of <code>permute()</code>. From what I can <em>tell</em>, the main suspect appears to be the throwing of the <code>_StopIteration</code> error, which involves the wrapping in an existential <code>Error</code> container.</p>
+
+<p>A simple fix to this problem is to define our own <code>first(where:)</code> method that just uses a for-in loop for random-access collections. This allows us to take advantage of a more performant version of the method, while still allowing for complicated non-random-access collections to have a <code>first(where:)</code> implementation that uses their (potentially) customised <code>forEach(_:)</code> implementation.</p>
+
+<pre><code>extension RandomAccessCollection {
+
+    func first(where predicate: (Iterator.Element) throws -&gt; Bool) rethrows -&gt; Iterator.Element? {
+
+        for element in self {
+            if try predicate(element) {
+                return element
+            }
+        }
+        return nil
+    }
+}
+</code></pre>
+
+<p>This now brings my benchmark time down from ~1.45 seconds to a nice ~0.04 seconds, which is only 2x slower than your original version of <code>permute()</code>, but is implemented with more functional methods. For your convenience, <a href="https://gist.github.com/hamishknight/ffdd1b9901cb8dc403c46e4f109b92f2" rel="noreferrer">here's a gist</a> with all the changes that I've made.</p>
+
+<p>I couldn't find any other immediately obvious candidates for optimisation – but would certainly be interested if anyone else can.</p>
+
+<hr>
+
+<h2>Mutating vs. non-mutating</h2>
+
+<blockquote>
+  <p>Which API is clearer?</p>
+</blockquote>
+
+<p>I think both are fairly clear in terms of their usage (although they will require documenting in order to inform to the user that they do the permutations lexicographically). It's often common to implement a mutating and non-mutating version of the same logic (there are lots of examples in the stdlib), as both have can their uses in different circumstances.</p>
+
+<p>Although for the non-mutating version, there's no need to completely re-invent the wheel – you can simply refactor it to use the mutating version's implementation:</p>
+
+<pre><code>extension Array where Element : Comparable {
+
+    func nextPermutation() -&gt; Array? {
+        var result = self
+        return result.permute() ? result : nil
+    }
+}
+</code></pre>
+
+<p>This doesn't impact the performance due to the fact that <code>Array</code> has copy-on-write semantics, so the array buffer won't actually be copied unless <code>permute()</code> actually does a permutation.</p>
+
+<p>But really, for most common usages of this logic, I think <a href="https://codereview.stackexchange.com/q/158799/104723">the sequence-based API</a> would probably be the clearest API to use – as I <em>imagine</em> most use cases will revolve around having to iterate through different permutations.</p>
+
+<blockquote>
+  <p>Can we make the non-mutating method as fast as the mutating one?</p>
+</blockquote>
+
+<p>I don't believe so – if you want to have a copy of the array prior to the mutation, you'll have to pay the cost of a copy. I suspect the compiler <em>may</em> be able to optimise cases where the caller doesn't rely on the value of the original array remaining the same – but that's up to the compiler, and AFAIK there's no easy way to assist it with that in this case.</p>
+    </div>

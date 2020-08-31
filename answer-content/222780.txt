@@ -1,0 +1,192 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I like the idea, but I'm in line with dfhwze meaning it's a little too verbose and complicated to follow, especially when unable to debug.</p>
+
+<p>I would prefer a more simple pattern like the one dfhwze suggests:</p>
+
+<pre><code>  var result =
+    Tester // the person
+    .Validate()
+    .NotNull(p =&gt; p.LastName, "LastName is Null")
+    .IsTrue(p =&gt; p.FirstName.Length &gt; 3, "FirstName is too short")
+    .Match(p =&gt; p.Address.Street, @"^Sesa(m|n)e Street$", "Street name is invalid");
+
+  Console.WriteLine(result);
+</code></pre>
+
+<p>This can be implemented in a lightweight way like the below, where I use a <a href="https://fsharpforfunandprofit.com/rop/" rel="nofollow noreferrer">Railway Orientend Programming</a>-ish pattern:</p>
+
+<pre><code>  public abstract class ValidateResult&lt;T&gt;
+  {
+    public ValidateResult(T source)
+    {
+      Source = source;
+    }
+
+    public T Source { get; }
+  }
+
+  public class Success&lt;T&gt; : ValidateResult&lt;T&gt;
+  {
+    public Success(T source) : base(source)
+    {
+    }
+
+    public override string ToString()
+    {
+      return "Everything is OK";
+    }
+  }
+
+  public class Failure&lt;T&gt; : ValidateResult&lt;T&gt;
+  {
+    public Failure(T source, string message) : base(source)
+    {
+      Message = message;
+    }
+
+    public string Message { get; }
+
+    public override string ToString()
+    {
+      return $"Error: {Message}";
+    }
+  }
+
+  public static class Validation
+  {
+    public static ValidateResult&lt;T&gt; Validate&lt;T&gt;(this T source)
+    {
+      return new Success&lt;T&gt;(source);
+    }
+
+    private static ValidateResult&lt;T&gt; Validate&lt;T&gt;(this ValidateResult&lt;T&gt; result, Predicate&lt;T&gt; predicate, string errorMessage)
+    {
+      if (result is Success&lt;T&gt; success)
+      {
+        if (!predicate(success.Source))
+          return new Failure&lt;T&gt;(success.Source, errorMessage);
+      }
+
+      return result;
+    }
+
+    public static ValidateResult&lt;T&gt; NotNull&lt;T, TMember&gt;(this ValidateResult&lt;T&gt; result, Expression&lt;Func&lt;T, TMember&gt;&gt; expression, string errorMessage)
+    {
+      var getter = expression.Compile();
+      Predicate&lt;T&gt; predicate = source =&gt; getter(source) != null;
+      return Validate(result, predicate, errorMessage);
+    }
+
+    public static ValidateResult&lt;T&gt; IsTrue&lt;T&gt;(this ValidateResult&lt;T&gt; result, Expression&lt;Func&lt;T, bool&gt;&gt; expression, string errorMessage)
+    {
+      var predicate = new Predicate&lt;T&gt;(expression.Compile());
+      return Validate(result, predicate, errorMessage);
+    }
+
+    public static ValidateResult&lt;T&gt; Match&lt;T&gt;(this ValidateResult&lt;T&gt; result, Expression&lt;Func&lt;T, string&gt;&gt; expression, string pattern, string errorMessage)
+    {
+      var getter = expression.Compile();
+      Predicate&lt;T&gt; predicate = source =&gt; Regex.IsMatch(getter(source), pattern);
+      return Validate(result, predicate, errorMessage);
+    }
+  }
+</code></pre>
+
+<p>The idea of the ROP pattern is that the first failure stops any further validation, but without throwing or any other error handling mechanism. You end up in the same place as if everything were OK, and can evaluate the result in one place. If you want to collect all possible failures, you can easily extent <code>ValidateResult&lt;T&gt;</code> with a collection of <code>ValidateResult&lt;T&gt;</code>s and then validate through the chain no matter what each result is.</p>
+
+<p>IMO it's easy to follow, maintain and extent - for instance with the ability to be able to distinguish between degrees of failure. You could for instance implement a <code>Warning&lt;T&gt; : ValdiateResult&lt;T&gt;</code>.</p>
+
+<hr>
+
+<p><strong>Update</strong></p>
+
+<p>As t3chb0t (kindly I believe) emphasizes in his comment, I missed that he wants to have predefined validation rules. The above pattern can easily accommodate  that requirement:</p>
+
+<pre><code>  public class Validator&lt;T&gt;
+  {
+    List&lt;Func&lt;ValidateResult&lt;T&gt;, ValidateResult&lt;T&gt;&gt;&gt; m_rules = new List&lt;Func&lt;ValidateResult&lt;T&gt;, ValidateResult&lt;T&gt;&gt;&gt;();
+
+    public ValidateResult&lt;T&gt; Validate(T source)
+    {
+      ValidateResult&lt;T&gt; result = source.Validate();
+      foreach (var rule in m_rules)
+      {
+        result = rule(result);
+      }
+
+      return result;
+    }
+
+    internal void AddRule(Predicate&lt;T&gt; predicate, string errorMessage)
+    {
+      Func&lt;ValidateResult&lt;T&gt;, ValidateResult&lt;T&gt;&gt; rule = result =&gt;
+      {
+        if (result is Success&lt;T&gt; success)
+        {
+          if (!predicate(success.Source))
+            return new Failure&lt;T&gt;(success.Source, errorMessage);
+        }
+
+        return result;
+      };
+      m_rules.Add(rule);
+    }
+  }
+</code></pre>
+
+<p>Extended with validation rules:</p>
+
+<pre><code>  public static class Validation
+  {
+    public static ValidateResult&lt;T&gt; ValidateWith&lt;T&gt;(this T source, Validator&lt;T&gt; validator)
+    {
+      return validator.Validate(source);
+    }
+
+
+    public static Validator&lt;T&gt; NotNull&lt;T, TMember&gt;(this Validator&lt;T&gt; validator, Expression&lt;Func&lt;T, TMember&gt;&gt; expression, string errorMessage)
+    {
+      var getter = expression.Compile();
+      Predicate&lt;T&gt; predicate = source =&gt; getter(source) != null;
+      validator.AddRule(predicate, errorMessage);
+      return validator;
+    }
+
+    public static Validator&lt;T&gt; IsTrue&lt;T&gt;(this Validator&lt;T&gt; validator, Expression&lt;Func&lt;T, bool&gt;&gt; expression, string errorMessage)
+    {
+      var predicate = new Predicate&lt;T&gt;(expression.Compile());
+      validator.AddRule(predicate, errorMessage);
+      return validator;
+    }
+
+    public static Validator&lt;T&gt; Match&lt;T&gt;(this Validator&lt;T&gt; validator, Expression&lt;Func&lt;T, string&gt;&gt; expression, string pattern, string errorMessage)
+    {
+      var getter = expression.Compile();
+      Predicate&lt;T&gt; predicate = source =&gt; Regex.IsMatch(getter(source), pattern);
+      validator.AddRule(predicate, errorMessage);
+      return validator;
+    }
+  }
+</code></pre>
+
+<p>And the same use case:</p>
+
+<pre><code>  Validator&lt;Person&gt; validator = new Validator&lt;Person&gt;();
+
+  validator
+    .NotNull(p =&gt; p.LastName, "LastName is Null")
+    .IsTrue(p =&gt; p.FirstName.Length &gt; 3, "FirstName is too short")
+    .Match(p =&gt; p.Address.Street, @"^Sesa(m|n)e Street$", "Street name is invalid");
+
+  var result = Tester.ValidateWith(validator);
+
+  if (result is Success&lt;Person&gt; success)
+  {
+    Console.WriteLine(success);
+  }
+  else if (result is Failure&lt;Person&gt; failure)
+  {
+    Console.WriteLine(failure);
+  }
+</code></pre>
+    </div>

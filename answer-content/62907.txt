@@ -1,0 +1,267 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Yes I think you do break SRP. Currently your class is pretty much untestable due to the hard-coded implicit dependency on <code>SerialPort</code> which is going to be very hard to mock out.</p>
+
+<p>You should definitely remove the connection handling (open, close, send, receive) into a separate interface and inject that instead.</p>
+
+<hr>
+
+<p>A few more things I noted:</p>
+
+<ol>
+<li><p>Your two <code>Send</code> methods are almost identical. The <code>string</code> method can be refactored o use the <code>byte[]</code> method for example:</p>
+
+<pre><code>public void Send(string command)
+{
+    // assuming the Mifare card accepts ASCII only anyway
+    Send(System.Text.Encoding.ASCII.GetBytes(command));
+}
+</code></pre></li>
+<li><p>There is an easier way to get the port names - <a href="http://msdn.microsoft.com/en-us/library/system.io.ports.serialport.getportnames%28v=vs.110%29.aspx" rel="nofollow"><code>SerialPort.GetPortNames()</code></a>.</p></li>
+<li><p>I don't really like using the <code>Description</code> attribute of the <code>enum</code> for the format string. This seems like a misuse of the attribute and I'd prefer to use a <code>Dictionary&lt;MifareCommand, string&gt;</code> for the mapping but that's just my opinion.</p></li>
+<li><p>You are catching all <code>Exception</code>s in various places and write them to the console. This is usually abad idea because you don't give the caller any idea that something went and pollute stdout with the messages. It's better to use either a dedicated logger to inject or <a href="http://msdn.microsoft.com/en-us/library/9w0w6s51%28v=vs.110%29.aspx" rel="nofollow"><code>Trace.TraceError()</code></a> to log the messages and rethrow the exception so the caller can deal with it.</p></li>
+<li><p>You dump various messages to the console without giving the caller the option to change that behaviour. Again using an injected logger or the <code>Trace</code> class is a better option.</p></li>
+<li><p>In your <code>Receive</code> method you catch the <code>TimeoutException</code> and format a custom return error. I think letting the caller catch the exception would be more flexible.</p></li>
+<li><p><a href="http://msdn.microsoft.com/en-us/library/System.IO.Ports.SerialPort%28v=vs.110%29.aspx" rel="nofollow"><code>SerialPort</code></a> is <code>IDisposable</code> because it derives from <code>Component</code> so whatever object owns the <code>SerialPort</code> should implement <code>IDisposable</code> as well. </p></li>
+</ol>
+
+<p>So what I was thinking about is along these lines of refactoring:</p>
+
+<pre><code>public interface IConnection
+{
+    public void Send(string data);
+    public void Send(byte[] data);
+    public string Receive();
+}
+
+public class SerialConnection : IConnection, IDisposable
+{
+    private SerialPort _SerialPort;
+
+    public SerialConnection() : this(null)
+    {
+    }
+
+    public SerialConnection(string port)
+    {
+        try 
+        {
+            if (string.IsNullOrWhiteSpace(port))
+                port = SerialPort.GetPortNames().FirstOrDefault();
+        }
+        catch (Win32Exception ex)
+        {
+            // GetPortNames() can throw this
+            Trace.TraceError(ex.ToString());
+            port = null;
+        }
+
+        if (string.IsNullOrWhiteSpace(port))
+            throw new ArgumentException("Port name not specified and unable to determine standard port");
+
+        _SerialPort = new SerialPort(port)  { Encoding = Encoding.ASCII };
+    }
+
+    public void Send(byte[] buffer)
+    {
+        try
+        {
+            if (!_SerialPort.IsOpen)
+                _SerialPort.Open();
+
+            _SerialPort.Write(buffer, 0, buffer.Length);
+
+            Thread.Sleep(5);
+
+            var command = BitConverter.ToString(buffer);
+
+            if (!string.IsNullOrEmpty(command))
+                Trace.WriteLine("Sent: '" + command.Remove(_SerialPort.NewLine, "-") + "'");
+        }
+        catch (Exception ex)
+        {
+            Trace.TraceError(ex.ToString());
+            throw; // re-throw and let the caller deal with it
+        }
+    }
+
+    public void Send(string command)
+    {
+        // assuming the Mifare card accepts ASCII only anyway
+        Send(System.Text.Encoding.ASCII.GetBytes(command));
+    }
+
+    public string Receive()
+    {
+        try
+        {
+            var ret = _SerialPort.ReadLine();
+            if (!string.IsNullOrEmpty(ret))
+                Trace.WriteLine("Received: '" + ret + "'");
+            return ret;
+        }
+        finally
+        {
+            _serialPort.DiscardInBuffer();
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_SerialPort != null)
+        {
+            _SerialPort.Dispose();
+            _SerialPort = null;
+        }
+    }
+}
+</code></pre>
+
+<p>And the <code>Mifare</code> class would then look something like this:</p>
+
+<pre><code>public enum MifareCommand
+{
+    StartAutoRead,
+    ReadMyStructure,
+    SuspendAutoRead,
+    ResumeAutoRead,
+    ReadBlock,
+    WriteBlock
+}
+
+public class Mifare : IDisposable
+{
+    private const int BlockSize = 16;
+    private const int ControlBlockInterval = 16;
+    private const int MyStrucureSizeBlock = 8;
+    private const int MyStrucureFirstBlock = 128;
+    private const int AutoReadBlock = 1;
+
+    private readonly Dictionary&lt;MifareCommand, string&gt; _CommandFormats 
+        = new Dictionary&lt;MifareCommand, string&gt; 
+            {
+                { StartAutoRead,   "D{0}0000{1}" },
+                { ReadMyStructure, "YCC0000{1}" },
+                { SuspendAutoRead, "U" },
+                { ResumeAutoRead,  "Z" },
+                { ReadBlock,       "B{0}0000{1}" },
+                { WriteBlock,      "E{0}0000{1}H{2}" },             
+            }
+
+    private readonly IConnection _Connection;
+
+    public string Key { get; set; }
+
+    public Mifare(IConnection connection)
+    {
+        if (_Connection == null)
+            throw new ArgumentNullException("connection");
+
+        _Connection = connection;
+        Key = "FFFFFFFFFFFF";
+    }
+
+    public void SuspendAutoRead()
+    {
+        Send(MifareCommand.SuspendAutoRead);
+    }
+
+    public void ResumeAutoRead()
+    {
+        Send(MifareCommand.ResumeAutoRead);
+    }
+
+    public void StartAutoRead()
+    {
+        Send(MifareCommand.StartAutoRead, AutoReadBlock);
+    }
+
+    public void ReadBlock(int block)
+    {
+        Send(MifareCommand.ReadBlock, block);
+    }
+
+    public void ReadMyStructre()
+    {
+        Send(MifareCommand.ReadMyStructure);
+    }
+
+    public void WriteBlock(int block, byte[] bytes)
+    {
+        if (bytes.Length &lt; BlockSize)
+            Array.Resize(ref bytes, BlockSize);
+
+        var blockString = block.ToString("X2");
+
+        var bytesString = BitConverter.ToString(bytes).Remove("-");
+
+        var commandString = string.Format(_CommandFormats[MifareCommand.WriteBlock], blockString, Key, bytesString);
+
+        Send(commandString);
+    }
+
+    public void WriteMyStructure(byte[] structure)
+    {
+        try
+        {
+
+            var lengthBytes = BitConverter.GetBytes(structure.Length);
+            Array.Reverse(lengthBytes); //big-endian
+
+            // 00 00 TT TT TT TT 00 00 00 00 00 00 00 00 00 00 
+            var headerBytesToWrite = new byte[BlockSize];
+            lengthBytes.CopyTo(headerBytesToWrite, 2);
+
+            WriteBlock(MyStrucureSizeBlock, lengthBytes);
+
+            for (var i = 0; i &lt; structure.Length; i += BlockSize)
+            {
+
+                var bytesToWrite = structure.Skip(i).Take(BlockSize).ToArray();
+
+                var block = MyStrucureFirstBlock + (i / BlockSize);
+
+                if (block % ControlBlockInterval == 0)
+                    block++;
+
+               WriteBlock(block, bytesToWrite);
+            }
+        }
+        catch (Exception e)
+        {
+            Trace.TraceError(e.ToString());
+            throw;
+        }
+    }
+
+    public void Send(MifareCommand command)
+    {
+        var commandString = string.Format(_CommandFormats[command], Key);
+
+        Send(commandString);
+    }
+
+    public void Send(MifareCommand command, int block)
+    {
+        var paramString = block.ToString("X2");
+
+        var commandString = string.Format(_CommandFormats[command], paramString, Key);
+
+        Send(commandString);
+    }
+
+    public string Receive()
+    {
+        return _Connection.Receive();
+    }
+
+    public void Dispose()
+    {
+        if (_Connection != null)
+        {
+            _Connection.Dispose();
+            _Connection = null;
+        }
+    }
+}
+</code></pre>
+    </div>

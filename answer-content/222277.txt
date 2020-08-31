@@ -1,0 +1,220 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+<pre><code>    var firstDate = (DateTime)datePropertyInfo.GetValue(stateModels.First());
+
+    if (firstDate &lt; dateFrom)
+      dateFrom = new DateTime(firstDate.Year, firstDate.Month, firstDate.Day, firstDate.Hour, 0, 0, DateTimeKind.Utc);
+</code></pre>
+</blockquote>
+
+<p>You take the first stateModel, but what if they are not ordered by date?</p>
+
+<hr>
+
+<blockquote>
+<pre><code>for (itemPointer = itemPointer; itemPointer &lt; stateModels.Count(); itemPointer++)
+</code></pre>
+</blockquote>
+
+<p><code>itemPointer = itemPointer</code> isn't neccesary:</p>
+
+<pre><code>for (; itemPointer &lt; stateModels.Count(); itemPointer++)
+</code></pre>
+
+<hr>
+
+<p>The last parameter to <code>CalculateTimeWindow&lt;T&gt;(..., ..., int i)</code> is initialized with the <code>out int i</code> parameter from <code>GetPropertiesAndDictionaries()</code>, but the values is actually not used and <code>i</code> is used as an iterator index set to <code>0</code> the first time used, so why have it as a parameter and not just a local variable? Get rid of that, if it's not used.</p>
+
+<hr>
+
+<p>This:</p>
+
+<pre><code>    public static IEnumerable&lt;T&gt; CalculateTimeWindows&lt;T&gt;(DateTime dateFrom, DateTime dateTo, List&lt;T&gt; stateModels) where T : new()
+    {
+        if (stateModels.Count() == 0)
+            return new List&lt;T&gt;();
+
+        dateFrom = GetPropertiesAndDictionaries(dateFrom, stateModels, out PropertyInfo datePropertyInfo, out List&lt;PropertyInfo&gt; copyProperties, out PropertyInfo timeWindowIdentifier, out int size, out TimeWindowDictionary[] dictionaries, out int i);
+
+        return CalculateTimeWindow(dateFrom, dateTo, stateModels, 5, datePropertyInfo, copyProperties, timeWindowIdentifier, size, dictionaries, i)
+                    .Concat(CalculateTimeWindow(dateFrom, dateTo, stateModels, 15, datePropertyInfo, copyProperties, timeWindowIdentifier, size, dictionaries, i))
+                    .Concat(CalculateTimeWindow(dateFrom, dateTo, stateModels, 60, datePropertyInfo, copyProperties, timeWindowIdentifier, size, dictionaries, i));
+    }
+</code></pre>
+
+<p>I would write as:</p>
+
+<pre><code>  public static IEnumerable&lt;T&gt; CalculateTimeWindows&lt;T&gt;(DateTime dateFrom, DateTime dateTo, List&lt;T&gt; stateModels) where T : new()
+  {
+    if (stateModels == null || stateModels.Count() == 0)
+      yield break; // return new List&lt;T&gt;();
+
+    dateFrom = GetPropertiesAndDictionaries(
+      dateFrom, 
+      stateModels, 
+      out PropertyInfo datePropertyInfo, 
+      out List&lt;PropertyInfo&gt; copyProperties, 
+      out PropertyInfo timeWindowIdentifier, 
+      out int size, 
+      out TimeWindowDictionary[] dictionaries, 
+      out int i);
+
+    byte[] windowDurations = { 5, 15, 60 };
+
+    foreach (byte duration in windowDurations)
+    {
+      foreach (T result in CalculateTimeWindow(dateFrom, dateTo, stateModels, duration, datePropertyInfo, copyProperties, timeWindowIdentifier, size, dictionaries, i))
+      {
+        yield return result;
+      }
+    }
+</code></pre>
+
+<p>or as: </p>
+
+<pre><code>  public static IEnumerable&lt;T&gt; CalculateTimeWindows&lt;T&gt;(DateTime dateFrom, DateTime dateTo, List&lt;T&gt; stateModels) where T : new()
+  {
+    if (stateModels.Count() == 0)
+      return new List&lt;T&gt;();
+
+    dateFrom = GetPropertiesAndDictionaries(
+      dateFrom,
+      stateModels,
+      out PropertyInfo datePropertyInfo,
+      out List&lt;PropertyInfo&gt; copyProperties,
+      out PropertyInfo timeWindowIdentifier,
+      out int size,
+      out TimeWindowDictionary[] dictionaries,
+      out int i);
+
+    byte[] windowDurations = { 5, 15, 60 };
+
+    return windowDurations.SelectMany(wd =&gt;
+      CalculateTimeWindow(
+        dateFrom,
+        dateTo,
+        stateModels,
+        wd,
+        datePropertyInfo,
+        copyProperties,
+        timeWindowIdentifier,
+        size,
+        dictionaries,
+        i));
+   }
+</code></pre>
+
+<p>It is much more readable and easy to maintain if you want to add a new time window.</p>
+
+<hr>
+
+<pre><code>    copyProperties = propInfos
+      .Where(
+        p =&gt; 
+          !p.GetCustomAttributes(typeof(IsTimeWindowIdentifier), true).Any() 
+          &amp;&amp; !p.GetCustomAttributes(typeof(DoNotCopyIntoTimeWindow), true).Any() 
+          &amp;&amp; !p.GetCustomAttributes(typeof(IsTimeWindowDate), true).Any() 
+          &amp;&amp; !p.GetCustomAttributes(typeof(IsProcessedIntoTimeWindow), true).Any() 
+          &amp;&amp; p.CanWrite 
+          &amp;&amp; !p.GetMethod.IsVirtual).ToList();
+</code></pre>
+
+<p>In the above you determine which properties to fetch data from in a negative way by checking what they are not. I think, I would define a <code>ValuePropertyAttribute</code> to mark the properties to get data from with. It is easier to maintain, because you'll always be able to see from this attribute which properties values are copied from on an object.</p>
+
+<hr>
+
+<p>When handling properties (setting and getting) there is a little too much conversion between <code>PropertyInfo</code>s and <code>string</code>s (names) IMO.</p>
+
+<p>You can reduce that by changing the definition of:</p>
+
+<pre><code>  public struct TimeWindowDictionary
+  {
+    public string Name { get; set; }
+    public Dictionary&lt;NullObject&lt;dynamic&gt;, int&gt; Dictionary { get; set; }
+  }
+</code></pre>
+
+<p>to </p>
+
+<pre><code>  public struct TimeWindowDictionary
+  {
+    public PropertyInfo PropertyInfo { get; set; }
+    public Dictionary&lt;NullObject&lt;dynamic&gt;, int&gt; Dictionary { get; set; }
+  }
+</code></pre>
+
+<p>and then change everything to accomodate to that - for instance:</p>
+
+<pre><code>    var properties = propInfos.Where(p =&gt; p.GetCustomAttributes(typeof(IsProcessedIntoTimeWindow), true).Any()).Select(x =&gt; x.Name);
+    size = properties.Count();
+
+    dictionaries = new TimeWindowDictionary[size];
+    i = 0;
+
+    foreach (var property in properties)
+    {
+      dictionaries[i] = new TimeWindowDictionary() { Name = property };
+      i++;
+    }
+</code></pre>
+
+<p>could be:</p>
+
+<pre><code>    dictionaries =
+      propInfos
+      .Where(p =&gt; p.GetCustomAttributes(typeof(IsProcessedIntoTimeWindow), true).Any())
+      .Select(p =&gt; new TimeWindowDictionary { PropertyInfo = p })
+      .ToArray();
+
+    size = dictionaries.Length;
+</code></pre>
+
+<p>and <code>GetValue(...)</code> could be:</p>
+
+<pre><code>  private static dynamic GetValue(object inputObject, PropertyInfo propertyInfo)
+  {
+    return propertyInfo.GetValue(inputObject);
+    //Type type = inputObject.GetType();
+    //System.Reflection.PropertyInfo propertyInfo = type.GetProperty(propertyName);
+    //return propertyInfo.GetValue(inputObject);
+  }
+</code></pre>
+
+<p>and <code>SetValue(...)</code> could likewise have the signature:</p>
+
+<pre><code>  private static void SetValue(object inputObject, PropertyInfo propertyInfo, object propertyVal)
+</code></pre>
+
+<p>and in <code>CalculateStateSeconds&lt;T&gt;(...)</code>:</p>
+
+<pre><code>        //PropertyInfo propertyInfo = tType.GetProperty(dictionary.Name);
+        var key = dictionary.PropertyInfo.GetValue(prevItem);
+        dictionary.Dictionary.TryGetValue(key, out int existingSeconds);
+        dictionary.Dictionary[key] = existingSeconds + seconds;
+</code></pre>
+
+<hr>
+
+<pre><code>  private static DateTime GetPropertiesAndDictionaries&lt;T&gt;(
+    DateTime dateFrom,
+    List&lt;T&gt; stateModels,
+    out PropertyInfo datePropertyInfo,
+    out List&lt;PropertyInfo&gt; copyProperties,
+    out PropertyInfo timeWindowIdentifier,
+    out int size,
+    out TimeWindowDictionary[] dictionaries,
+    out int i) where T : new()
+  {
+</code></pre>
+
+<p>When having all these arguments passed from method to method, I think I would make a container object for them and pass that instead. Alternatively you could make the class statefull with these parameters as members instead, so you can avoid having arguments to the methods at all. The methods should then be non static members of course. Your one and only static method could then be something like:</p>
+
+<pre><code>  public static IEnumerable&lt;T&gt; GetTimeWindows&lt;T&gt;(DateTime dateFrom, DateTime dateTo, List&lt;T&gt; stateModels) where T : new()
+  {
+    TimeWindow timeWindow = new TimeWindow(dateFrom, dateTo, stateModels);
+    return timeWindow.Calculate();
+  }
+</code></pre>
+
+<p>where the <code>TimeWindow</code> class should have an appropriate generric type parameter.</p>
+    </div>

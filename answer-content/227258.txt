@@ -1,0 +1,273 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Animation base class</h1>
+
+<blockquote>
+<pre><code>typedef std::chrono::high_resolution_clock hrc;
+</code></pre>
+</blockquote>
+
+<p>In modern C++, use an <em>alias-declaration</em>:</p>
+
+<pre><code>using hrc = std::chrono::high_resolution_clock;
+</code></pre>
+
+<p>It is arguably more readable.</p>
+
+<blockquote>
+<pre><code>std::chrono::time_point&lt;hrc&gt; m_now;
+
+unsigned int m_us;      // us for microseconds
+unsigned int m_endUs;
+</code></pre>
+</blockquote>
+
+<p>The types and names of the last two members are not helpful.  (By the way, <code>unsigned int</code> = <code>unsigned</code>.)  And they should be <code>private</code>:</p>
+
+<pre><code>private:
+    using time_point = std::chrono::high_resolution_clock::time_point;
+    time_point m_now;
+
+    using duration = std::chrono::high_resolution_clock::duration;
+    duration m_time_elapsed;
+    duration m_total_time;
+</code></pre>
+
+<p>The derived classes should have read-only access to <code>m_total_time</code>:</p>
+
+<pre><code>protected:
+    auto total_time() const
+    {
+        return m_total_time; 
+    }
+</code></pre>
+
+<blockquote>
+<pre><code>void UpdateTime() {
+    auto end = hrc::now();
+    auto diff = end - m_now;
+    m_now = end;
+    auto msDuration = std::chrono::duration_cast&lt;std::chrono::microseconds&gt;(diff);
+    m_us += (unsigned int)msDuration.count();
+}
+</code></pre>
+</blockquote>
+
+<p>This function is a bit complex because of the conversion between different types.  They can be simplified:</p>
+
+<pre><code>void UpdateTime()
+{
+    auto time = hrc::now();
+    time_elapsed += time - m_now;
+    m_now = time;
+}
+</code></pre>
+
+<blockquote>
+<pre><code>Animation() {
+    m_us = 0;
+    m_now = hrc::now();
+}
+</code></pre>
+</blockquote>
+
+<p>The constructor should provide a means to set the <code>m_total_time</code> member.  And it should use member initializer clauses instead of assignment:</p>
+
+<pre><code>template &lt;class Rep, class Period&gt;
+explicit Animation(const std::chrono::duration&lt;Rep, Period&gt;&amp; total_time)
+    : m_now{hrc::now()}
+    , m_time_elapsed{}
+    , m_total_time{total_time} // std::chrono::duration supports conversion
+{
+}
+</code></pre>
+
+<p>(The support for different <code>duration</code>s is for convenience.)</p>
+
+<blockquote>
+<pre><code>bool finished() {
+    return m_endUs &lt;= m_us;
+}
+</code></pre>
+</blockquote>
+
+<p>You are missing <code>const</code>.</p>
+
+<blockquote>
+<pre><code>virtual bool Update(sf::Sprite&amp; spr) = 0;
+</code></pre>
+</blockquote>
+
+<p>Good.</p>
+
+<h1>Animation child class</h1>
+
+<blockquote>
+<pre><code>FadeIn(int ms) {
+    m_endUs = ms * 1000;
+}
+</code></pre>
+</blockquote>
+
+<p>Missing <code>explicit</code> — an integer is not logically a <code>FadeIn</code>.  Type mismatch (you are using <code>unsigned</code> in the base class).  With the design mentioned, just do this:</p>
+
+<pre><code>using Animation::Animation;
+</code></pre>
+
+<p>And the constructors will work as expected.</p>
+
+<blockquote>
+<pre><code>// Updates the sprite based on the timeline, and returns if the animation is over
+virtual bool Update(sf::Sprite&amp; spr) {
+    UpdateTime();
+    if (finished()) return true;
+
+    sf::Color color = spr.getColor();
+    color.a = (int)((float)m_us / m_endUs * 255);
+    spr.setColor(color);
+    return false;
+}
+</code></pre>
+</blockquote>
+
+<p>Missing <code>override</code>.  Don't use C-style casts.  <code>float</code> may be too imprecise for this calculation.  Don't put the whole <code>if</code> statement on a single line.</p>
+
+<p>The color algorithm should be in a separate function:</p>
+
+<pre><code>private:
+    sf::Color get_color() const noexcept
+    {
+        auto color = spr.getColor();
+
+        double ratio = static_cast&lt;double&gt;(m_time_elapsed) / m_total_time;
+        color.a = static_cast&lt;int&gt;(ratio * 255);
+        return color;
+    }
+</code></pre>
+
+<p>Also, if overflow is not a concern, just multiply first and then divide to avoid the floating point.  And then the function can be simplified:</p>
+
+<pre><code>virtual bool Update(sf::Sprite&amp; spr) override
+{
+    UpdateTime();
+
+    if (finished()) {
+        return true;
+    } else {
+        spr.setColor(get_color());
+        return false;
+    }
+}
+</code></pre>
+
+<h1>Render Component</h1>
+
+<blockquote>
+<pre><code>RenderComponent() { }
+RenderComponent(sf::Drawable* element, sf::Vector2u size) {
+    sf::RenderTexture rt;
+    rt.create((unsigned int)size.x, (unsigned int)size.y);
+    rt.draw(*element);
+    m_texDefault = rt.getTexture();
+}
+</code></pre>
+</blockquote>
+
+<p>Good — except for the C-style casts:</p>
+
+<ul>
+<li><p>remove them if possible;</p></li>
+<li><p>otherwise, use <code>unsigned{size.x}</code> if possible;</p></li>
+<li><p>otherwise, use <code>static_cast</code>.</p></li>
+</ul>
+
+<blockquote>
+<pre><code>template &lt;typename T, typename... Args&gt;
+void SetAnimation(Args... args) {
+    m_animationPtr = std::make_unique&lt;T&gt;(args...);
+}
+</code></pre>
+</blockquote>
+
+<p>You are missing perfect forwarding:</p>
+
+<pre><code>template &lt;typename T, typename... Args&gt;
+void SetAnimation(Args&amp;&amp;... args)
+{
+    m_animationPtr = std::make_unique&lt;T&gt;(std::forward&lt;Args&gt;(args)...);
+}
+</code></pre>
+
+<blockquote>
+<pre><code>void draw(sf::RenderTarget* target) {
+    sf::Sprite sprite;
+    sprite.setTexture(m_texDefault);
+
+    // Handle animation and set pointer to null if done
+    if (m_animationPtr) {
+        if (m_animationPtr.get()-&gt;Update(sprite)) {
+            m_animationPtr = nullptr;
+        }
+        sf::Color c = sprite.getColor();
+    }
+    target-&gt;draw(sprite);
+}
+</code></pre>
+</blockquote>
+
+<p>Always turn warnings on — unused <code>c</code> variable should issue a warning.  (I am pretty sure <code>sprite.getColor()</code> has any side effects.)</p>
+
+<h1>A helper function</h1>
+
+<blockquote>
+<pre><code>sf::Vector2u floatRectToVec2u(sf::FloatRect r) {
+    sf::Vector2u vec;
+    vec.x = (unsigned int)ceil(r.width);
+    vec.y = (unsigned int)ceil(r.height);
+    return vec;
+    auto start = std::chrono::high_resolution_clock::now();
+}
+</code></pre>
+</blockquote>
+
+<p>This function is a pure math function, so should probably be <code>noexcept</code>.  The name is a bit awkward — it does not mention <code>ceil</code> at all.  Also, it seems that <code>ceil</code> should be <code>std::ceil</code>.  And what does the last line do?</p>
+
+<p>If <code>sf::Vector2u</code> can be constructed with the coordinates, the code is simplified:</p>
+
+<pre><code>sf::Vector2u ceil_vector(sf::FloatRect r)
+{
+    return {std::ceil(r.width), std::ceil(r.height)};
+}
+</code></pre>
+
+<h1>Main function</h1>
+
+<blockquote>
+<pre><code>int main()
+{
+    sf::RenderWindow window(sf::VideoMode(200, 200), "SFML works!");
+    sf::CircleShape shape(100.f);
+    shape.setFillColor(sf::Color::Green);
+    RenderComponent circle(&amp;shape, floatRectToVec2u(shape.getGlobalBounds()));
+    circle.SetAnimation&lt;FadeIn&gt;(1000);
+
+    while (window.isOpen())
+    {
+        sf::Event event;
+        while (window.pollEvent(event))
+        {
+            if (event.type == sf::Event::Closed)
+                window.close();
+        }
+
+        window.clear();
+        circle.draw(&amp;window);
+        window.display();
+    }
+
+    return 0;
+}
+</code></pre>
+</blockquote>
+
+<p>The main function looks nice.  (I don't why you are explicitly specifying <code>100.f</code> here instead of <code>100</code>, but maybe there's a good reason.)  <code>return 0;</code> is redundant for <code>main</code> and can be omitted.  <code>event</code> can be declared in the inner loop with <code>for</code>.</p>
+    </div>

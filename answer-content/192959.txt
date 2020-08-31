@@ -1,0 +1,148 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I know that this solution has some really bumpy corners and using it at scale would have some really interesting implications, but please consider it as a thought experiment.</p>
+
+<p>In all of the previously posted examples you still have the potential for a mistake - i.e., someone might intentionally or unintentionally do something along the lines of this:</p>
+
+<pre><code>private static readonly TypedKey&lt;int&gt; AgeKey = new TypedKey&lt;int&gt;("age");
+private static readonly TypedKey&lt;string&gt; BadAgeKey = new TypedKey&lt;string&gt;("age");
+dictionary.Set(BadAgeKey, “foo”);
+...
+// this would throw
+dictionary.Get(AgeKey);
+</code></pre>
+
+<p>And there is really nothing that you can do at compile time to validate that.  You could implement some kind of code analyzer to look for examples of <code>AgeKey</code> and <code>BadAgeKey</code>.  Normally this is addressed by name spacing keys so that they don’t overlap.</p>
+
+<p>In this solution, I attempted to solve that problem…  To do that I dropped the string key, and instead indexed the dictionary by Type, especially the Type of what the consumer is using as a key, and not the Type of data being stored.  Doing that means that each key has to be a predefined Type.  It does give you options for accessing the data. </p>
+
+<p>You could select which key to read/write at compile time using a Generic Type parameter or you could defer that to run time by passing the key as a normal parameter.</p>
+
+<p>And I came up with this:</p>
+
+<pre><code>public class TypeSafeKey&lt;T&gt; { }
+
+public class TypeSafeKeyValuePairBag
+{
+    public T GetItemOrDefault&lt;TKey, T&gt;(T defaultValue = default(T)) where TKey : TypeSafeKey&lt;T&gt;
+        =&gt; TryGet(typeof(TKey), out T result) ? result : defaultValue;
+
+    public T GetItemOrDefault&lt;T&gt;(TypeSafeKey&lt;T&gt; key, T defaultValue = default(T))
+        =&gt; TryGet(key?.GetType() ?? throw new ArgumentNullException(nameof(key)), out T result) ? result : defaultValue;
+
+    public void SetItem&lt;TKey, T&gt;(T value) where TKey : TypeSafeKey&lt;T&gt;
+        =&gt; m_values[typeof(TKey)] = value;
+
+    public void SetItem&lt;T&gt;(TypeSafeKey&lt;T&gt; key, T value)
+        =&gt; m_values[key?.GetType() ?? throw new ArgumentNullException(nameof(key))] = value;
+
+    public T GetItem&lt;TKey, T&gt;() where TKey : TypeSafeKey&lt;T&gt;
+        =&gt; Get&lt;T&gt;(typeof(TKey));
+
+    public T GetItem&lt;T&gt;(TypeSafeKey&lt;T&gt; key)
+        =&gt; Get&lt;T&gt;(key?.GetType() ?? throw new ArgumentNullException(nameof(key)));
+
+    private bool TryGet&lt;T&gt;(Type type, out T value)
+    {
+        if (m_values.TryGetValue(type, out object obj))
+        {
+            value = (T)obj;
+            return true;
+        }
+
+        value = default(T);
+        return false;
+    }
+
+    private T Get&lt;T&gt;(Type type)
+        =&gt; TryGet(type, out T result) ? result : throw new KeyNotFoundException($"Key {type.FullName} not found");
+
+    private Dictionary&lt;Type, object&gt; m_values = new Dictionary&lt;Type, object&gt;();
+}
+</code></pre>
+
+<p>Then using it would look something like this:</p>
+
+<pre><code>// You need to declare a Type for each key that you want to use, all though the types can defined anywhere
+// They don't need to be known to the assembly where TypeSafeKeyValuePairBag is defined, but they do need to
+// be known to the any code that is setting or getting any given key.  So even though the declaration of
+// these class could be spread throughout the source tree, since each is a type they are forced to be unique
+public class KeyHight : TypeSafeKey&lt;int&gt; { }
+public class KeyWidth : TypeSafeKey&lt;int&gt; { }
+public class KeyName : TypeSafeKey&lt;string&gt; { }
+
+// A static class, with static public members would reduce the number of instances of objects that needed to be created for repeated reads/writes. 
+// You would need to create these in a lazy fashion if you had many of them.  And since only their type matters, you don’t need to worry about locking, since two different instances of the same Type would function as the same key.  
+public static class Keys
+{
+    public static KeyHight KeyHight { get; } = new KeyHight();
+    public static KeyWidth KeyWidth { get; } = new KeyWidth();
+    public static KeyName KeyName { get; } = new KeyName();
+}
+
+...
+
+TypeSafeKeyValuePairBag bag = new TypeSafeKeyValuePairBag();
+
+// Accessing hard coded keys
+//Using Generic Type Parameters: The compiler can't infer the value Type from the Key Type, which means listing them both
+bag.SetItem&lt;KeyHight, int&gt;(5);
+//Passing the key as a parameter
+bag.SetItem(Keys.KeyWidth, 10);
+bag.SetItem(Keys.KeyName, "foo");
+
+// Selecting which keys to access at run time
+int value = 1;
+foreach(var key in new TypeSafeKey&lt;int&gt;[] { Keys.KeyHight, Keys.KeyWidth })
+{
+    value *= bag.GetItem(key);
+}
+
+Console.WriteLine($"{bag.GetItem&lt;KeyName, string&gt;()}'s area is {value}");
+</code></pre>
+
+<p>This does have some large drawbacks.  Specifically you need to create a lot of types which will add bloat.  And serializing it would be rather verbose.  It would also still be easy to use the wrong key, and before where that may have resulted in a runtime error, the wrong key could easily lead to corruption.</p>
+
+<p>Using Types has another really large complication if you are using versioned software. Many of the previous examples could easily be shared in a process that has a mixture of different assembly versions loaded.  This is definitely true if all the items in the property bag were primitive types.  The string constant “foo” defined in version 1.0 is going to the same in version 2.0 (assuming no one change the value).   When you start using types as keys you will get unexpected results if someone sets a value with one version of the key, but attempts to read it with another, specifically KeyHight defined in version 1.0 is not the same type as KeyHeight defined in version 2.0</p>
+
+<p>The multiple ways of getting to the setters and getters could also make it difficult to locate all the uses of a specific key, but since they are bound to type, most IDEs can easily get you a comprehensive list of accesses.</p>
+
+<p>I spent some time exploring what else you could do if you had a structure like this.  You could utilize the inheritance to build a hierarchy.  There are likely simpler and more efficient way to do this, but consider if we change the TryGet method like this:</p>
+
+<pre><code>private bool TryGet&lt;T&gt;(Type type, out T value)
+{
+    if (m_values.TryGetValue(type, out object obj))
+    {
+        value = (T)obj;
+        return true;
+    }
+
+    Type baseType = type.BaseType;
+    if (baseType != typeof(TypeSafeKey&lt;T&gt;))
+    {
+        return TryGet(baseType, out value);
+    }
+
+    value = default(T);
+    return false;
+}
+</code></pre>
+
+<p>And you consumed it like this:</p>
+
+<pre><code>public class KeyLevel0Value : TypeSafeKey&lt;int&gt; { }
+public class KeyLevelA1Value : KeyLevel0Value { }
+public class KeyLevelA2Value : KeyLevelA1Value { }
+public class KeyLevelB1Value : KeyLevel0Value { }
+public class KeyLevelB2Value : KeyLevelB1Value { }
+
+...
+
+bag.SetItem&lt;KeyLevelA1Value, int&gt;(5);
+// This will first check the value for LevelA2.  After not finding it, it will check LevelA2, and that value will be returned
+Console.WriteLine(bag.GetItem&lt;KeyLevelA2Value, int&gt;());
+// This will first check the value for LevelB2, LevelB1, and finally Level0, and since none are set it will return default
+Console.WriteLine(bag.GetItemOrDefault&lt;KeyLevelB2Value, int&gt;());
+</code></pre>
+
+<p>So with all that being said, this does create a Property bag that can hold arbitrary types, and access to the data is done in a type safe way.</p>
+    </div>

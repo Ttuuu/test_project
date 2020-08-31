@@ -1,0 +1,124 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Here's the most performant version I've got so far based on suggestions by @PieterWitvoet and 202_accepted. It also corrects the overflow bug from my OP.</p>
+
+<pre class="lang-c# prettyprint-override"><code>/// &lt;summary&gt;High performance integer parser with rudimentary flexibility.&lt;/summary&gt;
+/// &lt;remarks&gt;Supports negative numbers, but no whitespace or other non-digit characters
+/// may be present.
+/// Will not parse strings with more than 10 numeric characters,
+/// even if there are leading zeros (such that the integer does not overflow).&lt;/remarks&gt;
+public static unsafe bool FastTryParseInt(string input, out int result)
+{
+    // We never expect null, but enforcing this may enable some JIT optimizations.
+    if (input == null)
+    {
+        result = default(int);
+        return false;
+    }
+    fixed (char* cString = input)
+    {
+        unchecked
+        {
+            char* nextChar = cString;
+            bool isNegative = false;
+            // Check whether the first character is numeric
+            if (*nextChar &lt; '0' || *nextChar &gt; '9')
+            {
+                // Only allow a negative sign at the beginning of the string.
+                if (*nextChar != CharNegative)
+                {
+                    result = default(int);
+                    return false;
+                }
+                isNegative = true;
+                // Any other non-numeric characters after this is an error.
+                if (*++nextChar &lt; '0' || *nextChar &gt; '9')
+                {
+                    result = default(int);
+                    // Special Case: Excel has been known to format zero as "-".
+                    // So return true here IFF this non-digit char is the end-of-string.
+                    return *nextChar == Char.MinValue;
+                }
+            }
+            // Now process each character of the string
+            int localValue = *nextChar++ - '0';
+            while (*nextChar &gt;= '0' &amp;&amp; *nextChar &lt;= '9')
+                localValue = localValue * 10 + (*nextChar++ - '0');
+            // If the non-numeric character encountered to end the while loop
+            // wasn't the null terminator, the string is invalid.
+            if (*nextChar != Char.MinValue)
+            {
+                result = default(int);
+                return false;
+            }
+
+            // We need to check for an integer overflow based on the length of the string
+            long ptrLen = nextChar - cString;
+            // Result and overflow logic is different if there was a minus sign.
+            if (isNegative)
+            {
+                result = -localValue;
+                // Longest possible negative int is 11 chars (-2147483648)
+                // Less than 11 characters (including negative) is no risk of overflow
+                if (ptrLen &lt; 11L) return true;
+                // More than 11 characters is definitely an overflow.
+                if (ptrLen &gt; 11L) return false;
+                // Exactly 11 characters needs to be checked for overflow.
+                // Neat Trick: An overflow will always result in the first digit changing.
+                return *(cString + 1) - '0' == localValue / 1000000000
+                    // Special case, parsing 2147483648 overflows to -2147483648, but this
+                    // value should be supported if there was a leading minus sign.
+                    || localValue == Int32.MinValue;
+            }
+            // Same logic if positive, but one fewer characters is allowed (no minus sign)
+            result = localValue;
+            if (ptrLen &lt; 10L) return true;
+            if (ptrLen &gt; 10L) return false;
+            return *cString - '0' == localValue / 1000000000;
+        }
+    }
+}
+</code></pre>
+
+<p><strong>Benchmarks</strong></p>
+
+<p>I was seeing a lot of variability in my benchmark runs when I looped over a billion strings at once, so to mange noise, I changed my test code to run several smaller test in succession. Here are the results for the above code:</p>
+
+<blockquote>
+  <p>Native parser took 1202 ms. Custom parser took 181 ms. Performance
+  gain was 564.09% Native parser took 1211 ms. Custom parser took 177
+  ms. Performance gain was 584.18% Native parser took 1226 ms. Custom
+  parser took 241 ms. Performance gain was 408.71% Native parser took
+  1315 ms. Custom parser took 180 ms. Performance gain was 630.56%
+  Native parser took 1402 ms. Custom parser took 182 ms. Performance
+  gain was 670.33% Native parser took 1212 ms. Custom parser took 181
+  ms. Performance gain was 569.61% Native parser took 1221 ms. Custom
+  parser took 178 ms. Performance gain was 585.96% Native parser took
+  1203 ms. Custom parser took 178 ms. Performance gain was 575.84%
+  Native parser took 1203 ms. Custom parser took 178 ms. Performance
+  gain was 575.84% Native parser took 1220 ms. Custom parser took 179
+  ms. Performance gain was 581.56%</p>
+</blockquote>
+
+<p>The average is about <strong>575%</strong> faster than native parse.</p>
+
+<p><strong>Performance Improvements</strong></p>
+
+<ul>
+<li><p>Uses <code>unsafe</code> and <code>fixed</code> to treat the string as a null-terminated character array, avoiding the need to monitor or pre-compute the length of the string as we traverse it.</p></li>
+<li><p>Initializes the local value directly using the first numeric digit, avoiding a superfluous multiplication and addition with zero in the first loop.</p></li>
+<li><p>A null check at the beginning may enable some JIT optimizations.</p></li>
+<li><p>Uses a local integer value for accumulation during parsing, and only assigns <code>out result</code> once - since manipulating <code>out</code> variables directly is more expensive.</p></li>
+<li><p>Corrected the overflow check. In the majority case (less than 11/10 characters) there are no additional ops for overflow detection. Otherwise, for a number close to the limit, it takes just a couple additional ops to check whether the first digit changed due to overflow.</p></li>
+</ul>
+
+<p><strong>Omissions</strong></p>
+
+<ul>
+<li><p>Still does not account for leading zeros in overflow detection. Doing so slows down the expected case too much.</p></li>
+<li><p>Still does not allow white-space, thousand separators, a leading positive sign, or trailing signs.</p></li>
+</ul>
+
+<p>Note that in all above 'unhandled' cases, we're very careful to return <code>false</code> - we will never return <code>true</code> with an incorrect result.</p>
+
+<p>Note that you could replace all instances of <code>return false</code> with <code>return Int.TryParse(input, out result)</code> if you wanted to "fall-back" to the native integer parser in these rare cases to strike a balance between performance and flexibility. In our case, something similar is done further up the chain, so I haven't included it in this code.</p>
+    </div>

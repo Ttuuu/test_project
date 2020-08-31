@@ -1,0 +1,140 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>There is a lot here, so I only address a couple of points.</p>
+
+<blockquote>
+  <p>What are some ways I can reduce the header size to improve the compression ratios?</p>
+</blockquote>
+
+<p>An effective trick is switching to using <a href="https://en.wikipedia.org/wiki/Canonical_Huffman_code" rel="nofollow noreferrer">canonical Huffman codes</a>, which gives you an unambiguous mapping from a table of code <em>lengths</em> to the table of codes. So this enables decoding while the header only stores, for each symbol, the length of the corresponding code, which is much smaller than storing the entire code as well. <a href="https://www.ietf.org/rfc/rfc1951.txt" rel="nofollow noreferrer">DEFLATE</a> uses this (it goes <em>much further</em> to compress its header too, so if you want to make it even smaller you can look there for ideas), that RFC also provides code for decoding the set of lengths to a table of canonical Huffman codes.</p>
+
+<p>The encoder should also use the same lengths-to-codes implementation to ensure consistency, then the Huffman tree building (if you do it at all!) only serves to find the <em>lengths</em> of the codes. That would let you simplify <code>code_array_from_tree</code> a little since it doesn't need to build codes any more, only lengths.</p>
+
+<blockquote>
+  <p>Are there any general performance chokes that can be removed?</p>
+</blockquote>
+
+<p>Yes, first a small one. The way you encode, only one bit is written per iteration. You could append to a small bit-buffer held in an integer and then write out full bytes as they become available:</p>
+
+<pre><code>uint32_t buffer = 0;
+int numbits = 0;
+for (int i = 0; i &lt; datasize; i++) {
+    int len = codes[input[i]].length;
+    // make room for code
+    buffer &lt;&lt;= len;
+    numbits += len;
+    // save code to buffer
+    buffer |= codes[input[i]].code;
+    // output all the complete bytes in the buffer
+    while (numbits &gt;= 8) {
+        output[out_pos++] = buffer &gt;&gt; (numbits - 8);
+        numbits -= 8;
+    }
+}
+// TODO: save bits that remain in the buffer
+</code></pre>
+
+<p>Since the output is byte based and every byte is only written once, it's easy to adapt to streaming the output to a file rather than constructing all of in memory.</p>
+
+<p>There is a much larger performance problem in the decoder. You have used a bit-by-bit tree-walking decoding algorithm, that algorithm is inherently slow since it keeps traversing that tree. It also looks like this implementation of it can only handle codes up to 8 bits. Limiting code lengths is very reasonable, upping the maximum code length has diminishing returns that diminish very quickly, and long codes make table based decoding more complicated. 8 bits is a fairly short limit, suitable for text files but not for binary files.</p>
+
+<p>There are various table-based decoding strategies, that all have in common that you won't be walking down the actual Huffman tree, but they differ in their details. In the simplest variant, you use a table of 2<sup>k</sup> entries where <code>k</code> is your maximum code length (you have k=8 now, making this table <em>tiny</em>, DEFLATE has k=15). This table maps every possible state of your k-bit decoding buffer to a <code>(length, symbol)</code> pair corresponding with the first code in the buffer. You could interpret that table as caching the result of every possible way to do the tree-walk, combined with every possible "left-over" bit string (the part of the buffer after the first code). An other way to interpret it as the final limit of using wider and wider decoding <em>tries</em> (with the usual binary tree being a 2-way trie), leaving you with a trie that is only a single level deep so it becomes just an array.</p>
+
+<p>The decoding itself then can become something like:</p>
+
+<pre><code>while (true) {
+    uint32_t buffer = peekKBits(bit_position);
+    struct sym s = decoding_table[buffer];
+    bit_position += s.length;
+    output[out_pos++] = s.symbol;
+    if (s.symbol == END)
+        break;
+}
+</code></pre>
+
+<p><code>peekKBits</code> must support peeking slightly beyond the end of the data, until the END symbol is aligned with the start of the buffer. It can read from a stream if you want, the position passed to it will never decrease, it just has to support temporarily buffering a constant amount of data. The output can also be streamed.</p>
+
+<p>This looks simple, so maybe the complexity went into building the table? Actually not really, that's not so bad either, for example (this depends on the order in which you pack bits though, so this is just one possible way):</p>
+
+<pre><code>for (int i = 0; i &lt; symbols; i++) {
+    uint32_t code = codes[i].code;
+    int padlength = MAX_CODE_LENGTH - codes[i].length;
+    uint32_t padmask = (1U &lt;&lt; padlength) - 1;
+    // write an entry into the decoding table for every
+    // possible "padding" of the code up to the buffer size
+    struct sym s = { .length = codelength, .symbol = i };
+    for (uint32_t padding = 0; padding &lt;= padmask; padding++)
+        decoding_table[(code &lt;&lt; padlength) | padding] = s;
+}
+</code></pre>
+
+<p>The size of the table used in that simple variant does not scale well with the maximum supported code length, there are many variants with smaller tables. An obvious one is a multi-level table, which can land anywhere in the middle between the two extremes. There are <a href="https://www.researchgate.net/publication/262283882_An_efficient_algorithm_of_Huffman_decoder_with_nearly_constant_decoding_time" rel="nofollow noreferrer">more complex</a> options that get the table size down very well while staying away from true multi-level decoding, essentially replacing the initial steps with some arithmetic. If you keep k=8 then none of that is necessary, even the simplest table-based decoding algorithm would have a tiny table.</p>
+
+<hr>
+
+<p>To clarify the encoding and decoding processes, let's take this example: "ABACABAAAAAAA".</p>
+
+<p>B and C are the least common so, if you're using tree building, the corresponding nodes would be merged first, and then that merged node is merged with the A node, leading to codes like this:</p>
+
+<pre><code>A: 1
+B: 00
+C: 01
+</code></pre>
+
+<p>So the whole string translated to the corresponding codes would be <code>‭1 00 1 01 1 00 1 1 1 1 1 1 1</code> which can be packed into two bytes like this ‭<code>10010110 01111111</code>. I chose this example so it would cut a code through the middle on the byte boundary, because this typically occurs and must be handled.</p>
+
+<p>Different packing orders are possible, for example DEFLATE packs the first item into the bottom bits of a byte first. That doesn't fundamentally matter for this decoding technique, the padding bits would be at the top instead of at the bottom and <code>peekKbits</code> would concatenate the other way around. The principle remains the same, but the diagrams become more confusing.</p>
+
+<p>Since the longest code was 2 bits, we could use a 2-bit decoding buffer and a 4-entry decoding table. Obviously such small sizes are not typical, so I will also show what would happen with an 8-bit decoding buffer and the corresponding 256-entry table. First the small example though.</p>
+
+<p>The first 2-bit buffer would be <code>‭10</code> (here: <code>[10]010110</code>). <code>10</code> was not a code, it's really <code>1</code> with some extra stuff after it which we don't know what it is yet. This is why the table-building step appends the padding bits, here the padding is <code>0</code>. Anyway that 4-entry decoding table would look like this:</p>
+
+<pre><code>index symbol length
+   00      B      2
+   01      C      2
+   10      A      1
+   11      A      1
+</code></pre>
+
+<p>The buffer holds the value <code>10</code>, so looking at <code>table[2]</code> we decode an A and advance the bit-position by 1. Next the buffer is here: <code>1[00]10110</code>, decode a B, advance by 2, etc:</p>
+
+<pre><code>100[10]110 -&gt; A, 1
+1001[01]10 -&gt; C, 2
+100101[10] -&gt; A, 1
+</code></pre>
+
+<p>The next buffer crosses between the bytes, <code>1001011[0 0]1111111</code>. That's not difficult but it must be dealt with. For example, with the stateless <code>peekKbits</code> it could work like:</p>
+
+<pre><code>uint32_t peekKBits(int bit_pos) {
+    int byte_pos = bit_pos &gt;&gt; 3;
+    int bit_offset = 14 - (bit_pos &amp; 7);
+    uint32_t concat = (input[byte_pos] &lt;&lt; 8) | input[byte_pos + 1];
+    return (concat &gt;&gt; bit_offset) &amp; 3;
+}
+</code></pre>
+
+<p>Which reads two bytes (ensure they exist, this <em>will</em> read a byte beyond the input data so it has to be extended), concatenates them, shifts the concatenated string right until the two target bits at the bottom bits, and then chops off the top. Statefully flowing the data through a shift register, like I showed for encoding, is of course also possible. </p>
+
+<p>Anyway, however we get that next buffer, it'll be <code>00</code>, with one bit from the first byte and one bit from the second byte. It will decode to (B, 2), and after that there are only some boring <code>A</code>s to decode.</p>
+
+<p>A bigger decoding table is really the same idea, but with more padding bits, so many entries of the table will correspond to the same (symbol, length) pair. For a 256 entry table, all 8-bit values of the form <code>00xxxxxx</code> would map to <code>B, 2</code>, that's 64 entries just for B. The decoding process would now go like this:</p>
+
+<pre><code>[10010110] 01111111 -&gt; A, 1
+1[0010110 0]1111111 -&gt; B, 2
+100[10110 011]11111 -&gt; A, 1
+1001[0110 0111]1111 -&gt; C, 2
+100101[10 011111]11 -&gt; A, 1
+1001011[0 0111111]1 -&gt; B, 2
+10010110 0[1111111 x] -&gt; A, 1 (using padded input)
+more A's
+</code></pre>
+
+<hr>
+
+<p>If you limit code lengths in the decoder, the encoder should enforce this limit as well, otherwise it can produce undecodable files for unlucky inputs. There are various ways to do it, such as rebalancing the Huffman tree, modifying the frequencies and rebuilding the tree, using some totally different algorithm such as Package-Merge, fudging the lengths themselves while ensuring they remain a valid set of Huffman code lengths, or even <a href="https://github.com/JoernEngel/joernblog/blob/master/engel_coding.md" rel="nofollow noreferrer">directly building the set of lengths using a heuristic</a>.</p>
+
+<blockquote>
+  <p>Would there be any major issues porting my code to other systems? I have never used bit level operations before and I've heard that endianness can be a problem when using them</p>
+</blockquote>
+
+<p>Endianness determines what order the bytes of multi-byte types are laid out in in memory. That matters when you directly reinterpret the memory of some type as the memory of some other type, as in unions and casting <code>char*</code> to <code>int*</code> and then reading/writing to it, that sort of thing. Bitwise operators operate on integers, not memory, so they are unaffected by endianness.</p>
+    </div>

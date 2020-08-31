@@ -1,0 +1,96 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Seems like a decent implementation. You should be aware that <em>nothing</em> in this area is foolproof. Two ways to "break" your code are:</p>
+
+<pre><code>auto si = make_synchronized(42);
+// ...
+int *one;
+si.alter([&amp;](int&amp; val) {
+    one = &amp;val;
+});
+*one = 42;  // use outside of the lock
+</code></pre>
+
+<p>and</p>
+
+<pre><code>auto si = make_synchronized(42);
+auto&amp; si2 = si;
+// ...
+si.use([&amp;](const int&amp;) {
+    si2.alter([&amp;](int&amp;) {
+        // deadlock
+    });
+});
+</code></pre>
+
+<p>But this is no big deal, as long as you trust your users (which might mean yourself!) to avoid getting into this kind of situation. The second situation above (deadlock) is particularly easy to hide by placing the second <code>si.alter</code> inside a helper function, or by aliasing the way I did with <code>si2</code>.</p>
+
+<hr>
+
+<pre><code>#undef DISALLOW_EVIL_CONSTRUCTORS
+#define DISALLOW_EVIL_CONSTRUCTORS(TypeName) \
+  TypeName(const TypeName&amp;);                 \
+  void operator=(const TypeName&amp;)
+</code></pre>
+
+<p>At least three issues here. First, you should be using <code>=delete</code> instead of this macro. Simply:</p>
+
+<pre><code>template &lt;typename T&gt;
+class synchronized final {
+public:
+    synchronized(synchronized&amp;&amp;) = delete;
+    synchronized(const synchronized&amp;) = delete;
+    synchronized&amp; operator=(synchronized&amp;&amp;) = delete;
+    synchronized&amp; operator=(const synchronized&amp;) = delete;
+</code></pre>
+
+<p>(Once you've explicitly <code>=delete</code>d the move operations, further <code>=delete</code>ing the copy operations is unnecessary... but recommended, for clarity.)</p>
+
+<p>Second, although it doesn't apply too much in this specific case, having a macro that consists of multiple statements or declarations is usually a red flag. Look up "hygienic macros in C" for more information on the <code>do { ... } while (0)</code> idiom.</p>
+
+<p>Third, you're using</p>
+
+<pre><code>#undef X
+#define X Y
+</code></pre>
+
+<p>as a way to say "I really really want <code>X</code> to mean <code>Y</code>, even if someone else has already defined <code>X</code> to mean something different." That's probably a bad idea. If nobody else has previously defined <code>X</code>, then your <code>#undef</code> is redundant (and should be removed). If someone else <em>has</em> previously defined <code>X</code>, then your <code>#undef</code> makes your own code work but presumably breaks whatever <em>that</em> person was using <code>X</code> for! Rather than redefine <code>X</code> in a way that might break their code down the line, it would be much much better to just error out right here in that case (so again, the solution is to remove the <code>#undef</code>).</p>
+
+<hr>
+
+<p>I notice the <code>final</code> keyword on <code>class synchronized</code>. Why is it important to you that this class be <code>final</code>?</p>
+
+<hr>
+
+<pre><code>template &lt;typename Accessor&gt;
+void use(Accessor&amp;&amp; access) const {
+  read_lock l(mutex_);
+  std::forward&lt;Accessor&gt;(access)(value_);
+}
+</code></pre>
+
+<p>Perfect forwarding here is fine, but almost certainly overkill. I can't think of any case where I'd want the accessor itself to be either non-const or an rvalue. The accessor should <em>always</em> be of the form <code>[&amp;](const auto&amp; value) { ... }</code>; it never needs to have any captures that could be affected by <code>mutable</code>, and thus it never needs to be called as non-const. So we can simplify:</p>
+
+<pre><code>template&lt;class Accessor&gt;
+void use(const Accessor&amp; access) const {
+    read_lock l(mutex_);
+    access(value_);
+}
+</code></pre>
+
+<p>(Incidentally, anything other than four-space indents is horrible. :))</p>
+
+<hr>
+
+<pre><code>template &lt;typename T&gt; auto
+make_synchronized(T&amp;&amp; value) {
+  return synchronized&lt;T&gt;{ std::forward&lt;T&gt;(value) };
+}
+</code></pre>
+
+<p>Looks good, but...</p>
+
+<ul>
+<li><p>The <code>auto</code> here isn't buying you anything; it might be better to give the return type explicitly as <code>synchronized&lt;T&gt;</code>.</p></li>
+<li><p>The curly braces in <code>synchronized&lt;T&gt;{ ... }</code> are inconsistent with the way <code>make_</code> functions work everywhere else in the Standard Library. <code>make_shared</code> uses parens. <code>make_unique</code> uses parens. To observe the difference, make a class <code>A</code> where <code>A{...}</code> and <code>A(...)</code> call different constructors, <a href="https://godbolt.org/z/mB7ov_" rel="noreferrer">like this</a>. (<code>make_pair</code> and <code>make_tuple</code> also use parens, although I'm not sure if the difference is observable in those two cases.)</p></li>
+</ul>
+    </div>

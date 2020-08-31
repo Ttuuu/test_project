@@ -1,0 +1,262 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'm writing my own answer here because I incorporated some of the remarks of both other answers, 
+and ignored other ones. In this answer I explain why I took certain design choices.</p>
+
+<h1>@<a href="https://codereview.stackexchange.com/a/223202/123200">Georgy</a>:</h1>
+
+<ol>
+<li>good tip</li>
+<li>I don't expect much other than <code>str</code> and <code>int</code>, but <code>bytes</code> is a possibility too (<code>hash.digest</code>)</li>
+<li>The use of <code>compare_files</code> is to also whittle the subgroups down (if len(files) &gt; 1). 
+I stagger the comparisons from fast to more expensive.
+There might be a lot of files with the same size, but if they don't have the same checksum in their first few bytes, 
+there is no use in comparing the complete file. When done with an step in between logging how much files got compared at each stage,
+I saw the numbers dwindling step per step.</li>
+<li>the typeshed has a class signature for "hashlib._Hash", so I adapted this to a <code>typing.Protocol</code></li>
+</ol>
+
+<h1>@<a href="https://codereview.stackexchange.com/a/223171/123200">l0b0</a></h1>
+
+<ol>
+<li>I didn't inline them because I want to refer to them as named functions. I could make lambda's out of them, but that signifies the intent less than a named function <code>filesize</code></li>
+<li>I suggest a blocksize here to prevent python from reading in complete 8GB files into memory to take a digest`</li>
+<li>nice tip on the stricter mypy. It's tedious to do this for an existing code base, but it has showed me some bugs I wouldn't have otherwise spotted otherwise, so I'm gradually introducing this elsewhere as well.</li>
+<li>I used md5 because I could easily verify the md5hash against an external tool to test my implementation. Later I moved to CRC32.</li>
+<li>In my first versions I exported the <code>duplicates</code> in between iterations, and then a string representation was handy, and to compare it to the output of external tools to compute the hash</li>
+<li>True</li>
+<li>good tip</li>
+<li>Where did I use a mutable default parameter?</li>
+<li>I use r-strings for Windows paths as well. Then I don't have to escape all the <code>\</code>. Recently I found out VS Code makes a distinction in how it represents <code>r</code> and <code>R</code> strings, so I switched to <code>R</code> (Apparently <code>black</code> doesn't like them, and changes them to <code>r""</code>)</li>
+<li>That is the tricky part I have not been able to convey cleanly, but this is to dwindle down the more expensive operations. I renamed it to <code>potential_duplicates</code></li>
+<li>and 12. Correct, and this might be a good opportunity for a next version.</li>
+</ol>
+
+<h1>Other things</h1>
+
+<ul>
+<li>I include <code>pydocstyle</code> in my routing, so the docstring requirements have become a bit more strict. I haven't found the patience to annotate every parameter. I hope the variable names are clear enough</li>
+<li>I included a <code>min_filesize</code> argument to <code>find_duplicates</code> to be able to focus on the larger duplicates when trying to reduce disk usage</li>
+</ul>
+
+<hr>
+
+<p>crc32.hash.py</p>
+
+<pre><code>"""CRC32 adapted to the `hashlib._Hash` protocol."""
+from __future__ import annotations
+
+import typing
+import zlib
+
+
+class Hash(typing.Protocol):
+    """Protocol for a hash algorithm."""
+
+    digest_size: int
+    block_size: int
+
+    name: str
+
+    def __init__(
+        self, data: typing.Union[bytes, bytearray, memoryview] = ...
+    ) -&gt; None:
+        """Protocol for a hash algorithm."""
+        ...
+
+    def copy(self) -&gt; Hash:
+        """Return a copy of the hash object."""
+        ...
+
+    def digest(self) -&gt; bytes:
+        """Return the digest of the data passed to the update() method."""
+        ...
+
+    def hexdigest(self) -&gt; str:
+        """Like digest() except the digest is returned as a string object.
+
+        Like digest() except the digest is returned as a string object
+        of double length, containing only hexadecimal digits.
+        """
+        ...
+
+    def update(self, arg: typing.Union[bytes, bytearray, memoryview]) -&gt; None:
+        """Update the hash object with the bytes-like object."""
+        ...
+
+
+class CRC32(Hash):
+    """Adapts zlib.crc32" for the hashlib protocol."""
+
+    # docstring borrowed from https://docs.python.org/3/library/hashlib.html
+    digest_size = -1
+    block_size = -1
+
+    name = "crc32"
+
+    def __init__(self, data: typing.Union[bytes, bytearray, memoryview] = b""):
+        """Adapts zlib.crc32" for the hashlib protocol."""
+        self._checksum = zlib.crc32(bytes(data))
+
+    def copy(self) -&gt; CRC32:
+        """Return a copy of the hash object."""
+        duplicate = CRC32()
+        duplicate._checksum = self._checksum
+        return duplicate
+
+    def digest(self) -&gt; bytes:
+        """Return the digest of the data passed to the update() method."""
+        return self._checksum.to_bytes(2, byteorder="big")
+
+    def hexdigest(self) -&gt; str:
+        """Like digest() except the digest is returned as a string object.
+
+        Like digest() except the digest is returned as a string object
+        of double length, containing only hexadecimal digits.
+        """
+        return f"{self._checksum:X}"
+
+    def update(self, arg: typing.Union[bytes, bytearray, memoryview]) -&gt; None:
+        """Update the hash object with the bytes-like object."""
+        self._checksum = zlib.crc32(arg, self._checksum)
+
+
+if __name__ == "__main__":
+    test_files = {"CHANGELOG.rst": "C171C371"}
+    for filename, expected in test_files.items():
+        with open(filename, "rb") as f:
+            checksum = CRC32(f.read()).hexdigest()
+
+        print(f"{filename}: expected: {expected}; calculated: {checksum}")
+</code></pre>
+
+<p>find_duplicates.py</p>
+
+<pre><code>"""Code to find duplicate files."""
+from __future__ import annotations
+
+import datetime
+import hashlib
+import json
+import typing
+from collections import defaultdict
+from pathlib import Path
+
+from crc32hash import CRC32, Hash
+
+_Duplicates = typing.Mapping[
+    typing.Tuple[typing.Hashable, ...], typing.Iterable[Path]
+]
+DEFAULT_BLOCKSIZE = 65536
+
+
+def filesize(path: Path) -&gt; int:
+    """Return the filesize."""
+    return path.stat().st_size
+
+
+def hash_first(
+    path: Path,
+    hash_function: typing.Callable[[bytes], Hash] = hashlib.sha256,
+    blocksize: int = DEFAULT_BLOCKSIZE,
+) -&gt; str:
+    """Return the hash of the first block of the file."""
+    with path.open("rb") as afile:
+        return hash_function(afile.read(blocksize)).hexdigest()
+
+
+def hash_all(
+    path: Path, hash_function: typing.Callable[[bytes], Hash] = hashlib.sha256,
+) -&gt; str:
+    """Return the hash of the whole file."""
+    with path.open("rb") as afile:
+        hasher = hash_function(b"")
+        buf = afile.read(DEFAULT_BLOCKSIZE)
+        while buf:
+            hasher.update(buf)
+            buf = afile.read(DEFAULT_BLOCKSIZE)
+    return hasher.hexdigest()
+
+
+def crc_first(path: Path, blocksize: int = DEFAULT_BLOCKSIZE,) -&gt; str:
+    """Return the crc32 hash of the first block of the file."""
+    return hash_first(path=path, hash_function=CRC32, blocksize=blocksize)
+
+
+def crc32_all(path: Path) -&gt; str:
+    """Return the crc32 hash of the whole file."""
+    return hash_all(path=path, hash_function=CRC32)
+
+
+def compare_files(
+    comparison: typing.Callable[[Path], typing.Hashable],
+    potential_duplicates: _Duplicates,
+) -&gt; _Duplicates:
+    """Subdivide each group along `comparison`.
+
+    Discards subgroups with less than 2 items
+    """
+    results: typing.DefaultDict[
+        typing.Tuple[typing.Hashable, ...], typing.List[Path]
+    ] = defaultdict(list)
+    for old_hash, files in potential_duplicates.items():
+        for file in files:
+            results[(*old_hash, comparison(file))].append(file)
+
+    return {
+        filehash: files
+        for filehash, files in results.items()
+        if len(files) &gt; 1
+    }
+
+
+def find_duplicates(
+    rootdir: Path,
+    comparisons: typing.Optional[
+        typing.Iterable[typing.Callable[[Path], typing.Hashable]]
+    ] = None,
+    min_filesize: typing.Optional[int] = None,
+) -&gt; typing.List[typing.Tuple[str, ...]]:
+    """Find duplicate files in `rootdir` and its subdirectories.
+
+    Returns a list with subgroups of identical files
+
+    Groups the files along the each of the comparisons in turn.
+    Subgroups with less than 2 items are discarded.
+
+    Each of the `comparisons` should be a callable that accepts a
+    `pathlib.Path` as only argument, and returns a hashable value
+
+    if `comparisons` is not defined, compares along:
+        1. file size
+        2. CRC32 hash of the first block (65536 bytes)
+        3. CRC32 hash of the whole file
+    """
+    if comparisons is None:
+        comparisons = [filesize, crc_first, crc32_all]
+
+    potential_duplicates: _Duplicates = {
+        (): (file for file in rootdir.rglob("*") if file.is_file())
+    }
+    if min_filesize is not None:
+        potential_duplicates = {
+            key: (file for file in files if filesize(file) &gt; min_filesize)
+            for key, files in potential_duplicates.items()
+        }
+
+    for comparison in comparisons:
+        potential_duplicates = compare_files(comparison, potential_duplicates)
+    return [tuple(map(str, files)) for files in potential_duplicates.values()]
+
+
+if __name__ == "__main__":
+    duplicate_dir = Path(r".")
+    results = find_duplicates(rootdir=duplicate_dir, min_filesize=int(1e8))
+
+    # print(json.dumps(results, indent=2))
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = Path("./output") / f"{timestamp}.json"
+    with output_file.open("w") as fh:
+        json.dump(results, fh, indent=2)
+</code></pre>
+    </div>

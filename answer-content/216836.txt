@@ -1,0 +1,336 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>My only major observation is the choice of <code>DataManager</code>:</p>
+
+<ol>
+<li>You’ve made the <code>DataManager</code> a singleton but it has a <code>delegate</code>. That means you can effectively only have one controller acting as the delegate for the <code>DataManager</code>. If you’re only going to have one <code>delegate</code>, then <code>DataManager</code> shouldn't be a singleton (so that every controller can have its own <code>DataManager</code> with its own delegate). Or, if you want to make it a singleton, then perhaps rather than delegate pattern, I might suggest completion handler pattern (which is what I did in my code at the end of this answer).</li>
+</ol>
+
+<p>A few other observations, all fairly trivial in nature:</p>
+
+<ol start="2">
+<li><p>I don’t know why <code>SitewideTableViewController</code> has <code>session</code> and <code>task</code> properties. You’re not using them and they don’t belong in view controller anyway.</p></li>
+<li><p>Even if you had a need for the <code>task</code> property, instantiating it to a blank <code>URLSessionDataTask()</code> is not a good practice.</p></li>
+<li><p>If you are going to make a view controller conform to some delegate protocol, I’d advise doing it in an extension to the class:</p>
+
+<pre><code>class SitewideTableViewController: UITableViewController { ... }
+</code></pre>
+
+<p>and</p>
+
+<pre><code>extension SitewideTableViewController: DataManagerDelegate {
+    func didDownloadBreaches() { ... }
+}
+</code></pre>
+
+<p>This keeps your code better organized. That having been said, I wouldn’t even use the delegate-protocol pattern.</p></li>
+<li><p>I’m not sure why the closure to <code>HTTPManager</code>’s <code>get</code> method is optional. You’re not going to be calling <code>get</code> unless you wanted the result passed back in the closure.</p>
+
+<pre><code>class HTTPManager {
+    static let shared: HTTPManager = HTTPManager()
+
+    public func get(urlString: String, completionBlock: @escaping (Data?) -&gt; Void) {
+        guard let url = URL(string: urlString) else { return }
+
+        let task = URLSession.shared.dataTask(with: url) { data, _, _ in
+            completionBlock(data)
+        }
+        task.resume()
+    }
+}
+</code></pre></li>
+<li><p>Going a step further, with a completion handler closure with a type of <code>Data?</code> you only know if it succeeded or failed, but not why it failed. I’d suggest you have this pass back the <code>Data</code> if successful, but an <code>Error</code> if not successful.</p>
+
+<p>A nice approach to this is to use a <code>Result</code>-based parameter to the closure. This is included in Swift 5, but in prior versions of Swift, you can define it yourself like so:</p>
+
+<pre><code>enum Result&lt;T, U&gt; {
+    case success(T)
+    case failure(U)
+}
+</code></pre>
+
+<p>Then, rather than returning just <code>Data?</code> (where <code>nil</code> means that there was some error, but you don’t know what the issue was), you can return a <code>Result&lt;Data, Error&gt;</code>. I’d also add some validation logic:</p>
+
+<pre><code>class HTTPManager {
+    static let shared: HTTPManager = HTTPManager()
+
+    enum HTTPError: Error {
+        case invalidURL
+        case invalidResponse(Data?, URLResponse?)
+    }
+
+    public func get(urlString: String, completionBlock: @escaping (Result&lt;Data, Error&gt;) -&gt; Void) {
+        guard let url = URL(string: urlString) else {
+            completionBlock(.failure(HTTPError.invalidURL))
+            return
+        }
+
+        let task = URLSession.shared.dataTask(with: url) { data, response, error in
+            guard error == nil else {
+                completionBlock(.failure(error!))
+                return
+            }
+
+            guard
+                let responseData = data,
+                let httpResponse = response as? HTTPURLResponse,
+                200 ..&lt; 300 ~= httpResponse.statusCode else {
+                    completionBlock(.failure(HTTPError.invalidResponse(data, response)))
+                    return
+            }
+
+            completionBlock(.success(responseData))
+        }
+        task.resume()
+    }
+}
+</code></pre>
+
+<p>Then <code>fetchBreaches</code> can do:</p>
+
+<pre><code>func fetchBreaches() {
+    HTTPManager.shared.get(urlString: baseUrl + breachesExtensionURL) { [weak self] result in
+        switch result {
+        case .failure(let error):
+            // handle error here
+
+        case .success(let data):
+            // process `Data` here
+        }
+    }
+}
+</code></pre></li>
+<li><p>I’d suggest using <code>Date</code> types in <code>BreachModel</code> (which I’d personally just call <code>Breach</code> and make it a <code>struct</code>):</p>
+
+<pre><code>struct Breach: Codable {
+    let name: String
+    let title: String
+    let domain: String
+    var breachDate: Date? { return Breach.dateOnlyFormatter.date(from: breachDateString) }
+    let breachDateString: String
+    let addedDate: Date
+    let modifiedDate: Date
+    let pwnCount: Int
+    let description: String
+
+    private enum CodingKeys: String, CodingKey {
+        case name = "Name"
+        case title = "Title"
+        case domain = "Domain"
+        case breachDateString = "BreachDate"
+        case addedDate = "AddedDate"
+        case modifiedDate = "ModifiedDate"
+        case pwnCount = "PwnCount"
+        case description = "Description"
+    }
+
+    static let dateOnlyFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+}
+</code></pre>
+
+<p>The only trick here is that this API returns <code>BreachDate</code> as a date-only string, but <code>AddedDate</code> and <code>ModifiedDate</code> as date time strings. So, I’d use the standard ISO8601 date formatter for the decoder’s <code>dateDecodingStrategy</code> (shown below) for the latter two, but lazily decode the <code>BreachDate</code> using a date-only date formatter.</p>
+
+<p>The decoder would then look like:</p>
+
+<pre><code>let decoder = JSONDecoder()
+decoder.dateDecodingStrategy = .formatted(ApiManager.dateTimeFormatter)
+
+do {
+    let breaches = try decoder.decode([Breach].self, from: data)
+    // use `breaches` here
+} catch {
+    // handle `error` here
+}
+</code></pre>
+
+<p>where</p>
+
+<pre><code>static let dateTimeFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssX"
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    return formatter
+}()
+</code></pre>
+
+<p>But by making the model type use proper <code>Date</code> objects, then you can format them nicely in your UI without littering your UI code with logic to convert the ISO 8601 strings to dates.</p></li>
+<li><p>I’d personally pull the sorting of dates out of the <code>DataManager</code> and put it in <code>Breach.swift</code> in an extension to <code>Array</code> (or <code>RandomAccessCollection</code>):</p>
+
+<pre><code>extension RandomAccessCollection where Element == Breach {
+    func sortedByName() -&gt; [Breach] {
+        return sorted { a, b in a.name &lt; b.name }
+    }
+}
+</code></pre>
+
+<p>Then, when you have your array of breaches, you can just do</p>
+
+<pre><code>self.pwned = breaches.sortedByName()
+</code></pre></li>
+<li><p>I notice that your <code>pwnedData</code> (which I might suggest renaming to <code>pwnedBreaches</code> because it’s an array of <code>Breach</code> objects, not an array of <code>Data</code> objects) is initialized as an empty <code>[BreachModel]</code> before you retrieve the data. It’s not terribly critical in this particular case, but as a general rule, it is useful to distinguish between “this property has not been set” and “it has been set but there are no records.”</p>
+
+<p>Bottom line, I’d suggest making this an optional (where <code>nil</code> means that it hasn’t been set yet, and <code>[]</code> means that it has been set to an empty array).</p></li>
+</ol>
+
+<hr>
+
+<p>So pulling that all together, we end up with something like:</p>
+
+<pre><code>// SitewideTableViewController.swift
+
+class SitewideTableViewController: UITableViewController {
+    var pwnedBreaches: [Breach]?
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+
+        ApiManager.shared.fetchBreaches { [weak self] result in
+            guard let self = self else { return }
+
+            switch result {
+            case .failure(let error):
+                print(error)
+
+            case .success(let breaches):
+                self.pwnedBreaches = breaches.sortedByName()
+                self.tableView.reloadData()
+            }
+        }
+    }
+}
+
+// MARK: - UITableViewDataSource
+
+extension SitewideTableViewController {
+    override func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -&gt; Int {
+        return pwnedBreaches?.count ?? 0
+    }
+
+    override func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -&gt; UITableViewCell {
+        let cell = tableView.dequeueReusableCell(withIdentifier: "Sitewide", for: indexPath)
+        cell.textLabel?.text = pwnedBreaches?[indexPath.row].name
+        return cell
+    }
+}
+
+// Breach.swift
+
+struct Breach: Codable {
+    let name: String
+    let title: String
+    let domain: String
+    var breachDate: Date? { return Breach.dateOnlyFormatter.date(from: breachDateString) }
+    let breachDateString: String
+    let addedDate: Date
+    let modifiedDate: Date
+    let pwnCount: Int
+    let description: String
+
+    private enum CodingKeys: String, CodingKey {
+        case name = "Name"
+        case title = "Title"
+        case domain = "Domain"
+        case breachDateString = "BreachDate"
+        case addedDate = "AddedDate"
+        case modifiedDate = "ModifiedDate"
+        case pwnCount = "PwnCount"
+        case description = "Description"
+    }
+
+    static let dateOnlyFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+}
+
+extension RandomAccessCollection where Element == Breach {
+    func sortedByName() -&gt; [Breach] {
+        return sorted { a, b in a.name &lt; b.name }
+    }
+}
+
+// Result.swift
+//
+// `Result` not needed if you are using Swift 5, as it already has defined this for us.
+
+enum Result&lt;T, U&gt; {
+    case success(T)
+    case failure(U)
+}
+
+// ApiManager.swift
+
+class ApiManager {
+    static let shared = ApiManager()
+
+    let baseUrl = URL(string: "https://haveibeenpwned.com/api/v2")!
+    let breachesExtensionURL = "breaches"
+
+    static let dateTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ssX"
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        return formatter
+    }()
+
+    func fetchBreaches(completion: @escaping (Result&lt;[Breach], Error&gt;) -&gt; Void) {
+        let url = baseUrl.appendingPathComponent(breachesExtensionURL)
+
+        HTTPManager.shared.get(url) { result in
+            switch result {
+            case .failure(let error):
+                DispatchQueue.main.async { completion(.failure(error)) }
+
+            case .success(let data):
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .formatted(ApiManager.dateTimeFormatter)
+
+                do {
+                    let breaches = try decoder.decode([Breach].self, from: data)
+                    DispatchQueue.main.async { completion(.success(breaches)) }
+                } catch {
+                    print(String(data: data, encoding: .utf8) ?? "Unable to retrieve string representation")
+                    DispatchQueue.main.async { completion(.failure(error)) }
+                }
+            }
+        }
+    }
+}
+
+class HTTPManager {
+    static let shared = HTTPManager()
+
+    enum HTTPError: Error {
+        case invalidResponse(Data?, URLResponse?)
+    }
+
+    public func get(_ url: URL, completionBlock: @escaping (Result&lt;Data, Error&gt;) -&gt; Void) {
+        let task = URLSession.shared.dataTask(with: url) { data, response, error in
+            guard error == nil else {
+                completionBlock(.failure(error!))
+                return
+            }
+
+            guard
+                let responseData = data,
+                let httpResponse = response as? HTTPURLResponse,
+                200 ..&lt; 300 ~= httpResponse.statusCode else {
+                    completionBlock(.failure(HTTPError.invalidResponse(data, response)))
+                    return
+            }
+
+            completionBlock(.success(responseData))
+        }
+        task.resume()
+    }
+}
+</code></pre>
+    </div>

@@ -1,0 +1,115 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The way to fix your template deduction is: You have a function you're calling with certain arguments that you want to deduce the types of, right? So make that function into a template! That is, take your current:</p>
+
+<pre><code>template &lt;class Res, class Left, class Right, class LeftBranch, class RightBranch&gt;
+struct BinaryPatternMatch {
+  static Res match(const Either&lt;Left, Right&gt; *e, LeftBranch lb, RightBranch rb) {
+    assert(e != nullptr);
+    if (e-&gt;is_left()) {
+      return lb(*(static_cast&lt;const InLeft&lt;Left, Right&gt; *&gt;(e)));
+    } else {
+      return rb(*(static_cast&lt;const InRight&lt;Left, Right&gt; *&gt;(e)));
+    }
+  }
+};
+</code></pre>
+
+<p>and rewrite it so that the function is a template:</p>
+
+<pre><code>namespace BinaryPatternMatch {
+  template &lt;class Res, class Left, class Right, class LeftBranch, class RightBranch&gt;
+  Res match(const Either&lt;Left, Right&gt; *e, LeftBranch lb, RightBranch rb) {
+    assert(e != nullptr);
+    if (e-&gt;is_left()) {
+      return lb(*(static_cast&lt;const InLeft&lt;Left, Right&gt; *&gt;(e)));
+    } else {
+      return rb(*(static_cast&lt;const InRight&lt;Left, Right&gt; *&gt;(e)));
+    }
+  }
+};
+</code></pre>
+
+<p>This immediately lets you rewrite your test cases as e.g.</p>
+
+<pre><code>std::string patres(
+  BinaryPatternMatch::match&lt;std::string, int, int, decltype(on_left), decltype(on_right)&gt;(
+    &amp;inr,
+    on_left,
+    on_right
+  )
+);
+</code></pre>
+
+<p>and then you can drop any explicit parameters that are deducible:</p>
+
+<pre><code>std::string patres(
+  BinaryPatternMatch::match&lt;std::string&gt;(
+    &amp;inr,
+    on_left,
+    on_right
+  )
+);
+</code></pre>
+
+<p>The final step would be to provide template parameter <code>Res</code> with a <em>default value</em> of <code>decltype(lb(*(static_cast&lt;const InLeft&lt;Left, Right&gt; *&gt;(e))))</code> — of course using <a href="https://en.cppreference.com/w/cpp/utility/declval" rel="nofollow noreferrer"><code>std::declval&lt;LeftBranch&gt;()</code></a> in place of <code>lb</code>, and so on.</p>
+
+<hr>
+
+<p>Why do you want your lambdas to take e.g. <code>const InLeft&lt;int, int&gt;&amp; x</code> instead of just <code>int x</code>? It seems to me that the lambda shouldn't care that the int it's receiving is a "left int"; all it needs to care about is the actual integer value. The only reason I can think of to tag the lambda with the "leftness" of its parameter type would be if you were going to actually <em>use</em> that information for overload resolution. That is, it would be nice to make this kind of thing work:</p>
+
+<pre><code>int result1 = 
+  BinaryPatternMatch::match(
+    &amp;inr,
+    [](const Left&lt;int&gt;&amp; x) { return x + 1; },
+    [](const Right&lt;int&gt;&amp; x) { return x + 2; }
+  )
+);
+int result2 = 
+  BinaryPatternMatch::match(
+    &amp;inr,
+    [](const Right&lt;int&gt;&amp; x) { return x + 2; },
+    [](const Left&lt;int&gt;&amp; x) { return x + 1; }
+  )
+);
+assert(result1 == result2);
+</code></pre>
+
+<p>But <a href="https://quuxplusone.github.io/blog/2018/06/12/perennial-impossibilities/#detect-the-first-argument-type-of-a-function" rel="nofollow noreferrer">I don't advise trying to make that work</a>, because it would fall flat on its face when confronted with the <em>perfectly reasonable</em> code</p>
+
+<pre><code>int result2 = 
+  BinaryPatternMatch::match(
+    &amp;inr,
+    [](const auto&amp; x) { /* Don't make me write out long types! */ }
+    ...
+  )
+);
+</code></pre>
+
+<hr>
+
+<p>Speaking of passing lambda arguments in-line... notice that your test cases are testing <em>only</em> the situation where the lambda arguments are lvalues (e.g. <code>on_left</code>). You don't have any tests for the more expected situation where the lambda arguments are prvalues (e.g. <code>[](Left&lt;int&gt;) { }</code>). You should definitely have some tests for that.</p>
+
+<p>The closer your tests resemble real life, the fewer bugs you'll have — and you might even discover some new usage patterns that end up informing your API design!  (For example, you might discover that <code>Left&lt;int&gt; x</code> would be a much more convenient parameter declaration than <code>const InLeft&lt;int, int&gt;&amp; x</code>... and then think about how to implement it.)</p>
+
+<hr>
+
+<p>Speaking of which, you have no tests for <code>Either&lt;A,B&gt;</code> at all! That's surely a problem. Once you try using <code>Either</code>, you might realize that there's no good way to create an <code>Either</code> on the stack, and no way to dynamically reassign an <code>Either</code> from "left" to "right" without doing a new heap allocation.</p>
+
+<p>If you're doing this for real code, instead of as a [[reinventing-the-wheel]] exercise, you should probably stop and go back to <code>std::variant</code>, where you can already do things like</p>
+
+<pre><code>template&lt;class... Ts&gt; struct overloaded : Ts... { using Ts::operator()...; };
+template&lt;class... Ts&gt; auto overload(Ts... ts) { return overloaded&lt;Ts...&gt;{ts...}; }
+
+template&lt;class T&gt; struct Left { T value; };
+template&lt;class T&gt; struct Right { T value; };
+using Either = std::variant&lt;Left&lt;int&gt;, Right&lt;int&gt;&gt;;
+
+Either e = Left&lt;int&gt;{42};
+std::string result = std::visit(overload(
+    [](Left&lt;int&gt; x) { return "left " + std::to_string(x.value); },
+    [](Right&lt;int&gt; x) { return "right " + std::to_string(x.value); }
+), e);
+</code></pre>
+
+<p>That's the sort of syntax you're competing with when you try to roll your own pattern-matching.</p>
+    </div>

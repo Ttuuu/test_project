@@ -1,0 +1,162 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I would refrain from using <code>esp</code> as general purpose register. This is limiting you in using <code>call</code>/<code>ret</code> subroutines, and you risk memory corruption caused by interrupt happening in your program context.</p>
+
+<p>I would also refrain of such heavy LUT tables usage, as the program will be more likely limited by the I/O operations speed, so that tiny amount of calculation will quite likely hide in the buffered I/O waits.</p>
+
+<p>Here is my version, avoiding those things mentioned above:</p>
+
+<pre><code>; hexdump.asm
+; Description     : Prints stdin to stdout as hex and displays ASCII next to it.
+;                   It handles correctly the cases in which a sys_read returns
+;                   less than was requested but an EOF was not received, this
+;                   allows the user to dump arbitrary text from stdin to a file 
+;                   in the following way: ./hexdump &gt;&gt; dump.txt
+;
+; Build using these commands:
+;   nasm -f elf hexdump.asm
+;   ld -o hexdump hexdump.o -m elf_i386 -s
+;
+; Usage:
+;   ./hexdump &lt; input_file
+
+STDIN equ 0
+STDOUT equ 1
+SYS_READ equ 3
+SYS_WRITE equ 4
+SYS_EXIT equ 1
+NEW_LINE equ 0ah
+BUFFERSIZE equ 16
+
+section .data
+HexLUT  db  '0123456789ABCDEF'
+
+section .bss
+ReadBuffer: resb BUFFERSIZE
+DataBuffer: resb BUFFERSIZE
+
+DIVIDER_OFFSET EQU 3*BUFFERSIZE
+ASCII_OFFSET EQU DIVIDER_OFFSET+2
+PRINT_BUFFER_SIZE EQU ASCII_OFFSET + BUFFERSIZE + 1
+; = BUFFERSIZE * "%02x ", 2 chars for divider "| ", BUFFERSIZE * char + 1 for NEWLINE
+
+PrintBuffer: resb PRINT_BUFFER_SIZE
+
+section .text
+
+global _start ; make it visible
+
+_start:
+        lea     esi,[DataBuffer]
+        lea     edi,[DataBuffer+BUFFERSIZE]
+Read:
+        xor     ebx,ebx                 ; STDIN
+        lea     ecx,[ReadBuffer]        ; buffer to read into
+        mov     edx,BUFFERSIZE          ; BUFFERSIZE bytes at most
+        mov     eax,SYS_READ
+        int     80h
+        cmp     eax,ebx                 ; check return value with 0
+        jle     Finish                  ; &lt; 0 -&gt; error, 0 = no more bytes
+
+CopyReadData:
+        ; ecx = source of read data, eax = count
+        ; esi = current DataBuffer, edi = end of DataBuffer
+        cmp     esi,edi
+        ja      .DataBufferIsNotFull
+        ; display DataBuffer, when full
+        call    DisplayDataBuffer
+        lea     esi,[DataBuffer]        ; from the beginning of DataBuffer
+.DataBufferIsNotFull:
+        ; copy eax bytes from @ecx to @esi (clobbers bl)
+        mov     bl,[ecx]
+        mov     [esi],bl
+        inc     ecx
+        inc     esi
+        dec     eax
+        jnz     CopyReadData
+        jmp     Read                    ; read more data
+
+DisplayDataBuffer:
+    ; esi = end of DataBuffer data
+        push    eax
+        push    ebx
+        push    ecx
+        push    edx
+        lea     ebx,[PrintBuffer]
+    ; print BUFFERSIZE values as hexa "nn " string followed by space
+    ; or three "   " spaces in case of no more data in buffer
+        lea     ecx,[DataBuffer]
+        mov     edx,BUFFERSIZE
+PreparePrintBufferHex:
+        cmp     ecx,esi
+        jz      .noMoreData
+        mov     al,[ecx]
+        inc     ecx
+        call    Format_AL_AsHexWithSpaceTo_EBX
+        jmp     .finishLoop
+.noMoreData:
+        mov     [ebx],DWORD '    '
+        add     ebx,3
+.finishLoop:
+        dec     edx
+        jnz     PreparePrintBufferHex
+    ; print divider between hexa and ASCII parts
+        mov     [ebx],WORD '| '
+        add     ebx,2
+    ; print ASCII data (or spaces, when no more data)
+        lea     ecx,[DataBuffer]
+        mov     edx,BUFFERSIZE
+PreparePrintBufferAscii:
+        cmp     ecx,esi
+        mov     al,' '
+        jz      .validAscii     ; no more data
+        mov     al,[ecx]
+        inc     ecx
+        cmp     al,0x7F         ; values 00-1F and 7F-FF are shown as '.'
+        jae     .invalidAscii
+        cmp     al,' '
+        jae     .validAscii
+.invalidAscii:
+        mov     al,'.'
+.validAscii:
+        mov     [ebx],al
+        inc     ebx
+        dec     edx
+        jnz     PreparePrintBufferAscii
+    ; Add new line character at the end of line
+        mov     [ebx],BYTE NEW_LINE
+    ; Output PrintBuffer to screen
+        mov     eax,SYS_WRITE
+        mov     ebx,STDOUT
+        lea     ecx,[PrintBuffer]
+        mov     edx,PRINT_BUFFER_SIZE
+        int     80h
+        pop     edx
+        pop     ecx
+        pop     ebx
+        pop     eax
+        ret
+
+Format_AL_AsHexWithSpaceTo_EBX:
+        push    eax
+        shr     eax,4
+        call    .EAX_nibble
+        pop     eax
+        call    .EAX_nibble
+        mov     [ebx],BYTE ' '
+        inc     ebx
+        ret
+
+.EAX_nibble:
+        and     eax,0x0F
+        mov     al,[HexLUT+eax]
+        mov     [ebx],al
+        inc     ebx
+        ret
+
+Finish:
+        call    DisplayDataBuffer       ; display any incomplete line of data
+        mov     ebx,eax                 ; error code from SYS_READ is exit code
+        mov     eax,SYS_EXIT
+        int     80h
+</code></pre>
+    </div>

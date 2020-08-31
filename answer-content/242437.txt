@@ -1,0 +1,148 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I have rewritten the code you've provided in <code>sheet.py</code>. Whilst it's pretty much an entire rewrite I believe the problems with the code aren't that drastic.</p>
+
+<ol>
+<li><p>Be more scared of <a href="https://en.wikipedia.org/wiki/Side_effect_(computer_science)" rel="nofollow noreferrer">side effects</a> and partially initialized classes.</p>
+
+<p>I feel 'side effect' is a loaded term. If you look it up then you're bound to find <a href="https://en.wikipedia.org/wiki/Functional_programming" rel="nofollow noreferrer">FP</a> zealots saying it's the spawn of Satan. Whilst OOP lovers will say it's FP scaremongering.</p>
+
+<p>Either way your over-reliance on side effects in your code is making my life harder, as determining the state <code>Sheet</code> is in is much harder. Personally I would remove all, bar one, side effects from <code>Sheet</code>.</p></li>
+<li><p>Don't be scared of making small classes.</p>
+
+<p>I feel the largest problem with the code is the lack of a <code>GoogleSession</code> class that interacts with <a href="https://2.python-requests.org/en/master/user/advanced/#session-objects" rel="nofollow noreferrer"><code>requests.Session</code></a>. We can see this problem manifest in <code>errerResilience</code>.</p>
+
+<blockquote>
+  <p>Centralized Error Handling for API Calls. Would ideally
+  be a decorator, however working with different slices and indices
+  (e.g. refreshToken) in return values doesn't make this possible(?)</p>
+</blockquote>
+
+<p>This is not the best design. Instead if you wrap an immutable <code>requests.Session</code> object in your own <code>GoogleSession</code> then you can build a <code>get</code> method that does this on each request. The benefit of doing it at this level is that you have the raw request and so you can just try over and over until it works. Additionally it looks like you're just calling <code>requests.Session</code>. making the calling code have additional functionality almost seamlessly.</p></li>
+<li><p>The functionality <code>Sheet</code> provides would be better as a library.</p>
+
+<p>By only passing <code>GoogleSession</code> to <code>Sheet</code> and removing all side effects you should notice my plan for <code>Sheet</code> is vastly different to what it is right now. By following both of these all methods will need to be passed the sheet's information as arguments.</p>
+
+<p>This makes the code easier to follow as now there are no strange, and needless, side effects when interacting with <code>Sheet</code>. The code is also now ridiculously short.</p></li>
+<li><p>You should follow <a href="https://en.wikipedia.org/wiki/Composition_over_inheritance" rel="nofollow noreferrer">composition over inheritance</a>.</p>
+
+<p>Whilst I think it's dumb to have COI as a principle, I do however agree that for many programmers it's much easier to get composition right. Good use of inheritance is notoriously hard to teach as many bad guides use shapes as an example.</p>
+
+<p>I should note that the rest of my answer has suggested using composition; <code>Sheet</code> uses <code>GoogleSession</code>, where <code>GoogleSession</code> uses <code>requests.Session</code>. I'm also suggesting <code>CustomSheet</code> use <code>Sheet</code> rather than inherit from it.</p></li>
+</ol>
+
+<p>You have some additional problems:</p>
+
+<ul>
+<li>You have too much logging for my taste. If you just log on each request to debug then you don't really need any more.</li>
+<li>Having <code>logger.error</code> followed by a <code>raise Exception</code> just feels wrong to me. Either the exception will be handled in which case you logging it as an error is erroneous, or the exception won't be handled and you'll get the error and a traceback when the program halts.</li>
+<li>Many of the log messages in <code>errorResilience</code> are juvenile.</li>
+</ul>
+
+<p>Below is the changes I made to <code>sheets.py</code>. Unfortunately I do not have the time to review more than just this file. Please think about editing your code to follow some of the changes I made, and potentially post a follow up question.<br>
+<sub><strong>Note</strong>: Untested</sub></p>
+
+<pre class="lang-py prettyprint-override"><code>import requests
+from time import sleep
+from random import randint
+
+from modules.PositionRange import PositionRange
+
+import logging
+logger = logging.getLogger(__name__)
+
+from . import settings
+
+
+class GoogleError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+    def __repr__(self):
+        return f'GoogleError({self.code!r}, {self.message!r})'
+
+    def __str__(self):
+        return f'[{self.code}] {self.message}'
+
+
+class GoogleSession:
+    def __init__(self, session: requests.Session) -&gt; None:
+        self._token = None
+        self.session = session
+
+    def get(self, *args: Any, **kwargs: Any) -&gt; Any:
+        for _ in range(5):
+            if self._token is None:
+                self.update_token(self.get_oauth_token())
+            r = self.session.get(*args, **kwargs)
+            data = r.json()
+            if 'error' not in data:
+                return data
+            error = data['error']
+            self._handle_error(error['code'], error['message'])
+        raise GoogleError(error['code'], error['message'])
+
+    def _handle_error(self, code: int, message: str) -&gt; None:
+        logger.debug(f'[{code}] {message}')
+        if code in (401, 403):
+            self.update_token(self.get_oauth_token())
+        elif code == 429:
+            tsleep = 100 + randint(10, 50)
+            logger.warn(f'API limit exceeded. Auto-recovering by waiting {tsleep}s.')
+            sleep(tsleep)
+        else:
+            raise GoogleError(code, message)
+
+    def get_oauth_token(self) -&gt; str:
+        data = self.get(
+            'https://www.googleapis.com/oauth2/v4/token',
+            headers={
+                'Content-Type': 'application/x-www-form-urlencoded'
+            },
+            data={
+                'client_id': settings.CLIENT_ID,
+                'client_secret': settings.CLIENT_SECRET,
+                'refresh_token': settings.REFRESH_TOKEN,
+                'grant_type': 'refresh_token'
+            },
+        )
+        return data['access_token']
+
+    def update_token(self, token: str) -&gt; None:
+        self._token = token
+        self.session.headers.update({'Authorization': f'Bearer {Sheets.accessToken}'})
+
+
+class SheetHelper:
+    def __init__(self, session: GoogleSession) -&gt; None:
+        self.session = session
+
+    def get_id(self, name: str) -&gt; str:
+        data = self.session.get(
+            'https://www.googleapis.com/drive/v3/files',
+            params={'q': f'name = "{name}"'},
+        )
+        return data['files'][0]['id']
+
+    def get_info(self, id: str) -&gt; dict:
+        return self.session.get(f'https://sheets.googleapis.com/v4/spreadsheets/{id}')
+
+    def get_sheet(self, id: str, name: str, range: PositionRange):
+        return self.session.get(
+            f'https://sheets.googleapis.com/v4/spreadsheets/{id}/values/{requests.utils.quote(name)}{range}'
+        )
+
+    def get(self, name: str, id: Optional[str] = None):
+        if id is None:
+            id = self.getSpreadsheet(name)
+
+        info = self.get_info(id)
+        return (
+            id,
+            name,
+            info['properties']['title'],
+            info['sheets'],
+        )
+</code></pre>
+    </div>

@@ -1,0 +1,151 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>A few things to consider:</p>
+
+<ol>
+<li>Loops in python are very inefficient. To optimize performance, when
+it is possible to vectorize code, you should do so. </li>
+<li>Avoid calculating the same thing multiple times. For example, the term <span class="math-container">$$ cos(\omega_{n,m}t + \phi_{n,m}) $$</span> does not depend on x and y, so there is no need to calculate it during every iteration of the loop.</li>
+<li>The number of calculations you are performing is huge. Nx * Ny * Nt * n_max * m_max is roughly 191 billion iterations, and on each of those iterations, multiple calculations are performed. I am not sure about the reason for using so many points on your x,y,t grid, but for adequate visualization, much fewer are required. If the goal is numerical precision, I would recommend checking out SciPy's interp2D function. What you could do is calculate a smaller number of grid points, and if you need to sample a value that is not on the grid, you can use the 2d interpolation function.</li>
+</ol>
+
+<p>I have altered your code to vectorize it as much as possible. I did not completely vectorize out the loops, because my laptop does not have RAM capacity in the triple digits of gigabytes.</p>
+
+<p>Reducing the number of grid points in the X and Y directions results in a huge speedup, and the resulting plot is shown after the code.</p>
+
+<pre><code>import numpy as np
+
+#Nx = 384
+#Ny = 384
+#Nt = 360
+
+Nx = 38
+Ny = 37
+Nt = 360
+
+#########################################################
+# function to calculate standing wave (original code had error in amp line)
+#########################################################
+def s_wave(lx, ly, xx, yy, tt, pp, max_modes):
+    tot_amp = 0    # Initialize total amplitude to 0
+    Mm      = 1000 # a constant relevant to my problem
+    p_idx   = 0    # The index for accessing the phase noise
+
+    for m in range (0,max_modes):
+        for n in range (0,max_modes):
+            #############################
+            # Calculating Omega
+            #############################
+            omega1 = n*np.pi/(lx*Mm)
+            omega2 = m*np.pi/(ly*Mm)
+
+            omega  = np.sqrt(omega1**2 + omega2**2)
+
+            #############################
+            # Calculating Amplitude
+            #############################
+            amp1   = np.sin(n*np.pi*xx/lx)
+            amp2   = np.sin(m*np.pi*yy/ly)
+            amp3   = np.cos(omega*tt - pp[p_idx])
+
+            amp    = amp1 * amp2 * amp3
+
+            #############################
+            # Update total amplitude
+            #############################
+            tot_amp = tot_amp + amp
+            p_idx   = p_idx + 1
+
+    return tot_amp
+
+def s_wave_opt(lx, ly, xx, yy, tt, pp, max_n, max_m):
+    tot_amp = 0    # Initialize total amplitude to 0
+    Mm      = 1000 # a constant relevant to my problem
+
+    #############################
+    # Initialize total amplitudes at all points to 0
+    #############################
+    A_total = np.zeros([len(xx), len(yy), len(tt)])
+
+    #############################
+    # Calculate omega
+    #############################
+    n,m     = np.mgrid[1:max_n+1:1, 1:max_m+1:1]
+    omega_n = n * np.pi / ( lx * Mm )
+    omega_m = m * np.pi / ( ly * Mm )
+    omega   = np.sqrt(omega_n**2 + omega_m**2)
+
+    #############################
+    # Vactorize calculation of term3
+    #############################
+    term3 = np.multiply.outer(t,omega)
+    term3 = np.add(pp,term3)
+    term3 = np.cos(term3)
+
+    #############################
+    # Calculating A[x,y,:]
+    #############################
+    nr     = np.arange(1,max_n+1)
+    term1  = np.multiply.outer(xx, nr*np.pi/(lx*Mm))
+    term1  = np.sin(term1)
+
+    mr     = np.arange(1,max_m+1)
+    term2  = np.multiply.outer(yy, mr*np.pi/(ly*Mm))
+    term2  = np.sin(term2)
+
+    for y_idx in range(len(yy)):
+        xy  = np.multiply.outer(term1, term2[y_idx])
+        xyt = np.multiply(xy[:,None,:,:],term3[None,:,:,:])
+        tot = np.sum(xyt, axis=(2,3))
+        A_total[:,y_idx,:] = tot
+
+    return A_total
+
+
+# building grid points in x and y direction
+Lx = 6.144 # Length of the Box along each axis
+Ly = 6.144
+T = 10 # delta_T 
+x = np.linspace(-Lx/2, Lx/2, Nx)
+y = np.linspace(-Ly/2, Ly/2, Ny)
+t = np.linspace(0, (Nt-1)*T, Nt)
+
+modes_n = 60
+modes_m = 61
+phase2  = np.random.uniform(0,2*np.pi, [modes_n,modes_m])
+ustand  = s_wave_opt(Lx, Ly, x, y, t, phase2, modes_n, modes_m)
+</code></pre>
+
+<p>The resulting plot was too large to attach as a gif, but attached is a screenshot of one frame:
+<a href="https://i.stack.imgur.com/MVOoL.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/MVOoL.png" alt="One frame of plot"></a></p>
+
+<p>The code to produce the gif plot:</p>
+
+<pre><code>##################################################
+# Plotting the results
+##################################################
+from mpl_toolkits import mplot3d
+import matplotlib.pyplot as plt
+
+import os
+if not os.path.isdir("./images"):
+    os.system("mkdir images")
+
+for i in range(Nt):
+    fig = plt.figure()
+    ax  = plt.axes(projection='3d')
+    X,Y = np.meshgrid(y,x)
+    ax.plot_surface(X, Y, ustand[:,:,i])
+
+    ax.set_xlim3d(x.min(), x.max())
+    ax.set_ylim3d(y.min(), y.max())
+    ax.set_zlim3d(ustand.min(), ustand.max())
+    ax.set_title("Standing Wave at Time {}".format(t[i]))
+    plt.savefig("./images/frame{}.png".format(i))
+    plt.close()
+
+
+os.system("ffmpeg -i ./images/frame%d.png -vf palettegen -y paletter.png &amp;&amp; ffmpeg -framerate 20 -loop 0 -i ./images/frame%d.png -i paletter.png -lavfi paletteuse -y plot.gif")
+</code></pre>
+
+<p>The code runs in about 4 minutes. Roughly 1 minute are the calculations, and the rest is time spent creating the graph.</p>
+    </div>

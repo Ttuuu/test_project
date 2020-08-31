@@ -1,0 +1,98 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>There are some problems with this implementation:</p>
+<ul>
+<li>if both the query in <code>loadData</code> fail, <code>res.status(500).end(err.message)</code> is run twice so you will get an error <code>RESPONSE ALREADY CLOSED</code> that could lead to server crash, and this must be avoided</li>
+<li>you are not using a linter on your code. I can say that because you have the <code>error</code> parameter in the callback, but in the code, you wrote <code>..end(err.message)</code>, so adopt a linter to see these error before they happen in production that would cause a crash of your application since <code>err</code> would be <code>undefined</code></li>
+<li>every request adds in the memory heap the functions <code>loadData</code>, <code>deletePostSchemaReords</code> and <code>deleteCommentRecords</code> causing pressure on the garbage collector and slowing down your endpoints and this can be voided</li>
+<li>a lot of code replicated that must be avoided to have a nice and maintainable endpoint</li>
+<li><code>fs.unlinkSync</code> kills the performance in an API endpoint</li>
+<li><code>deleteCommentRecords()</code> is called for every <code>comments_image_output</code> but this would execute <code>comments_image_output.length</code> times the same query, this is a functional error</li>
+<li>in <code>deleteCommentRecords()</code> a transaction begins and the immediately committed so it is not adding any performance gain: a transaction works best when there are multiple <code>query</code> to execute across multiple tables</li>
+<li>the <code>loadData</code> function is deleting rows from DB, so the name is misbehaviour</li>
+<li>in <code>deletePostSchemaReords</code> there is only a query without the <code>transaction</code> so the rollback is ineffective</li>
+<li>the <code>response</code> object should be managed by one entity otherwise there is too much coupling between general functions (like delete an array of files) and the HTTP protocol</li>
+</ul>
+<p>Here how I would proceed with the refactor.</p>
+<ul>
+<li>I used the callback style (instead of <code>async/await</code>) since you are not using promises</li>
+<li>I assume there is a <code>db</code> and a <code>uploadDir</code> global objects - since are not in the code example</li>
+</ul>
+<pre class="lang-js prettyprint-override"><code>router.delete('/:id', (req, res) =&gt; {
+  loadData(req.params.id, (err, files) =&gt; {
+    if (err) { return res.status(500).end(err.message) }
+
+    // if both query are successful delete from the database
+    deleteAll(req.params.id, (err) =&gt; {
+      if (err) { return res.status(500).end(err.message) }
+
+      res.redirect(303, '/admin/posts') // response to the client first
+
+      // the database deletion is OK, now delete the files quitely
+      const deleteFileArray = files.comment.concat(files.post)
+      deleteFiles(deleteFileArray, (err) =&gt; {
+        if (err) {
+          console.log('ops failed to delete files, but who cares?')
+        }
+      })
+    })
+  })
+})
+
+function loadData (postId, callback) {
+  let runs = 0
+  const output = { comment: null, post: null, error: null }
+
+  db.query('SELECT image FROM commentschema WHERE postID = ?', postId, processQueryResult.bind(null, 'comment', 'image'))
+  db.query('SELECT filename FROM PostSchema WHERE id = ?', postId, processQueryResult.bind(null, 'post', 'filename'))
+
+  // this function will be executed twice an manage only one callback call
+  function processQueryResult (responseType, columnName, error, images) {
+    if (error) {
+      output.error = error
+    } else {
+      output[responseType] = images.map(row =&gt; uploadDir + row[columnName])
+    }
+
+    if (++runs === 2) { // call the callback with the sum of the files to delete
+      callback(output.error, output)
+    }
+  }
+}
+
+function deleteAll (postId, callback) {
+  // Delete PostSchema records
+  db.beginTransaction(function (err) {
+    if (err) return callback(err)
+
+    // Delete comment section records
+    db.query('DELETE FROM commentSchema WHERE PostID = ?', postId, (err) =&gt; {
+      if (err) { return db.rollback(callback.bind(null, err)) }
+
+      db.query('DELETE FROM postschema where id = ?', postId, (err) =&gt; {
+        if (err) { return db.rollback(callback.bind(null, err)) }
+
+        db.commit((err) =&gt; {
+          if (err) { return db.rollback(callback.bind(null, err)) }
+          console.log('Transaction Completed Successfully.')
+          callback()
+        })
+      })
+    })
+  })
+}
+
+function deleteFiles (files, callback) {
+  let i = files.length
+  files.map(function (filepath) {
+    fs.unlink(filepath, function (err) {
+      if (err) {
+        callback(err)
+      } else if (--i &lt;= 0) {
+        callback(null)
+      }
+    })
+  })
+}
+<span class="math-container">```</span>
+</code></pre>
+    </div>

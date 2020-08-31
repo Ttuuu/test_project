@@ -1,0 +1,182 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You should separate the UI from the actual logic of the program.<br>
+Whilst a nice UI is cool I believe that it's impeding your ability to structure your code properly.
+And so I'd recommend making Mail Crypt a Python library first, and a CLI second.</p>
+
+<p>Since this is a library we want:</p>
+
+<ul>
+<li>Any errors raised to pass through to the user.</li>
+<li>No <code>print</code> statements.</li>
+<li>All values to be provided to the method. (not inside the method)</li>
+</ul>
+
+<p>Additionally since <code>load_inbox</code>, <code>delete_email</code> and <code>import_public_key</code> require the same code we can make an <code>Email</code> class to interact with them.</p>
+
+<p>This can get the following code:</p>
+
+<pre class="lang-py prettyprint-override"><code>class MailCrypt:
+    def __init__(self, smtp, imap):
+        self.smtp = smtp
+        self.imap = imap
+
+    def send(self, account, recipient, message):
+        message = encrypt_msg(message.encode(), recipient)
+        self.smtp.sendmail(account, recipient, message)
+
+    def emails(self):
+        self.imap.select('inbox')
+        uids = self.imap.uid('search', None, 'ALL')
+        for uid in data[1][0].split():
+            email = self.imap.uid('fetch', uid, '(RFC822)')
+            yield Email(
+                self.imap,
+                email.message_from_bytes(email[1][0][1]),
+                uid.decode(),
+            )
+
+    def delete_all(self):
+        self.imap.expunge()
+
+    def share_public_key(self, account, recipient):
+        with open('my_public_key.pem', 'r') as f:
+            public_key = f.read()
+        smtp_server_instance.sendmail(account, recipient, public_key)
+
+    def generate_keys(self, passphrase):
+        private_key = RSA.generate(4096)
+        public_key = private_key.publickey()
+
+        with open('my_public_key.pem', 'wb') as fpub, \
+                open('private_key.pem', 'wb') as fpri:
+            fpub.write(public_key.export_key('PEM'))
+            fpri.write(private_key.export_key('PEM', passphrase=passphrase))
+
+
+class Email:
+    def __init__(self, imap, email, uid):
+        self.email = email
+        self.uid = uid
+
+    def read(self):
+        return decrypt_msg(self.email.get_payload(), self.email['From'])
+
+    def delete(self):
+        self.imap.uid('store', self.uid, '+X-GM-LABELS', '(\\Trash)')
+
+    def import_key(self):
+        payload = self.email.get_payload()
+        if 'PUBLIC' in payload:
+            public_key_store(msg['From'], payload)
+</code></pre>
+
+<p>This is, I hope, clearly much easier to read and work with than the code you have.</p>
+
+<p>This doesn't cover all of the functionality that you had before.
+For example I've only written the code to import the key from one email.
+I have also not written the select an email code that you had duplicated over multiple functions.</p>
+
+<p>However to implement these is really quite simple:</p>
+
+<pre class="lang-py prettyprint-override"><code>def import_all(mc):
+    for email in mc.emails():
+        email.import_key()
+
+
+def select_email(mc):
+    emails = {e.uid: e for e in mc.emails()}
+    for email in emails.values():
+        print('UID: {} FROM: {}'.format(email.uid, email.email['From']))
+    uid = input('What email would you like? ')
+    return emails[uid]
+</code></pre>
+
+<p>The public key store should:</p>
+
+<ul>
+<li>Be a class.</li>
+<li>Store the keys in memory.</li>
+<li>Raise an error if the key you're asking for is not in the store.</li>
+</ul>
+
+<pre class="lang-py prettyprint-override"><code>class PublicStore:
+    def __init__(self, location):
+        self._location = location
+        self._keys = self._load()
+
+    def _load(self):
+        try:
+            with open(self._location, 'rb') as f:
+                return pickle.load(f)
+        except FileNotFoundError:
+            return {}
+
+    def store(email, key):
+        self._keys[email] = key
+        with open(self._location, 'wb') as f:
+            pickle.dump(self._keys, f)
+
+    def get(email):
+        return RSA.import_key(self._keys[email])
+</code></pre>
+
+<p>Your encryption and decryption can be improved by:</p>
+
+<ul>
+<li>Moving the personal key into a class.</li>
+<li>Getting the personal and sender keys outside of the encrypt or decrypt functions.</li>
+<li>Removing a lot of unneeded variables.</li>
+<li>You can use a comprehension to build the <code>seperated_msg</code>.</li>
+<li><p>You should let errors propagate. This is not the correct place to handle them.</p>
+
+<p>If you're not a fan of this then you can alternately create another class and handle the verification in one or two of its methods.</p></li>
+</ul>
+
+<pre class="lang-py prettyprint-override"><code>class PersonalKey:
+    def __init__(self, public_location, private_location):
+        self._public_location = public_location
+        self._private_location = private_location
+
+    def get_public(self, passphrase):
+        with open(self._public_location, 'r') as f:
+            return RSA.import_key(f.read(), passphrase=passphrase)
+
+    def get_private(self, passphrase):
+        with open(self._private_location, 'r') as f:
+            return RSA.import_key(f.read(), passphrase=passphrase)
+
+
+def encrypt_msg(message, sender_key, personal_key):
+    aes_cipher = AES.new(get_random_bytes(32), AES.MODE_EAX)
+    aes_cipher_text, tag = aes_cipher.encrypt_and_digest(message)
+    return (
+        aes_cipher_text.hex()
+        + ' ' + tag.hex()
+        + ' ' + aes_cipher.nonce.hex()
+        + ' ' + PKCS1_OAEP.new(sender_key).encrypt(session_key).hex()
+        + ' ' + pss.new(personal_key).sign(SHA512.new(message)).hex()
+    )
+
+
+def decrypt_msg(message, sender_key, personal_key):
+    seperated_msg = [
+        value.encode().fromhex(value)
+        for value in message.split(' ')
+    ]
+    aes_cipher = AES.new(
+        PKCS1_OAEP.new(personal_key).decrypt(seperated_msg[3]),
+        AES.MODE_EAX,
+        nonce=seperated_msg[2],
+    )
+    clear_text = aes_cipher.decrypt(seperated_msg[0])
+    aes_cipher.verify(seperated_msg[1])
+    pss.new(sender_key).verify(SHA512.new(clear_text), seperated_msg[4])
+    return clear_text
+</code></pre>
+
+<p>Unfortunately the answer has consumed enough of my time. The above code my not work, and the changes I made in each section conflict with each-other.</p>
+
+<p>Please can you take the above answer and complete the final steps getting the code to work together. When you're doing this with the above functions you are not allowed to use <code>print</code>, <code>getpass</code> or <code>input</code> in the above. However when, effectively, rebuilding the CLI you can use these functions until your heart's content.</p>
+
+<p>Once you've made your changes please come back and post another question :)</p>
+    </div>

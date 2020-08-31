@@ -1,0 +1,209 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>counting flops</h3>
+
+<p>Let's unpack the inner loop, where all the work is being done. I am repeating the whole thing here, wrapping to 80 columns and adding some indentation to make it easier to read.</p>
+
+<pre><code>double value = sin(phase) *
+        pGain-&gt;GetProcessedVoiceValue(voiceIndex, sampleIndex);
+
+*left++ += value;
+*right++ += value;
+
+// next phase
+phase += BOUNDED(
+        mRadiansPerSample * (
+            bp0 * GetPitchWarped(pPitch-&gt;GetProcessedVoiceValue(voiceIndex,
+                    sampleIndex), pitchMin, pitchRange)
+            + GetOffsetWarped(pOffset-&gt;GetProcessedVoiceValue(voiceIndex,
+                    sampleIndex), offsetMin, offsetRange)
+        ),
+        0, pi
+    );
+
+while (phase &gt;= twopi) { phase -= twopi; }
+
+// . . .
+
+inline double GetOffsetWarped(double normalizedValue, double min, double range)
+{
+    return min + normalizedValue * range;
+}
+inline double GetPitchWarped(double normalizedValue, double min, double range)
+{
+    return exp((min + normalizedValue * range) * ln2per12);
+}
+</code></pre>
+
+<p>Let's see if I've got this straight. This is your program, as I understand it. You have 16 independent oscillators, each with their own time-varying frequency and gain. The frequency is a function of a pitch and an offset frequency. For now, I'll define pitch as separate from frequency (omega) in more or less the same manner you have done, switching to python for brevity: <code>omega = omega_C * 2**(pitch/12)</code>, where <code>omega_C = TAU*440*2**(-2 + 3/12)</code> is the frequency of the C below middle C. So pitch is in semitones and frequency is in rad/s. In numpy terms, you are doing the following for each oscillator:</p>
+
+<pre><code># code sample 0
+
+# Rescale user inputs.
+pitches = pitch_min + pitches_raw*pitch_range
+omega_offsets = omega_offset_min + omega_offsets_raw*omega_offset_range
+gains = gain_min + gains_raw*gain_range
+
+omegas = omega_C * 2**(pitches/12) + omega_offsets
+values = gains*np.sin(phase0 + np.cumsum(omegas)*dt)
+</code></pre>
+
+<p>That is basically the entire program. First, the constants.</p>
+
+<p><code>dt</code> is the time in seconds between samples. <code>dt = 1/sample_rate</code>, <code>sample_rate = 44100</code>. I have written the cumulative sum using this dt to illustrate the direct correspondence to the integral over a time-varying omega that the sum is approximating.</p>
+
+<p><code>phase0</code> is the oscillator's phase at the beginning of the block you are currently processing.</p>
+
+<p><code>gains</code>, <code>pitches</code>, and <code>omega_offsets</code> are three floating point user inputs, gains and pitches possibly being mapped to an after touch MIDI keyboard with a pitch bend and omega_offsets mapped to a sweet MIDI slider, all being sampled at the audio sample rate. They are being represented as numpy vectors, hence the esses. <code>Gains</code> ranges from 0 to 1, <code>pitches</code> ranges from 4 octaves below omega_C to 4 octaves above omega_C, and <code>omega_offsets</code> ranges from -900Hz to 900Hz. (Incidentally, your gain min and max are not being used!) That offset frequency is super weird and kinda cool. That makes no sense from a conventional music theory standpoint. With any offset at all, pitch will no longer match up with octaves. I'd actually like to hear what that sounds like.</p>
+
+<p>You could have made it easier for the reader to figure all that out. If I didn't already have some idea what to look for, I would have been completely lost. You should find a way to get your code to look as much like code sample 0 as possible.</p>
+
+<p>Anyway, how fast <em>should</em> this loop run? How many flops does this loop translate to? Counting the number of operations <em>per sample</em> and using code sample 0 as a guide, I count 5 +s, 7 *s, an exp and a sin. Adding another + for when the 16 voices are added, that's 6 +s. Using <a href="http://www.latkin.org/blog/2014/11/09/a-simple-benchmark-of-various-math-operations/" rel="nofollow noreferrer">this benchmark</a> as a rough guideline, that translates to 6 + 7 + 10 + 15 = 38 flops per sample per voice. Multiplying by 16 voices and 44100 samples per second, that's <strong>27 megaflops</strong>. A 1 GHz processor has a thousand cycles to do just 27 of those calculations. You should be seeing almost zero CPU on your toaster. There's something else going on here.</p>
+
+<p>In fact, there's nothing wrong with your code. It was your benchmark. See the epilogue. But I left all these suggestions here anyway if for some reason you want your code to go even faster.</p>
+
+<h3>small loops</h3>
+
+<p>Your code might be slower than it could be because your inner loop is too big. Loops run fastest when they are as small as possible. This is because the fastest memory your system has—registers—is in extremely limited supply. If your loop is too big, the system runs out of registers and it has to use slower memory to run the loop. You can break up that inner loop into smaller loops—one per line of code in code sample 0 should work OK. In theory, that should make your code run faster. But the compiler is actually able to figure out most of that, since everything is contained in a single file. It is able to inline whatever it wants and reorder execution however it wants, because it knows what every function is actually doing. This idea is closely related to vectorisation.</p>
+
+<h3>vectorising</h3>
+
+<p>You're doing the same operations <code>blockSize</code> times. You should be able to speed that up with simd. The <a href="https://software.intel.com/en-us/mkl-developer-reference-c-v-sin" rel="nofollow noreferrer">Intel MKL has simd-accelerated vectorised sin(), etc.</a> that you can use. Code sample 0 gives you a basic idea of what the vectorised code is going to look like. The MKL docs don't give an example, so I'll give one now. As a reminder, you really don't have to do this. See the epilogue.</p>
+
+<pre><code>#include &lt;mkl.h&gt;
+
+// determines the size of a static array.
+#define SASIZE(sa) (sizeof(sa)/sizeof(*sa))
+
+// . . .
+
+float phases[] = {1.f, 2.f, 3.f, 4.f, 5.f};
+float sin_phases[SASIZE(phases)];
+vsSin(SASIZE(phases), phases, sin_phases);
+// Now, sin_phases[i] = sin(phases[i]). All of the sin()s were computed
+// all at once, about 4 or 8 at a time using simd instructions.
+</code></pre>
+
+<h3>float</h3>
+
+<p>This is all audio data, so you don't need doubles. Floats will work just fine, and they'll be way way faster, especially after you get simd working.</p>
+
+<h3>integral phase</h3>
+
+<p>You can store and manipulate phase using <code>uint32_t</code>s. It is naturally modular with modulus 2**32, so you never need to do any <code>fmod</code>s or subtractions, especially repeated subtractions in a loop.</p>
+
+<pre><code>            while (phase &gt;= twopi) { phase -= twopi; }  // idk about this...
+</code></pre>
+
+<p>That there is some weirdness. The mod 2**32 happens automatically when converting from float, adding, subtracting, whatever, so it should be a lot faster and a lot more accurate. You should only convert back to float phase before a sin operation or something like that. Here's an example. I also included an example of how to do the same modulo operation in all floating point numbers.</p>
+
+<pre><code>#include &lt;cstdio&gt;  // Hey, I like *printf().
+#include &lt;cinttypes&gt;
+
+// These are actually templated C++ math functions. The c doesn't
+// stand for C, I guess...
+#include &lt;cmath&gt;
+
+using namespace std;
+
+#define TAU 6.283185307179586
+
+
+// fmodf, but always rounding toward negative infinity.
+// The output will always be in [0, y). This is not the case
+// with fmod(). See man fmod.
+float fmodf_rd(float x, float y)
+{
+    float r = fmod(x, y);
+    return r &lt; 0.f? r + y : r;
+}
+uint32_t integral_phase(float phi)
+{
+    return phi / (float)TAU * 0x1p32f;
+}
+float float_phase(uint32_t phi_i)
+{
+    return (float)phi_i * (float)TAU * 0x1p-32f;
+}
+
+int main(int argc, const char *argv[])
+{
+    // Phases, in radians.
+    float alpha = TAU/12., beta = atan(2.f);
+    uint32_t alpha_i = integral_phase(alpha), beta_i = integral_phase(beta);
+
+    // Phase calculations in radians and floating point:
+    float gamma = fmodf_rd(5.f*alpha - 7.f*beta, (float)TAU);
+    // The same phase calculation in integral phase. Note there is no
+    // mod operation at all.
+    uint32_t gamma_i = 5*alpha_i - 7*beta_i;
+
+
+    printf("difference = %.9g\n", (double)(float_phase(gamma_i) - gamma));
+    return 0;
+}
+</code></pre>
+
+<h3>Epilogue: An M. Night Shyamalan twist.</h3>
+
+<p>This has been bothering me enough that I finally ran your code. You were saying you were getting slow results, but your code, though a little funky, did not look particularly slow actually. So I assumed it was something wrong with your benchmark. I nuked the C++ <code>chrono</code> badness and replaced it with <code>dtime(),</code> a wrapper I wrote around <code>clock_gettime()</code>. <code>dtime()</code> returns the current value of <code>CLOCK_MONOTONIC</code> in seconds as a double. I also redid the benchmark math, outputting the performance in terms of %CPU. This is the diff:</p>
+
+<pre><code>--- mod.cpp-    2018-11-20 03:19:11.091296221 -0500
++++ mod.cpp 2018-11-20 03:39:39.529689861 -0500
+@@ -1,7 +1,21 @@
+-#include &lt;iostream&gt;
++#include &lt;stdio.h&gt;
++#include &lt;time.h&gt;
++#include &lt;assert.h&gt;
++
+ #include &lt;cstring&gt;
+ #include &lt;cmath&gt;
+-#include &lt;chrono&gt;
++
++double timespec_to_d(struct timespec *ts)
++{
++    return (double)ts-&gt;tv_sec + 1e-9*(double)ts-&gt;tv_nsec;
++}
++double dtime(void)
++{
++    struct timespec ts;
++    int res = clock_gettime(CLOCK_MONOTONIC, &amp;ts);
++    assert(res == 0);
++    return timespec_to_d(&amp;ts);
++}
+
+ const int voiceSize = 16;
+ const int bufferSize = 256;
+@@ -154,7 +168,7 @@
+     // audio host call
+     int numProcessing = 1024 * 50;
+     int counterProcessing = 0;
+-    std::chrono::high_resolution_clock::time_point pStart = std::chrono::high_resolution_clock::now();
++    double t0 = dtime();
+     while (counterProcessing++ &lt; numProcessing) {
+         int blockSize = 256;
+         myPlugin.ProcessDoubleReplace(blockSize, bufferLeft, bufferRight);
+@@ -162,6 +176,8 @@
+         // do somethings with buffer
+
+     }
+-    std::chrono::high_resolution_clock::time_point pEnd = std::chrono::high_resolution_clock::now();
+-    std::cout &lt;&lt; "execution time: " &lt;&lt; std::chrono::duration_cast&lt;std::chrono::milliseconds&gt;(pEnd - pStart).count() &lt;&lt; " ms" &lt;&lt; std::endl;
++    double dt_busy = (dtime() - t0)/numProcessing/bufferSize,
++           dt_total = 1./sampleRate;
++    printf("CPU = %.6g %%\n", dt_busy/dt_total);
++    return 0;
+ }
+</code></pre>
+
+<p><code>dt_busy</code> is the total amount of time your code takes to process a single sample. <code>dt_total</code>, the time between samples, is the total amount of time your code has to process a single sample. Divide the two and you predict %CPU usage while your DLL is running.</p>
+
+<p><em>aaaaaaand</em> this is the output:</p>
+
+<pre><code>% g++ -o mod mod.cpp
+% ./mod                 
+CPU = 0.105791 %
+% 
+</code></pre>
+
+<p>When running as a plugin with realtime user input streams, your code will use .1% CPU. It was your benchmark the entire time.</p>
+    </div>

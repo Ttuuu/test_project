@@ -1,0 +1,157 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First of all, your code produces a <em>lot</em> of warnings and errors on Clang. I recommend trying to compile your code with at least two compilers, especially in cases like this where it's small enough to just cut-and-paste into <a href="https://godbolt.org/z/3_Cr6X" rel="nofollow noreferrer">Godbolt Compiler Explorer</a>.</p>
+
+<p>The only immediately fatal error in your <code>.h</code> file is that you declared <code>struct Node</code> public, and then re-declared it as private later. You can't do that. Just make the forward-declaration also private; or even better, make the first declaration the <em>only</em> declaration.</p>
+
+<p>In your test file, you write</p>
+
+<pre><code>const std::uniform_int_distribution&lt;std::mt19937::result_type&gt; dist // ...
+</code></pre>
+
+<p>A <code>const</code> distribution won't do you any good! The <code>operator()</code> of all standard distributions is non-const-qualified (because they have internal state that the <code>operator()</code> needs to modify). Remove the <code>const</code>. Besides, <a href="https://quuxplusone.github.io/blog/2019/01/03/const-is-a-contract/" rel="nofollow noreferrer"><code>const</code> is a contract</a>, and in this case you're making a contract between yourself and... yourself! (And making an contract between yourself and <code>operator()</code> which <code>operator()</code> then tries to violate, which is why you get a compiler error in the first place.)</p>
+
+<pre><code>template&lt;class K, class M&gt;
+inline BSTree&lt;K, M&gt;::BSTree(std::size_t size,
+    const key_compare fn) : comp(fn), value_comp(fn)
+</code></pre>
+
+<p>All compilers will warn about this mistake: you've said "initialize <code>comp</code> to this and <code>value_comp</code> to that," but in fact what will happen at runtime is "initialize <code>value_comp</code> to this and <code>comp</code> to that," because the data members are declared in the latter order.</p>
+
+<pre><code>template&lt;class K&gt;
+bool myfunc2(const K&amp; a, const K&amp; b) noexcept {
+    const bool ret = std::less&lt;K&gt;::less()(a, b);
+    return ret;
+}
+</code></pre>
+
+<p>The compiler won't be able to compile this, because it has no way of knowing (at parse time) that <code>std::less&lt;K&gt;::less</code> is a type name and not a variable name. It'll assume it's a variable name, so that <code>std::less&lt;K&gt;::less()</code> is a function call... and then at template-instantiation time, it'll discover that it's a constructor call instead, and it'll fail. You need the keyword <code>typename</code> in there to tell the parser what to expect.</p>
+
+<p>Separately, don't write two lines when one will do.</p>
+
+<pre><code>    return typename std::less&lt;K&gt;::less()(a, b);
+</code></pre>
+
+<p>(Flabbergastingly, Clang trunk will <em>also</em> issue a warning on the above line <s><em>even though it is the only correct way to write the code.</em></s> (Clang will issue an error if you omit the <code>typename</code> keyword.) I'll raise this bug on the bug tracker.)</p>
+
+<blockquote>
+  <p>EDIT: Aha! Clang's diagnostic failed to enlighten me, but the actual problem here was simply that you meant <code>return std::less&lt;K&gt;()(a, b);</code>. That extra <code>::less</code> shouldn't have been there at all. Yeesh. Filed <a href="https://bugs.llvm.org/show_bug.cgi?id=43733" rel="nofollow noreferrer">https://bugs.llvm.org/show_bug.cgi?id=43733</a> for the unhelpful diagnostic.</p>
+</blockquote>
+
+<hr>
+
+<p>For your tests, you can use a testing framework such as GTest (the old standby, easy to install from any package manager) or newer things like Catch2. In GTest, your first couple of test cases would look like this:</p>
+
+<pre><code>cat &gt;tests.cc &lt;&lt;EOF
+#include "bst.h"
+#include &lt;algorithm&gt;
+#include &lt;gtest/gtest.h&gt;
+
+TEST(BSTree, FirstTest)
+{
+    BSTree&lt;int&gt; bt(20000);
+    auto [it, good] = bt.insert(5,'a');
+    EXPECT_TRUE(good);
+
+    std::tie(it, good) = bt.insert(2,'b');
+    EXPECT_TRUE(good);
+
+    std::tie(it, good) = bt.insert(21,'c');
+    EXPECT_TRUE(good);
+
+    std::pair&lt;int, char&gt; expected[] = {{2,'b'}, {5,'a'}, {21,'c'}};
+    EXPECT_TRUE(std::equal(bt.begin(), bt.end(), expected, expected+3));
+}
+
+TEST(BSTree, SecondTest)
+{
+    BSTree&lt;int&gt; bt = {{2,'b'}, {5,'a'}, {21,'c'}};
+    EXPECT_EQ(bt.erase(5), 1);
+    EXPECT_EQ(bt.erase(5), 0);
+}
+EOF
+$ g++ tests.cc -std=c++17 -lgtest_main -lgtest
+$ ./a.out
+Running main from googletest/src/gtest_main.cc
+[==========] Running 2 tests from 1 test suite.
+[----------] Global test environment set-up.
+[----------] 2 tests from BSTree
+[ RUN      ] BSTree.FirstTest
+[       OK ] BSTree.FirstTest (0 ms)
+[ RUN      ] BSTree.SecondTest
+[       OK ] BSTree.SecondTest (1 ms)
+[----------] 2 tests from BSTree (1 ms total)
+
+[----------] Global test environment tear-down
+[==========] 2 tests from 1 test suite ran. (1 ms total)
+[  PASSED  ] 2 tests.
+</code></pre>
+
+<hr>
+
+<p>Actually, I lied. This line</p>
+
+<pre><code>BSTree&lt;int&gt; bt = {{2,'b'}, {5,'a'}, {21,'c'}};
+</code></pre>
+
+<p>ought to work, but you didn't write an <code>initializer_list</code> constructor, so instead, I have to write something like</p>
+
+<pre><code>BSTree&lt;int&gt; bt;
+bt.insert({{2,'b'}, {5,'a'}, {21,'c'}});
+</code></pre>
+
+<hr>
+
+<p>It's weird that you have a constructor taking <code>size_t size</code>, like <code>vector</code>, but that constructor doesn't initialize the container with <code>size</code> elements. And that constructor needs to be <code>explicit</code>, btw! Otherwise</p>
+
+<pre><code>BSTree&lt;int&gt; bt = 42;
+</code></pre>
+
+<p>works, and you don't want that.</p>
+
+<hr>
+
+<p>It's very weird to me that the <code>value_type</code> of <code>BSTree&lt;int&gt;</code> is <code>std::pair&lt;int, char&gt;</code> — where on earth did that <code>char</code> come from??  Imagine if the standard <code>std::map</code> had a defaulted <code>mapped_type</code> parameter. That would be crazy, right? So why is it a good idea for <code>BSTree</code>? (And why can't I just make a binary search tree of <code>int</code>s in the first place — why <em>must</em> I attach a <code>char</code> payload to every node?)</p>
+
+<hr>
+
+<p>Your <code>iterator</code> type is broken (and thus won't work with any of the standard algorithms) because it fails to provide <code>using difference_type = std::ptrdiff_t;</code>. This is one of the five member typedefs that every iterator type <em>must</em> provide. If you'd tested your iterators you'd have seen that they didn't work with the STL.</p>
+
+<hr>
+
+<p>It's also weird that you provide different types for <code>iterator</code> and <code>const_iterator</code> but <em>not</em> different types for <code>iterator</code> and <code>reverse_iterator</code>. Each of your iterators is paying for an extra bool of storage, just so that you can use the same static type for forward and backward iteration?  Do you have some special motivation why you used this technique?</p>
+
+<p>The usual technique would be something like this:</p>
+
+<pre><code>using reverse_iterator = std::reverse_iterator&lt;iterator&gt;;
+using const_reverse_iterator = std::reverse_iterator&lt;const_iterator&gt;;
+reverse_iterator rbegin() { return reverse_iterator(end()); }
+const_reverse_iterator rbegin() const { return const_reverse_iterator(end()); }
+const_reverse_iterator crbegin() const { return rbegin(); }
+</code></pre>
+
+<hr>
+
+<pre><code>if (index_ == out_of_range) {
+    std::stringstream ss;
+    ss &lt;&lt; "\nOut Of Range: operator++\n";
+    throw std::out_of_range(ss.str());
+}
+</code></pre>
+
+<p>First, please don't use global variables. (You have four of these global <code>constexpr</code> variables. They have four distinct values, almost like an enumeration... but it's unclear if that's actually important to the code.) If you must use globals, at least don't name them the same thing as standard exception <em>types</em>. And finally, don't write three lines when one would do.</p>
+
+<pre><code>if (index_ == 0) {  // what's special about this index??
+    throw std::out_of_range("Out Of Range: operator++");
+}
+</code></pre>
+
+<p>Notice that I've removed the excess newlines in your <code>e.what()</code> string. What-strings traditionally don't have any "formatting"; they're just simple strings that the client programmer can wrap in formatting if he wants to.</p>
+
+<pre><code>std::cout &lt;&lt; "error: " &lt;&lt; e.what() &lt;&lt; "\n";
+    // this would look weird if e.what() also had embedded newlines
+</code></pre>
+
+<hr>
+
+<p>That's all for now... but if you fix all the compiler warnings and errors, and write some good tests and run them (You don't even have to upload the tests! But write them and run them and fix the bugs they find!), and re-upload the code as a new question, I'll probably be back to look at the actual data structure.</p>
+    </div>

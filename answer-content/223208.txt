@@ -1,0 +1,162 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The most important advice I can offer is to turn on <code>strictNullChecks</code> and <code>noImplicitAny</code>. Without these settings, TypeScript's ability to warn you about problems in your code is severely limited.</p>
+
+<p>Doing this first, TypeScript reveals several problems (Ignoring errors from your tests, you just need a <code>!</code> assertion):</p>
+
+<pre><code>test.ts:19:21 - error TS2345: Argument of type 'undefined' is not assignable to parameter of type 'never'.
+
+19     this.stack.push(executor);
+                       ~~~~~~~~
+
+test.ts:24:11 - error TS2322: Type 'undefined' is not assignable to type '() =&gt; Promise&lt;string&gt;'.
+
+24     const op: () =&gt; Promise&lt;string&gt; = this.stack.shift();
+             ~~
+</code></pre>
+
+<p>None of these errors are particularly difficult to fix. First, we need to define the type of <code>stack</code>. Right now, as it is assigned <code>[]</code>, the inferred type is <code>[]</code> (an empty tuple). If we look at the type of functions added to it in <code>add</code>, we see that a function of type <code>() =&gt; void</code> is added, so declare that.</p>
+
+<pre><code>class RequestThrottle {
+  stack: (() =&gt; void)[] = [];
+</code></pre>
+
+<p>This change will change the reported errors slightly, giving us more useful error messages.</p>
+
+<pre><code>test.ts:19:21 - error TS2345: Argument of type 'undefined' is not assignable to parameter of type '() =&gt; void'.
+
+19     this.stack.push(executor);
+                       ~~~~~~~~
+
+test.ts:24:11 - error TS2322: Type '(() =&gt; void) | undefined' is not assignable to type '() =&gt; Promise&lt;string&gt;'.
+  Type 'undefined' is not assignable to type '() =&gt; Promise&lt;string&gt;'.
+
+24     const op: () =&gt; Promise&lt;string&gt; = this.stack.shift();
+             ~~
+</code></pre>
+
+<p>The next problem is caused by <code>let executor;</code>. Since no type has been declared, TypeScript will implicitly type the variable as <code>any</code>. You <em>could</em> fix this by typing <code>executor</code> as <code>(() =&gt; void) | undefined</code> and then asserting that it has been set after executing the promise, but it is simpler to just add the function to <code>stack</code> within the promise.</p>
+
+<p>At the same time, declaring the <code>add</code> function as a property instead of an arrow function on the class (like you did with <code>pullAndExecute</code>) is kind of weird. I'd prefer this style:</p>
+
+<pre><code>class RequestThrottle {
+  stack: (() =&gt; void)[] = [];
+  spacing = 1000;
+
+  add = (req: () =&gt; Promise&lt;string&gt;): Promise&lt;string&gt; =&gt; {
+    return new Promise&lt;string&gt;((resolve) =&gt; {
+      this.stack.push(() =&gt; {
+        resolve(req());
+      });
+    });
+  };
+</code></pre>
+
+<p>This resolves the first issue, the second issue can be easily resolved by dropping the erroneous <code>Promise&lt;string&gt;</code> type on <code>op</code> in the <code>pullAndExecute</code> function.</p>
+
+<pre><code>class RequestThrottle {
+  stack: (() =&gt; void)[] = [];
+  spacing = 1000;
+
+  add = (req: () =&gt; Promise&lt;string&gt;): Promise&lt;string&gt; =&gt; {
+    return new Promise&lt;string&gt;((resolve) =&gt; {
+      this.stack.push(() =&gt; {
+        resolve(req());
+      });
+    });
+  };
+
+  pullAndExecute = () =&gt; {
+    const op = this.stack.shift();
+    if (op) op();
+  };
+
+  interval = setInterval(this.pullAndExecute, this.spacing);
+
+  stop = () =&gt; clearInterval(this.interval);
+}
+</code></pre>
+
+<p>Next we must consider the access level of each member. <code>add</code> should obviously be public. Similarly, it makes sense for <code>stop</code> to be public. But <code>stack</code>, <code>spacing</code>, <code>interval</code> and <code>pullAndExecute</code> are all implementation details. Users of this class shouldn't need to care (or even know) that they exist. They should all be marked as <code>private</code>.</p>
+
+<p>Despite this... users might want to be able to specify <code>spacing</code> when using the class. There are two ways to meet this need. Either let the user specify it in the constructor, or add a <code>start</code> method that starts the interval. I prefer the <code>start</code> solution.</p>
+
+<pre><code>class RequestThrottle {
+  private stack: (() =&gt; void)[] = [];
+  private interval = 0;
+
+  add = (req: () =&gt; Promise&lt;string&gt;): Promise&lt;string&gt; =&gt; {
+    return new Promise&lt;string&gt;((resolve) =&gt; {
+      this.stack.push(() =&gt; {
+        resolve(req());
+      });
+    });
+  };
+
+  private pullAndExecute = () =&gt; {
+    const op = this.stack.shift();
+    if (op) op();
+  };
+
+  start = (spacing = 1000) =&gt; {
+    this.stop();
+    this.interval = setInterval(this.pullAndExecute, spacing);
+  };
+
+  stop = () =&gt; clearInterval(this.interval);
+}
+</code></pre>
+
+<p>Note that in the <code>start</code> method I call <code>stop</code> first. This is to ensure that we don't have multiple <code>queue</code> consuming clocks running at once.</p>
+
+<p>Now, you mentioned that you wanted this class to work with a <code>Promise&lt;R&gt;</code>. As written, it will only let you use <code>Promise&lt;string&gt;</code>. Thankfully, this is a trivial fix, we just need to make the <code>add</code> method generic.</p>
+
+<pre><code>  add = &lt;R&gt;(req: () =&gt; Promise&lt;R&gt;): Promise&lt;R&gt; =&gt; {
+    return new Promise&lt;R&gt;((resolve) =&gt; {
+      this.stack.push(() =&gt; {
+        resolve(req());
+      });
+    });
+  };
+</code></pre>
+
+<p>With all these changes together, the class becomes:</p>
+
+<pre><code>class RequestThrottle {
+  private stack: (() =&gt; void)[] = [];
+  private interval = 0;
+
+  add = &lt;R&gt;(req: () =&gt; Promise&lt;R&gt;): Promise&lt;R&gt; =&gt; {
+    return new Promise&lt;R&gt;((resolve) =&gt; {
+      this.stack.push(() =&gt; {
+        resolve(req());
+      });
+    });
+  };
+
+  start = (spacing = 1000) =&gt; {
+    this.stop();
+    this.interval = setInterval(this.pullAndExecute, spacing);
+  };
+
+  stop = () =&gt; clearInterval(this.interval);
+
+  private pullAndExecute = () =&gt; {
+    const op = this.stack.shift();
+    if (op) op();
+  };
+}
+</code></pre>
+
+<p>A couple other notes:</p>
+
+<ol>
+<li><p>Don't use <code>for .. in</code> to iterate over arrays. Use <code>for .. of</code> instead.</p>
+
+<pre><code>for (const i of [1, 2, 3, 4, 5, 6]) {
+  throttle.add(enqueue(i)).then(console.log);
+}
+</code></pre></li>
+<li><p>Don't make promises that can never be resolved or rejected. In <code>addChild</code>, the promise will never be resolved.</p></li>
+<li><p>Should <code>RequestThrottle</code> throttle based on promise starts or promise resolves? Currently it throttles based on the initial call of a function... but if that function takes more than <code>spacing</code> to resolve, you could have multiple promises waiting at once. This might be desired, but it is something to consider.</p></li>
+</ol>
+    </div>

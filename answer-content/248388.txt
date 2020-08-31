@@ -1,0 +1,48 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Using types to represent both successful results and error scenarios is generally a very good move, and F# certainly makes it easier to do this than other languages. As I think you've found though, it can get quite complicated as the number of scenarios grows! You're on the right track, but I'm going to suggest one thing you can do to simplify the approach and make it clearer in a couple of places.</p>
+<p>As you've identified, there are a couple of branches of code that in theory should not happen:</p>
+<ol>
+<li>The command is not valid but we still end up writing events to the store.</li>
+<li>The command is valid and produces events but we do not attempt to write anything to the store.</li>
+</ol>
+<p>These "impossible" branches stem from the <code>handleCore</code> function, from which we're returning a value that represents more options than are theoretically possible. To put it another way, the knowledge about what can actually happen inside this function is not being captured in its return type. We can tidy things up a great deal by defining the return value from the command handlers in a more formal way. I'll focus on the validating command handler since it's the more complex of the two:</p>
+<pre><code>type CommandHandlerResult =
+    /// The command was not valid or could not be applied to the existing state.
+    | CommandValidationFailed of error:ValidationError
+    /// The command was applied successfully to the existing state, producing
+    /// zero or more events and a new state.
+    | CommandApplied of newEvents:Event list * newState:State
+    /// The command was valid, but there was an error when writing new events to the store.
+    | FailedToWriteEvents of error:WriteError
+</code></pre>
+<p>This is obviously fairly verbose, but that's kind of the point, because their intent is now much clearer than the nested combinations of Ok/Error/Some/None, which ultimately gave us more flexibility than we wanted or needed. This already should make some difference to the readability of the <code>handleCore</code> function:</p>
+<pre><code>let handleCore =
+    async {
+        // ...
+        match decide commandMessage.Command historyState with
+        | Error error -&gt; return CommandValidationFailed error
+        // Command was applied, but no change was required, so no need to
+        // write any events because there are none!
+        | Ok [] -&gt; return CommandApplied ([], historyState)
+        | Ok newEvents -&gt;
+            // Attempt to write the new events to the store.
+            let! writeResult =
+                CommandHandlerUtils.saveEvents tryWriteEvents historyEventReads newEvents streamKey
+            match writeResult with
+            | Error error -&gt; return StateUpdateFailed error
+            | Ok _ -&gt;
+                let newState = build historyState events
+                return CommandApplied (newEvents, newState)
+    }
+</code></pre>
+<p>Note that the return value from the <code>decide</code> function is no longer passed through as part of the <code>handleCore</code> result, we've instead transformed it completely into a <code>CommandHandlerResult</code> and have therefore captured the outcome of <code>handleCore</code> much more clearly. The real improvement in readability comes when handling the result of <code>handleCore</code> in the <code>acceptOutcome</code> function:</p>
+<pre><code>let acceptOutcome last _ (commandHandlerResult: CommandHandlerResult) =
+    match commandHandlerResult with
+    | CommandValidationFailed error -&gt; error |&gt; Error |&gt; Return
+    | CommandApplied (events, state) -&gt; (events, state) |&gt; Ok |&gt; Return
+    | FailedToWriteEvents (UnexpectedStreamVersion _) when not last -&gt; TryAgain
+    | FailedToWriteEvents writeError -&gt; writeError |&gt; WriteEventsException |&gt; raise
+</code></pre>
+<p>In my opinion this is now much easier to understand. There are no "impossible" routes and you don't really need to know a great deal about what the command handler is doing because the outcome is encoded in a very descriptive way by its return type.</p>
+<p>Generally speaking, defining return types as discriminated unions can be a great way to deal with complex error/failure scenarios where <code>Option&lt;'T&gt;</code> or <code>Result&lt;'T, 'TFailure&gt;</code> are not quite flexible or descriptive enough.</p>
+    </div>

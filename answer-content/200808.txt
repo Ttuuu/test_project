@@ -1,0 +1,74 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Since you are using Python &gt;= 3.5, you sould use <a href="https://docs.python.org/3/library/subprocess.html#subprocess.run" rel="nofollow noreferrer"><code>subprocess.run</code></a> that superseeds the <a href="https://docs.python.org/3/library/subprocess.html#call-function-trio" rel="nofollow noreferrer">older high-level API</a>. Doing so, you would be able to use the <code>env</code> keyword to provide the new environment for the child process; letting you get rid of the <code>_Env</code> class completely:</p>
+
+<pre><code>def send(user, args):
+    """Sends a notification to the respective user."""
+
+    uid = _getuid(user)
+    env = os.environ.copy()
+    env[_DBUS_ENV_VAR] = _DBUS_ENV_PATH.format(uid)
+    command = (_NOTIFY_SEND,) + tuple(args)
+
+    if fork() == 0:
+        setuid(uid)
+
+        exit_code = subprocess.run(command, env=env).returncode
+        _exit(exit_code)
+
+    _, returncode = wait()
+    return returncode
+</code></pre>
+
+<p>However manually forking to call <code>setuid</code> doesn't feel quite right either; especially since subprocess will fork itself. And I don't talk about the way the child return code is returned to the caller… There have to be something easier.</p>
+
+<p>The <a href="https://docs.python.org/3/library/subprocess.html#subprocess.Popen" rel="nofollow noreferrer"><code>Popen</code></a> constructor exposes a <code>preexec_fn</code> parameter that will do exactly that: after the <code>fork</code> and before the child <code>exec</code>, <code>preexec_fn</code> will by called by the child process. Let's put that to good use:</p>
+
+<pre><code>def send(user, args):
+    """Sends a notification to the respective user."""
+
+    uid = _getuid(user)
+    env = os.environ.copy()
+    env[_DBUS_ENV_VAR] = _DBUS_ENV_PATH.format(uid)
+    command = (_NOTIFY_SEND,) + tuple(args)
+
+    proc = subprocess.Popen(command, env=env, preexec_fn=lambda: setuid(uid))
+    return proc.wait()
+</code></pre>
+
+<p>Lastly, you can build the <code>command</code> by unpacking the generator directly rather than combining tuples:</p>
+
+<pre><code>def send(user, args):
+    """Sends a notification to the respective user."""
+
+    uid = _getuid(user)
+    env = os.environ.copy()
+    env[_DBUS_ENV_VAR] = _DBUS_ENV_PATH.format(uid)
+    command = (_NOTIFY_SEND, *args)
+
+    proc = subprocess.Popen(command, env=env, preexec_fn=lambda: setuid(uid))
+    return proc.wait()
+</code></pre>
+
+<p>However, since <code>send</code> is called in a <code>for</code> loop with exactly the same <code>args</code> each time, it might be a good idea to unroll that call to avoid duplicated work:</p>
+
+<pre><code>def broadcast(args, uids=_UIDS):
+    """Sends the respective message to all
+    users with an active DBUS session.
+    """
+
+    returncode = 0
+    env = os.environ.copy()
+    command = (_NOTIFY_SEND, *args)
+
+    for path in _RUN_USER.glob(_DBUS_BUS_GLOB):
+        uid = int(path.parent.name)
+
+        if uid in uids:
+            env[_DBUS_ENV_VAR] = _DBUS_ENV_PATH.format(uid)
+
+            proc = subprocess.Popen(command, env=env, preexec_fn=lambda: setuid(uid))
+            returncode += proc.wait()
+
+    return returncode
+</code></pre>
+    </div>

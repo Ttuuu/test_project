@@ -1,0 +1,210 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<ul>
+<li><p><code>ID</code> as a <code>string</code> is weird. I expect to see an <code>int</code> here to benefit of the auto increment feature.</p></li>
+<li><p>your <code>delete</code> handler is weak. Suppose the GET <code>ID</code> parameter is set to a non existing <code>ID</code> value, the read operation will fail but the value of the <code>ID</code> property of the <code>student</code> variable will be an empty string. The next <code>delete</code> statement will delete the row with <code>ID==""</code>, which might exists and be a valid. The problem also exists for an <code>integer</code> <code>PK</code> where <code>ID=0</code>. You must check <strong>all</strong> errors.</p></li>
+<li><p>the <code>update</code> handler has a similar problem, and it is not acceptable for as long as the api provides both <code>add</code> and <code>update</code> as different operations. Usually an <code>update</code> operation requires to check against a couple <code>PK+LastUpdateDate</code> to ensure acid transactions from <code>UI</code> POV. So, you might try to load the entity from the db, at the cost of an extra read. Or update with clauses. The latter might be done automatically by the db framework, this is unclear without a better knowledge of its internal.</p></li>
+<li><p>the <code>getAllStudents</code> handler is a ddos. Obviously that always depends of the db size, but for a production system there must not exist any handler that loads the entire db in memory. So add <code>Limit/Offset</code> parameters, check they are valid and apply them to the query.</p></li>
+<li><p>overall your code has too many level of indentations. You should practice the <code>early return</code> pattern to improve its clarity.</p></li>
+</ul>
+
+<p>Here is an updated version of the code, so the reader can evaluate the <code>return early</code> pattern and appreciate various modifications as explained before.</p>
+
+<ul>
+<li>Care was taken to demonstrate a proper startup/shutdown sequence to prevent connections misshandling.</li>
+<li><code>http.Server</code> is moved out so the handler is mountable onto alternatives http server implementation (httptest.*)</li>
+<li>the db engine is switched to sqlite for demonstration</li>
+<li>OP was missing the pgsql driver blank import</li>
+</ul>
+
+<p>here is the code (it is still missing proper test suite!)</p>
+
+<pre><code>package main
+
+import (
+    "context"
+    "encoding/json"
+    "errors"
+    "fmt"
+    "log"
+    "net/http"
+    "os"
+    "os/signal"
+    "strconv"
+    "time"
+
+    "github.com/gorilla/mux"
+    "github.com/jinzhu/gorm"
+    _ "github.com/jinzhu/gorm/dialects/sqlite"
+)
+
+type student struct {
+    ID   string `gorm:"primary_key" json:"id"`
+    Name string `json:"name"`
+    Age  int    `json:"age"`
+
+    // http://gorm.io/docs/conventions.html
+    // gorm.Model is a basic GoLang struct which includes the following fields: ID, CreatedAt, UpdatedAt, DeletedAt.
+    CreatedAt time.Time
+    UpdatedAt time.Time
+    DeletedAt *time.Time
+}
+
+type App struct {
+    DB *gorm.DB
+}
+
+func (a *App) Handler() http.Handler {
+    r := mux.NewRouter()
+    r.HandleFunc("/students", a.getAllStudents).Methods("GET")
+    r.HandleFunc("/students", a.addStudent).Methods("POST")
+    r.HandleFunc("/students/{id}", a.updateStudent).Methods("PUT")
+    r.HandleFunc("/students/{id}", a.deleteStudent).Methods("DELETE")
+    return r
+}
+
+func (a *App) Open() error {
+    db, err := gorm.Open("sqlite3", ":memory:")
+    if err != nil {
+        return err
+    }
+    a.DB = db
+    return db.AutoMigrate(&amp;student{}).Error
+}
+
+func (a *App) Close() error {
+    return a.DB.Close()
+}
+
+func (a *App) getAllStudents(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    // see also a struct decoder to transform get params as struct.
+    // https://github.com/gorilla/schema
+    var offset, limit int
+    {
+        y := r.URL.Query().Get("Limit")
+        if y != "" {
+            x, err := strconv.Atoi(y)
+            if err != nil {
+                sendErr(w, fmt.Errorf("Limit argument, %v", err), http.StatusBadRequest)
+                return
+            }
+            limit = x
+        }
+        y = r.URL.Query().Get("Offset")
+        if y != "" {
+            x, err := strconv.Atoi(y)
+            if err != nil {
+                sendErr(w, fmt.Errorf("Offset argument, %v", err), http.StatusBadRequest)
+                return
+            }
+            offset = x
+        }
+    }
+    if limit &lt; 0 || limit &gt; 30 {
+        limit = 30
+    }
+    var all []student
+    err := a.DB.Find(&amp;all).Limit(limit).Offset(offset).Error
+    if err != nil {
+        sendErr(w, err, http.StatusInternalServerError)
+        return
+    }
+    json.NewEncoder(w).Encode(all)
+}
+
+func (a *App) addStudent(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    s := student{}
+    err := json.NewDecoder(r.Body).Decode(&amp;s)
+    if err != nil {
+        sendErr(w, err, http.StatusBadRequest)
+        return
+    }
+    err = a.DB.Create(&amp;s).Error
+    if err != nil {
+        sendErr(w, err, http.StatusInternalServerError)
+        return
+    }
+    w.WriteHeader(http.StatusCreated)
+}
+
+func (a *App) updateStudent(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    s := student{}
+    err := json.NewDecoder(r.Body).Decode(&amp;s)
+    if err != nil {
+        sendErr(w, err, http.StatusBadRequest)
+        return
+    }
+    id := mux.Vars(r)["id"]
+    if s.ID != id {
+        sendErr(w, errors.New("invalid ID"), http.StatusBadRequest)
+        return
+    }
+    s.ID = id                 // Why not read it from Body directly ?
+    err = a.DB.Save(&amp;s).Error //gorm does a proper job http://gorm.io/docs/update.html
+    sendErr(w, err, http.StatusInternalServerError)
+}
+
+func (a *App) deleteStudent(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    id := mux.Vars(r)["id"]
+    s := student{}
+    err := a.DB.First(&amp;s, id).Error
+    if err != nil {
+        sendErr(w, err)
+        return
+    }
+    err = a.DB.Delete(s).Error
+    sendErr(w, err)
+}
+
+func sendErr(w http.ResponseWriter, err error, codes ...int) {
+    if err == nil {
+        return
+    }
+    if len(codes) &lt; 1 {
+        codes = append(codes, http.StatusInternalServerError)
+    }
+    response, _ := json.Marshal(map[string]string{"error": err.Error()})
+    w.Header().Set("Content-Type", "application/json")
+    http.Error(w, string(response), codes[0])
+}
+
+func main() {
+    app := App{}
+    if err := app.Open(); err != nil {
+        log.Fatal("open failed", err)
+    }
+    defer app.Close()
+
+    srv := &amp;http.Server{
+        Addr:    ":8080",
+        Handler: app.Handler(),
+    }
+
+    err := make(chan error)
+    go func() {
+        err &lt;- srv.ListenAndServe()
+    }()
+
+    select {
+    case e := &lt;-err:
+        log.Fatal("listen failed", e)
+    case &lt;-time.After(time.Millisecond * 200):
+        log.Println("app started at ", srv.Addr)
+    }
+
+    sigint := make(chan os.Signal, 1)
+    signal.Notify(sigint, os.Interrupt)
+    &lt;-sigint
+    log.Println("got signal")
+
+    if err := srv.Shutdown(context.Background()); err != nil {
+        // Error from closing listeners, or context timeout:
+        log.Printf("HTTP server Shutdown: %v", err)
+    }
+    log.Println("properly shutdown")
+}
+</code></pre>
+    </div>

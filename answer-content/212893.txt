@@ -1,0 +1,72 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I think you'll find that <a href="https://wingolog.org/archives/2018/05/21/correct-or-inotify-pick-one" rel="nofollow noreferrer">inotify has problems of its own</a> and that you're already on the right path.  </p>
+
+<p>The approach I'd use: get this working the way you want, then run it in a loop while your wget runs, removing successful files as it goes. </p>
+
+<p>If you're concerned about polling overhead (I wouldn't be: the size of the directory should remain manageable so long as you're uploading/deleting along the way), have the wget process emit filenames into a log file or a named pipe, while the curl process consumes them.</p>
+
+<p>You can attack the resource problem in a couple of ways. One, use <code>exec</code> to launch curl so that there isn't an intermediate bash process sitting around waiting for curl to exit.  Two, keep count of the number of children, and reap them when the number gets too high.  Three, check <code>ulimit -u</code> and consider increasing that number.</p>
+
+<p>In the code below I've made a few lesser edits:</p>
+
+<ul>
+<li>content-types in an associative array with sensible default</li>
+<li>use <code>[[ ]]</code> instead of <code>[ ]</code> (the former is a bash builtin)</li>
+<li>clean up the <code>find</code> command line a little.  I've guessed that the <code>sed</code> invocation is meant to remove <code>$local_repo</code>?</li>
+<li>omit forked echo and curl-HEAD; rely on exit status instead</li>
+<li>use curl's <code>-w</code> to get a useful line of output on success</li>
+<li>store pids in an associative array with filenames as values, to allow meaningful response to outcomes</li>
+<li>"Content-type" has a lowercase t</li>
+<li>run <code>upload</code> in infinite loop, keep count of files found, exit when no more files are found</li>
+</ul>
+
+<p>There may be some bugs, since I don't have your environment to test.  Proceed accordingly.</p>
+
+<pre><code>#!/usr/bin/env bash
+reap() {
+    for pid in ${!pid2fn[@]}
+    do
+        local fn=${pid2fn[$pid]} 
+        if wait ${pid} 
+        then 
+            echo successful upload of $fn
+            # rm $fn
+        else
+            echo $fn upload failed with status $?         
+        fi
+        unset pid2fn[$pid]
+    done
+}
+upload() {
+    local local_repo="${1:?no resource directory supplied}"
+    local remote_repo="${2:?no destination repository supplied}"
+    local default_ct=application/octet-stream
+    local user=${3:-${USER:-$(read -p "Username: "  user &amp;&amp; [[ -n $user ]] &amp;&amp; echo $user) }}
+    local pwd=$(read -s -p "Password: "  pwd &amp;&amp; [[ -n $pwd ]] &amp;&amp; echo $pwd )
+    local max_children=100
+    local found=0
+    declare -A pid2fn
+    declare -A types=(
+        [jar]=application/java-archive
+        [md5]=application/x-checksum
+        [pom]=application/x-maven-pom+xml
+        [sha1]=application/x-checksum
+        [txt]=text/plain
+        [xml]=application/xml
+    )
+    for art in $( find "$local_repo" -type f -name "[^.]*" -not -name index.html | sed s,^$local_repo/*,, )
+    do
+        let found=found+1
+        local ct=${types[${art##*.}]:-$default_ct}
+        local dest="$remote_repo/$art"
+        local status="$art -&gt; $dest | response %{http_code} sent %{size_upload} bytes\n"
+        exec curl -u "$user:$pwd" -X PUT -d "@$art" -H "Content-type: $ct" -w "$status" "$dest" 2&gt;&amp;1 &amp;
+        pid2fn[$!]=$art
+        [[ ${#pid2fn[@]} -ge $max_children ]] &amp;&amp; reap
+    done
+    reap
+    [[ $found -gt 0 ]]
+}
+while upload "$@"; do :; done
+</code></pre>
+    </div>

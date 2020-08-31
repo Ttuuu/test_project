@@ -1,0 +1,135 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>General</h1>
+<p>Good work for a C newcomer!  Welcome to the club!</p>
+<p>Thank you for providing a good test program, and for the macro to exercise the list code - that really helps give confidence in the implementation.  The tests do have some limitations, since they only test inserting elements and freeing the entire table; there's no tests of lookup, updating values or removing single entries, for example.  Tests of removal should remove elements from beginning, end and interior of lists, and of singleton lists.</p>
+<p>The code compiles almost cleanly (just a single warning) and appears not to leak, double-free, or access inaccessible memory:</p>
+<pre class="lang-none prettyprint-override"><code>gcc -std=c17 -fPIC -g -Wall -Wextra -Wwrite-strings -Wno-parentheses -Wpedantic -Warray-bounds      -Wconversion    215494.c    -o 215494
+215494.c: In function ‘get_hash_index’:
+215494.c:34:35: warning: conversion to ‘long unsigned int’ from ‘int’ may change the sign of the result [-Wsign-conversion]
+       hash = ((hash &lt;&lt; 5) + hash) + c; /* hash * 33 + c */
+                                   ^
+make TOOL='valgrind --leak-check=full' 215494.run
+make[1]: Entering directory '/home/tms/stackexchange/review'
+ulimit -v 1048576 -t 60; exec \
+valgrind --leak-check=full ./215494   
+==17736== Memcheck, a memory error detector
+==17736== Copyright (C) 2002-2017, and GNU GPL'd, by Julian Seward et al.
+==17736== Using Valgrind-3.14.0 and LibVEX; rerun with -h for copyright info
+==17736== Command: ./215494
+==17736== 
+DISP idx: 11/0 | key: sDhHqlcDnv. | value: hDwkwdBpjcw
+DISP idx: 69/0 | key: HwkKbzfehqz | value: yr.eJkngluK
+DISP idx: 88/0 | key: xgrJHpAmjvc | value: BktdguAmqli
+DISP idx: 108/0 | key: jF.rlbJDhhq | value: mKvagbzjeta
+DISP idx: 149/0 | key: tJkIsBbrw.m | value: I.muKitmAAo
+DISP idx: 235/0 | key: edEhiKsCydl | value: gjHrepwzohI
+DISP idx: 11/0 | key: sDhHqlcDnv. | value: hDwkwdBpjcw
+DISP idx: 69/0 | key: HwkKbzfehqz | value: yr.eJkngluK
+DISP idx: 108/0 | key: jF.rlbJDhhq | value: mKvagbzjeta
+DISP idx: 149/0 | key: tJkIsBbrw.m | value: I.muKitmAAo
+DISP idx: 235/0 | key: edEhiKsCydl | value: gjHrepwzohI
+FREE | key: sDhHqlcDnv. | value: hDwkwdBpjcw
+FREE | key: HwkKbzfehqz | value: yr.eJkngluK
+FREE | key: jF.rlbJDhhq | value: mKvagbzjeta
+FREE | key: tJkIsBbrw.m | value: I.muKitmAAo
+FREE | key: edEhiKsCydl | value: gjHrepwzohI
+==17736== 
+==17736== HEAP SUMMARY:
+==17736==     in use at exit: 0 bytes in 0 blocks
+==17736==   total heap usage: 19 allocs, 19 frees, 1,324 bytes allocated
+==17736== 
+==17736== All heap blocks were freed -- no leaks are possible
+==17736== 
+==17736== For counts of detected and suppressed errors, rerun with: -v
+==17736== ERROR SUMMARY: 0 errors from 0 contexts (suppressed: 0 from 0)
+</code></pre>
+<p>Let's fix the warning:</p>
+<pre><code>      hash = hash * 33 + (unsigned)c;
+</code></pre>
+<p>Note that I've eliminated the need for the comment: multiplying by a constant is an operation that compilers are very good at optimising, and you should expect to see the same object code from both versions.  It doesn't help performance to write it less clearly.</p>
+<h1>Private helpers</h1>
+<p>We should use <code>static</code> for the internal functions that are not part of the public interface.  This will be important when we compile the implementation separately so that we can link with other code.</p>
+<h1>Const correctness</h1>
+<p>Consider which pointer arguments point to data that should not be modified, and add <code>const</code> where appropriate:</p>
+<pre><code>static unsigned long get_hash_index(char const *str) {
+</code></pre>
+<p>(or <code>const char *</code>; the order of the keywords doesn't matter, but the position relative to <code>*</code> does matter).</p>
+<h1>Allocations</h1>
+<p>We correctly test the result of <code>malloc()</code> here:</p>
+<blockquote>
+<pre><code> char *s = malloc(size + 1);
+ if (s) {
+     rand_string(s, size);
+ }
+ return s;
+</code></pre>
+</blockquote>
+<p>But we use it without checking in other locations, such as:</p>
+<blockquote>
+<pre><code>struct HashItem * new_pair = (struct HashItem*) malloc(sizeof(HashItem));
+new_pair-&gt;key = key;
+new_pair-&gt;value = value;
+</code></pre>
+</blockquote>
+<p>That's Undefined behaviour waiting to bite.  When we fix that, we'll need to change the function interface so that we can report the failure to the calling code.</p>
+<p>BTW, there's no need to cast the result of <code>malloc()</code> like that; pointers to <code>void</code> can be assigned to variables of any pointer type.</p>
+<p>I'd recommend re-writing that as</p>
+<pre><code>struct HashItem *new_pair = malloc(sizeof *new_pair);
+if (!new_pair) {
+    return ERROR_VALUE; /* use your preferred error type/value here */
+}
+new_pair-&gt;key = key;
+new_pair-&gt;value = value;
+</code></pre>
+<h1>Avoid <code>while (1)</code></h1>
+<p>I think we can refactor <code>hset()</code> to replace the indefinite loop with a definite one, by reversing the sense of the <code>if</code> test:</p>
+<pre><code>bool hset(HashItem *hash_table[], char const *key, char const *value)
+{
+    unsigned long idx = get_hash_index(key);
+
+    /* search the list for matching key */
+    for (struct HashItem *node = hash_table[idx];  node;  node = node-&gt;tail) {
+        if (strcmp(key, node-&gt;key) == 0) {
+            node-&gt;value = value;
+            return true;          /* success */
+        }
+    }
+
+    /* not found - insert at head */
+    struct HashItem *new_pair = malloc(sizeof *new_pair);
+    if (!new_pair) {
+        return false;       /* failed! */
+    }
+
+    new_pair-&gt;key = key;
+    new_pair-&gt;value = value;
+    new_pair-&gt;tail = hash_table[idx];
+    hash_table[idx] = new_pair;
+    return true;
+}
+</code></pre>
+<p>Inserting at the head also eliminates the special case of the empty list - the <code>for</code> loop is empty in that case and we just drop through to the insertion code.</p>
+<h1>Prefer iteration to recursion</h1>
+<p><code>freeInnerNodes()</code> will recurse as deeply as the list is long.  We can easily avoid that, by iterating through the list instead:</p>
+<pre><code>void freeInnerNodes(struct HashItem * node)
+{
+    while (node) {
+        struct HashItem *next = node-&gt;tail;
+        freeNode(node);
+        node = next;
+    }
+}
+</code></pre>
+<h1>Don't assign to variables going out of scope</h1>
+<p>Very minor, but the last line of this function is completely pointless:</p>
+<blockquote>
+<pre><code>void freeNode(struct HashItem * node) {
+  free(node-&gt;key);
+  free(node-&gt;value);
+  free(node);
+  node = NULL;
+}
+</code></pre>
+</blockquote>
+<p>No other code can access the variable <code>node</code>, so the assignment achieves nothing.</p>
+    </div>

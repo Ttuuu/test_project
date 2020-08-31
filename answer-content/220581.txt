@@ -1,0 +1,770 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>EDIT:</strong> I also fixed a typo:  <code>main</code> should be <code>int main(void)</code>!</p>
+
+<hr>
+
+<p>After fixing the bugs <strong>@chux</strong> found, there was still another bug:</p>
+
+<p>This line:</p>
+
+<pre class="lang-c prettyprint-override"><code>        tmp -= (tmp - min_len + 3) / 4;
+</code></pre>
+
+<p>should be:</p>
+
+<pre class="lang-c prettyprint-override"><code>        tmp -= tmp / 5 - !(tmp % 5);
+</code></pre>
+
+<p>I also restructured the big function into smaller functions, and used <code>CHAR_BIT</code> instead of the magic number <code>8</code>:</p>
+
+<pre class="lang-c prettyprint-override"><code>/* 2019 - Alejandro Colomar Andrés */
+/******************************************************************************
+ ******* headers **************************************************************
+ ******************************************************************************/
+#include "libalx/base/stdio/printf.h"
+
+#include &lt;limits.h&gt;
+#include &lt;stdbool.h&gt;
+#include &lt;stddef.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+
+#include &lt;printf.h&gt;
+
+
+/******************************************************************************
+ ******* macros ***************************************************************
+ ******************************************************************************/
+#define BIN_REPR_BUFSIZ (sizeof(uintmax_t) * CHAR_BIT)
+
+
+/******************************************************************************
+ ******* enums ****************************************************************
+ ******************************************************************************/
+
+
+/******************************************************************************
+ ******* structs / unions *****************************************************
+ ******************************************************************************/
+struct  Printf_Pad {
+        char    ch;
+        int     len;
+};
+
+
+/******************************************************************************
+ ******* variables ************************************************************
+ ******************************************************************************/
+
+
+/******************************************************************************
+ ******* static functions (prototypes) ****************************************
+ ******************************************************************************/
+static  int     printf_b_output         (FILE *stream,
+                                        const struct printf_info *info,
+                                        const void *const args[]);
+static  int     printf_b_arginf_sz      (const struct printf_info *info,
+                                        size_t n, int *argtypes, int *size);
+
+static  uintmax_t printf_b_value        (const struct printf_info *info,
+                                        const void *arg);
+static  int     printf_b_bin_repr       (bool bin[BIN_REPR_BUFSIZ],
+                                        const struct printf_info *info,
+                                        const void *arg);
+static  int     printf_b_bin_len        (const struct printf_info *info,
+                                        int min_len);
+static  int     printf_b_pad_len        (const struct printf_info *info,
+                                        int bin_len);
+static  int     printf_b_print_prefix   (FILE *stream,
+                                        const struct printf_info *info);
+static  int     printf_b_pad_zeros      (FILE *stream,
+                                        const struct printf_info *info,
+                                        int min_len);
+static  int     printf_b_print_number   (FILE *stream,
+                                        const struct printf_info *info,
+                                        bool bin[BIN_REPR_BUFSIZ],
+                                        int min_len, int bin_len);
+static  char    printf_pad_ch           (const struct printf_info *info);
+static  int     printf_pad_spaces       (FILE *stream, int pad_len);
+
+
+
+
+/******************************************************************************
+ ******* global functions *****************************************************
+ ******************************************************************************/
+int     alx_printf_init (void)
+{
+
+        if (register_printf_specifier('b', printf_b_output, printf_b_arginf_sz))
+                return  -1;
+        if (register_printf_specifier('B', printf_b_output, printf_b_arginf_sz))
+                return  -1;
+
+        return  0;
+}
+
+
+/******************************************************************************
+ ******* static functions (definitions) ***************************************
+ ******************************************************************************/
+static  int     printf_b_output         (FILE *stream,
+                                        const struct printf_info *info,
+                                        const void *const args[])
+{
+        struct  Printf_Pad  pad = {0};
+        bool    bin[BIN_REPR_BUFSIZ];
+        int     min_len;
+        int     bin_len;
+        int     len;
+        int     tmp;
+
+        len = 0;
+
+        min_len = printf_b_bin_repr(bin, info, args[0]);
+        bin_len = printf_b_bin_len(info, min_len);
+
+        pad.ch = printf_pad_ch(info);
+        if (pad.ch == ' ')
+                pad.len = printf_b_pad_len(info, bin_len);
+
+        /* Padding with ' ' (right aligned) */
+        if ((pad.ch == ' ')  &amp;&amp;  !info-&gt;left) {
+                tmp = printf_pad_spaces(stream, pad.len);
+                if (tmp == EOF)
+                        return  EOF;
+                len += tmp;
+        }
+
+        /* "0b"/"0B" prefix */
+        if (info-&gt;alt) {
+                tmp = printf_b_print_prefix(stream, info);
+                if (tmp == EOF)
+                        return  EOF;
+                len += tmp;
+        }
+
+        /* Padding with '0' */
+        if (pad.ch == '0') {
+                tmp = printf_b_pad_zeros(stream, info, min_len);
+                if (tmp == EOF)
+                        return  EOF;
+                len += tmp;
+        }
+
+        /* Print number (including leading 0s to fill precission) */
+        tmp = printf_b_print_number(stream, info, bin, min_len, bin_len);
+        if (tmp == EOF)
+                return  EOF;
+        len += tmp;
+
+        /* Padding with ' ' (left aligned) */
+        if (info-&gt;left) {
+                tmp = printf_pad_spaces(stream, pad.len);
+                if (tmp == EOF)
+                        return  EOF;
+                len += tmp;
+        }
+
+        return  len;
+}
+
+static  int     printf_b_arginf_sz      (const struct printf_info *info,
+                                        size_t n, int *argtypes, int *size)
+{
+
+        (void)info;
+        (void)size;
+
+        if (n &gt; 0)
+                argtypes[0] = PA_INT;
+
+        return 1;
+}
+
+static  uintmax_t printf_b_value        (const struct printf_info *info,
+                                        const void *arg)
+{
+
+        if (info-&gt;is_long_double)
+                return  *(unsigned long long *)arg;
+        if (info-&gt;is_long)
+                return  *(unsigned long *)arg;
+        if (info-&gt;is_char)
+                return  *(unsigned char *)arg;
+        if (info-&gt;is_short)
+                return  *(unsigned short *)arg;
+        return  *(unsigned *)arg;
+}
+
+static  int     printf_b_bin_repr       (bool bin[BIN_REPR_BUFSIZ],
+                                        const struct printf_info *info,
+                                        const void *arg)
+{
+        uintmax_t   val;
+        int         min_len;
+
+        val = printf_b_value(info, arg);
+
+        memset(bin, 0, sizeof(bin[0]) * BIN_REPR_BUFSIZ);
+        for (min_len = 0; val; min_len++) {
+                if (val % 2)
+                        bin[min_len]    = 1;
+                val &gt;&gt;= 1;
+        }
+
+        if (!min_len)
+                return  1;
+        return  min_len;
+}
+
+static  int     printf_b_bin_len        (const struct printf_info *info,
+                                        int min_len)
+{
+
+        if (info-&gt;prec &gt; min_len)
+                return  info-&gt;prec;
+        return  min_len;
+}
+
+static  int     printf_b_pad_len        (const struct printf_info *info,
+                                        int bin_len)
+{
+        int pad_len;
+
+        pad_len = info-&gt;width - bin_len;
+        if (info-&gt;alt)
+                pad_len -= 2;
+        if (info-&gt;group)
+                pad_len -= (bin_len - 1) / 4;
+        if (pad_len &lt; 0)
+                pad_len = 0;
+
+        return  pad_len;
+}
+
+static  int     printf_b_print_prefix   (FILE *stream,
+                                        const struct printf_info *info)
+{
+        int len;
+
+        len = 0;
+        if (fputc('0', stream) == EOF)
+                return  EOF;
+        len++;
+        if (fputc(info-&gt;spec, stream) == EOF)
+                return  EOF;
+        len++;
+
+        return  len;
+}
+
+static  int     printf_b_pad_zeros      (FILE *stream,
+                                        const struct printf_info *info,
+                                        int min_len)
+{
+        int len;
+        int tmp;
+
+        len = 0;
+        tmp = info-&gt;width - (info-&gt;alt * 2);
+        if (info-&gt;group)
+                tmp -= tmp / 5 - !(tmp % 5);
+        for (int i = tmp - 1; i &gt; min_len - 1; i--) {
+                if (fputc('0', stream) == EOF)
+                        return  EOF;
+                len++;
+                if (info-&gt;group  &amp;&amp;  !(i % 4)) {
+                        if (fputc('_', stream) == EOF)
+                                return  EOF;
+                        len++;
+                }
+        }
+
+        return  len;
+}
+
+static  int     printf_b_print_number   (FILE *stream,
+                                        const struct printf_info *info,
+                                        bool bin[sizeof(uintmax_t) * CHAR_BIT],
+                                        int min_len, int bin_len)
+{
+        int len;
+
+        len = 0;
+
+        /* Print leading zeros to fill precission */
+        for (int i = bin_len - 1; i &gt; min_len - 1; i--) {
+                if (fputc('0', stream) == EOF)
+                        return  EOF;
+                len++;
+                if (info-&gt;group  &amp;&amp;  !(i % 4)) {
+                        if (fputc('_', stream) == EOF)
+                                return  EOF;
+                        len++;
+                }
+        }
+
+        /* Print number */
+        for (int i = min_len - 1; i; i--) {
+                if (fputc('0' + bin[i], stream) == EOF)
+                        return  EOF;
+                len++;
+                if (info-&gt;group  &amp;&amp;  !(i % 4)) {
+                        if (fputc('_', stream) == EOF)
+                                return  EOF;
+                        len++;
+                }
+        }
+        if (fputc('0' + bin[0], stream) == EOF)
+                return  EOF;
+        len++;
+
+        return  len;
+}
+
+static  char    printf_pad_ch           (const struct printf_info *info)
+{
+
+        if ((info-&gt;prec != -1)  ||  (info-&gt;pad == ' ')  ||  info-&gt;left)
+                return  ' ';
+        return  '0';
+}
+
+static  int     printf_pad_spaces       (FILE *stream, int pad_len)
+{
+        int len;
+
+        len = 0;
+        for (int i = pad_len; i; i--) {
+                if (fputc(' ', stream) == EOF)
+                        return  EOF;
+                len++;
+        }
+
+        return  len;
+}
+
+
+/******************************************************************************
+ ******* end of file **********************************************************
+ ******************************************************************************/
+</code></pre>
+
+<p>I also added some more tests to be able to detect that bug, which I was suspecting that existed; now I also show the value of <code>len</code> (calculated indirectly from the return value of <code>printf</code>):</p>
+
+<pre class="lang-c prettyprint-override"><code>/* Test */
+#include "libalx/base/stdio/printf.h"
+
+
+#include &lt;stddef.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;stdio.h&gt;
+
+
+int main(void)
+{
+    int len;
+    char buff[BUFSIZ];
+
+    alx_printf_init();
+
+    snprintf(buff, 30, "Hey, %i == %#b :)\n", 5, 5);
+    printf("%s", buff);
+    printf("\n");
+
+    printf("....----....----....----....----\n");
+    len = printf("%llb;\n", 0x5Ellu);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%lB;\n", 0x5Elu);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%b;\n", 0x5Eu);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%hB;\n", 0x5Eu);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%hhb;\n", 0x5Eu);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%jb;\n", (uintmax_t)0x5E);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%zb;\n", (size_t)0x5E);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+    len = printf("%#b;\n", 0x5Eu);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#B;\n", 0x5Eu);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+    len = printf("%10b;\n", 0x5Eu);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%010b;\n", 0x5Eu);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%.10b;\n", 0x5Eu);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+    len = printf("%-10B;\n", 0x5Eu);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+    len = printf("%'B;\n", 0x5Eu);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");   
+    printf("....----....----....----....----\n");
+    len = printf("%#16.12b;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%-#'20.12b;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'020B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+    len = printf("%#020B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'020B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%020B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+    len = printf("%#021B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'021B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%021B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+    len = printf("%#022B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'022B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%022B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+    len = printf("%#023B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'023B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%023B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+    len = printf("%-#'19.11b;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'019B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#019B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+    len = printf("%'019B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%019B;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#016b;\n", 0xAB);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+    printf("....----....----....----....----\n");
+    len = printf("%'010B;\n", 0xB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'010B;\n", 0xB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'010B;\n", 0x1B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'010B;\n", 0x1B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'010B;\n", 0x2B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'010B;\n", 0x2B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'010B;\n", 0x4B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'010B;\n", 0x4B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'010B;\n", 0x8B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'010B;\n", 0x8B);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+    len = printf("%'010B;\n", 0xB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'010B;\n", 0xB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'011B;\n", 0xB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'011B;\n", 0xB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'012B;\n", 0xB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'012B;\n", 0xB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'013B;\n", 0xB);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'013B;\n", 0xB);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+    len = printf("%'010B;\n", 0x1B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'010B;\n", 0x1B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'011B;\n", 0x1B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'011B;\n", 0x1B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'012B;\n", 0x1B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'012B;\n", 0x1B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'013B;\n", 0x1B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'013B;\n", 0x1B);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+    len = printf("%'010B;\n", 0x2B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'010B;\n", 0x2B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'011B;\n", 0x2B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'011B;\n", 0x2B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'012B;\n", 0x2B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'012B;\n", 0x2B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'013B;\n", 0x2B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'013B;\n", 0x2B);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+    len = printf("%'010B;\n", 0x4B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'010B;\n", 0x4B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'011B;\n", 0x4B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'011B;\n", 0x4B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'012B;\n", 0x4B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'012B;\n", 0x4B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'013B;\n", 0x4B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'013B;\n", 0x4B);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+    len = printf("%'010B;\n", 0x8B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'010B;\n", 0x8B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'011B;\n", 0x8B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'011B;\n", 0x8B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'012B;\n", 0x8B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'012B;\n", 0x8B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%'013B;\n", 0x8B);
+    printf("%i\n", len - strlen(";\n"));
+    len = printf("%#'013B;\n", 0x8B);
+    printf("%i\n", len - strlen(";\n"));
+    printf("....----....----....----....----\n");
+
+    return 0;
+}
+</code></pre>
+
+<p>Which shows the following output:</p>
+
+<pre class="lang-c prettyprint-override"><code>Hey, 5 == 0b101 :)
+
+....----....----....----....----
+1011110;
+7
+1011110;
+7
+1011110;
+7
+1011110;
+7
+1011110;
+7
+1011110;
+7
+1011110;
+7
+....----....----....----....----
+0b1011110;
+9
+0B1011110;
+9
+....----....----....----....----
+   1011110;
+10
+0001011110;
+10
+0001011110;
+10
+....----....----....----....----
+1011110   ;
+10
+....----....----....----....----
+101_1110;
+8
+....----....----....----....----
+....----....----....----....----
+  0b000010101011;
+16
+0b0000_1010_1011    ;
+20
+0B000_0000_1010_1011;
+20
+....----....----....----....----
+0B000000000010101011;
+20
+0_0000_0000_1010_1011;
+21
+00000000000010101011;
+20
+....----....----....----....----
+0B0000000000010101011;
+21
+0_0000_0000_1010_1011;
+21
+000000000000010101011;
+21
+....----....----....----....----
+0B00000000000010101011;
+22
+00_0000_0000_1010_1011;
+22
+0000000000000010101011;
+22
+....----....----....----....----
+0B000000000000010101011;
+23
+000_0000_0000_1010_1011;
+23
+00000000000000010101011;
+23
+....----....----....----....----
+0b000_1010_1011    ;
+19
+0B00_0000_1010_1011;
+19
+0B00000000010101011;
+19
+....----....----....----....----
+0000_0000_1010_1011;
+19
+0000000000010101011;
+19
+0b00000010101011;
+16
+....----....----....----....----
+....----....----....----....----
+0_0000_1011;
+11
+0B000_1011;
+10
+0_0001_1011;
+11
+0B001_1011;
+10
+0_0010_1011;
+11
+0B010_1011;
+10
+0_0100_1011;
+11
+0B100_1011;
+10
+0_1000_1011;
+11
+0B1000_1011;
+11
+....----....----....----....----
+0_0000_1011;
+11
+0B000_1011;
+10
+0_0000_1011;
+11
+0B0000_1011;
+11
+00_0000_1011;
+12
+0B0_0000_1011;
+13
+000_0000_1011;
+13
+0B0_0000_1011;
+13
+....----....----....----....----
+0_0001_1011;
+11
+0B001_1011;
+10
+0_0001_1011;
+11
+0B0001_1011;
+11
+00_0001_1011;
+12
+0B0_0001_1011;
+13
+000_0001_1011;
+13
+0B0_0001_1011;
+13
+....----....----....----....----
+0_0010_1011;
+11
+0B010_1011;
+10
+0_0010_1011;
+11
+0B0010_1011;
+11
+00_0010_1011;
+12
+0B0_0010_1011;
+13
+000_0010_1011;
+13
+0B0_0010_1011;
+13
+....----....----....----....----
+0_0100_1011;
+11
+0B100_1011;
+10
+0_0100_1011;
+11
+0B0100_1011;
+11
+00_0100_1011;
+12
+0B0_0100_1011;
+13
+000_0100_1011;
+13
+0B0_0100_1011;
+13
+....----....----....----....----
+0_1000_1011;
+11
+0B1000_1011;
+11
+0_1000_1011;
+11
+0B1000_1011;
+11
+00_1000_1011;
+12
+0B0_1000_1011;
+13
+000_1000_1011;
+13
+0B0_1000_1011;
+13
+....----....----....----....----
+<span class="math-container">````</span>
+</code></pre>
+    </div>

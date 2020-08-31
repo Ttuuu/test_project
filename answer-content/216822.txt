@@ -1,0 +1,97 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'm afraid that I'm not familiar with pandas, so there are definitely some things that I'm missing. However, I've done a bit of poking this code with a profiler, and I have a two suggestions that I expect would be helpful. </p>
+
+<p>In my timings, over half of the runtime (3.5s out of 6.5s for 100 repetitions) in your example was spent on these two lines:</p>
+
+<pre><code>x = dat[(dat['hour'] == i) &amp; (dat['day'] == k)].distance
+y = dat[(dat['hour'] == j) &amp; (dat['day'] == l)].distance
+</code></pre>
+
+<p>If I understand the code correctly, <code>(dat['hour'] == i)</code> is passing over the whole dataset searching for indexes with the specified hour. Especially given that this is in the middle of a very hot loop, that seems like prime work to avoid doing! Consider changing the data structure to allow for quicker look ups: perhaps have a dictionary that maps your chosen hour to a list or set of indexes. </p>
+
+<hr>
+
+<p>Second, let's take a look at this <code>custom_fn</code></p>
+
+<pre><code>def custom_fn(x, y):
+    x = pd.Series(x)
+    y = pd.Series(y)
+    x = x**2
+    y = np.sqrt(y)
+    return x.sum() - y.sum()
+</code></pre>
+
+<p>Now, I would normally not pay much attention to this function, because according to the profiler it just used up 8% of the total runtime. However, I did notice that it is almost completely seperable. The last line uses data derived from both <code>x</code> and <code>y</code> but until that you just use <code>x</code> for <code>x</code> things and <code>y</code> for <code>y</code> things. That suggests that there is considerable opportunity to cache the relevant <code>x.sum()</code> and <code>y.sum()</code> components, with the relevant calculations done outside of so deeply nested a loop.</p>
+
+<hr>
+
+<p>For reference, the following code is my initial go at using some of this caching approach. There is still plenty of opportunity to improve, including changing data structure as mentioned, but it is already significantly faster. It has come down from 6.5 seconds to 3.5 seconds in total, of which 2 seconds is packing the dmat table. </p>
+
+<pre><code>import pandas as pd
+import numpy as np
+
+dat = pd.DataFrame({'day': {0: 1, 1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1, 7: 1, 8: 1, 9: 1, 10: 2, 11: 2, 12: 2, 13: 2, 14: 2, 15: 2, 16: 2, 17: 2, 18: 2, 19: 2}, 'hour': {0: 1, 1: 1, 2: 1, 3: 1, 4: 1, 5: 2, 6: 2, 7: 2, 8: 2, 9: 2, 10: 1, 11: 1, 12: 1, 13: 1, 14: 1, 15: 2, 16: 2, 17: 2, 18: 2, 19: 2}, 'distance': {0: 1.2898851269657656, 1: 0.0, 2: 0.8371526423804061, 3: 0.8703856587273138, 4: 0.6257425922449789, 5: 0.0, 6: 0.0, 7: 0.0, 8: 1.2895328696587023, 9: 0.0, 10: 0.6875527848294374, 11: 0.0, 12: 0.0, 13: 0.9009031833559706, 14: 0.0, 15: 1.1040652963428623, 16: 0.0, 17: 0.0, 18: 0.0, 19: 0.0}})
+
+def x_sum(x):
+    x = pd.Series(x)
+    x = x**2
+    return x.sum()
+
+def y_sum(y):
+    y = pd.Series(y)
+    y = np.sqrt(y)
+    return y.sum()
+
+def custom_fn(x_s, y_s):
+    return x_s - y_s
+
+def get_hour(i):
+    return (dat['hour'] == i)
+
+def get_day(k): 
+    return (dat['day'] == k)
+
+def get_day_hour(hour, day):
+    x = dat[hour &amp; day].distance
+    return x
+
+# Empty data.frame to append to
+dmat = pd.DataFrame()
+
+day_indices = {k : get_day(k) for k in range(1, 3)}
+hour_indices = {i : get_hour(i) for i in range(1, 3)}
+
+x_sum_indices = { (i, j): x_sum(get_day_hour(hour_indices[i], day_indices[j])) for i in range(1, 3) for j in range(1, 3)}
+y_sum_indices = { (i, j): y_sum(get_day_hour(hour_indices[i], day_indices[j])) for i in range(1, 3) for j in range(1, 3)}
+
+# For i, j = hour; k, l = day
+for i in range(1, 3):
+    for j in range(1, 3):
+        for k in range(1, 3):
+            for l in range(1, 3):
+                x_s = x_sum_indices[(i, k)]
+                y_s = y_sum_indices[(j, l)]
+
+                # Calculate difference
+                jds = custom_fn(x_s, y_s)
+
+                # Build data frame and append
+                outdat = pd.DataFrame({'day_hour_a': f"{k}_{i}", 'day_hour_b': f"{l}_{j}", 'jds': [round(jds, 4)]})
+                dmat = dmat.append(outdat, ignore_index=True)
+return dmat
+
+# Pivot data to get matrix
+distMatrix = dmat.pivot(index='day_hour_a', columns='day_hour_b', values='jds')
+
+print(distMatrix)
+</code></pre>
+
+<p>If you had a different <code>custom_fn</code> function that was not so easily separable, you could still benefit from caching the inputs to the function. E.g. </p>
+
+<pre><code>x_indices = { (i, j): get_day_hour(hour_indices[i], day_indices[j]) for i in range(1, 3) for j in range(1, 3)}
+y_indices = x_indices
+
+...
+    jds = custom_fn(x_indices[(i, k)], y_indices[(j, l)])
+</code></pre>
+    </div>

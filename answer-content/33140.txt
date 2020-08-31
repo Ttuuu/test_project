@@ -1,0 +1,153 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I would first make <code>ChangeResult&lt;T&gt;</code> truly immutable using <code>sealed</code> and <code>readonly</code>. It's unfortunate that we don't have true immutable syntax for automatic properties, but space is cheap, they say:</p>
+
+<pre><code>/// &lt;summary&gt;
+/// Immutable class containing changes
+/// &lt;/summary&gt;
+public sealed class ChangeResult&lt;T&gt; : IChangeResult&lt;T&gt;
+{
+    private readonly ReadOnlyCollection&lt;T&gt; deleted;
+
+    private readonly ReadOnlyCollection&lt;T&gt; changed;
+
+    private readonly ReadOnlyCollection&lt;T&gt; inserted;
+
+    public ChangeResult(IList&lt;T&gt; deleted, IList&lt;T&gt; changed, IList&lt;T&gt; inserted)
+    {
+        this.deleted = new ReadOnlyCollection&lt;T&gt;(deleted);
+        this.changed = new ReadOnlyCollection&lt;T&gt;(changed);
+        this.inserted = new ReadOnlyCollection&lt;T&gt;(inserted);
+    }
+
+    public IList&lt;T&gt; Deleted
+    {
+        get
+        {
+            return this.deleted;
+        }
+    }
+
+    public IList&lt;T&gt; Changed
+    {
+        get
+        {
+            return this.changed;
+        }
+    }
+
+    public IList&lt;T&gt; Inserted
+    {
+        get
+        {
+            return this.inserted;
+        }
+    }
+}
+</code></pre>
+
+<p>and because it's good design to program to interfaces, I extracted one:</p>
+
+<pre><code>public interface IChangeResult&lt;T&gt;
+{
+    IList&lt;T&gt; Deleted
+    {
+        get;
+    }
+
+    IList&lt;T&gt; Changed
+    {
+        get;
+    }
+
+    IList&lt;T&gt; Inserted
+    {
+        get;
+    }
+}
+</code></pre>
+
+<p>Then, in your <code>CompareTo&lt;TSource, TKey&gt;()</code> method, I have it return said interface. Also, I expand the <code>deleted</code> and <code>changed</code> lists to the capacity of the <code>local</code> enumerable (converted to a list locally so an expensive enumerable doesn't get iterated multiple times). This may be overkill in some cases, but in the worst cases, you wind up eliminating potentially expensive list expansion reallocations. A classic speed-vs-space tradeoff. I would then posit that this is actually a great algorithm to go parallel with, as long as you don't care about the order in the three lists:</p>
+
+<pre><code>/// &lt;summary&gt;
+/// Gets the changes [Deleted, changed, inserted] comparing this collection to another.
+/// &lt;/summary&gt;
+/// &lt;typeparam name="TSource"&gt;&lt;/typeparam&gt;
+/// &lt;typeparam name="TKey"&gt;&lt;/typeparam&gt;
+/// &lt;param name="local"&gt;The source collection.&lt;/param&gt;
+/// &lt;param name="remote"&gt;The remote collection to compare against.&lt;/param&gt;
+/// &lt;param name="keySelector"&gt;The primary key selector function&lt;/param&gt;
+/// &lt;returns&gt;&lt;/returns&gt;
+public static IChangeResult&lt;TSource&gt; CompareTo&lt;TSource, TKey&gt;(
+    this IEnumerable&lt;TSource&gt; local,
+    IEnumerable&lt;TSource&gt; remote,
+    Func&lt;TSource, TKey&gt; keySelector)
+{
+    if (local == null)
+    {
+        throw new ArgumentNullException("local");
+    }
+
+    if (remote == null)
+    {
+        throw new ArgumentNullException("remote");
+    }
+
+    if (keySelector == null)
+    {
+        throw new ArgumentNullException("keySelector");
+    }
+
+    local = local.ToList();
+
+    var remoteKeyValues = remote.ToDictionary(keySelector);
+    var deleted = new List&lt;TSource&gt;(local.Count());
+    var changed = new List&lt;TSource&gt;(local.Count());
+    var localKeys = new HashSet&lt;TKey&gt;();
+
+    Parallel.ForEach(
+        local,
+        localItem =&gt;
+        {
+            var localKey = keySelector(localItem);
+
+            lock (localKeys)
+            {
+                localKeys.Add(localKey);
+            }
+
+            /* Check if primary key exists in both local and remote
+             * and if so check if changed, if not it has been deleted
+             */
+            TSource changeCandidate;
+
+            if (remoteKeyValues.TryGetValue(localKey, out changeCandidate))
+            {
+                if (changeCandidate.Equals(localItem))
+                {
+                    return;
+                }
+
+                lock (changed)
+                {
+                    changed.Add(changeCandidate);
+                }
+            }
+            else
+            {
+                lock (deleted)
+                {
+                    deleted.Add(localItem);
+                }
+            }
+        });
+
+    var inserted = remoteKeyValues
+        .AsParallel()
+        .Where(x =&gt; !localKeys.Contains(x.Key))
+        .Select(x =&gt; x.Value)
+        .ToList();
+
+    return new ChangeResult&lt;TSource&gt;(deleted, changed, inserted);
+}
+</code></pre>
+    </div>

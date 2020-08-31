@@ -1,0 +1,205 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Let’s capture parsing/formatting logic in the attributes to simplify extensibility. You would need to inherit the following base attribute class to define new column types:</p>
+
+<pre><code>[AttributeUsage(AttributeTargets.Property)]
+public abstract class FieldAttribute : Attribute
+{
+    protected FieldAttribute(int length, int order) =&gt; 
+        Length = length;
+
+    public int Length { get; }
+    public int AbsLength =&gt; Math.Abs(Length);
+    public int Order { get; }
+    protected abstract string Format(object value);
+    protected abstract object Parse(string text);
+
+    public string this[PropertyInfo property, object record]
+    {
+        get =&gt; Clip(Align(Format(property.GetValue(record))));                
+        set =&gt; property.SetValue(record, 
+            Convert.ChangeType(
+                Parse(value.Trim()), property.PropertyType));
+    }
+
+    string Align(string text) =&gt;
+        Length &gt; 0 ? text.PadRight(AbsLength) : text.PadLeft(AbsLength);
+
+    string Clip(string text) =&gt; 
+        text.Substring(0, AbsLength);
+}
+</code></pre>
+
+<p>As you can see the negative <code>Length</code> value right-aligns the content.</p>
+
+<p>Now some concrete field type specializations:</p>
+
+<pre><code>public class TextAttribute : FieldAttribute
+{
+    public TextAttribute(int length, [CallerLineNumber] int order = 0)
+        : base(length, order)
+    {
+    }
+
+    protected override string Format(object value) =&gt; $"{value}";
+    protected override object Parse(string text) =&gt; text;
+}
+</code></pre>
+
+<p>And:</p>
+
+<pre><code>public class NumberAttribute : FieldAttribute
+{
+    public NumberAttribute(int length, [CallerLineNumber] int order = 0)
+        : base(length, order)
+    {
+    }
+
+    protected override string Format(object value) =&gt; $"{value}";
+    protected override object Parse(string text) =&gt; decimal.Parse(text);
+}
+</code></pre>
+
+<p>And:</p>
+
+<pre><code>public class DateAttribute : FieldAttribute
+{
+    public DateAttribute(int length, [CallerLineNumber] int order = 0) 
+        : base(length, order)
+    {
+    }
+
+    protected override string Format(object value) =&gt; $"{value:yyyyMMdd}";
+    protected override object Parse(string text) =&gt; 
+        DateTime.ParseExact(text, "yyyyMMdd", CultureInfo.InvariantCulture);
+}
+</code></pre>
+
+<p>The next step would be to create a serializer which caches the schema provided by reflection:</p>
+
+<pre><code>public class Serializer&lt;T&gt; where T : new()
+{
+    static IEnumerable&lt;(PropertyInfo Property, FieldAttribute Attribute)&gt; Schema { get; } =
+        typeof(T).GetProperties()
+            .SelectMany(p =&gt; from a in p.GetCustomAttributes(true).OfType&lt;FieldAttribute&gt;()
+                             orderby a.Order ascending
+                             select (p, a))
+            .ToArray();
+
+    public static T Parse(string line)
+    {
+        var record = new T();
+        var start = 0;
+        foreach (var (property, attribute) in Schema)
+        {
+            attribute[property, record] = line.Substring(start, attribute.AbsLength);
+            start += attribute.AbsLength;
+        }
+
+        return record;
+    }
+
+    public static string Format(T record) =&gt;
+        string.Join("", from f in Schema
+                        select f.Attribute[f.Property, record]);
+}
+</code></pre>
+
+<p>Now let’s define loading/saving:</p>
+
+<pre><code>public class File&lt;THeader, TRecord&gt; 
+    where THeader: new()
+    where TRecord: new()
+{
+    public static File&lt;THeader, TRecord&gt; Parse(string text) =&gt;
+        Load(new StringReader(text));
+
+    public static File&lt;THeader, TRecord&gt; Load(string path) =&gt;
+        Load(new StreamReader(path));
+
+    public static File&lt;THeader, TRecord&gt; Load(TextReader reader)
+    {
+        using (reader)
+            return new File&lt;THeader, TRecord&gt;(
+                Serializer&lt;THeader&gt;.Parse(reader.ReadLine()),
+                Enumerable.Range(0, int.MaxValue)
+                    .Select(i =&gt; reader.ReadLine())
+                    .TakeWhile(s =&gt; s != null)
+                    .Select(s =&gt; Serializer&lt;TRecord&gt;.Parse(s)));
+    }
+
+    public File()
+        : this(new THeader(), new TRecord[0])
+    {
+    }
+
+    File(THeader header, IEnumerable&lt;TRecord&gt; records) =&gt;
+        (Header, Records) = (header, records.ToList());
+
+    public THeader Header { get; } 
+    public IList&lt;TRecord&gt; Records { get; }
+
+    public override string ToString() =&gt; 
+        string.Join(Environment.NewLine,
+            Records.Select(Serializer&lt;TRecord&gt;.Format)
+            .Prepend(Serializer&lt;THeader&gt;.Format(Header)));
+
+    public void Save(string path) =&gt;
+        Save(new StreamWriter(path));
+
+    public void Save(TextWriter writer)
+    {
+        using (writer)
+            writer.WriteLine(ToString());
+    }
+}
+</code></pre>
+
+<p>We are ready to test (note the localization support):</p>
+
+<pre><code>[TestClass]
+public class File_Should
+{
+    [TestMethod]
+    public void Serialize()
+    {
+        var file = new File&lt;FileHeader, FileRecord&gt;();
+        file.Records.Add(new FileRecord
+        {
+            Name = "Thomas Jefferson",
+            Born = new DateTime(1743, 04, 13),
+            Age = 83
+        });
+
+        var s = file.ToString();
+        var copy = File&lt;FileHeader, FileRecord&gt;.Parse(s);
+
+        Assert.AreEqual("Имя", copy.Header.Name);
+        Assert.AreEqual("ДР", copy.Header.Born);
+        Assert.AreEqual("Возраст", copy.Header.Age);
+        Assert.AreEqual("Thomas Jefferson", copy.Records[0].Name);
+        Assert.AreEqual(new DateTime(1743, 04, 13), copy.Records[0].Born);
+        Assert.AreEqual(83, copy.Records[0].Age);
+    }
+}
+</code></pre>
+
+<p>Where:</p>
+
+<pre><code>class FileHeader
+{
+    [Text(20)] public string Name { get; set; } = "Имя";
+    [Text(10)] public string Born { get; set; } = "ДР";
+    [Text(10)] public string Age { get; set; } = "Возраст";
+}
+</code></pre>
+
+<p>And:</p>
+
+<pre><code>class FileRecord
+{
+    [Text(20)] public string Name { get; set; }
+    [Date(-10)] public DateTime Born { get; set; }
+    [Number(-10)] public int Age { get; set; }
+}
+</code></pre>
+    </div>

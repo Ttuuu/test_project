@@ -1,0 +1,144 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First, a standard approach for dealing with the <code>skipSpaces</code> issue is to define a higher-order parser combinator, traditionally called <code>lexeme</code>:</p>
+
+<pre><code>lexeme :: ReadP a -&gt; ReadP a
+lexeme p = p &lt;* skipSpaces
+</code></pre>
+
+<p>Here, <code>lexeme</code> takes a space-naive parser <code>p</code>, and converts it into a new parser that parses whatever <code>p</code> was planning to parse, and then reads and discards any trailing spaces.  You use <code>lexeme</code> in the definitions of any of your parsers that would reasonably be assumed to read a complete "lexeme" and ignore any trailing space.  For example, <code>number</code> should be a <code>lexeme</code> parser:</p>
+
+<pre><code>number :: ReadP Expression
+number = lexeme $ fmap (Number . read) (many1 digit)
+</code></pre>
+
+<p>So should <code>operator</code>, though obviously not <code>digit</code>!  <code>expression</code> won't need to use <code>lexeme</code>, because we'll arrange to end it with a lexeme parser.</p>
+
+<p>It's also helpful to define a <code>symbol</code> parser which is essentially <code>string</code> that ignores trailing spaces:</p>
+
+<pre><code>symbol :: String -&gt; ReadP String
+symbol = lexeme . string
+</code></pre>
+
+<p>Consistently used, <code>lexeme</code> (and <code>symbol</code>) will deal with all unwanted spaces, other than any leading spaces at the very start of your parse.  If you have a non-recursive "top level" grammar production, like say a parser for <code>program :: ReadP Program</code>, then you would probably deal with them there.  In your example, you don't have such a production (e.g., <code>expression</code> is recursive), so you'd stick an extra <code>skipSpaces</code> in <code>parseExpression</code>.  This is also a good place to put <code>eof</code> to make sure there isn't any trailing material that you aren't parsing:</p>
+
+<pre><code>parseExpression :: String -&gt; Maybe Expression
+parseExpression input = case readP_to_S (skipSpaces *&gt; expression &lt;* eof) input of
+    [] -&gt; Nothing
+    xs -&gt; (Just . fst . last) xs
+</code></pre>
+
+<p>Second, your use of a <code>Read</code> instance for parsing your operators is very unusual.  It would be more standard to make it a helper in the <code>operator</code> parser, writing something like:</p>
+
+<pre><code>operator :: ReadP Operator
+operator = readSymbol &lt;$&gt; (symbol "+" &lt;|&gt; symbol "-")
+  where readSymbol "+" = Add
+        readSymbol "-" = Subtract
+</code></pre>
+
+<p>(though an even <em>more</em> standard version is given below).</p>
+
+<p>Third, in <code>expression</code>, you can avoid the <code>case</code> construct by using alternation <code>(&lt;|&gt;)</code> like so:</p>
+
+<pre><code>expression' :: ReadP Expression
+expression' = do
+    left &lt;- number
+    (do op &lt;- operator
+        right &lt;- expression
+        return (Infix left op right)
+     &lt;|&gt; return left)
+</code></pre>
+
+<p>This would be the standard approach for non-parallel parser libraries (e.g., Parsec or Megaparsec).  For <code>ReadP</code>, it's better to replace the <code>(&lt;|&gt;)</code> operator with the ReadP-specific <code>(&lt;++)</code> operator to avoid also following the unwanted second parse in parallel.  Beware that <code>(&lt;++)</code> has higher precedence than <code>(&lt;|&gt;)</code>, so some extra parentheses might be needed if it's being used in combination with other operators, as in the examples below.</p>
+
+<p>Fourth, you've probably noticed my use of the applicative operators <code>&lt;*</code> and <code>*&gt;</code> and the alias <code>&lt;$&gt;</code> for <code>fmap</code> in the code above.  It is <strong>very common</strong> to use these -- plus the additional applicative operator <code>&lt;*&gt;</code> and sometimes the operators <code>&lt;**&gt;</code> or <code>&lt;$</code> -- in parsers.  Once you get used to them, they tend to lead to less cluttered code.</p>
+
+<p>For example, a more standard way of writing <code>expression</code> would be:</p>
+
+<pre><code>expression' :: ReadP Expression
+expression' =     Infix &lt;$&gt; number &lt;*&gt; operator &lt;*&gt; expression
+              &lt;|&gt; number
+</code></pre>
+
+<p>or the slightly more efficient solution:</p>
+
+<pre><code>expression :: ReadP Expression
+expression = do
+  left &lt;- number
+  (Infix left &lt;$&gt; operator &lt;*&gt; expression) &lt;++ return left
+</code></pre>
+
+<p>Note that, in the context of parsers, an expression like <code>f &lt;$&gt; p &lt;*&gt; q</code> means "try to run the parser <code>p</code>, and then the parser <code>q</code>; assuming they both succeed, pass their return values to <code>f</code>".  In other words, that <code>Infix</code> expression is essentially:</p>
+
+<pre><code>Infix left op right
+</code></pre>
+
+<p>where <code>op</code> is the return value from the parser <code>operator</code> and <code>right</code> is the return value from the parser <code>expression</code>.</p>
+
+<p>Similarly, the standard way of writing <code>operator</code> is actually:</p>
+
+<pre><code>operator :: ReadP Operator
+operator = Add &lt;$ symbol "+" &lt;|&gt; Subtract &lt;$ symbol "-"
+</code></pre>
+
+<p>This one requires an additional word of explanation.  The operator <code>&lt;$</code> is kind of an odd duck.  It's type signature is:</p>
+
+<pre><code>(&lt;$) :: a -&gt; f b -&gt; f a
+</code></pre>
+
+<p>but in the context of parsers specifically, the meaning of <code>x &lt;$ p</code> is "try to run the parser <code>p</code>; if it succeeds, ignore its return value and return <code>x</code>".  Basically, it's used to replace the return value of a parser that's used only for its success or failure and not its return value.</p>
+
+<p>Note that these versions of <code>expression</code>, like your original version, treat the operators as right associative.  This may be a problem if you're trying to parse "1-2-3" as equivalent to "(1-2)-3" instead of "1-(2-3)".</p>
+
+<p>A few additional minor points:</p>
+
+<ul>
+<li><code>isDigit</code> is a more readable name for <code>\c -&gt; c &gt;= '0' &amp;&amp; c &lt;= '9'</code></li>
+<li><code>munch1</code> is more efficient than <code>many1 (satisfy xxx)</code>, so I'd redefine <code>number</code> to use it</li>
+<li>for testing, it's probably a good idea to have a <code>parseExpressions</code> function that looks at <em>all</em> the parses</li>
+<li>for production, it's probably a good idea to check for ambiguous parses and do something about it, rather than (fairly arbitrarily) selecting the last parse in the list</li>
+</ul>
+
+<p>With all of these suggestions implemented, the final version would look something like:</p>
+
+<pre><code>{-# OPTIONS_GHC -Wall #-}
+
+import Data.Char (isDigit)
+import Control.Applicative
+import Text.ParserCombinators.ReadP (eof, munch1, ReadP, readP_to_S,
+                                     skipSpaces, string, (&lt;++))
+
+data Operator = Add | Subtract
+
+data Expression = Number Int
+                | Infix { left :: Expression, op :: Operator, right :: Expression }
+
+lexeme :: ReadP a -&gt; ReadP a
+lexeme p = p &lt;* skipSpaces
+
+symbol :: String -&gt; ReadP String
+symbol = lexeme . string
+
+number :: ReadP Expression
+number = lexeme $ Number . read &lt;$&gt; munch1 isDigit
+
+operator :: ReadP Operator
+operator = Add &lt;$ symbol "+" &lt;|&gt; Subtract &lt;$ symbol "-"
+
+expression :: ReadP Expression
+expression = do
+  x &lt;- number
+  (Infix x &lt;$&gt; operator &lt;*&gt; expression) &lt;++ return x
+
+top :: ReadP Expression
+top = skipSpaces *&gt; expression &lt;* eof
+
+parseExpressions :: String -&gt; [(Expression, String)]
+parseExpressions = readP_to_S top
+
+parseExpression :: String -&gt; Maybe Expression
+parseExpression input = case parseExpressions input of
+    [] -&gt; Nothing
+    [(x,"")] -&gt; Just x
+    _ -&gt; error "ambiguous parse"
+</code></pre>
+    </div>

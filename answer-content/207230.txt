@@ -1,0 +1,247 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>There's a few things that can be improved here:</p>
+
+<p>First, I'm not sure if you neglected it here or if you actually aren't using it, but every file should start with a call to <code>ns</code>. This sets the namespace that the code following it will be in so other files can <code>require</code> it properly. If the code resides in <code>src/my_thing/my_file</code>, you would have</p>
+
+<pre><code>(ns my-thing.my-file)
+</code></pre>
+
+<p>At the top.</p>
+
+<hr>
+
+<p>Second, unfortunately, that <code>gen-primes</code> function that you took from SO isn't a good example a proper practice. Unless you have an extraordinarily good reason, don't use <code>def</code> (and by extension, <code>defn</code>) to create a locally bound symbol. <code>def</code> creates globals that exist even once the function has returned:</p>
+
+<pre><code>(take 0 (gen-primes)) ; Run the function just so the inner defn happens
+=&gt; ()
+
+(type primes-step)
+=&gt; irrelevant.cr2_original$gen_primes$primes_step__4224
+</code></pre>
+
+<p>Note how using using <code>primes-step</code> doesn't lead to an error. It's in scope!</p>
+
+<p>To fix this, you could either just use <code>let</code> and define the function like was done with <code>reinsert</code>:</p>
+
+<pre><code>(defn gen-primes []
+  (let [reinsert (fn [table x prime]
+                   (update-in table [(+ prime x)] conj prime))
+
+        primes-step (fn primes-step [table d]
+                      (if-let [factors (get table d)]
+                        (recur (reduce #(reinsert %1 d %2) (dissoc table d) factors)
+                               (inc d))
+                        (lazy-seq (cons d (primes-step (assoc table (* d d) (list d))
+                                                       (inc d))))))]
+
+    (primes-step {} 2)))
+</code></pre>
+
+<p>or, since you're only defining local functions, this is a good use-case for <code>letfn</code>:</p>
+
+<pre><code>(defn gen-primes []
+  (letfn [(reinsert [table x prime]
+            (update-in table [(+ prime x)] conj prime))
+
+          (primes-step [table d]
+            (if-let [factors (get table d)]
+              (recur (reduce #(reinsert %1 d %2) (dissoc table d) factors)
+                     (inc d))
+              (lazy-seq (cons d (primes-step (assoc table (* d d) (list d))
+                                             (inc d))))))]
+
+    (primes-step {} 2)))
+</code></pre>
+
+<p>The latter doesn't have as much indentation, which is always nice.</p>
+
+<p>This can be <em>greatly</em> simplified though if you're willing to sacrifice some performance for readability. Here's a version I threw together:</p>
+
+<pre><code>(defn gen-primes []
+  ; Quick helper predicate
+  ; A number is prime if there is not some number which is a factor of the number
+  (letfn [(prime? [n]
+            (not (some #(zero? (rem n %))
+                       (range 2 (int (inc (Math/sqrt n)))))))]
+
+    ; Drop the first two numbers from the range (because we don't care about 0 and 1
+    ; Then filter all the primes
+    (filter prime? (drop 2 (range)))))
+</code></pre>
+
+<p>Rarely do you ever actually need to use <code>lazy-seq</code> explicitly. <code>lazy-seq</code> is the fundamental, low level building block for creating lazy sequences. Fortunately, many functions like <code>filter</code> already return a lazy sequence. In my function above, I'm just lazily filtering out all the non-primes from an infinite range of numbers, without ever explicitly using <code>lazy-seq</code>.</p>
+
+<p>I realized after I posted this that this is actually a bit of an "apples and oranges" comparison. My version is a naïve brute-force approach which, while terse, is inefficient. Looking at the original code again, I'm assuming it's some kind of sieve that likely performs much better than my version. </p>
+
+<hr>
+
+<p><code>get-digits</code> can be greatly simplified as well if you just abuse strings here:</p>
+
+<pre><code>(defn my-get-digits [num]
+  (-&gt;&gt; num
+       (str) ; Have str do most of the heavy lifting
+       (map str) ; Then turn each character back into a string so they can be parsed
+       (map #(Long/parseLong %))
+       (into '())))
+</code></pre>
+
+<p>They even perform identically. I was expecting mine to be slower, but it ended up being 0.1 µs faster:</p>
+
+<pre><code>(cc/quick-bench
+  (get-digits 192837465))
+Evaluation count : 93972 in 6 samples of 15662 calls.
+             Execution time mean : 5.665620 µs
+    Execution time std-deviation : 872.894028 ns
+   Execution time lower quantile : 4.709602 µs ( 2.5%)
+   Execution time upper quantile : 6.504343 µs (97.5%)
+                   Overhead used : 4.360719 ns
+=&gt; nil
+
+(cc/quick-bench
+  (my-get-digits 192837465))
+Evaluation count : 130404 in 6 samples of 21734 calls.
+             Execution time mean : 5.508682 µs
+    Execution time std-deviation : 485.864725 ns
+   Execution time lower quantile : 4.669716 µs ( 2.5%)
+   Execution time upper quantile : 5.944096 µs (97.5%)
+                   Overhead used : 4.360719 ns
+</code></pre>
+
+<p>Where <code>cc</code> is an alias for the <a href="https://github.com/hugoduncan/criterium" rel="nofollow noreferrer">Criterium</a> core module; a great benchmarking library.</p>
+
+<p>Again, try to reuse existing constructs unless you have a good reason to get your hands dirty, or you really want the practice (although practicing reusing existing constructs is important as well).</p>
+
+<hr>
+
+<p><code>are-permutations-of-each-other?</code> has a little duplication, but is simple enough that that's not a big deal. If you wanted, you could use <code>map</code> to reduce some of the duplication. I made a var-arg function so it can accept any number of numbers to check. It's highly unnecessary, but doing so works well with use of <code>map</code> anyways, and doesn't change its usage. There's two nearly identical versions to choose from, depending on whether or not you want to use functions composition via <code>comp</code>, or just lazily map twice:</p>
+
+<pre><code>(defn are-permutations-of-each-other? [&amp; nums]
+  (-&gt;&gt; nums
+       (map (comp sort get-digits))
+       (apply =)))
+
+(defn are-permutations-of-each-other? [&amp; nums]
+  (-&gt;&gt; nums
+       (map get-digits)
+       (map sort)
+       (apply =)))
+</code></pre>
+
+<hr>
+
+<p>This isn't a big deal, but in your main threading call that ties everything together, you have</p>
+
+<pre><code>(-&gt;&gt; (for [i four-digit-primes
+               j four-digit-primes]
+           [i j])
+
+     (remove #(apply = %))
+     ...)
+</code></pre>
+
+<p>There's certainly nothing wrong with this. I'll just point out that an alternative is just to apply filter directly in the <code>for</code>:</p>
+
+<pre><code>(-&gt;&gt; (for [i four-digit-primes
+           j four-digit-primes
+           :when (not= i j)] ; Here
+       [i j])
+     ...)
+</code></pre>
+
+<p><code>for</code> can accept three kinds of keywords like that in its binding list. <code>:when</code> only adds to the list if the condition is true. It's like Python's <code>if</code> inside of list comprehensions.</p>
+
+<hr>
+
+<p>Again in the main thread, you have:</p>
+
+<pre><code>(filter (fn [[n1 n2]]
+          (let [mx (max n1 n2)
+                mn (min n1 n2)
+                diff (- mx mn)
+                next (+ mx diff)]
+            (and (&lt; next 10000)
+                 (four-digit-primes next)
+                 (are-permutations-of-each-other? n1 next)))))
+</code></pre>
+
+<p>At some point, you need to look at your anonymous function and break it off into it's own function. Not only does that neaten up the threading calls, it <em>names</em> the function so it's clearer what the code is actually doing.</p>
+
+<hr>
+
+<p>A little down, you have </p>
+
+<pre><code>(map #(map str %))
+(map (partial apply str))
+</code></pre>
+
+<p>Now, it doesn't matter which you choose, but consistency is nice. In the first line, you're using <code>#()</code>, and in the second, you're using <code>partial</code>; even though both can be done using either. I prefer <code>#()</code> unless I'm already inside a function macro since I find <code>partial</code> adds a lot of noise. Which you use doesn't matter though; just try to apply the same idea everywhere and be consistent in your style.</p>
+
+<hr>
+
+<p>Finally, I stuck the whole main thread call into a <code>-main</code> function. Having code executing on the top level like that sucks if you're developing using a REPL. Every time I tried to load the function into the REPL to reflect a change I had made, the whole thing would run, which forced me to wait a couple seconds extra. In most cases, I prefer to stick everything inside functions so stuff only runs when I want it to.</p>
+
+<hr>
+
+<p>Taking all that into consideration, here's what I ended up with:</p>
+
+<pre><code>(ns irrelevant.cr2-fixed)
+
+(defn- gen-primes []
+  (let [prime? (fn [n] (not (some #(zero? (rem n %))
+                                  (range 2 (int (inc (Math/sqrt n)))))))]
+
+    ; Drop the first two numbers from the range (because we don't care about 0 and 1
+    ; Then filter all the primes
+    (filter prime? (drop 2 (range)))))
+
+(defn- get-digits [num]
+  (-&gt;&gt; num
+       (str) ; Have str do most of the heavy lifting
+       (map str) ; Then turn each character back into a string so they can be parsed
+       (map #(Long/parseLong %))
+       (into '())))
+
+(defn- are-permutations-of-each-other? [&amp; nums]
+  (-&gt;&gt; nums
+       (map get-digits)
+       (map sort)
+       (apply =)))
+
+(defn -main []
+  (let [four-digit-primes (-&gt;&gt; (gen-primes)
+                               (drop-while #(&lt; % 1000))
+                               (take-while #(&lt; % 10000))
+                               (apply sorted-set))
+
+        ; Give this a better name. I have no idea what you'd want to call it.
+        filter-helper (fn [[n1 n2]]
+                        (let [mx (max n1 n2)
+                              mn (min n1 n2)
+                              diff (- mx mn)
+                              next (+ mx diff)]
+                          (and (&lt; next 10000)
+                               (four-digit-primes next)
+                               (are-permutations-of-each-other? n1 next))))]
+
+    (-&gt;&gt; (for [i four-digit-primes
+               j four-digit-primes
+               :when (not= i j)]
+           [i j])
+         (filter #(apply are-permutations-of-each-other? %))
+         (filter filter-helper)
+         (map sort)
+         (distinct)
+         (map #(cons (+ (second %) (- (second %) (first %))) %))
+         (map sort)
+         (map #(map str %))
+         (map #(apply str %))
+         (second)
+         (println))))
+
+(-main)
+296962999629
+=&gt; nil
+</code></pre>
+
+<p>Hopefully that helps you out. Your code is actually quite good for someone learning the language. Keep it up!</p>
+    </div>

@@ -1,0 +1,202 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>My first answer was a review of the OP's post.  This answer is an alternate approach.</p>
+<p>The my first solution and OP's approach took about 775 seconds to make 3936 synchronized WinHttp.WinHttpRequest requests.  Using asynchronous MSXML2.ServerXMLHTTP requests with a callback class completes the same 3936 requests to 16 seconds.</p>
+<p><a href="https://i.stack.imgur.com/7ZFxg.jpg" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/7ZFxg.jpg" alt="Results Image"></a></p>
+<h2>UpdateRegions:Sub</h2>
+<pre><code>Public Sub UpdateRegions()
+    Dim StartTime As Long: StartTime = Timer
+    Dim Target As Range
+    Dim Controller As EBirdController
+    Set Controller = New EBirdController
+    Controller.Initialize
+
+    While Not Controller.ReadyStateComplete
+        DoEvents
+    Wend
+
+    With Worksheets("Results")
+        .Cells.Clear
+        With .Range("A1").Resize(1, 6)
+            .Value = Array("Contry Code", "Country", "Region Code", "Region", "Sub Region Code", "Sub Region")
+            .Font.Bold = True
+            .Interior.Color = 6299648
+            .Font.ThemeColor = xlThemeColorDark1
+        End With
+        Set Target = Controller.CopyToRange(.Range("A2"))
+
+        .Sort.SortFields.Clear
+        .Sort.SortFields.Add Key:=Target.Columns("B"), SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal
+        .Sort.SortFields.Add Key:=Target.Columns("D"), SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal
+        .Sort.SortFields.Add Key:=Target.Columns("F"), SortOn:=xlSortOnValues, Order:=xlAscending, DataOption:=xlSortNormal
+        With .Sort
+            .SetRange Target.Resize(Target.Rows.Count + 1).Offset(-1)
+            .Header = xlYes
+            .MatchCase = False
+            .Orientation = xlTopToBottom
+            .SortMethod = xlPinYin
+            .Apply
+        End With
+        .Columns.AutoFit
+    End With
+    MsgBox "Run Time in Seconds: " &amp; Round(Timer - StartTime, 2)
+End Sub
+</code></pre>
+<h2>EBirdController:Class</h2>
+<pre><code>Option Explicit
+Private Const COUNTRY_URL As String = "https://ebird.org/ws2.0/ref/region/list/country/world.csv"
+Private Const REGION_BASE_URL As String = "https://ebird.org/ws2.0/ref/region/list/subnational"
+Private Const MAX_CONNECTIONS As Long = 50
+Private Type Members
+    CompletedRequestsList As Object
+    OpenRequestsList As Object
+    RequestStack As Object
+End Type
+Private m As Members
+
+Private Enum DataFields
+    dfCode = 1
+    dfName
+End Enum
+
+Private Sub Class_Initialize()
+    Set m.CompletedRequestsList = CreateObject("System.Collections.ArrayList")
+    Set m.OpenRequestsList = CreateObject("System.Collections.ArrayList")
+    Set m.RequestStack = CreateObject("System.Collections.Stack")
+End Sub
+
+Private Function getRequestData(Request As EBirdRegionalRequest) As String()
+    Dim values() As String, results() As String
+    Dim index As Long, r As Long
+    values = Split(Request.getResponseText, Chr(10))
+
+    If UBound(values) &gt; 1 Then ReDim results(1 To UBound(values) - 1, 1 To 2) Else ReDim results(0 To 0, 1 To 2)
+    For r = 1 To UBound(values) - 1
+        index = InStr(values(r), ",")
+        results(r, dfCode) = Left(values(r), index - 1)
+        results(r, dfName) = Right(values(r), Len(values(r)) - index)
+    Next
+
+    getRequestData = results
+End Function
+
+Public Sub Initialize()
+    AddRequest COUNTRY_URL
+    ProcessRequestStack
+End Sub
+
+Public Sub ReadyStateChangeHandler(Request As EBirdRegionalRequest)
+    Dim data() As String
+    Dim index As Long, r As Long
+    Dim URL As String
+    m.OpenRequestsList.Remove Request.URL
+    data = getRequestData(Request)
+
+    If UBound(data) = 0 Then  'And Request.URL Like REGION_BASE_URL &amp; "2\*"
+        m.CompletedRequestsList.Add Array(Request.countryCode, Request.country, Request.regionCode, Request.region, data(r, dfCode), data(r, dfName))
+    Else
+        For r = 1 To UBound(data)
+            If Request.URL = COUNTRY_URL Then
+                URL = REGION_BASE_URL &amp; "1/" &amp; data(r, dfCode) &amp; ".csv"
+                AddRequest URL, data(r, dfCode), data(r, dfName)
+            ElseIf Request.URL Like REGION_BASE_URL &amp; "1/*" Then
+                URL = REGION_BASE_URL &amp; "2/" &amp; data(r, dfCode) &amp; ".csv"
+                AddRequest URL, Request.countryCode, Request.country, data(r, dfCode), data(r, dfName)
+            Else
+                m.CompletedRequestsList.Add Array(Request.countryCode, Request.country, Request.regionCode, Request.region, data(r, dfCode), data(r, dfName))
+            End If
+        Next
+    End If
+    Set Request = Nothing
+    ProcessRequestStack
+End Sub
+
+Private Sub AddRequest(URL As String, Optional countryCode As String, Optional country As String, Optional regionCode As String, Optional region As String)
+    Dim Request As New EBirdRegionalRequest
+    With Request
+        .URL = URL
+        .countryCode = countryCode
+        .country = country
+        .regionCode = regionCode
+        .region = region
+    End With
+    m.RequestStack.Push Request
+End Sub
+
+Private Sub ProcessRequestStack()
+    Dim Request As EBirdRegionalRequest
+    If m.OpenRequestsList.Count = MAX_CONNECTIONS Then Stop
+    Do Until m.OpenRequestsList.Count = MAX_CONNECTIONS Or m.RequestStack.Count = 0
+        Set Request = m.RequestStack.Pop
+        m.OpenRequestsList.Add Request.URL
+        Request.setCallback Me
+    Loop
+End Sub
+
+Public Function CopyToRange(Target As Range) As Range
+    Dim results() As Variant
+    If m.CompletedRequestsList.Count &gt; 0 Then
+        results = m.CompletedRequestsList.ToArray
+        results = Application.Transpose(results)
+        results = Application.Transpose(results)
+        Set Target = Target.Resize(UBound(results), UBound(results, 2))
+        Target.Value = results
+    End If
+    Set CopyToRange = Target
+End Function
+
+Public Property Get ReadyStateComplete() As Boolean
+    ReadyStateComplete = m.OpenRequestsList.Count = 0 And m.RequestStack.Count = 0
+End Property
+</code></pre>
+<h2>EBirdRegionalRequest:Class</h2>
+<pre><code>Option Explicit
+Private Const API_KEY As String = "Sign up and get your own key..lol"
+Private Const API_REQUEST_HEADER As String = "X-eBirdApiToken"
+Private Type Members
+    Controller As EBirdController
+    responseText As String
+    XMLHttpReq As Object
+End Type
+Private m As Members
+
+Public country As String
+Public countryCode As String
+Public region As String
+Public regionCode As String
+Public subRegion As String
+Public subregionCode As String
+Public URL As String
+
+Function getResponseText() As String
+    getResponseText = m.XMLHttpReq.responseText
+End Function
+
+Public Sub ReadyStateChangeHandler()
+Attribute ReadyStateChangeHandler.VB_UserMemId = 0
+    If m.XMLHttpReq.readyState = 4 Then
+        m.Controller.ReadyStateChangeHandler Me
+    End If
+End Sub
+
+Public Sub setCallback(Controller As EBirdController)
+    Set m.Controller = Controller
+    Set m.XMLHttpReq = CreateObject("MSXML2.ServerXMLHTTP")
+    With m.XMLHttpReq
+        .onreadystatechange = Me
+        .Open "GET", URL, True
+        .setRequestHeader API_REQUEST_HEADER, API_KEY
+        .Send
+    End With
+End Sub
+</code></pre>
+<h2>References</h2>
+<p><a href="http://www.tushar-mehta.com/publish_train/xl_vba_cases/vba_web_pages_services/#_Toc173749363" rel="nofollow noreferrer">http://www.tushar-mehta.com/publish_train/xl_vba_cases/vba_web_pages_services/#_Toc173749363</a>
+<a href="https://msdn.microsoft.com/en-us/library/ms757030.aspx" rel="nofollow noreferrer">https://msdn.microsoft.com/en-us/library/ms757030.aspx</a>
+<a href="http://dailydoseofexcel.com/archives/2006/10/09/async-xmlhttp-calls/" rel="nofollow noreferrer">http://dailydoseofexcel.com/archives/2006/10/09/async-xmlhttp-calls/</a>
+<a href="https://github.com/driverdan/node-XMLHttpRequest/blob/master/lib/XMLHttpRequest.js#L358" rel="nofollow noreferrer">https://github.com/driverdan/node-XMLHttpRequest/blob/master/lib/XMLHttpRequest.js#L358</a>
+<a href="https://codingislove.com/http-requests-excel-vba/" rel="nofollow noreferrer">https://codingislove.com/http-requests-excel-vba/</a></p>
+<h2>Max Connections</h2>
+<p>There is no noticeable difference between having 50 or 100 open connections at one time.  Increasing <code>MAX_CONNECTIONS</code> to 250 causes the code not to complete.  For some reason this increases the callback time and causes a number of requests not to be returned to the <code>Controller</code>.</p>
+<h2>Edits</h2>
+<p>I update the code to late binding.  This is no longer a need for any "External Library References".</p>
+    </div>

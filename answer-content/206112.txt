@@ -1,0 +1,183 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>Code:</strong></p>
+
+<ul>
+<li><p>Prefix the header guard with something unique (at least to the project) to prevent possible collisions. (e.g. <code>MYPROJNAME_TEXT_H</code> ).</p>
+
+<pre><code>#ifndef PROJECTNAME_TEXT_H
+#define PROJECTNAME_TEXT_H
+
+...
+
+#endif // PROJECTNAME_TEXT_H
+</code></pre>
+
+<p>or use <code>#pragma once</code> instead:</p>
+
+<pre><code>#pragma once
+
+...
+</code></pre></li>
+<li><p>Wrapping everything in the project in a project namespace is also sensible.</p></li>
+<li><p>Header files should be self-sufficient in terms of includes. The user (you!) should be able to include only the header file <code>#include &lt;Text.h&gt;</code>, but at the moment this won't compile, as the header files for various things used in <code>Text.h</code> would have to be included manually:</p>
+
+<pre><code>#include &lt;SDL.h&gt;
+#include &lt;SDL_TTF.h&gt;
+#include &lt;Windows.h&gt;
+#include &lt;string.h&gt;
+...
+
+#include &lt;Text.h&gt;
+
+...
+
+    Text text;
+    text.Initialize(...); 
+...
+</code></pre>
+
+<p>which gets tiresome quickly. It's better to include them in one place (the header that needs them).</p></li>
+<li><p>Function declarations should be in the header file, but function definitions should be in an accompanying .cpp file. This makes the class interface more readable, and more importantly reduces the amount of things we have to include in the header.</p></li>
+</ul>
+
+<hr>
+
+<ul>
+<li><p>Use <code>std::string</code> instead of fixed-size character arrays because:</p>
+
+<ul>
+<li>It's variable length (and it's quite reasonable for the text to be &gt;50 characters, or for a font file path to be &gt;50 characters).</li>
+<li>Copy or comparison knows the length without having to parse the whole thing to find the null character at the end.</li>
+<li>The <code>std::string</code> interface is much easier to use!</li>
+</ul></li>
+<li><p>Use <code>nullptr</code> not <code>NULL</code> for null pointer values.</p></li>
+<li><p>Use constant variables, not macros (macros are not scoped to your project and may affect other code). In this case the variables can be <code>static const</code> inside the Text class:</p>
+
+<pre><code>class Text
+{
+public:
+
+    static const std::string DefaultFont;
+    static const int DefaultFontSize = 24;
+    static const SDL_Color DefaultFontColor;
+
+    ...
+};
+
+... in Text.cpp:
+
+const std::string Text::DefaultFont = "Fonts/Ubuntu.ttf";
+const SDL_Color Text::DefaultFontColor = SDL_Color{ 255, 255, 255, 255 }; // it has 4 members!
+</code></pre></li>
+<li><p>Use a constructor initializer list to initialize variables, and make sure to initialize them in the same order as they are initialized in the class. (And don't use <code>ZeroMemory</code>; initialize the actual struct members):</p>
+
+<pre><code>... in Text.cpp:
+
+Text::Text():
+    m_loaderFunction(TTF_RenderText_Blended),
+    m_text(),
+    m_fontPath(DefaultFont),
+    ...
+    srcRect{ 0, 0, 0, 0 },
+    ...
+    m_sprite(nullptr) {
+
+    ...
+}
+</code></pre></li>
+<li><p>Make the member variables <code>private</code>! This ensures that the correct interface is used to change the class state.</p></li>
+<li><p>Using <code>this-&gt;</code> explicitly for every member variable access is quite wordy (and mainly unnecessary). Adding a prefix like <code>m_</code> to member variable names (e.g. <code>m_fontSize</code>) is probably neater.</p></li>
+</ul>
+
+<hr>
+
+<ul>
+<li><p>It's fine for the copy and assignment to look much the same. At the moment though, it looks like we can leak font objects. <code>Load()</code> checks for non-null sprites in the current object and destroys them; we need something similar for the font.</p></li>
+<li><p>Making the class copyable could be a bad idea. If two textures are exactly the same, we generally only want one instance of the texture in memory. Perhaps a <code>Text Clone()</code> function would be a reasonable choice.</p></li>
+</ul>
+
+<hr>
+
+<p><strong>Design:</strong></p>
+
+<ul>
+<li><p>Storing a number inside the class is quite confusing. Especially as we use a pointer to some external value. This also is potentially dangerous if the pointed to variable is destroyed before the <code>Text</code> instance. It's much cleaner to simply update the text <code>text.ChangeText(std::to_string(n));</code> and remove all the numeric stuff from the class.</p></li>
+<li><p>This brings up another point. We don't know what this class represents externally (a number, an enum, actual text). If the external code has to check whether a number has changed to see if the text needs updating, it might as well do the same for actual text. In that case, there's no point in storing the text in the <code>Text</code> class either!</p></li>
+<li><p>We know if the class is <code>good</code> if the texture is not null. So we don't need a separate variable for this, and could just add a <code>bool IsGood() const;</code>.</p></li>
+<li><p>The class is storing both an SDL_TTF font, and an SDL_Texture containing a rendered string. However, it's extremely likely that multiple strings are going to be rendered with the same font, so storing a separate font object with every text string is a waste. We can split the class up into a separate <code>Font</code> and <code>Text</code> class.</p></li>
+<li><p>Note that at this point, the <code>Text</code> class is almost a generic Sprite / Quad class, since it only contains the SDL_Texture, and the things needed to render it.</p></li>
+</ul>
+
+<p>An interface more like the following might be better:</p>
+
+<pre><code>class Font
+{
+public:
+
+    Font();
+    Font(std::string const&amp; fontPath, int fontSize);
+
+    ~Font(); // calls TTF_CloseFont();
+
+    // not copyable
+    Font(Font const&amp;) = delete;
+    Font&amp; operator=(Font const&amp;) = delete;
+
+    // moveable -&gt; copy the pointer over, then set it to null in the original (i.e. transfer ownership)
+    Font(Font&amp;&amp; other);
+    Font&amp; operator=(Font&amp;&amp; other);
+
+    SDL_Surface* RenderText(std::string const&amp; text, SDL_Color const&amp; color);
+
+    bool IsLoaded() const;
+
+private:
+
+    TTF_Font* m_font;
+};
+
+class Sprite
+{
+public:
+
+    Sprite();
+    Sprite(SDL_Renderer* renderer, SDL_Surface* surface); // creates surface and src rect.
+
+    ~Sprite(); // destroys texture
+
+    // not copyable
+    Sprite(Sprite const&amp;) = delete;
+    Sprite&amp; operator=(Sprite const&amp;) = delete;
+
+    // moveable -&gt; copy the pointer and other data. set the pointer to null in the original (i.e. transfer ownership)
+    Sprite(Sprite&amp;&amp; other);
+    Sprite&amp; operator=(Sprite&amp;&amp; other);
+
+    void Render(SDL_Renderer* renderer, int x, int y);
+
+    bool IsGood() const; // is m_sprite not a nullptr
+    bool IsVisible() const;
+
+private:
+
+    bool m_visible;
+    SDL_Texture* m_sprite;
+    SDL_Rect m_src;
+};
+
+...
+
+    Font font("Fonts/Ubuntu.ttf", 24);
+
+    auto surface1 = font.RenderText("hello world!", SDL_Color{ 255, 255, 255, 255 });
+    Sprite sprite1(renderer, surface1);
+
+    auto surface1 = font.RenderText("asdlkfh!", SDL_Color{ 255, 0, 0, 255 });
+    Sprite sprite2(renderer, surface2);
+
+    sprite1.Render(renderer, 0, 0);
+    sprite2.Render(renderer, 50, 50);
+
+...
+</code></pre>
+    </div>

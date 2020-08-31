@@ -1,0 +1,91 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I see some things that may help you improve your program.</p>
+<h2>Use all required <code>#include</code>s</h2>
+<p>The code uses a <code>condition_variable</code> but does not <code>#include &lt;condition_variable&gt;</code>.  It should!</p>
+<h2><a href="https://www.youtube.com/watch?v=O8OE4gedQuc" rel="nofollow noreferrer">Be careful with that mutex, Eugene</a></h2>
+<h2></h2>
+<p>It's not actually <em>wrong</em> but within <code>JobHolder::addResult</code>, the first line is this:</p>
+<pre><code>std::unique_lock&lt;std::mutex&gt;   lock(mutex);
+</code></pre>
+<p>It's correct to grab the lock there, but you don't really need to unlock or relock after that, so it would be better to use the simpler <code>std::lock_guard</code> there instead.</p>
+<h2>Minimize what's being protected by a mutex</h2>
+<p>The <code>JobHolder</code> class largely blocks parallel processing by its current design.  That's because the single <code>mutex</code> class member is locked before <em>any</em> data access which means that the code that processes the users queue is blocked while new user IDs are being fetched.  It seems to me that a finer grained locking mechanism would make more sense here.  Separate locks for the <code>users</code> and <code>userFuture</code> would simplify the locking regime, free up some otherwise blocked processing time and eliminate the need for the <code>justWaiting</code> and <code>lastFinished</code> items entirely.  Notionally, there are three tasks: fetching the user ids, fetching user details, and sorting them to process the query.  I would suggest that first two tasks can be asynchronous and only need to communicate via a shared <code>usersIds</code> vector.  The second two are also asynchronous and would only need to communicate via a <code>users</code> vector.  This suggests a rather different design in which a templated shareable vector (i.e. with suitable locking to assure coherency) could be the central coordinating data structures.  So instead of the current <code>JobHolder</code>, another possibility would be to augment the base <code>Job</code> class so that it has a shareable input and output queue.</p>
+<h2>Use sentinels for all processing</h2>
+<p>Since there is apparently a sentinal data item that signals the end of the queue of user ids, that same idea could be used to signal the ids processor that there is no more data.  By having this signal within the data stream, it means there no longer needs to be an external signal for this notion, simplifying the code somewhat.</p>
+<h2>Consider a map/reduce approach</h2>
+<p>Another way to approach this problem would be to have multiple threads each working on a subset of <code>User</code>s and each produce their own set of the five youngest.  Then those answers could be gathered and reduced to a single final set of five.</p>
+<hr>
+<p><strong>Note:</strong> The following items are from the earlier review of version 1, but are repeated here since they still apply.</p>
+<hr>
+<h2>Use a better data structure</h2>
+<p>The use of the <code>heap</code> is not bad and is intuitively a reasonable structure for keeping the five youngest users, but because it's only five entries, I'd suggest that a <code>std::array&lt;User,5&gt;</code> might be better.  Even a linear search would require a very few comparisons and the advantage is that it's a fixed size structure.</p>
+<h2>Do the cheaper tests first</h2>
+<p>Right now, the <code>processesData</code> function compares phone number first and then age.  Since the age comparison does not use a regex, I would strongly suspect that it is a less computationally expensive comparison, so it would probably make sense to do that first.  Obviously this is somewhat data-dependent, but it's worth thinking about.</p>
+<h2>Use <code>regex_match</code> to match a whole string</h2>
+<p>The current code is using <code>regex_search</code> which looks for a match anywhere within the string, but the regex itself starts with <code>'^'</code> and ends with <code>'$'</code>, so clearly the intent is to only match the entire string.  For that, <code>regex_match</code> is more appropriate than <code>regex_search</code> and you can omit the start and end tokens from the regex.</p>
+<h2>Minimize the time a mutex is held</h2>
+<p>Right now the code holds a mutex lock even before we know that this will actually alter the underlying structure.  That is, we may add a user who is older than the oldest person currently in the heap, only to remove that user again.  That's inefficient and holds the lock for longer than the mimimum time.  Instead, I'd do something like this:</p>
+<pre><code>#include &lt;iostream&gt;
+#include &lt;regex&gt;
+#include &lt;string&gt;
+#include &lt;array&gt;
+#include &lt;mutex&gt;
+
+const std::regex  phoneNumber("[0-9][0-9][0-9][- ][0-9][0-9][0-9][- ][0-9][0-9][0-9][0-9]");
+
+struct User {
+    std::string phone;
+    int age{999};   // start with invalid age
+};
+
+std::ostream&amp; operator&lt;&lt;(std::ostream&amp; out, const User&amp; user) {
+    return out &lt;&lt; "age: " &lt;&lt; user.age &lt;&lt; ", phone: " &lt;&lt; user.phone;
+}
+
+const auto youngestUser = [](User const&amp; lhs, User const&amp; rhs){return lhs.age &lt; rhs.age;};
+
+int main() {
+    using namespace std;
+
+    vector&lt;User&gt; samples{
+        {"212-123-4567", 10},
+        {"212-123-4568", 81},
+        {"212-123-4569", 18},
+        {"2 2-123-4570", 99},
+        {"212-123-4571", 57},
+        {"2 2-123-4572", 45},
+        {"212-123-4573", 33},
+        {"212-123-4574", 21},
+        {"212-123-4575", 18},
+        {"2 2-123-4576", 16},
+        {"212-123-4577", 30},
+        {"2 2-123-4578", 50},
+        {"212-123-4579", 77},
+        {"2 2-123-4580", 23},
+    };
+
+    array&lt;User, 5&gt; result;
+    cout &lt;&lt; "before:\n";
+    copy(result.begin(), result.end(), ostream_iterator&lt;User&gt;{cout, "\n"});
+    for (const auto&amp; person: samples) {
+        if (person.age &lt; result.back().age &amp;&amp; regex_match(person.phone, phoneNumber)) {
+            User youngerPerson(person);
+            lock_guard&lt;mutex&gt; lock(mutex);
+            if (person.age &lt; result.back()) {
+                swap(youngerPerson, result.back());
+                sort(result.begin(), result.end(), youngestUser); 
+            }
+        }
+    }
+    cout &lt;&lt; "after:\n";
+    copy(result.begin(), result.end(), ostream_iterator&lt;User&gt;{cout, "\n"});
+}
+</code></pre>
+<p>Obviously this sample code is single-threaded, but it shows the suggested lock placement accurately.  It also shows doing one last comparison <em>after</em> the lock is obtained to avoid data race problems in which another thread has modified <code>result</code> between the time of the check and the time this thread obtains the lock.</p>
+<p><strong>Caution:</strong> accessing the data value of <code>person.back()</code> <em>without</em> locking the structure is inherently risky, but I believe it is OK in this particular case because:</p>
+<ol>
+<li>all other threads will only add lower ages to the structure</li>
+<li>because we're looking for human ages in years, this is extremely likely to be a single byte quantity and therefore atomic (even if it's stored in a <code>long int</code>)</li>
+<li>the structure is a fixed-size <code>std::array</code> and so <code>person.back()</code> will not change address</li>
+</ol>
+    </div>

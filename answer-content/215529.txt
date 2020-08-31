@@ -1,0 +1,194 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You'll have to take some of these at face value as I don't use Drupal.</p>
+
+<p>I looked at this purely from a logical and structural view point, So there are probably a few things going on here i may not realize.  So make sure to review my suggestions closely.</p>
+
+<p>For example I don't know what a lot of the inputs are I may have suggested changing a few to constants such as this <code>$tableToCheck = 'SAVED_SEARCHES'</code> to <code>$tbl = self::TBL_SAVED_USERS</code> in <code>dbIsHashUsed</code> what I used was the tbl name.</p>
+
+<p>Some of them I had to extensively rework, so pay attention to them.  Most of it is simplification, removing some local variables etc.</p>
+
+<p>Oh and I found a bug (I think) in <code>generateMD5Hash</code> the table name is not used <code>$forTable</code> the third argument.</p>
+
+<p>etc..</p>
+
+<pre><code>private function __construct()
+{
+    //...
+    //use static instead of self if you plan on extending this (Late static binding) - something to consider for all static calls
+    $this-&gt;searchParam = self::initSearchParamsArray();
+   //...
+}
+
+public static function create(): SearchesSaved
+{
+     return new SearchesSaved; //the () are not required here 
+    //you can leave them for readability
+    //but I find a lot of programmers don't know this
+}
+
+private function setInitSearchParam($paramName, $paramValue)
+{
+    //...
+    if (isset($this-&gt;searchParam[$paramName]))
+        //isset is much faster then array_key_exists (Language construct vs function call)
+    //...
+}
+
+//use dependency injection if possible
+//this is not called internally (that i could find) so it may be a good choice for it
+public function setSearchParams(\WhateverClass $Query): void
+{
+
+     //...
+         $args[$arg] = $validator-&gt;sanitise($Query-&gt;get($arg));
+    //...
+}
+
+private function validateSearchParams(): bool
+{
+    //simplify
+    return (
+            is_null($this-&gt;searchParam['search_location']) || 
+            !is_string($this-&gt;searchParam['search_location']) || 
+            strlen($this-&gt;searchParam['search_location']) &lt;= 0) 
+        );
+}
+
+//combine and simplify
+public function unsubscribe(string $hash, string $email_address): ?int
+{
+
+    try {
+        $searchUser = $this-&gt;dbGetSearchUserByEmail($email_address);
+
+        $status = $this-&gt;dbDeleteSearch(
+               $hash,
+               $email_address,
+               ($searchUser['unique_hash'] === $hash)
+        );
+    } catch (\Exception $ex) {
+        $status = 5;
+    }
+
+    return $status;
+}
+
+
+//Make sure to test this one I had to change a lot 
+public function saveSearch(string $email_address): void
+{
+    if (self::validateSearchParams()) {
+        if (is_null(self::dbGetSearchUserByEmail($email_address)) {
+            //insert if no users
+            self::dbInsertSearchUser($email_address); //1
+        }
+
+        //generate this
+        $uniqueHash = $this-&gt;generateMD5Hash($email_address);
+
+        //if uniqueHash is a string AND it's not used AND a user exists
+        if (
+            is_string($uniqueHash) &amp;&amp;
+            !self::dbIsHashUsed($uniqueHash) &amp;&amp;
+            !is_null($searchUserData = self::dbGetSearchUserByEmail($email_address)) //assignment
+        ) {
+             $this-&gt;dbInsertSearch($email_address, $uniqueHash, $searchUserData);
+        }
+    }
+}
+
+private function processAllSavedSearches(): void
+{
+    //allSearches  can be removed
+
+    foreach ($this-&gt;dbGetAllSearchesToProcess() as $search) {
+        $searchResultData = $this-&gt;runSearchByHash($search['unique_hash']);
+
+        //you can just use if it's not empty insted of count which is faster
+        if (!empty($searchResultData)) { 
+            $packet = $this-&gt;buildDotmailerPacket($searchResultData, $search);
+            if (!is_null($packet)) {
+                $this-&gt;dotMailerSearchPackets[] = $packet;
+            }
+        }
+    }
+
+    foreach ($this-&gt;dotMailerSearchPackets as $packet) {
+        $this-&gt;triggerDotmailerEmail($packet);
+    }
+}
+
+//Not sure about this - it looks like it should be broken down some but not sure how
+//private function buildDotmailerPacket(array $srchResult, array $srchParam)
+
+//add this constant
+const DEBUG_MODE = 'debug';
+
+//this looks like a good place for a constant
+//consider - $SearchesSaved-&gt;drushProcessSearches(SearchesSaved::DEBUG_MODE)
+//less error prone, eg. did I do "debug" or "debuging" - you wonder 18 months from now?
+public function drushProcessSearches(?string $debug): void
+{
+        if ($debug === self::DEBUG_MODE) {
+            $this-&gt;debugDrush = true;
+        }
+         $this-&gt;drushDebug('Attempting to process all saved searches');
+
+        //remove this -&gt;   $drushProcessStatus = null; Unused
+
+        //..
+}
+
+private function generateMD5Hash(
+        string $email_address,
+        string $additionalSalt = null,
+        string $forTable = 'SAVED_SEARCHES' //&lt;--- unused {BUG} ? - this should be a constant as well
+): string {
+    //unchanged
+    $salt = microtime();
+    $salt2 = (!is_null($additionalSalt)) ? $additionalSalt : '';
+    $stringToHash = $salt . $salt2 . $email_address;
+
+    return md5($stringToHash);
+}
+
+//add these constants
+const TBL_SAVED_SEARCHES = 'lrg_saved_searches';
+const TBL_SAVED_USERS = 'lrg_savedSearchUsers';
+
+private function dbIsHashUsed(string $hash, string $tbl = self::TBL_SAVED_USERS): bool
+{ 
+    if($tableToCheck !== self::TBL_SAVED_SEARCHES){
+        $tbl = self::TBL_SAVED_USERS;
+    }
+
+    $args = [
+        ':unique_hash' =&gt; $hash,
+    ];
+
+    try {
+        $query = $this-&gt;db-&gt;query(
+            "SELECT COUNT(`id`) as `HashNumCount` FROM $tbl WHERE `unique_hash` LIKE :unique_hash;"
+            , [':unique_hash' =&gt; $hash]
+        );
+        $result = $query-&gt;fetchAssoc(); //could do fetchColumn or however you Drupal guys do it
+
+        return ( $result &amp;&amp; $result['HashNumCount'] &gt; 0 );
+
+    } catch (\Exception $ex) {
+        \Drupal::logger('SearchesSaved Class')-&gt;error('dbIsHashUsed() Exception: ' . $ex-&gt;getMessage());
+    }
+}
+
+//there are a few like this one
+private function dbGetSearchUserByEmail(string $email_address): ?array
+{
+    try {
+        $query = $this-&gt;db-&gt;query("SELECT * FROM `lrg_savedSearchUsers` WHERE `email_address` = :email", [':email' =&gt; $email_address]); //consstancy
+        return $query-&gt;fetchAssoc();
+    } catch (\Exception $ex) {
+        \Drupal::logger('SearchesSaved Class')-&gt;error('dbGetSearchUserByEmail() Exception: ' . $ex-&gt;getMessage());
+    }
+}
+</code></pre>
+    </div>

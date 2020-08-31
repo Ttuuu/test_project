@@ -1,0 +1,126 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I have found a way to use a runtime struct instead of a closure. <code>Logger</code> needs to borrow the runtime, and it must implement <code>Drop</code> so that <code>Runtime::drop</code> is not called before <code>Logger::drop</code>.</p>
+
+<pre><code>mod logger {
+
+    use std::marker::PhantomData;
+    use std::sync::mpsc::{channel, Sender};
+    use std::thread::JoinHandle;
+    use time::now;
+
+    pub type LogError = std::sync::mpsc::SendError&lt;String&gt;;
+
+    pub struct Runtime {
+        sender: Option&lt;Sender&lt;String&gt;&gt;,
+        thread_handle: Option&lt;JoinHandle&lt;()&gt;&gt;,
+    }
+
+    impl Runtime {
+        pub fn new() -&gt; Self {
+            let (sender, receiver) = channel();
+            let thread_handle = std::thread::spawn(move || {
+                while let Ok(msg) = receiver.recv() {
+                    println!("{}", msg);
+                }
+                println!("LOG FINISHED");
+            });
+
+            Runtime {
+                sender: Some(sender),
+                thread_handle: Some(thread_handle),
+            }
+        }
+
+        pub fn logger(&amp;self) -&gt; Logger {
+            Logger {
+                sender: self.sender.clone().unwrap(),
+                _marker: PhantomData,
+            }
+        }
+    }
+
+    impl Drop for Runtime {
+        fn drop(&amp;mut self) {
+            // Removes the last sender alive, so that the thread quits.
+            let _ = self.sender.take();
+
+            if let Some(handle) = self.thread_handle.take() {
+                if let Err(e) = handle.join() {
+                    eprintln!("Error while exiting the logger manager: {:?}", e);
+                }
+            }
+        }
+    }
+
+    /// The actual logger.
+    #[derive(Clone)]
+    pub struct Logger&lt;'a&gt; {
+        sender: Sender&lt;String&gt;,
+        _marker: PhantomData&lt;&amp;'a ()&gt;,
+    }
+
+    impl Logger&lt;'_&gt; {
+        /// Logs an information.
+        pub fn info(&amp;self, s: impl std::fmt::Display) -&gt; Result&lt;(), LogError&gt; {
+            let s = format!("[{}] [INFO ] {}", now().rfc3339(), s);
+
+            self.sender.send(s)
+        }
+
+        /// Logs an error.
+        pub fn error(&amp;self, s: impl std::fmt::Display) -&gt; Result&lt;(), LogError&gt; {
+            let s = format!("[{}] [ERROR] {}", now().rfc3339(), s);
+
+            self.sender.send(s)
+        }
+    }
+
+    impl Drop for Logger&lt;'_&gt; {
+        fn drop(&amp;mut self) {
+            // The non-trivial drop prevents the logger to outlives the manager.
+        }
+    }
+}
+
+// Demontration:
+fn main() -&gt; Result&lt;(), logger::LogError&gt; {
+    let log_manager = logger::Runtime::new();
+    let logger = log_manager.logger();
+
+    logger.info("Hello world")?;
+    // Cloning without overhead:
+    logger.clone().error("Oops, error")?;
+
+    Ok(())
+}
+</code></pre>
+
+<p>If one try to make a logger outlive the runtime, it will not compile:</p>
+
+<pre><code>fn main() -&gt; Result&lt;(), logger::LogError&gt; {
+    let log_manager = logger::Runtime::new();
+    let logger = log_manager.logger();
+
+    logger.clone().info("Hello world")
+}
+</code></pre>
+
+<p>Gives:</p>
+
+<pre class="lang-none prettyprint-override"><code>error[E0597]: `log_manager` does not live long enough
+  --&gt; src/main.rs:85:18
+   |
+85 |     let logger = log_manager.logger();
+   |                  ^^^^^^^^^^^ borrowed value does not live long enough
+86 | 
+87 |     logger.clone().info("Hello world")
+   |     -------------- a temporary with access to the borrow is created here ...
+88 | }
+   | -
+   | |
+   | `log_manager` dropped here while still borrowed
+   | ... and the borrow might be used here, when that temporary is dropped and runs the `Drop` code for type `logger::Logger`
+   |
+   = note: The temporary is part of an expression at the end of a block. Consider forcing this temporary to be dropped sooner, before the block's local variables are dropped. For example, you could save the expression's value in a new local variable `x` and then make `x` be the expression at the end of the block.
+</code></pre>
+    </div>

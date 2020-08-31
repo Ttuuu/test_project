@@ -1,0 +1,64 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+<p>I could have used a cron job to run this every 5 minutes (without the while loop) but that seemed like unnecessary configuration fiddling, with the problem of which user to run under as well (a user with minimal perms, naturally).</p>
+</blockquote>
+<p>Instead of <code>cron</code>, you can register this as a <code>systemd</code> service with a <a href="https://wiki.archlinux.org/index.php/Systemd/Timers" rel="nofollow noreferrer"><code>timer</code></a>. This elevates the timing out of the Python script and enhances control over timing tenfold. You can then work with return codes of the Python script for further action (e.g. <code>Restart</code> and <code>RestartSec=300</code> keywords). This can get rid of the currently awkward <code>try</code>/<code>except</code> blocks and the helper <code>just_built</code>.</p>
+<p>NixOS seems to have the <a href="https://nixos.wiki/wiki/Nix_Cookbook" rel="nofollow noreferrer">capability</a> (under <em>Creating Periodic Services</em>).</p>
+<p>At the end, you have a clear and clean Python script that does not have to be kept alive continuously and does one thing well. Further, you leave the timing and success handling to a facility that is much better at it than a <code>time.sleep</code> can hope to be.</p>
+<p>The overhead configuration is not a lot; you seem to have more scripting experience than me, and I managed just fine. To get you started, the <code>systemd.service</code> file can be:</p>
+<pre class="lang-yaml prettyprint-override"><code>[Unit]
+Description=Build git project continuously
+
+[Service]
+# Type=oneshot is default
+Type=oneshot
+
+# User= is required to find ~/.ssh for GitHub.
+# Otherwise, User=root is default, which will fail to find keys
+User=&lt;user&gt;
+
+WorkingDirectory=/home/&lt;user&gt;/path/to/repo
+
+ExecStart=/usr/bin/python3 -m &lt;your module/package&gt;
+</code></pre>
+<p>You can even play with things like <code>ExecStartPre=/usr/bin/git pull</code> to separate out the <code>git pull</code> part, which seems more natural as a <code>systemd</code> command than in a Python script (since there, it requires <code>run</code>, <code>split</code>, ...).</p>
+<p>More info on the <code>.service</code> syntax is found <a href="https://www.freedesktop.org/software/systemd/man/systemd.service.html" rel="nofollow noreferrer">here</a>, and <a href="https://www.freedesktop.org/software/systemd/man/systemd.time.html" rel="nofollow noreferrer">here</a> is more info for the <code>.timer</code> syntax.</p>
+<hr>
+<p>As a second thought, the <code>git_pull</code> function does not seem terribly robust.
+A quick check reveals that a <code>git pull</code> when already up-to-date returns <code>0</code> (which is fine, but not useful here), which is probably why you implemented the function the way you did.
+But what if that status message string ever changes?</p>
+<p>A different approach is found <a href="https://stackoverflow.com/a/3278427/11477374">here</a>, and put into your code, it can look like:</p>
+<pre class="lang-py prettyprint-override"><code>from subprocess import run
+from shlex import split
+from pathlib import Path
+
+WD = Path.cwd()
+
+def git_pull(work_dir):
+    # Instead of lambda, maybe use functools.partial:
+    cwd_run = lambda cmd: run(split(cmd), cwd=work_dir, capture_output=True)
+
+    cwd_run("git remote update")
+    current_branch_short = "@"
+    upstream_branch_short = "@{u}"
+    current_branch_hash = cwd_run(f"git rev-parse {current_branch_short}").stdout
+    upstream_branch_hash = cwd_run(f"git rev-parse {upstream_branch_short}").stdout
+
+    branches_diverged = current_branch_hash != upstream_branch_hash
+    if branches_diverged:
+        cwd_run("git pull")
+    return branches_diverged
+
+git_pull(work_dir=WD)
+</code></pre>
+<p>This is more robust in the sense that it does not rely on a specific string in <code>stdout</code>.
+However, it has two distinct disadvantages:</p>
+<ol>
+<li><p>It polls the remote twice; once to update, once to actually pull. This overhead is probably not a lot.</p>
+</li>
+<li><p>The test can only check if branches have diverged, but not in which direction. If your local is ahead, the test passes as <code>True</code> and <code>git pull</code> is triggered, which does not make sense. Since this is run on your server that only ever pulls in changes and never has local ones, it is probably fine. In that case, a branch diversion is always equal to a remote change that requires a <code>pull</code>.</p>
+<p>In the link above, this disadvantage is solved using <code>git merge-base @ @{u}</code>, yielding a <em>base</em> at which the branches have diverged. So if implemented correctly/fully (not necessary for your case), it is not really a disadvantage.</p>
+</li>
+</ol>
+<p>See if this can work for you, since it is not a strict (no downsides) improvement.</p>
+    </div>

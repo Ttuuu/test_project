@@ -1,0 +1,364 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>As @vogel612 suggested updated code is more of an answer rather than edited question. Here is the updated code:</p>
+
+<pre><code>#pragma once
+#include &lt;Windows.h&gt;
+
+#include &lt;atomic&gt;
+#include &lt;mutex&gt;
+#include &lt;exception&gt;
+
+namespace rip_parallel
+{
+    // Forward declaration needed for 'friend' specification.
+    class upgradable_lock;
+
+    // Class upgradable_mutex.
+    // Used as a synchronization primitve for upgradable_lock.
+    class upgradable_mutex
+    {
+    public:
+        friend class upgradable_lock;
+    public:
+        // Constructs upgradable_mutex object.
+        upgradable_mutex(void) noexcept
+        {
+            InitializeSRWLock(&amp;m_sharedlock);
+
+            // We need synchronization event as a barrier that will be set by the owner of shared lock once it needs upgrade.
+            m_readevent = CreateEvent(nullptr, TRUE, TRUE, nullptr);
+        }
+        // Destroys upgradable_mutex object.
+        ~upgradable_mutex(void)
+        {
+            // Once the object is marked for destruction - set the event and close the handle.
+            SetEvent(m_readevent);
+            CloseHandle(m_readevent);
+        }
+    public:
+        // Deleted copy constructor.
+        upgradable_mutex(const upgradable_mutex&amp;) = delete;
+        // Deleted move constructor.
+        upgradable_mutex(upgradable_mutex&amp;&amp;) = delete;
+    public:
+        // Deleted copy assignment operator.
+        upgradable_mutex&amp; operator=(const upgradable_mutex&amp;) = delete;
+        // Deleted move assignment operator.
+        upgradable_mutex&amp; operator=(upgradable_mutex&amp;&amp;) = delete;
+    public:
+        // Acquires shared access over the lock.
+        void lock_shared(void)
+        {
+            // Each thread that wants READ access, has to wait for read to be enabled first.
+            // This will enable the thread(s) that wants to acquire upgrade lock to disable further reads while upgrade is active.
+            // Writers are not involved in this wait mechanism, cause once at least one thread has shared access, all writers are suspended.
+
+            // Wait infinite.
+            WaitForSingleObject(m_readevent, INFINITE);
+
+            // Here we need to acquire a READ lock (primary). However we also have to update readers count atomically whilst obtaining the lock.
+            // So, we have to use secondary lock (std::unique_lock). Setting the secondary lock (std::unique_lock) while acquiring the primary 
+            // lock (SRWLock) will lead to a deadlock if we do not leave a few milliseconds for other threads to complete their operations and 
+            // release the primary lock.
+            while (true)
+            {
+                // Scope for the lock.
+                {
+                    // This lock allows us to do the following in atomic operation:
+                    //  1. Acquire the SRWLock
+                    //  2. Alter number of readers
+                    std::unique_lock&lt;std::mutex&gt; guard(m_mutexguard);
+
+                    // We'll try to acquire READ lock.
+                    BOOLEAN bResult = TryAcquireSRWLockShared(&amp;m_sharedlock);
+                    if (bResult)
+                    {
+                        // Once acquired, increment readers count.
+                        m_readers++;
+
+                        // Acquired. Exit.
+                        break;
+                    }
+
+                    // Everything executed inside current scope is atomic.
+                }
+
+                // If we cannot acquire it, sleep shortly and try again.
+                Sleep(10);
+            }
+        }
+        // Releases shared access over the lock.
+        void unlock_shared(void)
+        {
+            // Release READ access.
+            ReleaseSRWLockShared(&amp;m_sharedlock);
+
+            // Protect readers count manipulation.
+            std::unique_lock&lt;std::mutex&gt; guard(m_mutexguard);
+
+            // Once released, decrement readers count.
+            m_readers--;
+        }
+        // Acquires exclusive access over the lock. Suspends the calling thread until lock is obtained.
+        void lock(void)
+        {
+            // Since we're not gonna use 2 locks for WRITE access, we won't use TryAcquireSRWLockExclusive to 
+            // acquire the WRITE lock. This will make lock obtaining fair and won't be causing starvation of writers.
+            AcquireSRWLockExclusive(&amp;m_sharedlock);
+        }
+        // Releases exclusive access over the lock.
+        void unlock(void)
+        {
+            // Release WRITE access.
+            ReleaseSRWLockExclusive(&amp;m_sharedlock);
+        }
+    private:
+        // Enables shared access over the lock.
+        void enable_read(void)
+        {
+            // Scope for the lock.
+            {
+                // Protect readers count manipulation.
+                std::unique_lock&lt;std::mutex&gt; guard(m_mutexguard);
+
+                // Since current thread has upgraded access type, we have to update readers count, since it'll be decremented in unlock_shared.
+                m_readers++;
+            }
+
+            // We have to keep track of upgraders count, in order to enable READ, once all upgarders have completed.
+            m_upgraders--;
+
+            if (m_upgraders == 0)
+            {
+                // Once all upgraders have completed WRITE operation, enable readers.
+                SetEvent(m_readevent);
+            }
+        }
+        // Disables shared access over the lock.
+        void disable_read(void)
+        {
+            // The thread(s) that wants to upgrade access, has to disable further READ access.
+            // It means that it has to reset the event and disable other threads to acquire mutex - otherwise we would deadlock.
+            if (m_upgraders == 0)
+            {
+                // If there are no other upgraders at the moment - reset the event. Otherwise, it's already in non-signaled state.
+                ResetEvent(m_readevent);
+            }
+
+            // Scope for the lock.
+            {
+                // Protect readers count manipulation.
+                std::unique_lock&lt;std::mutex&gt; guard(m_mutexguard);
+
+                // Since current thread is upgrading access type, we have to reduce readers count.
+                m_readers--;
+            }
+
+            // We have to keep track of upgraders count, in order to enable READ, once all upgarders have completed.
+            m_upgraders++;
+        }
+        // Returns active readers count.
+        int readers_count(void)
+        {
+            // Protect readers count manipulation.
+            std::unique_lock&lt;std::mutex&gt; guard(m_mutexguard);
+
+            // Get actual readers count.
+            return m_readers;
+        }
+        // Synchronizes all threads that are requesting upgrade, by allowing one writer at a time.
+        void upgrader_acquire_exclusive_access(void)
+        {
+            // Once we have upgraded our state, we need to acquire exclusive access.
+            m_mutex.lock();
+        }
+        // Synchronizes all threads that are requesting upgrade, by allowing one writer at a time.
+        void upgrader_release_exclusive_access(void)
+        {
+            // Once we have completed exclusive operation we have to release exclusive access.
+            m_mutex.unlock();
+        }
+    private:
+        HANDLE m_readevent              = nullptr;
+        SRWLOCK m_sharedlock            = SRWLOCK_INIT;
+        int m_readers                   = 0;
+        std::atomic&lt;int&gt; m_upgraders    = 0;
+        std::mutex m_mutexguard;
+        std::mutex m_mutex;
+    };
+
+    // Enum upgradable_lock_state.
+    // Used to determine internal state of upgradable_lock object.
+    enum upgradable_lock_state
+    {
+        // No state. No locking occured.
+        defer_state     = 0,
+        // Shared state. Lock is obtained in READ mode.
+        shared_state    = 1,
+        // Exclusive state. Lock is obtained in WRITE mode.
+        exclusive_state = 2,
+        // Upgraded state. Lock that was previously in READ mode, has upgraded to WRITE mode.
+        upgrade_state   = 4
+    };
+
+    // Class upgradable_lock.
+    // Lightweight READ/WRITE lock abstraction which supports atomical upgrade from shared to exclusive state.
+    class upgradable_lock
+    {
+    public:
+        // Constructs upgradable_lock object. Supports RAII-style locking.
+        upgradable_lock(upgradable_mutex&amp; ref_mutex, upgradable_lock_state initial_state = rip_parallel::shared_state)
+            : m_mutex(ref_mutex)
+        {
+            // Determine trhe requested lock state.
+            switch (initial_state)
+            {
+            case rip_parallel::shared_state:
+                // User has specified shared state.
+                lock_shared();
+                break;
+            case rip_parallel::exclusive_state:
+            case rip_parallel::upgrade_state:
+                // Whether the user has specified exclusive or upgrade state, at the end we want exclusive access.
+                lock_unique();
+                break;
+            }
+        }
+        // Automatically releases the lock and destroys the upgradable_lock object.
+        ~upgradable_lock(void)
+        {
+            // Unlock the object.
+            unlock();
+        }
+    public:
+        // Deleted copy constructor.
+        upgradable_lock(const upgradable_lock&amp;) = delete;
+        // Deleted move constructor.
+        upgradable_lock(upgradable_lock&amp;&amp;) = delete;
+    public:
+        // Deleted copy assignment operator.
+        upgradable_lock&amp; operator=(const upgradable_lock&amp;) = delete;
+        // Deleted move assignment operator.
+        upgradable_lock&amp; operator=(upgradable_lock&amp;&amp;) = delete;
+    public:
+        // Unlocks the upgradable_lock object.
+        void unlock(void)
+        {
+            // We need to determine object state in order to know which unlocking mechanism to execute.
+            switch (m_state)
+            {
+            case rip_parallel::shared_state:
+                // If we are in shared state - all we need is to invoke unlock_shared. Mutex will handle the rest.
+                m_mutex.unlock_shared();
+                break;
+            case rip_parallel::exclusive_state:
+                // If we are in exclusive state - all we need is to invoke unlock. Mutex will handle the rest.
+                m_mutex.unlock();
+                break;
+            case rip_parallel::upgrade_state:
+                // If we were in the upgrade state, then we need to release the upgraders exclusive lock.
+                m_mutex.upgrader_release_exclusive_access();
+                // Then we need to enable future readers access.
+                m_mutex.enable_read();
+                // At the end, since upgrader just became another reader, we need to unlock shared access.
+                m_mutex.unlock_shared();
+                break;
+            }
+            // In any case above, state has become - 'no lock'.
+            m_state = rip_parallel::defer_state;
+        }
+        // Acquires exclusive access over the lock. Suspends the calling thread until lock is obtained.
+        void lock_unique(void)
+        {
+            // Recursive calls are not supported.
+            if (m_state == rip_parallel::exclusive_state)
+            {
+                return;
+            }
+            // If we are in any state, other than 'no lock' and 'exclusive' - results are undefined.
+            // It's safer to throw exception.
+            if (m_state != rip_parallel::defer_state)
+            {
+                throw std::exception("While trying to acquire unique lock, invalid state of upgradable_lock was found. State was: " + m_state);
+            }
+
+            // Obtain the exclusive lock.
+            m_mutex.lock();
+            // Update the state accordingly.
+            m_state = rip_parallel::exclusive_state;
+        }
+        // Acquires shared access over the lock. Suspends the calling thread until lock is obtained.
+        void lock_shared(void)
+        {
+            // Recursive calls are not supported.
+            if (m_state == rip_parallel::shared_state)
+            {
+                return;
+            }
+            // If we are in any state, other than 'no lock' and 'shared' - results are undefined.
+            // It's safer to throw exception.
+            if (m_state != rip_parallel::defer_state)
+            {
+                throw std::exception("While trying to acquire shared lock, invalid state of upgradable_lock was found. State was: " + m_state);
+            }
+
+            // Obtain the shared lock.
+            m_mutex.lock_shared();
+            // Update the state accordingly.
+            m_state = rip_parallel::shared_state;
+        }
+        // Atomically acquires exclusive access over the lock, without releasing the shared access. Spins the calling thread until upgrade is obtained.
+        void lock_upgrade(void)
+        {
+            // Recursive calls are not supported.
+            if (m_state == upgrade_state)
+            {
+                return;
+            }
+            else if (m_state == exclusive_state)
+            {
+                // If we are in 'exclusive' state already - results are undefined.
+                // It's safer to throw exception.
+                throw std::exception("While trying to upgrade shared lock, invalid state of upgradable_lock was found. State was: " + m_state);
+            }
+            else if (m_state == defer_state)
+            {
+                // If we are in 'no lock' state - we need to obtain 'shared' lock, first.
+                m_mutex.lock_shared();
+            }
+            // Update the state accordingly.
+            m_state = rip_parallel::upgrade_state;
+
+            // Since we have acquired READ access at this point, it means that any future thread(s) that wants to acquire WRITE access
+            // will be suspended, until we release the READ access. That excludes all writters from the equation. In order to atomically
+            // upgrade, all we need to handle now are future readers. By calling upgradable_mutex::disable_read we are changing the
+            // upgradable_mutex::m_readevent to signaled state. After this point all future thread(s) that wants READ access will be
+            // suspended until the upgradable_mutex::enable_read is invoked and upgradable_mutex::m_readevent is changed back to
+            // non-signaled state.
+            m_mutex.disable_read();
+
+            // Once we have excluded all future WRITE requests and disabled all future READ requests, there is a possibility that some
+            // readers are still active, and have not yet completed their READ operations. That's why we will spin and sleep some short
+            // amount of time - 10ms in below case, waiting for all readers to complete their operations.
+            while (m_mutex.readers_count())
+            {
+                Sleep(10);
+            }
+
+            // Only once there are no active readers, and we have disabled all future READ/WRITE requests - we can then conclude that
+            // only upgraders are now active. Last step is to synchronize upgarders between themselves using separate mutex object.
+            m_mutex.upgrader_acquire_exclusive_access();
+
+            // Once upgrader reaches THIS POINT, it means that lock was successfully upgraded.
+            // EXCLUSIVE work may be performed now.
+        }
+    private:
+        upgradable_mutex&amp; m_mutex;
+        upgradable_lock_state m_state = rip_parallel::defer_state;
+    };
+};
+</code></pre>
+
+<p>EDIT:
+I've made another edit, thanks to the @RbMm notes. There was an issue due to lock and readers count not being made atomically but this is resolved now.</p>
+    </div>

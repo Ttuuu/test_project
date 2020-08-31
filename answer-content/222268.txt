@@ -1,0 +1,192 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Although there's a comment in <code>SimpleDestroy&lt;T, false&gt;::destroyElements()</code> claiming that <code>~T()</code> doesn't throw, there's very little to assure that.  Our only guarantee is that we currently call it only from the version of <code>SimpleCopy</code> that handles non-throwing destructors, but it would be easy to accidentally break that requirement - for example, we might want to use it to implement <code>~Vector&lt;T&gt;()</code>.</p>
+
+<p>It's easy to make it more robust - decrement <code>obj.length</code> as we go along, rather than once at the end.  That makes the behaviour more like standard containers.</p>
+
+<hr>
+
+<p>I don't see why <code>destroyElements()</code> and <code>simpleCopy()</code> need their own (publicly-visible!) classes.  Those classes could be private member classes of <code>Vector</code>, but I think that's still overkill: the functions may be better as private members of the <code>Vector</code> class:</p>
+
+<pre><code>private:
+    void destroyElements_trivial();
+    void destroyElements_nontrivial();
+    void destroyElements() {
+        (std::is_trivially_destructible_v&lt;T&gt;
+            ? destroyElements_trivial : destroyElements_nontrivial)();
+    }
+
+    void simpleCopy_trivial(Vector&lt;T&gt; const&amp; src);
+    void simpleCopy_nontrivial(Vector&lt;T&gt; const&amp; src);
+    void simpleCopy(Vector&lt;T&gt; const&amp; src) {
+        (SimpleCopyableAssignableTraitNoThrow&lt;T&gt;::value
+            ? simpleCopy_trivial : simpleCopy_nontrivial)(src);
+    }
+</code></pre>
+
+<p>Implementation is straightforward:</p>
+
+<pre><code>template&lt;typename T&gt;
+void Vector&lt;T&gt;::destroyElements_trivial()
+{
+    length  = 0;
+}
+
+template&lt;typename T&gt;
+void Vector&lt;T&gt;::destroyElements_nontrivial()
+{
+    while (length) {
+        buffer[--length].~T();
+    }
+    length = 0;
+}
+
+
+template&lt;typename T&gt;
+void Vector&lt;T&gt;::simpleCopy_trivial(Vector&lt;T&gt; const&amp; src)
+{
+    if (this == &amp;src) {
+        return;
+    }
+
+    // Destroy the members of the current object
+    destroyElements();
+
+    // Copy from the source object
+    for (auto const&amp; value: src) {
+        push(value);
+    }
+}
+template&lt;typename T&gt;
+void Vector&lt;T&gt;::simpleCopy_nontrivial(Vector&lt;T&gt; const&amp; src)
+{
+    Vector&lt;T&gt; tmp(src);       // Copy
+    swap(tmp);                // Swap
+}
+</code></pre>
+
+<p>We can further simplify into single methods, using <code>if constexpr</code>:</p>
+
+<pre><code>private:
+    void destroyElements();
+    void simpleCopy(Vector&lt;T&gt; const&amp; src);
+</code></pre>
+
+
+
+<pre><code>template&lt;typename T&gt;
+void Vector&lt;T&gt;::destroyElements()
+{
+    if constexpr (!std::is_trivially_destructible_v&lt;T&gt;) {
+        while (length) {
+            buffer[--length].~T();
+        }
+    }
+    length  = 0;
+}
+
+
+template&lt;typename T&gt;
+void Vector&lt;T&gt;::simpleCopy(Vector&lt;T&gt; const&amp; src)
+{
+    if (this == &amp;src) {
+        return;
+    }
+
+    if constexpr (SimpleCopyableAssignableTraitNoThrow&lt;T&gt;::value) {
+        // Destroy the members of the current object
+        destroyElements();
+
+        // Copy from the source object
+        for (auto const&amp; value: src) {
+            push(value);
+        }
+    } else {
+        Vector&lt;T&gt; tmp(src);       // Copy
+        swap(tmp);                // Swap
+    }
+}
+</code></pre>
+
+<p>That's cleaner and shorter than having the destruct and copy outsourced to friend classes.  It also enables us to dispense with the traits classes (which can move to being <code>static constexpr</code> members), and yields this much reduced version of the question code:</p>
+
+<pre><code>#include &lt;type_traits&gt;
+
+namespace ThorsAnvil
+{
+    template&lt;typename T&gt;
+    class Vector
+    {
+        // copied from original question so it compiles
+        std::size_t     capacity;
+        std::size_t     length;
+        T*              buffer;
+
+        static constexpr bool is_nothrow_assignable =
+            std::is_nothrow_destructible_v&lt;T&gt; &amp;&amp; std::is_nothrow_copy_assignable_v&lt;T&gt;;
+        static constexpr bool is_trivially_destructible =
+            std::is_trivially_destructible_v&lt;T&gt;;
+
+        public:
+            Vector&amp; operator=(Vector const&amp; value) noexcept(is_nothrow_assignable)
+            {
+                simpleCopy(value);
+                return *this;
+            }
+
+        T* begin() const;
+        T* end() const;
+        void push(T const&amp; u);
+
+    private:
+        void destroyElements();
+        void simpleCopy(Vector&lt;T&gt; const&amp; src) noexcept(is_nothrow_assignable);
+    };
+
+
+    template&lt;typename T&gt;
+    void Vector&lt;T&gt;::destroyElements()
+    {
+        if constexpr (is_trivially_destructible) {
+            length = 0;
+        } else {
+            while (length) {
+                buffer[--length].~T();
+            }
+        }
+    }
+
+
+
+    template&lt;typename T&gt;
+    void Vector&lt;T&gt;::simpleCopy(Vector&lt;T&gt; const&amp; src) noexcept(is_nothrow_assignable)
+    {
+        if (this == &amp;src) {
+            return;
+        }
+
+        if constexpr (is_nothrow_assignable) {
+            // Destroy the members of the current object
+            destroyElements();
+
+            // Copy from the source object
+            for (auto const&amp; value: src) {
+                push(value);
+            }
+        } else {
+            Vector&lt;T&gt; tmp(src);       // Copy
+            swap(tmp);                // Swap
+        }
+    }
+
+}
+</code></pre>
+
+<hr>
+
+<p>Simple typos (more important than usual, given that this is didactic code):</p>
+
+<ul>
+<li>Trivialy -&gt; <strong>Trivially</strong></li>
+<li>detonation -&gt; <strong>destination</strong></li>
+</ul>
+    </div>

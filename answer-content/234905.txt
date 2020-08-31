@@ -1,0 +1,137 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>An answer to document how to integrate some of the excellent feedback points from @G. Sliepen in <a href="https://codereview.stackexchange.com/a/234888/212940">his accepted answer</a> above. </p>
+
+<p>The following have been changed from the original question above:</p>
+
+<ul>
+<li>Remove <code>constexpr</code> since it is not required and opens up options for using the STL algorithms (except for the static <code>U</code>, where constexpr allows <code>inline</code> definition of this constant) </li>
+<li>Use <code>std::array&lt;long|int, 3&gt;</code> to store both the <code>triple</code> and the <code>vec3</code> transform data. This allows more algorithmic use than <code>._a, ._b, ._c</code> and <code>._x, ._y, ._z</code>. (But see below for how I retained simple accessor syntax)</li>
+<li>Use <code>std::inner_product</code> and <code>std::transform</code> to do the matrix multiplication. <code>std::accumulate</code> for the perimeter. </li>
+<li>Addition of a "Breadth first search" (BFS) finder.</li>
+</ul>
+
+<p>Things I decided not to adopt:</p>
+
+<ul>
+<li><code>std::function</code>, which is known to be very slow, was deemed inappropriate for inner loop lambda. So the constraining of the lambda type remains a TODO. </li>
+<li>C-Arrays: Lose their size when you pass them around (since Kernighan and Ritchie) and decay to a pointer. So <code>std::array&lt;&gt;</code> adds value as we can easily use it in algorithms, because it knows its size and you can call <code>std::begin()</code> etc. We learn to live with the "many braces". </li>
+</ul>
+
+<p>The one extra wrinkle was to make <code>triple</code> <em>inherit from</em> <code>std::array&lt;long, 3&gt;</code> and <code>vec3</code> <em>inherit from</em> <code>std::array&lt;int, 3&gt;</code>. Then similarly for <code>trans</code>. This allows strong typing (ie not just a <code>using alias</code> which just decays away) but retains the easy and direct access via <code>operator[]</code> and usage in algorithms or <code>ranged for loops</code> without writing a single line of code. There is no <code>vtable</code> or similar overhead, because this is not <code>virtual</code>, <code>polymorphic</code> inheritance. </p>
+
+<p>Performance is identical to the original above. Code size looks bigger (<a href="https://godbolt.org/z/jYwDpn" rel="nofollow noreferrer">goldbolt link</a>), but that is all due to the new BFS algo which uses <code>std::queue</code>, heap allocators etc. If we remove that for a fairer comparison the code size is identical to above, and speed on <code>-O3</code> is identical. ie STL <code>std::inner_product</code> and <code>std::transform</code> and <code>std::accumulate</code> are truly "zero cost" here, and arguably "negative cost" given the improved readability and more general algorithm. </p>
+
+<p>An unrelated annoyance is the boilerplate in <code>operator&lt;&lt;</code>. Still haven't found a terse way of expressing that. </p>
+
+<pre><code>#include &lt;algorithm&gt;
+#include &lt;array&gt;
+#include &lt;cstdio&gt;
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;numeric&gt;
+#include &lt;queue&gt;
+
+namespace pythag {
+
+class triple : public std::array&lt;long, 3&gt; {
+public:
+  template &lt;typename F&gt;
+  void find(long max_perim, F&amp;&amp; proc) {
+    // recursive DFS
+    if (perimeter() &gt; max_perim) return;
+    proc(*this);
+    for (auto&amp; T: U) transform(T).find(max_perim, proc);
+  }
+
+  template &lt;typename F&gt;
+  void find_by_level(int max_depth, F&amp;&amp; proc) {
+    // iterative BFS with level tracking / limiting
+    std::queue&lt;triple&gt; q;
+    q.push(*this);
+    int depth          = 0;
+    int cnt_this_depth = 1;
+    int cnt_next_depth = 0;
+    while (!q.empty()) {
+      auto t = q.front();
+      q.pop();
+      proc(t);
+      cnt_next_depth += U.size(); // always 3
+      if (--cnt_this_depth == 0) {
+        if (++depth &gt; max_depth) return;
+        cnt_this_depth = cnt_next_depth;
+        cnt_next_depth = 0;
+      }
+      for (auto&amp; T: U) q.push(t.transform(T));
+    }
+  }
+
+  [[nodiscard]] long perimeter() const noexcept {
+    return std::accumulate(this-&gt;begin(), this-&gt;end(), 0L);
+  }
+
+  friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; stream, const triple&amp; t) noexcept {
+    // Frustrating boiler plate. Any terse alternatives, that do it quickly and correctly?
+    char comma[] = {'\0', ' ', '\0'}; // NOLINT
+    for (auto d: t) {
+      stream &lt;&lt; comma &lt;&lt; d;
+      comma[0] = ',';
+    }
+    return stream;
+  }
+
+private:
+  struct vec3 : public std::array&lt;int, 3&gt; {};   // strong types by inheritance
+  struct trans : public std::array&lt;vec3, 3&gt; {}; // to distinguish from triple
+
+  [[nodiscard]] triple transform(const trans&amp; T) const noexcept {
+    auto res = triple{};
+    std::transform(T.begin(), T.end(), res.begin(), [this](vec3 V) {
+      return std::inner_product(V.begin(), V.end(), this-&gt;begin(), 0L);
+    });
+    return res;
+  }
+
+  static constexpr auto U = std::array&lt;trans, 3&gt;{{
+      // https://en.wikipedia.org/wiki/Pythagorean_triple#Parent.2Fchild_relationships
+      {{{{{1, -2, 2}},    // vec3 U[0][0]
+         {{2, -1, 2}},    // vec3 U[0][1]
+         {{2, -2, 3}}}}}, // vec3 U[0][1]
+
+      {{{{{1, 2, 2}},    // vec3 U[1][0]
+         {{2, 1, 2}},    // vec3 U[1][1]
+         {{2, 2, 3}}}}}, // vec3 U[1][2]
+
+      {{{{{-1, 2, 2}},    // vec3 U[2][0]
+         {{-2, 1, 2}},    // vec3 U[2][1]
+         {{-2, 2, 3}}}}}, // vec3 U[2][2]
+  }};
+};
+
+} // namespace pythag
+
+int main() {
+  using pythag::triple;
+
+  // basic usage demo
+  auto print = [](const triple&amp; t) { std::cout &lt;&lt; t &lt;&lt; "\n"; };
+  std::cout &lt;&lt; "Primitive triples up to a perimeter of 200\n";
+  triple{{3, 4, 5}}.find(200, print);
+  std::cout &lt;&lt; "\nPrimitive triples up to 2 levels of transformation away from {3,4,5}\n";
+  triple{{3, 4, 5}}.find_by_level(2, print);
+
+  // // performance test
+  // long sum_peri = 0;
+  // long count    = 0;
+  // pythag::triple{{3, 4, 5}}.find(
+  //     100'000'000, // produces 7'023'027 triples in &lt;100ms on i7 2600
+  //     [&amp;sum_peri, &amp;count](const auto&amp; t) {
+  //       sum_peri += t.perimeter();
+  //       ++count;
+  //     });
+
+  // // prevent entire programme being optimised away without &lt;iostream&gt;
+  // return (sum_peri ^ count) &amp; 0xff;
+}
+
+</code></pre>
+    </div>

@@ -1,0 +1,177 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Congratulations — I think this is the first concurrency-related code I've reviewed on CodeReview in which I have <em>not</em> managed to find any concurrency-related bugs! It looks like a solid implementation of "hand-over-hand" traversal. (Now that I've said that, I bet someone else will find a bug. :))</p>
+
+<p>First, a few stylistic nitpicks:</p>
+
+<pre><code>using namespace std;
+</code></pre>
+
+<p>Never! Just write <code>std::vector&lt;std::thread&gt;</code> if that's what you mean. The small space savings isn't worth dealing with all the people like me who'll tell you over and over not to write <code>using namespace std;</code> at global scope. :)</p>
+
+<hr>
+
+<pre><code>const int N = 10;
+</code></pre>
+
+<p>Make this <code>constexpr int N = 10;</code> and you won't need to capture a copy of it in your lambda. (EDIT: Looks like I'm wrong. MSVC captures a copy in either case; GCC and Clang don't-capture in either case, unless the lambda takes the address of its copy, in which case they both capture. What a mess.)</p>
+
+<hr>
+
+<pre><code>for (int i = 0; i &lt; n; i++) {
+    threads[i].join();
+}
+</code></pre>
+
+<p>Prefer to write this with a ranged for loop:</p>
+
+<pre><code>for (auto&amp;&amp; thread : threads) {
+    thread.join();
+}
+</code></pre>
+
+<p>(EDIT: I use <code>auto&amp;&amp;</code> because it Always Works. You could use <code>auto&amp;</code> or <code>const auto&amp;</code> as appropriate, but then you'd have to worry about which one was appropriate in each given case, and so would your code-reviewer. <code>auto&amp;&amp;</code> Always Works.)</p>
+
+<hr>
+
+<pre><code>struct Node {
+    int val;
+    Node *next;
+    mutex m;
+
+    Node(int val_, Node *next_ = nullptr) : val(val_), next(next_) {}
+};
+</code></pre>
+
+<p>Defaulted function arguments are the devil. And, completely independently, so are implicit conversions! I would prefer to write this as:</p>
+
+<pre><code>struct Node {
+    int val;
+    Node *next = nullptr;
+    mutex m;
+
+    explicit Node(int val_) : val(val_) {}
+    explicit Node(int val_, Node *next_) : val(val_), next(next_) {}
+};
+</code></pre>
+
+<p>or even</p>
+
+<pre><code>struct Node {
+    int val;
+    Node *next;
+    mutex m;
+
+    explicit Node(int val_) : Node(val_, nullptr) {}
+    explicit Node(int val_, Node *next_) : val(val_), next(next_) {}
+};
+</code></pre>
+
+<p>(EDIT: I put <code>explicit</code> on every constructor, even the multi-argument ones, unless I have a specific reason that I <em>want</em> implicit conversion. In C++11, an implicit multi-arg constructor permits e.g.</p>
+
+<pre><code>void foo(const Node&amp;);
+Node bar() {
+    foo({1, nullptr});
+    return {1, nullptr};
+}
+</code></pre>
+
+<p>and I consider preventing that "feature" to be a good thing.)</p>
+
+<hr>
+
+<p>Okay, now for the serious stuff.</p>
+
+<pre><code>void erase(int pos);
+</code></pre>
+
+<p>This is a really weird API for a linked list. For one thing, even for a non-concurrent linked list, you're turning "erase a node" into an O(n) operation. More importantly for a <em>concurrent</em> linked list, I can't see how this operation is useful at all! Suppose some thread says "please erase the 42nd element." How does it even know what the 42nd element <em>is</em>, given that any other thread could modify the list at any time?</p>
+
+<hr>
+
+<p>Your use of raw <code>new</code> and <code>delete</code> looks safe to me, but it would be a lot easier to verify its safety if you just didn't use raw <code>new</code> and <code>delete</code>! Consider this trivial rewrite of <code>insert</code>:</p>
+
+<pre><code>void insert(int val, int pos) {
+    auto new_node = std::make_unique&lt;Node&gt;(val);
+    Node *prev = head_;
+    unique_lock&lt;mutex&gt; prev_lk(prev-&gt;m);
+    Node *node = prev-&gt;next;
+    unique_lock&lt;mutex&gt; node_lk(node-&gt;m);
+    for (int i = 0; i &lt; pos &amp;&amp; node != tail_; i++) {
+        prev = node;
+        node = node-&gt;next;
+        prev_lk.swap(node_lk);
+        node_lk = unique_lock&lt;mutex&gt;(node-&gt;m);
+    }
+    new_node-&gt;next = node;
+    prev-&gt;next = new_node.release();
+}
+</code></pre>
+
+<p>Only two lines changed, but now it's <em>obvious</em> that we never leak memory...</p>
+
+<hr>
+
+<p>...except in the destructor of <code>LockBasedLinkedList</code>, which (being defaulted) just leaks every node remaining in the list! Was that intentional, or an oversight?</p>
+
+<hr>
+
+<p>Also consider the behavior of</p>
+
+<pre><code>LockBasedLinkedList a;
+auto b = a;
+</code></pre>
+
+<p>This certainly doesn't do what you want. What <em>do</em> you want it to do? If the answer is "I want it not to compile," then you should <code>=delete</code> your copy operations:</p>
+
+<pre><code>LockBasedLinkedList(const LockBasedLinkedList&amp;) = delete;
+LockBasedLinkedList&amp; operator=(const LockBasedLinkedList&amp;) = delete;
+</code></pre>
+
+<p>(EDIT: Deleting your copy operations will automatically cause your move operations to not-get-implicitly-generated. The full rules are a mess: <a href="https://stackoverflow.com/a/24512883/1424877">see here</a>. Feel free to explicitly <code>=delete</code> your move operations too, if you want.)</p>
+
+<hr>
+
+<p>In <code>get</code>:</p>
+
+<pre><code>    if (node == tail_) {
+        return 0;
+    }
+</code></pre>
+
+<p>How would your user distinguish the <code>0</code> that means "no such node" from the <code>0</code> that means "this node exists and has value <code>0</code>"? I would strongly recommend designing your API so that this distinction is obvious to the user. For example:</p>
+
+<pre><code>std::optional&lt;int&gt; get(int);
+</code></pre>
+
+<hr>
+
+<blockquote>
+  <p>How to return unique_lock in a function...?</p>
+</blockquote>
+
+<p>I think this is related to your <code>get</code> API, yeah? That is, maybe you want something like</p>
+
+<pre><code>LockedNodePointer get(int);
+
+class LockedNodePointer {
+public:
+    LockedNodePointer(std::nullptr_t) : ptr_(nullptr) {}
+    Node&amp; operator*() const { return *ptr_; }
+    Node&amp; operator-&gt;() const { return ptr_; }
+private:
+    friend class LockBasedLinkedList;
+    using Lock = std::unique_lock&lt;std::mutex&gt;;
+    explicit LockedNodePointer(Lock lk, Node *ptr) : lk_(lk), ptr_(ptr) {}
+    Lock lk_;
+    Node *ptr_;
+};
+</code></pre>
+
+<p>This is an even cleaner way to distinguish "node with value <code>0</code>" from "no such node."</p>
+
+<hr>
+
+<p>It would also be interesting to consider: do you need a version of your <code>get</code> member function that is <code>const</code>-qualified? (Getting an element doesn't really modify the list, right?)</p>
+
+<p>Do you need two overloads of <code>get</code> — one <code>const</code> and one non-<code>const</code>?</p>
+    </div>

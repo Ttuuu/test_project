@@ -1,0 +1,158 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>While your approach is simple and straightforward to implement there are some important drawbacks to realize.</p>
+
+<p>First, it doesn't take advantage of the power templates offer. Since you're specializing for every possible usage of <code>string_cast</code> there's no opportunity for the compiler to generate code for you. A consequence of this is that you have a lot of 'clipboard heritance', copy and pasting the same function and changing parts of it to do what you want. This is a form of code duplication.</p>
+
+<p>The approach does not lend itself to extendibility. What happens if you want to add support for another string type later on? The combination of functions you have to write would explode!</p>
+
+<p>So there're clearly opportunities for some major improvement. Let see how we can refactor this so that it better adheds to DRY. If you take a step back and think about how <code>string_cast</code> is used you'll find there are really just 3 scenarios it has to support:</p>
+
+<ul>
+<li>cast to the same string type.</li>
+<li>cast to a different string type.</li>
+<li>cast from a raw pointer representation into a string type.</li>
+</ul>
+
+<p>Each of these cases can be handle by writing a template for them. Starting with the string_cast function that acts as an interface:</p>
+
+<pre><code>template &lt;typename Td, typename Ts&gt;
+</code></pre>
+
+<p>string_cast now takes 2 template parameters. Keeping your naming convention, I use <code>Ts</code> to indicate the source type. (<code>TO</code> and <code>FROM</code> are probably better names.)</p>
+
+<pre><code>Td string_cast(const Ts &amp;source)
+{
+</code></pre>
+
+<p>We use type deduction to identify what we're casting from.</p>
+
+<pre><code>    return string_cast_imp&lt;Td, Ts&gt;::cast(source);
+</code></pre>
+
+<p>Once we know what type <code>Td</code> and <code>Ts</code> is we delegate to <code>string_cast_imp</code> and the appropriate template will be instantiated.</p>
+
+<pre><code>}
+</code></pre>
+
+<hr>
+
+<p>Let's handle the easy case first:</p>
+
+<pre><code>template &lt;typename Td&gt;
+struct string_cast_imp&lt;Td, Td&gt;
+{
+    static const Td&amp; cast(const Td &amp;source)
+    {
+        return source;
+</code></pre>
+
+<p>For casting to the same string type, we don't need to do anything. Just return back what was given. Since this is nothing more than a pass-through returning by reference is ok. <code>string_cast</code> will make a copy before going out of scope since it's return by value.</p>
+
+<pre><code>    }
+};
+</code></pre>
+
+<hr>
+
+<p>Now for the important case, the reason for writing <code>string_cast</code> in the first place! The basic process is the same, only certain aspects are different:</p>
+
+<ul>
+<li>conversion function used. eg. <code>WideCharToMultiByte</code> vs <code>MultiByteToWideChar</code></li>
+<li>buffer type used. eg. <code>vector&lt;char&gt;</code> for string vs <code>vector&lt;wchar_t&gt;</code> for wstring</li>
+<li>string type returned. That's captured by our template parameter <code>Td</code> so we don't have to worry about this as much.</li>
+</ul>
+
+<p>You can extract those differences into a trait-like policy class.</p>
+
+<pre><code>template &lt;typename Td, typename Ts&gt;
+struct string_cast_imp
+{
+    static Td cast(const Ts &amp;source)
+    {
+        int length = string_traits&lt;Ts&gt;::byte_convert( CP_ACP, source.data(), source.length(), 
+                                                      NULL, 0 );
+        if( length == 0 )
+        {
+            return Td();
+        }
+</code></pre>
+
+<p>Here I removed the <code>string.empty()</code> check since it's not really needed. If the string is empty <code>length</code> will be 0 anyway so this is properly handled.</p>
+
+<pre><code>        vector&lt; typename string_traits&lt;Td&gt;::char_trait &gt; buffer( length );
+</code></pre>
+
+<p>Here we use our policy class to tell us the proper character-type to use for our buffer. If <code>Td = string</code> then <code>string_traits&lt;Td&gt;::char_trait</code> will be a <code>char</code>. If it's a wstring then <code>string_traits&lt;Td&gt;::char_trait</code> will evaluate to a <code>wchar_t</code>.</p>
+
+<pre><code>        string_traits&lt;Ts&gt;::byte_convert( CP_ACP, source.data(), source.length(), 
+                                                 &amp;buffer[ 0 ] , length );
+</code></pre>
+
+<p>Similiarly, <code>byte_convert</code> acts as a wrapper to the correct byte function to call. This attrib is captured by our policy class as well.</p>
+
+<pre><code>        return Td( buffer.begin(), buffer.end() );
+    }
+};
+</code></pre>
+
+<p><br>
+<br>
+We define our string_traits policies like this:</p>
+
+<pre><code>template &lt;typename T&gt;
+struct string_traits;
+</code></pre>
+
+<p>Declare the general base-form but don't define it. This way if code tries to cast from an illegit string-type it will give a compile error.</p>
+
+<pre><code>template &lt;&gt;
+struct string_traits&lt;string&gt;
+{
+    typedef char char_trait;
+    static int byte_convert(const int codepage, LPCSTR data  , int data_length, 
+                                                LPWSTR buffer, int buffer_size)
+    {
+</code></pre>
+
+<p>You might want to play around with the parameters it accepts but this should give you the general idea.</p>
+
+<pre><code>        return ::MultiByteToWideChar( codepage, 0, data, data_length, buffer, buffer_size );
+    }
+};
+</code></pre>
+
+<hr>
+
+<p>And now for the last case. For raw pointer types we can just wrap it into an appropriate string type and call one of our above string functions. We have to overload <code>string_cast</code> here because our base form accepts a reference type. Since reference types to arrays <em>do not</em> decay into a pointer type, this second template form will specifically handle that case for us.</p>
+
+<pre><code>template &lt;typename Td, typename Ts&gt;
+Td string_cast(Ts *source)
+{
+    return string_cast_imp&lt;Td, typename string_type_of&lt;const Ts *&gt;::wrap &gt;::cast(source);
+</code></pre>
+
+<p>Notice I'm using <code>const Ts *</code> as template parameter for <code>string_type_of</code>. Regardless of whether <code>Ts</code> is const or not we always use template form <code>&lt;const Ts *&gt;</code> to get the information we need.</p>
+
+<pre><code>}
+</code></pre>
+
+<p><br></p>
+
+<p><code>string_type_of</code> is another policy we define as follows:</p>
+
+<pre><code>template &lt;typename T&gt;
+struct string_type_of;
+</code></pre>
+
+<p>This policy class tells us what string-type to use for a given raw pointer type.</p>
+
+<pre><code>template &lt;&gt;
+struct string_type_of&lt;const char *&gt;
+{
+    typedef string wrap;
+};
+</code></pre>
+
+<p><br>
+With this refactor, you've reduced the number of written functions from 8 down to just 4 and eliminated code duplication. Perhaps more importantly adding support for another string-type is significantly easier, just specialized another policy for that string-type and you're done.</p>
+    </div>

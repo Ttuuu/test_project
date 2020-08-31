@@ -1,0 +1,462 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Looking at those many answers and comments suggesting several ways to solve some issues, along with speeding this up, I mixed up some ideas and I came out with the following edits:</p>
+
+<p><em>The <code>EnumerateSubstrings</code> method:</em></p>
+
+<pre><code>/// &lt;summary&gt;
+/// Enumerate substrings from a specified stream.
+/// &lt;/summary&gt;
+/// &lt;param name="stream"&gt;The stream to read.&lt;/param&gt;
+/// &lt;param name="encoding"&gt;The encoding to use.&lt;/param&gt;
+/// &lt;param name="bufferSize"&gt;The length of each substring.&lt;/param&gt;
+/// &lt;returns&gt;&lt;/returns&gt;
+/// &lt;exception cref="ArgumentException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="ArgumentNullException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="IOException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="DecoderFallbackException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="NotSupportedException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="ObjectDisposedException"&gt;&lt;/exception&gt;
+public static IEnumerable&lt;string&gt; EnumerateSubstrings(this Stream stream, Encoding encoding, int bufferSize = DefaultBufferSize)
+{
+    // Ensure that stream is not a null pointer.
+    if (stream is null)
+        throw new ArgumentNullException(nameof(stream));
+    // Ensure that stream is readable.
+    if (!stream.CanRead)
+        throw new NotSupportedException("The stream must be readable.");
+    Contract.EndContractBlock();
+    char[] buffer = new char[bufferSize];
+    using (StreamReader reader = new StreamReader(stream, encoding, false, bufferSize, true))
+        for (int position = 0, read; (read = reader.ReadBlock(buffer, 0, bufferSize)) &gt; 0; position += read)
+        if (read == bufferSize)
+            yield return new string(buffer);
+        else
+            yield return new string(buffer, 0, read);
+}
+</code></pre>
+
+<p><em>The <code>ReadTo</code> method:</em></p>
+
+<pre><code>/// &lt;summary&gt;
+/// Read the current stream until a specified string is encountered.
+/// &lt;/summary&gt;
+/// &lt;param name="stream"&gt;The source stream.&lt;/param&gt;
+/// &lt;param name="separator"&gt;The string that marks the end.&lt;/param&gt;
+/// &lt;param name="encoding"&gt;The encoding to use.&lt;/param&gt;
+/// &lt;param name="bufferSize"&gt;The size of the buffers.&lt;/param&gt;
+/// &lt;returns&gt;&lt;/returns&gt;
+/// &lt;exception cref="ArgumentException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="ArgumentNullException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="IOException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="DecoderFallbackException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="NotSupportedException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="ObjectDisposedException"&gt;&lt;/exception&gt;
+public static string ReadTo(this Stream stream, in string separator, in Encoding encoding, in int bufferSize = DefaultBufferSize)
+{
+    // Ensure that some parameters are not null pointers.
+    if (stream is null)
+        throw new ArgumentNullException(nameof(stream));
+    if (separator is null)
+        throw new ArgumentNullException(nameof(separator));
+    if (encoding is null)
+        throw new ArgumentNullException(nameof(encoding));
+    // This method requires seeking and reading, so ensure that the specified stream supports those features.
+    if (!stream.CanSeek)
+        throw new NotSupportedException("The stream must be seekable.");
+    if (!stream.CanRead)
+        throw new NotSupportedException("The stream must be readable.");
+    Contract.EndContractBlock();
+
+    long initialPosition = stream.Position;
+
+    // This StringBuilder will build the resulting text. Using this to avoid too many string reallocations.
+    StringBuilder text = new StringBuilder();
+
+    bool hasSuffix = false;
+    StringBuilder endingSeparator = new StringBuilder();
+
+    // Iterate through each substring in the stream. Each one is a buffer converted to a string using a specified encoding.
+    foreach (string _substring in stream.EnumerateSubstrings(encoding, bufferSize))
+    {
+        string substring = _substring;
+        // Retrieve how many bytes is the current substring long. This will be necessary to handle some seekings on the stream.
+        int substringByteLength = encoding.GetByteCount(substring);
+        // Check out whether the previous substring had a suffix.
+        if (hasSuffix)
+        {
+            // If it had, then verify whether the current substring starts with the remaining part of the separator.
+            string newEndingSeparator = separator.Substring(endingSeparator.Length);
+            bool separatorChanged = false;
+            while (newEndingSeparator.Length != 0 &amp;&amp; !substring.StartsWith(newEndingSeparator, StringComparison.Ordinal))
+            {
+                newEndingSeparator = newEndingSeparator.Remove(newEndingSeparator.Length - 1);
+                separatorChanged = true;
+            }
+            if (newEndingSeparator.Length == 0)
+            {
+                // If the code reached here, then the previous suffix were not part of a separator, as the whole of the separator cannot be found.
+                hasSuffix = false;
+                //text.Append(endingSeparator);
+                //text.Append(substring);
+                substring = endingSeparator + substring;
+            }
+            else
+            {
+                if (!separatorChanged)
+                {
+                    string result = text.ToString();
+                    // Seek till before the separator and break the loop.
+                    stream.Position = initialPosition + encoding.GetByteCount(result);
+                    return result;
+                }
+                endingSeparator.Append(newEndingSeparator);
+                continue;
+            }
+        }
+
+        {
+            // Check out whether the current substring contains the separator.
+            int separatorIndex = substring.IndexOf(separator, StringComparison.Ordinal);
+            // If the current substring starts with the separator, just skip it and break the loop, so the StringBuilder will only contain previous substrings.
+            if (separatorIndex == 0)
+                break;
+            if (separatorIndex != -1)
+            {
+                // If that's the case, take this substring till the previously found index, ...
+                string newSubstring = substring.Remove(separatorIndex);
+                // ...then append the new substring (the one before the separator) to the StringBuilder, ...
+                text.Append(newSubstring);
+                string result = text.ToString();
+                // ...and finally seek the current stream before the separator-
+                stream.Position = initialPosition + encoding.GetByteCount(result);
+                return result;
+            }
+        }
+
+        // Sometimes, it might happen that the separator is divided between the current substring and the next one.
+        // So, see whether the current substring ends with just one part (even one only character) of the separator.
+        endingSeparator.Clear();
+        endingSeparator.Append(separator);
+
+        do
+            // Remove the last character from the 'ending separator'.
+            endingSeparator = endingSeparator.Remove(endingSeparator.Length - 1, 1);
+        // If the ending separator isn't empty yet and the current substring doesn't end with it,
+        // continue the loop.
+        while (!(endingSeparator.Length == 0 || substring.EndsWith(endingSeparator.ToString(), StringComparison.Ordinal)));
+
+        // At this time, the ending separator will be an initial part of the specified separator,
+        // which is a 'suffix' of the current substring.
+        // Push the length of the suffix on the stack, so I'll avoid to call the Length getter accessor multiple times.
+        int suffixLength = endingSeparator.Length;
+
+        // If the suffix is empty, that means the current string doesn't end with even just a part of the separator.
+        // Therefore, just append the current string to the StringBuilder.
+        if (suffixLength == 0)
+            text.Append(substring);
+        else
+        {
+            // If rather the suffix isn't empty, then mark this with the boolean hasSuffix and
+            // append the current substring only till before the suffix.
+            hasSuffix = true;
+            text.Append(substring, 0, substring.Length - suffixLength);
+        }
+    }
+
+    if (hasSuffix)
+        text.Append(endingSeparator);
+
+    return text.ToString();
+}
+</code></pre>
+
+<p>Now, I apparently fixed all the bugs people pointed out and as per some suggestion I was able to make it a bit faster. If anyone should find out other issues or any way to speed this up even more, it'll be happily accepted and regarded.  </p>
+
+<p>Thanks to everyone who participated to this question, who helped me a lot.</p>
+
+<p><strong>EDIT:</strong>
+I just came out with a brand new algorithm (even if there might be still some similarities), which I think works, and it's also way simpler, notwithstanding the concepts are still the same.</p>
+
+<p>The necessary changes only regard the <code>ReadTo</code> method. Here is it:</p>
+
+<pre><code>/// &lt;summary&gt;
+/// Read the current stream until a specified string is encountered.
+/// &lt;/summary&gt;
+/// &lt;param name="stream"&gt;The source stream.&lt;/param&gt;
+/// &lt;param name="separator"&gt;The string that marks the end.&lt;/param&gt;
+/// &lt;param name="encoding"&gt;The encoding to use.&lt;/param&gt;
+/// &lt;param name="bufferSize"&gt;The size of the buffers.&lt;/param&gt;
+/// &lt;param name="comparisonType"&gt;The rules of comparison for the current search.&lt;/param&gt;
+/// &lt;returns&gt;&lt;/returns&gt;
+/// &lt;exception cref="ArgumentException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="ArgumentNullException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="IOException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="DecoderFallbackException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="NotSupportedException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="ObjectDisposedException"&gt;&lt;/exception&gt;
+public static string ReadTo(this Stream stream, in string separator, in Encoding encoding, in int bufferSize = DefaultBufferSize, in StringComparison comparisonType = StringComparison.Ordinal)
+{
+    // Ensure that some parameters are not null pointers.
+    if (stream is null)
+        throw new ArgumentNullException(nameof(stream));
+    if (separator is null)
+        throw new ArgumentNullException(nameof(separator));
+    if (encoding is null)
+        throw new ArgumentNullException(nameof(encoding));
+    // This method requires seeking and reading, so ensure that the specified stream supports those features.
+    if (!stream.CanSeek)
+        throw new NotSupportedException("The stream must be seekable.");
+    if (!stream.CanRead)
+        throw new NotSupportedException("The stream must be readable.");
+    Contract.EndContractBlock();
+
+    long initialPosition = stream.Position;
+
+    StringBuilder text = new StringBuilder();
+
+    string endingSeparator = null;
+
+    foreach (string chunk in stream.EnumerateSubstrings(encoding, bufferSize))
+    {
+
+        // If there was an ending separator, try to find a match.
+        if (endingSeparator != null)
+        {
+            // Retrieve the remaining separator (i.e., the part of the separator after the ending one).
+            string remainingSeparator = separator.Substring(endingSeparator.Length);
+
+            // Remove characters from the end of the remaining separator until it is found at the beginning of the
+            // current chunk, unless it gets empty first.
+            // The newly-cut remaining separator will be named starting separator.
+            string startingSeparator = remainingSeparator;
+            while (!chunk.StartsWith(startingSeparator, comparisonType))
+            {
+                startingSeparator = startingSeparator.RemoveLast(1);
+                if (startingSeparator.Length == 0)
+                    break;
+            }
+
+            // If the starting separator is empty, it means that the ending separator was only a partial match.
+            // Therefore, append the ending separator to the text. Otherwise, break the loop, as the separator was found.
+            if (startingSeparator.Length == 0)
+            {
+                text.Append(endingSeparator);
+                endingSeparator = null;
+            }
+            else
+                break;
+        }
+
+        // Try to search the separator in the current chunk.
+        if (chunk.TrySearch(separator, out int match, comparisonType))
+        {
+            // If it was found, break the loop here and append the current chunk till before the match.
+            text.Append(chunk, 0, match);
+            break;
+        }
+
+        // Remove characters from the end of the separator until the separator is found at the end of the current chunk,
+        // unless it gets empty first. The newly-cut separator will be named ending separator.
+        endingSeparator = separator;
+        do
+            endingSeparator = endingSeparator.RemoveLast();
+        while (endingSeparator.Length != 0 &amp;&amp; !chunk.EndsWith(endingSeparator, comparisonType));
+
+        {
+            // If an ending separator was found, append the current chunk till before the ending separator.
+            // If the ending separator will be only a partial match, then the it will be further appended to
+            // the text again.
+            int endingSeparatorLength = endingSeparator.Length;
+            if (endingSeparatorLength == 0)
+                endingSeparator = null;
+            else
+            {
+                text.Append(chunk, 0, chunk.Length - endingSeparatorLength);
+                continue;
+            }
+        }
+
+        // The current chunk doesn't contains the separator nor ends with part of it, so append it.
+        text.Append(chunk);
+    }
+
+    // Store the result of this method.
+    string result = text.ToString();
+
+    // Seek the current stream just after the result.
+    stream.Position = initialPosition + result.Length;
+
+    // Return the result.
+    return result;
+}
+</code></pre>
+
+<p>The above method requires the following two ones:</p>
+
+<pre><code>/// &lt;summary&gt;
+/// Try to search a specified substring in the current string.
+/// &lt;/summary&gt;
+/// &lt;param name="source"&gt;The source string.&lt;/param&gt;
+/// &lt;param name="search"&gt;The substring to search.&lt;/param&gt;
+/// &lt;param name="match"&gt;When this method returns, contains the index at which the substring was found, if it was; otherwise, -1.&lt;/param&gt;
+/// &lt;param name="comparisonType"&gt;The rules of comparison for the current search.&lt;/param&gt;
+/// &lt;returns&gt;Whether the specified substring was found or not.&lt;/returns&gt;
+/// &lt;exception cref="ArgumentNullException"&gt;&lt;/exception&gt;
+public static bool TrySearch(this string source, in string search, out int match, in StringComparison comparisonType = StringComparison.CurrentCulture)
+{
+    if (source is null)
+        throw new ArgumentNullException(nameof(source));
+    if (search is null)
+        throw new ArgumentNullException(nameof(search));
+    Contract.EndContractBlock();
+    if (search.Length &gt; source.Length)
+    {
+        match = -1;
+        return false;
+    }
+    match = source.IndexOf(search, comparisonType);
+    return match != -1;
+}
+
+/// &lt;summary&gt;
+/// Remove the last &lt;paramref name="count"/&gt; characters from the current string.
+/// &lt;/summary&gt;
+/// &lt;param name="str"&gt;The source string.&lt;/param&gt;
+/// &lt;param name="count"&gt;The number of characters to remove from the end of the current string.&lt;/param&gt;
+/// &lt;returns&gt;&lt;/returns&gt;
+public static string RemoveLast(this string str, in int count = 1)
+{
+    if (str is null)
+        throw new ArgumentNullException(nameof(str));
+    Contract.EndContractBlock();
+    return str.Remove(str.Length - count);
+}
+</code></pre>
+
+<p><strong>EDIT:</strong>
+Again, here is another brand new implementation (which will require the above 
+<code>TrySearch</code> method):</p>
+
+<pre><code>/// &lt;summary&gt;
+/// Read the current stream until a specified string is encountered.
+/// &lt;/summary&gt;
+/// &lt;param name="stream"&gt;The source stream.&lt;/param&gt;
+/// &lt;param name="separator"&gt;The string that marks the end.&lt;/param&gt;
+/// &lt;param name="encoding"&gt;The encoding to use.&lt;/param&gt;
+/// &lt;param name="bufferSize"&gt;The size of the buffers.&lt;/param&gt;
+/// &lt;param name="comparisonType"&gt;The rules of comparison for the current search.&lt;/param&gt;
+/// &lt;returns&gt;&lt;/returns&gt;
+/// &lt;exception cref="ArgumentException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="ArgumentNullException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="IOException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="DecoderFallbackException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="NotSupportedException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="ObjectDisposedException"&gt;&lt;/exception&gt;
+public static string ReadTo(this Stream stream, in string separator, in Encoding encoding, in int bufferSize = DefaultBufferSize, in StringComparison comparisonType = StringComparison.Ordinal)
+{
+    if (stream is null)
+        throw new ArgumentNullException(nameof(stream));
+    if (separator is null)
+        throw new ArgumentNullException(nameof(separator));
+    if (encoding is null)
+        throw new ArgumentNullException(nameof(encoding));
+    if (!stream.CanSeek)
+        throw new NotSupportedException("The stream must be seekable.");
+    if (!stream.CanRead)
+        throw new NotSupportedException("The stream must be readable.");
+    Contract.EndContractBlock();
+    long initialPosition = stream.Position;
+    string text = string.Empty;
+    foreach (string chunk in stream.EnumerateSubstrings(encoding, bufferSize))
+    {
+        text += chunk;
+        if (text.TrySearch(separator, out int match, comparisonType))
+        {
+            text = text.Remove(match);
+            break;
+        }
+    }
+    stream.Position = initialPosition + text.Length;
+    return text;
+}
+</code></pre>
+
+<p>I also thought about another quite simple algorithm, which would work only if the buffer size is greater than or equal to the length of the separator. But this would be faster, as it will mainly use a <code>StringBuilder</code> and will end up finding separators concatenating a string for just two buffers each one). Therefore, I first check for the buffer size and the length of the separator, and then choose what implementation is being used:</p>
+
+<pre><code>/// &lt;summary&gt;
+/// Read the current stream until a specified string is encountered.
+/// &lt;/summary&gt;
+/// &lt;param name="stream"&gt;The source stream.&lt;/param&gt;
+/// &lt;param name="separator"&gt;The string that marks the end.&lt;/param&gt;
+/// &lt;param name="encoding"&gt;The encoding to use.&lt;/param&gt;
+/// &lt;param name="bufferSize"&gt;The size of the buffers.&lt;/param&gt;
+/// &lt;param name="comparisonType"&gt;The rules of comparison for the current search.&lt;/param&gt;
+/// &lt;returns&gt;&lt;/returns&gt;
+/// &lt;exception cref="ArgumentException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="ArgumentNullException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="IOException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="DecoderFallbackException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="NotSupportedException"&gt;&lt;/exception&gt;
+/// &lt;exception cref="ObjectDisposedException"&gt;&lt;/exception&gt;
+public static string ReadTo(this Stream stream, in string separator, in Encoding encoding, in int bufferSize = DefaultBufferSize, in StringComparison comparisonType = StringComparison.Ordinal)
+{
+    if (stream is null)
+        throw new ArgumentNullException(nameof(stream));
+    if (separator is null)
+        throw new ArgumentNullException(nameof(separator));
+    if (encoding is null)
+        throw new ArgumentNullException(nameof(encoding));
+    if (!stream.CanSeek)
+        throw new NotSupportedException("The stream must be seekable.");
+    if (!stream.CanRead)
+        throw new NotSupportedException("The stream must be readable.");
+    Contract.EndContractBlock();
+    long initialPosition = stream.Position;
+    string text;
+    if (bufferSize &lt; separator.Length)
+    {
+        text = string.Empty;
+        foreach (string chunk in stream.EnumerateSubstrings(encoding, bufferSize))
+        {
+            text += chunk;
+            if (text.TrySearch(separator, out int match, comparisonType))
+            {
+                text = text.Remove(match);
+                break;
+            }
+        }
+    }
+    else
+    {
+        StringBuilder builder = new StringBuilder();
+        string chunk = null;
+        bool flag = false;
+        foreach (string substring in stream.EnumerateSubstrings(encoding, bufferSize))
+        {
+            if (flag)
+                chunk += substring;
+            else
+                chunk = substring;
+            if (chunk.TrySearch(separator, out int match, comparisonType))
+            {
+                int diff = match - chunk.Length + substring.Length;
+                if (diff != 0)
+                    if (diff &lt; 0)
+                        builder.Remove(builder.Length + diff, -diff);
+                    else
+                        builder.Append(substring, 0, diff);
+                break;
+            }
+            chunk = substring;
+            flag = true;
+            builder.Append(substring);
+        }
+        text = builder.ToString();
+    }
+    stream.Position = initialPosition + text.Length;
+    return text;
+}
+</code></pre>
+
+<p>I hope this works. Please, tell me if I'm wrong :)</p>
+    </div>

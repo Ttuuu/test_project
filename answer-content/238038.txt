@@ -1,0 +1,204 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Things I would do differently:</p>
+
+<ul>
+<li>make the function checking for the line where to insert accept any iterator which yields lines. This hoists the IO to a level above, and makes the function easier to test. I would also throw an exception if there is no place to insert the line, instead of returning <code>-1</code> as a sentinel value</li>
+<li>make the function inserting the line a generator that yields lines</li>
+<li>use a temporary file to write the new content, and when finished, copy this to the original file</li>
+</ul>
+
+<h1>Finding the insertion place</h1>
+
+<p>With some rearrangements, replacing the <code>while</code> for a <code>for</code>-loop and inversions of checks, I arrive at something like this</p>
+
+<pre><code>def find_insert_position(lines: typing.Iterator[str]) -&gt; int:
+    line_index = -1
+    for line in lines:
+        line_index += 1
+
+        key, match = _parse_line(line)
+        if key != "required_packages":
+            continue
+        required_packages_start = match.group("required_packages")
+        if required_packages_start != "[":
+            continue
+        logging.debug("Found REQUIRED_PACKAGES")
+        while True:
+            library = line.rstrip()
+            if library == "]":  # End of required packages
+                return line_index
+            try:
+                line = next(lines)
+                line_index += 1
+            except StopIteration:
+                raise ValueError("No required packages found")
+    raise ValueError("No required packages found")
+</code></pre>
+
+<p>I also started using the <code>logging</code> module instead of a <code>print</code>, and added type annotations.</p>
+
+<p>I also adapted the regex a bit to</p>
+
+<pre><code>SEARCH_DICT = {
+    "required_packages": re.compile(
+        r"^REQUIRED_PACKAGES = (?P&lt;required_packages&gt;.*)$"
+    )
+}
+</code></pre>
+
+<p>This works in both your and this method.</p>
+
+<p>In your original method, I found no reason for the <code>while line.strip()</code>. On the contrary. If there is an empty line somewhere in the list of required packages, this does not work. I changed this to a <code>while True</code>.</p>
+
+<p>This code can be tested with a number of testcases, listed at the end of the answer</p>
+
+<pre><code>test_cases = {
+    test_case_empty: None,
+    test_case_no_req: None,
+    test_case_empty_req: 2,
+    test_case_one_line_req: None,
+    test_case_req: 8,
+    code: 27,
+    test_case_req_empty_line: 9,
+}
+
+for test_case, expected_result in test_cases.items():
+    try:
+        result = find_insert_position(test_case.split("\n"))
+        assert result == expected_result
+    except ValueError as e:
+        assert expected_result is None
+</code></pre>
+
+<h1>inserting the line</h1>
+
+<p>This can be very easily done with a generator:</p>
+
+<pre><code>import itertools
+def insert_line(lines: typing.Iterable[str], insert_position: int, line_to_insert: str):
+    lines = iter(lines)
+    for i, line in enumerate(itertools.islice(lines, insert_position)):
+        yield line
+    if insert_position &gt; i + 1:
+        raise ValueError("insert_position is beyond `lines`")
+    yield line_to_insert
+    yield from lines
+</code></pre>
+
+<p>And tested as follows:</p>
+
+<blockquote>
+<pre><code>list(insert_line(["a"] * 10, 10, "test"))
+</code></pre>
+</blockquote>
+
+<pre><code>['a', 'a', 'a', 'a', 'a', 'a', 'a', 'a', 'a', 'a', 'test']
+</code></pre>
+
+<blockquote>
+<pre><code>list(insert_line(["a"] * 10, 11, "test"))
+</code></pre>
+</blockquote>
+
+<pre><code>Raises ValueError
+</code></pre>
+
+<p>So this is also a simple, easily testable unit.</p>
+
+<h1>tempfile</h1>
+
+<p>Instead of reading and writing to the same file, I would either create a temporary file (with <a href="https://docs.python.org/3/library/tempfile.html" rel="nofollow noreferrer">tempfile</a> and then replace the original with it, or concatenate the results into a string and then write that to the file</p>
+
+<pre><code>def write_result(lines, output_file: Path):
+    with tempfile.TemporaryDirectory() as tempdir:
+        my_tempfile : Path = Path(tempdir) / "output.txt"
+        with my_tempfile.open("w") as filehandle:
+            for line in lines:
+                filehandle.write(line)
+        my_tempfile.replace(output_file)
+</code></pre>
+
+<p>or</p>
+
+<pre><code>result = "\n".join(lines)
+ast.parse(result)
+outut_file.write_text(result)
+</code></pre>
+
+<p>The main difference is when the source is large, this will use more memory</p>
+
+<h2>verify the result</h2>
+
+<p>You can even use the <code>ast</code> or <code>py_compile</code> module to check whether you generated valid python by inserting a <code>py_compile.compile(my_tempfile)</code> before replacing the original with the generate file</p>
+
+<h1>putting it together:</h1>
+
+<pre><code>if __name__ == "__main__":
+    source_file = Path("test.py")
+    TEST_LIBRARY = "    'test,'\n"
+    with source_file.open("r") as filehandle:
+        try:
+            insert_location = find_insert_position(filehandle)
+        except ValueError:
+            insert_location = None
+    print(f"insert_location: {insert_location}")
+    if insert_location is not None:
+        with source_file.open("r") as filehandle:
+            new_lines = list(insert_line(
+                lines=filehandle,
+                insert_position=insert_location,
+                line_to_insert=TEST_LIBRARY,
+            ))
+        write_result(new_lines, source_file.with_suffix(".new.py"))
+</code></pre>
+
+<p>I've added the <code>.with_suffix(".new.py")</code> so during testing, you can check the results side by side.</p>
+
+<p>I've also replaced the <code>'</code> in <code>TEST_LIBRARY</code> with <code>"</code> so you don't have to escape the <code>'</code>. I also see you use tabs to indent, better use 4 spaces.</p>
+
+<p>Also know that this approach might not work when the last line in the <code>REQUIRED_PACKAGES</code> does not end with a <code>,</code>. Python concatenates strings on different lines, so this will not be picked up by the <code>py_compile</code> either, so this will fail silently.</p>
+
+<hr>
+
+<h1>test cases</h1>
+
+<pre><code>test_case_empty = """
+
+
+"""
+test_case_no_req = """
+no required packages
+"""
+
+test_case_empty_req = """
+REQUIRED_PACKAGES = [
+]
+"""
+
+test_case_one_line_req = """
+REQUIRED_PACKAGES = []
+"""
+
+test_case_req = """
+REQUIRED_PACKAGES = [
+    'absl-py &gt;= 0.7.0',
+    'astunparse == 1.6.3',
+    'backports.weakref &gt;= 1.0rc1;python_version&lt;"3.4"',
+    'enum34 &gt;= 1.1.6;python_version&lt;"3.4"',
+    'gast == 0.3.3',
+    'scipy == 1.2.2;python_version&lt;"3"',
+]
+"""
+test_case_req_empty_line = """
+REQUIRED_PACKAGES = [
+    'absl-py &gt;= 0.7.0',
+    'astunparse == 1.6.3',
+    'backports.weakref &gt;= 1.0rc1;python_version&lt;"3.4"',
+    'enum34 &gt;= 1.1.6;python_version&lt;"3.4"',
+
+    'gast == 0.3.3',
+    'scipy == 1.2.2;python_version&lt;"3"',
+]
+"""
+</code></pre>
+    </div>

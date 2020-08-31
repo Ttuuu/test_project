@@ -1,0 +1,167 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Design</h1>
+
+<p>While it might seem that the current design is working fine, I think there are two distinct issues lurking beneath the surface.</p>
+
+<h3>Issue #1: <code>operator double</code></h3>
+
+<p>From what I can tell, the intention behind these unit classes seems to be the prevention of unit mismatches. Providing an access function to the contained value is not a bad idea, but using the <strong>implicit</strong> conversion operator for doing so is probably not the wisest choice here.</p>
+
+<p>Consider the following snippet:</p>
+
+<pre><code>auto angle = Degrees{ 180.0 };
+auto sine = std::sin(angle);
+</code></pre>
+
+<p>It compiles easy enough, but will then fail silently at runtime. It likely won't even crash the application, but quietly produce values different to those expected.</p>
+
+<p>Of course, this is a contrived case ("<code>std::sin</code> is not really in the scope of this library (yet)!"), but nonetheless it shows a problem: As it is, there is hardly any prevention of accidental unit mismatches.</p>
+
+<p>Adding the keyword <code>explicit</code> to <code>operator double()</code> might help with some of these cases (though not with <code>std::sin</code>), but not all of them.</p>
+
+<blockquote>
+  <p>If this were the only issue, it would be easy to fix with a getter function with a descriptive name (e.g. <code>getDegrees</code>).</p>
+</blockquote>
+
+<h3>Issue #2: Extensibility</h3>
+
+<p>Let's say that in the future, you (as the library developer) want to add another representation for angles (e.g. gons/gradians). Sounds simple, right?</p>
+
+<p>And at that point, it is. Adding one more class according to the given scheme, four more converting constructors, and it is done.</p>
+
+<blockquote>
+  <p>Someone familiar with the SOLID principles might already spot a code smell in the last sentence: <strong>four more converting constructors</strong>, two of which have to be added to the existing and otherwise rather independent classes <code>Degrees</code> and <code>Radians</code>, thus violating the Open-Closed part of SOLID.</p>
+</blockquote>
+
+<p>After that comes another user A of the library and wants to add his own custom angle representation <code>RepA</code>. And then comes user B with <code>RepB</code>.</p>
+
+<p>And suddenly, we're having twenty converting constructors just for those five classes. And each additional representation is going to add a lot more: For <span class="math-container">\$N\$</span> representations, we need <span class="math-container">\$N \cdot (N - 1)\$</span> converting constructors to cover all combinations.</p>
+
+<blockquote>
+  <p>And that is assuming independent developers add converting constructors for each others implementation. Otherwise, <code>operator double</code> will again lurk in the shadows, allowing for code to compile that really should not.</p>
+
+<pre><code>class Gradians {
+public:
+    Gradians(double);
+    Gradians(const Degrees&amp;);
+    Gradians(const Radians&amp;);
+    operator double() const;
+    // ...
+};
+
+class Turns {
+public:
+    Turns(double);
+    Turns(const Degrees&amp;);
+    Turns(const Radians&amp;);
+    operator double() const;
+    // ...
+};
+</code></pre>
+  
+  <p>Now stuff like <code>auto a = Gons(300.0); auto b = Turns(a);</code> will actually compile, but produce wrong results (<code>b == 300.0</code> instead of <code>b == 0.75</code>).</p>
+</blockquote>
+
+<p>How can we solve this conundrum?</p>
+
+<p>A first step would be to separate the value from its representation(s) by choosing one internal representation which can be converted on demand:</p>
+
+<pre><code>class Angle {
+public:
+    static Angle fromDegrees(double degrees);
+    static Angle fromRadians(double radians);
+
+    double radians() const;
+    double degrees() const;
+private:
+    Angle(double radians) : radians_{ radians } {}
+
+    double radians_;
+};
+
+Angle Angle::fromDegrees(double degrees) {
+    auto radians = degrees * SoC::Maths::Trigonometry::DegToRad;
+    return Angle{ radians };
+}
+
+Angle Angle::fromRadians(double radians) {
+    return Angle{ radians };
+}
+
+double Angle::degrees() const {
+    return radians_ * SoC::Maths::Trigonometry::RadToDeg;
+}
+
+double Angle::radians() const {
+    return radians_;
+}
+</code></pre>
+
+<p>As you can see, I chose radians for my internal representation (mostly because that's what the trigonometric functions of the standard libary expect). For adding a new representation, we now only need to add one factory function (<code>fromXyz(...)</code>) and one getter function (<code>xyz()</code>).</p>
+
+<blockquote>
+  <p>While this is a lot cleaner (and takes care of some issues), SOLID devotees will not fail to notice that the violation of the Open-Closed principle hasn't been fixed yet, just moved.</p>
+  
+  <p>To address this, we could introduce a hierarchy of derived classes, but that seems like overkill for this problem.</p>
+  
+  <p>Another easy solution would be to use templates:</p>
+
+<pre><code>struct Degrees {
+    static double toRadians(double degrees) {
+        return degrees * SoC::Maths::Trigonometry::DegToRad;
+    }
+    static double fromRadians(double radians) {
+        return radians * SoC::Maths::Trigonometry::RadToDeg;
+    }
+};
+
+struct Radians {
+    static double toRadians(double radians) { return radians; }
+    static double fromRadians(double radians) { return radians; }
+};
+
+class Angle {
+public:
+    template&lt;typename Representation&gt;
+    static Angle from(double value) {
+        return Angle{ Representation::toRadian(value) };
+    }
+
+    template&lt;typename Representation&gt;
+    double as() const {
+        return Repreentation::fromRadians(radians_);
+    }
+
+private:
+    Angle(double radians) : radians_{ radians } {}
+
+    double radians_;
+};
+
+ // Usage
+ auto angle = Angle::from&lt;Degrees&gt;(180.0);
+ auto sine = std::sin(angle.as&lt;Radians&gt;());
+</code></pre>
+</blockquote>
+
+<p>Of course, this is far from done, yet:</p>
+
+<ul>
+<li>Operators for addition, subtraction (angles), multiplication and/or division (scalars) could be overloaded for this <code>Angle</code> class</li>
+<li>For demonstration purposes I didn't mark the member functions above <code>noexcept</code> or <code>constexpr</code>. This should likely be amended.</li>
+<li>Helper functions like <code>sin</code>, <code>cos</code>, <code>tan</code> and similar could be provided for this <code>Angle</code> class.</li>
+<li>For the template version: The templates could be restricted to only accept types with correct signatures for <code>fromRadians</code> and <code>toRadians</code>.</li>
+</ul>
+
+<h1>Implementation</h1>
+
+<p>Aside from the design considerations mentioned above, I can add these points for the general implementation:</p>
+
+<ul>
+<li>Consider marking converting constructors and conversion operators as <code>explicit</code>.</li>
+<li>Very likely <code>sizeof(Degree) == sizeof(double)</code>, so there probable won't be a benefit for taking a <code>const Degree&amp;</code> parameter over just <code>Degree</code>.</li>
+<li>I'd suggest checking the precision of the constants ' DegToRad<code>and</code>RadToDeg`, especially if calculated on your own. If the precision on these constants is poor, there might be small numeric errors that accumulate over multiple conversions to and fro.</li>
+<li>A comment reads <code>/// Function Call Operator</code>: Actually, no, this is a conversion operator. A function call operator would look like this: <code>double operator()() const</code>.</li>
+<li>Generally, the comments don't tell me much about anything. Unless there is a hard requirement for them (in which case they should be improved) I'd suggest removing them. In their current form, they are at best visual clutter, and confusing at worst.</li>
+</ul>
+    </div>

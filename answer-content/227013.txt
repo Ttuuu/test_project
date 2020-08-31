@@ -1,0 +1,90 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'm going to first address your main question:</p>
+
+<blockquote>
+  <p>Like I said, seems to me that if SQL Engine would process the first part(PolicyNumber filtering) that takes 3 seconds, and then do the second part (calculation for those PolicyNumber's) that takes another 3 seconds - that would be awesome. </p>
+</blockquote>
+
+<p>Ultimately, T-SQL is a declarative language, meaning you tell it what you want, and it figures out how to do it. It does so by using a lot of behind-the-scenes information to estimate what the most efficient way of doing it will be, and then does it. If it estimated incorrectly, then you get poor performance. There isn't a way<sup>a</sup> to get it to pick a different plan explicitly; you need to make sure it can pick the best plan for itself.</p>
+
+<p>In your case, it is picking nested loops for your joins to <code>PlazaInsuranceWPDataSet</code> because it thinks that very few (probably 1<sup>b</sup>) rows are going to actually join. Nested loops <strong>are the fastest way to join</strong> very small amounts of unsorted data; they require no startup cost, memory, or sorting. Nested loops start to perform very, very poorly if there is a decent amount of data there.</p>
+
+<p>So why would the optimizer think that no rows are going to come out of them? Lets look at the joins you do:</p>
+
+<ol>
+<li>In the <code>policy_data</code>, the <code>PolicyNumber IN ( &lt;&lt;subquery&gt;&gt; )</code> is a <a href="https://sqlperformance.com/2018/02/sql-plan/row-goals-part-2-semi-joins" rel="nofollow noreferrer">semi-join</a>, even though you don't have an explicit <code>JOIN</code> present.</li>
+<li>In the <code>policy_dates</code> CTE you join from the policy data to the calendar data.</li>
+<li>In the final query, you join from <code>tblCalendar</code> to your <code>policy_dates</code> CTE</li>
+</ol>
+
+<p>Your entire query uses questionable methodology to filter and join data that makes it really, really hard for SQL Server to figure out how many rows are going to come out of a given operator. Eventually, SQL Server will get so confused that it will assume that nothing is going to join, and pick nested loops for everything. If SQL Server is wrong (as it appears to be) then it is going to run very, very slowly.</p>
+
+<p>Specifically, SQL Server maintains <a href="https://docs.microsoft.com/en-us/sql/relational-databases/performance/cardinality-estimation-sql-server?view=sql-server-2017" rel="nofollow noreferrer">cardinality estimates</a> on most tables, indices, and columns in the database. This cardinality estimate tells you things about the approximate distribution of data in the table, and it can use that to determine what kind of plan is needed. For example, assume you have a query like this:</p>
+
+<pre><code>SELECT B.SomeFunData
+  FROM MyTable A
+    INNER JOIN MyOtherTable B
+      ON B.SurrogateKey = A.ForeignKey
+  WHERE A.SurrogateKey &gt; 10000000 -- Get the rows after 10M
+</code></pre>
+
+<p>This seems like a very straightforward query, right? If SQL Server doesn't think there are rows where <code>A.SurrogateKey &gt; 10000000</code> then it might first filter <code>A</code>, then nested-loop join to <code>B</code> to avoid any performance issues. This would be bad if it was wrong, but if it is right then it has picked a great plan.</p>
+
+<p>The problem with your query is that your predicates rely on things that SQL Server has no estimate for - functions.</p>
+
+<p>SQL Server knows the distribution of values in <code>tblClassCodesPlazaCommercial.ClassCode</code>, but not of <code>CASE WHEN ClassCode NOT IN ( @ClassCode ) THEN 1 END</code>. Similarly, it doesn't know the distribution of <code>CAST( PlazaInsuranceWPDataSet.PolicyEffectiveDate AS date)</code>. It is very important to use <a href="https://stackoverflow.com/q/799584/3076272">SARGable</a> expressions in your query; joining on or filtering on non-sargable expressions will generally lead to poor performance</p>
+
+<hr>
+
+<p>So how do we resolve this? There are a few low-hanging fruit we can grab immediately:</p>
+
+<ol>
+<li>Instead of recalculating <code>digits</code> and <code>numbers</code> and <code>calendar</code> every time, you should create a <a href="https://www.brentozar.com/training/t-sql-level/3-number-date-tables-10m/" rel="nofollow noreferrer">numbers table and a date table</a>. These can be persisted somewhere, and are very useful in many applications.</li>
+<li><code>Earned_to_date</code> is not a good thing to use in your joins; you would likely be better off if you could pre-compute it and use it as a variable; then SQL Server can use normal optimizations instead of shoddy cardinality estimates</li>
+<li>If you have a filter on something that doesn't depend on other tables, don't include it in the join. <code>l.StartRiskMonth BETWEEN '01-01-2015' AND '12-31-2016'</code> should become part of populating <code>policy_dates</code> instead of the join to it.</li>
+</ol>
+
+<p>After that it gets a bit trickier.</p>
+
+<p>Your <code>policy_data</code> CTE needs to be cleaned up. Right now your <code>HAVING</code> clause is going to be pretty difficult for the optimizer to clean up. What you actually wanted was to find all <code>PolicyNumber</code>s that have only valid <code>ClassCode</code>s, correct? Using <code>NOT EXISTS</code> and a normal <code>WHERE</code> clause still gets you the semi-join, but SARGably.</p>
+
+<pre><code>AND NOT EXISTS ( SELECT 1
+                    FROM tblClassCodesPlazaCommercial ValidPolicyNumbers
+                    WHERE ValidPolicyNumbers.ClassCode NOT IN ( @ClassCode )
+                    AND ValidPolicyNumbers.PolicyNumber = PlazaInsuranceWPDataSet.PolicyNumber )
+</code></pre>
+
+<p>Now, because you later join on <code>PolicyEffectiveDate</code> and <code>PolicyExpirationDate</code>, you really should try to either join on them using the same data-type, or store them as <code>date</code>s in the table. If you can't change how they're stored, a <a href="https://www.brentozar.com/archive/2018/02/computed-columns-cardinality-estimates/" rel="nofollow noreferrer">computed column</a><sup>c</sup> may be appropriate.</p>
+
+<p>We've already talked about the <code>policy_dates</code> CTE; the cleanups mentioend above should help this one a lot.</p>
+
+<p>For the final query, you'll want to not join on <code>YEAR</code> and <code>MONTH</code>. One option here would be to materialize <code>policy_dates</code> into a temp table and then join on that, and include the calculated <code>YEAR</code> and <code>MONTH</code> in that table. Alternatively, if you just join from <code>tblCalendar</code> to the <code>StartRiskMonth</code> as a date, that will likely work, and then you can use a <code>DISTINCT</code> or <code>GROUP BY</code> to clean up the granularity.</p>
+
+<p>Speaking of <code>GROUP BY</code>, using functions in there is usually a no-no as well; now you can't use any existing sorts in the data (for example, if you have an index that sorts by the first 3 columns it can't use that). I also suspect you don't need to actually group by that many things; using an aggregate over a value that doesn't change granularity will generally perform better than including it in the <code>GROUP BY</code>. </p>
+
+<p>For example:</p>
+
+<pre><code>SELECT FirstName, LastName, COUNT( * ) Age
+  FROM PeopleList
+  GROUP BY FirstName, LastName
+</code></pre>
+
+<p>Suppose this table kept track of people's ages by having a row per year of their life. Further suppose that everyone has a unique first and last name, and that neither change (obviously not real-world data, but its fine as an example). It would perform better if we did this:</p>
+
+<pre><code>SELECT FirstName, MAX( LastName ) LastName, COUNT( * ) Age
+  FROM PeopleList
+  GROUP BY FirstName
+</code></pre>
+
+<p>This will perform better because the <code>GROUP BY</code> operation sorts data in the background; sorting on a single column is cheaper than the other, and we know that based on our real data the <code>MAX</code> doesn't change anything about the results.</p>
+
+<hr>
+
+<p>Footnotes:</p>
+
+<ul>
+<li><sup>a: I'm lying, of course. Breaking your query up into separate chunks (for example, materializing data into a temp table) or using certain query hints can force the optimizer to do things in a certain order. These are both valid techniques to use, although restructuring should almost always be preferred to query hints</sup>  </li>
+<li><sup>b: If you ever notice an estimated number of rows in a plan of 1, SQL Server probably actually thinks that no rows will come out of that operator. If it actually optimized for 0 rows, <strong>and it was wrong</strong>, then it would generate the incorrect result. That is why it will always estimate 1 row to ensure that it gets the correct answer, even if very slowly</sup></li>
+<li><sup>c: I'm actually not sure if a computed column of a <code>CAST</code> will actually have decent cardinality estimates; certainly worth playing with, however</sup></li>
+</ul>
+    </div>

@@ -1,0 +1,143 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>General comments</strong>:  I would move the timeout and batch sizes into private fields.  I don't know what version of c# you are using but you could create a class or if you have the nice tuple support you can just create it like so</p>
+
+<pre><code>private readonly (TimeSpan timeout, int buffer) _saveBatchSettings = (TimeSpan.FromSeconds(3), 1000);
+private readonly (TimeSpan timeout, int buffer) _publishBatchSettings = (TimeSpan.FromSeconds(1), 500);
+</code></pre>
+
+<p>It's nice to have these outside the main program because typically with batching you have to tweak the timeouts and size to find the sweet spot and this make it simpler to find what you need to change. </p>
+
+<p>Also you have no way to complete the source.  I would recommend making the class IDisposable and in the dispose mark the source as complete. </p>
+
+<p><strong>TPL DataFlow comments</strong>:   Why not use a BroadcastBlock that is tied to the BatchBlocks then it's one send and not two.  </p>
+
+<p>Move this</p>
+
+<pre><code>var res = x.GroupBy(d =&gt; d.Ticker).Select(d = &gt;d.OrderByDescending(s =&gt;s.DateTime).FirstOrDefault()).ToList();
+</code></pre>
+
+<p>Into a TransformBlock and make the ActionBlock just contain the code to publish the result.</p>
+
+<p>For ActionBlock, this is just my preference, I make a method that the action block calls to instead of inline lambda it.  That code is typically the processing code and it's easier to maintain and read if it's in it's own method and outside the pipeline setup. </p>
+
+<p><strong>ReactiveExtensions</strong>:  If you are willing to add ReactiveExtensions to your project you can mix and Rx and TPL DataFlow Blocks.  Rx has a built in method for your buffering called <a href="https://docs.microsoft.com/en-us/previous-versions/dotnet/reactive-extensions/hh229200(v%3Dvs.103)" rel="nofollow noreferrer">Buffer</a>.  The DataFlow blocks has an <a href="https://docs.microsoft.com/en-us/dotnet/api/system.threading.tasks.dataflow.dataflowblock.asobservable?view=netcore-2.2#System_Threading_Tasks_Dataflow_DataflowBlock_AsObservable__1_System_Threading_Tasks_Dataflow_ISourceBlock___0__" rel="nofollow noreferrer">AsObservable</a> and <a href="https://docs.microsoft.com/en-us/dotnet/api/system.threading.tasks.dataflow.dataflowblock.asobserver?view=netcore-2.2" rel="nofollow noreferrer">AsObserver</a> to switch to and from Rx and TPL. This would be an example for using Rx with TPL</p>
+
+<pre><code>public class StreamMessagePipeline&lt;T&gt; : IDisposable
+    where T : StreamingMessage
+{
+    private BroadcastBlock&lt;T&gt; _source;
+
+    private readonly (TimeSpan timeout, int buffer) _saveBatchSettings = (TimeSpan.FromSeconds(3), 1000);
+    private readonly (TimeSpan timeout, int buffer) _publishBatchSettings = (TimeSpan.FromSeconds(1), 500);
+
+    public StreamMessagePipeline()
+    {
+        _source = new BroadcastBlock&lt;T&gt;(x =&gt; x);
+        SetupSaveBatchPipeline();
+        SetupPublishBatchPipeline();
+    }
+
+    public async Task Handle(T record)
+    {
+        await _source.SendAsync(record);
+    }
+
+    private void SetupSaveBatchPipeline()
+    {
+        var actionBlockSave = new ActionBlock&lt;IList&lt;T&gt;&gt;(SaveBatch);
+
+        // Instead of action block you could stay in Rx and just use Subscribe 
+        _source.AsObservable()
+            .Buffer(_saveBatchSettings.timeout, _saveBatchSettings.buffer)
+            .Where(x =&gt; x.Count &gt; 0) // unlike TriggerBatch Buffer will send out an empty list
+            .Subscribe(actionBlockSave.AsObserver());
+    }
+
+    private void SetupPublishBatchPipeline()
+    {
+
+        var transformBlock = new TransformBlock&lt;IList&lt;T&gt;, IList&lt;T&gt;&gt;(x =&gt;
+        {
+            return x.GroupBy(d =&gt; d.Ticker)
+                .Select(d =&gt; d.OrderByDescending(s =&gt; s.DateTime).FirstOrDefault()).ToList();
+        });
+
+        var actionBlockPublish = new ActionBlock&lt;IList&lt;T&gt;&gt;(PublishBatch);
+
+        transformBlock.LinkTo(actionBlockPublish, new DataflowLinkOptions()
+        {
+             PropagateCompletion = true,
+        });
+
+        _source.AsObservable()
+            .Buffer(_publishBatchSettings.timeout, _publishBatchSettings.buffer)
+            .Where(x =&gt; x.Count &gt; 0) // unlike TriggerBatch Buffer will send out an empty list
+            .Subscribe(transformBlock.AsObserver());
+    }
+
+    private void SaveBatch(IList&lt;T&gt; messages)
+    {
+        // Save the batch
+    }
+
+    private void PublishBatch(IList&lt;T&gt; messages)
+    {
+        // publish the batch 
+    }
+
+    #region IDisposable Support
+    private bool disposedValue = false; // To detect redundant calls
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (!disposedValue)
+        {
+            if (disposing)
+            {
+                _source.Complete();
+            }
+            disposedValue = true;
+        }
+    }
+
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+    #endregion
+
+}
+</code></pre>
+
+<p><strong>Update</strong> If you don't want to use Rx you can still make a custom block to that has the same functionality.  </p>
+
+<pre><code>public static class TimerBatchBlock
+{
+    public static IPropagatorBlock&lt;T, T[]&gt; Create&lt;T&gt;(int batchSize, TimeSpan timeSpan, GroupingDataflowBlockOptions options = null)
+    {
+        var batchBlock = new BatchBlock&lt;T&gt;(batchSize, options ?? new GroupingDataflowBlockOptions());
+        var broadCastBlock = new BroadcastBlock&lt;T[]&gt;(x =&gt; x);
+        var bufferBlock = new BufferBlock&lt;T[]&gt;();
+
+        // timer setup (System.Threading.Timer)
+        var timer = new Timer(x =&gt; ((BatchBlock&lt;T&gt;)x).TriggerBatch(), batchBlock, timeSpan, timeSpan);
+        var resetTimerBlock = new ActionBlock&lt;T[]&gt;(_ =&gt; timer.Change(timeSpan, timeSpan)); // reset timer each time buffer outputs
+        resetTimerBlock.Completion.ContinueWith(_ =&gt; timer.Dispose());
+
+        // link everything up
+        var linkOptions = new DataflowLinkOptions()
+        {
+            PropagateCompletion = true,
+        };
+        broadCastBlock.LinkTo(resetTimerBlock, linkOptions);
+        broadCastBlock.LinkTo(bufferBlock, linkOptions);
+        batchBlock.LinkTo(broadCastBlock, linkOptions);
+
+        return DataflowBlock.Encapsulate(batchBlock, bufferBlock);
+    }
+}
+</code></pre>
+
+<p>You would link BroadCastBlock -&gt; TimerBatchBlock -&gt; ActionBlock</p>
+    </div>

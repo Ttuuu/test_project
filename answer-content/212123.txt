@@ -1,0 +1,132 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>Update:</strong> <em>Zeta suggested that what I gave was not really a review. So I present a review first:</em></p>
+
+<ul>
+<li><p>The data type <code>EvalErr</code> has both <code>ParseErr</code>, <code>StackErr</code> and <code>OpErr</code>. A common error type for your entire pipeline seems like an OK idea, since the individual parts (parser, evaluator) will not be used independently.</p></li>
+<li><p>Your error values are all parameterised with a <code>String</code>, which can be super useful as you write the parser, but this makes testing negative cases more difficult. A <code>StackErr</code> may be parameterised with the actual stack that broke. This also makes negative testing easier; a good sign of code quality is testability. You can always produce meaningful error messages based on <code>StackErr ns</code> (and whatever remaining context that makes for a good message; what was the operator that failed?).</p>
+
+<p>Similarly, <code>OpErr</code> could take a single <code>Char</code>.</p></li>
+<li><p>You perform unsafe pattern matching in the <code>where</code> of <code>collapseOn</code>:</p>
+
+<pre><code>where (n2:n1:nrest) = ns
+      (op:oprest) = ops
+</code></pre>
+
+<p>You justify this by guarding against too short lists.</p>
+
+<p>But this creates a dependency between multiple lines.</p>
+
+<p>You can avoid this either by using pattern matching to <em>restrict access</em> to executing code: A function body that will only execute once a pattern matches is safe. Or you can extract values monadically, providing for more abstraction (including implicit error handling). For example, a monadic stack may work like:</p>
+
+<pre><code>eval Add = do
+  v1 &lt;- pop
+  v2 &lt;- pop
+  push (v1 + v2)
+</code></pre></li>
+<li><p>I'm not sure exactly what <code>collapseOn</code> does. It handles a bunch of types of errors that are at different levels of abstraction. And then it calls <code>eval</code>, pushes the result to the stack, and removes an operator from a list of operators for some reason or other.</p>
+
+<p>Is <em>collapse</em> a metaphor for error handling? Or for reducing the stack?</p>
+
+<p>So I'd say it does too many things.</p></li>
+<li><p>You can check that there are enough elements via pattern matching or monadic popping from the stack without calculating the entire length (a full traversal of the stack) every time you handle a new element.</p></li>
+<li><p>Your list of supported operators is repeated many times. This makes adding new ones difficult and error-prone. The precedence and associativity of your operators is embedded in the ordering of your code and makes it hard to derive, extend or verify that they're right.</p></li>
+<li><p>The following <code>StateT</code> functions seem a little off:</p>
+
+<pre><code>updateOnceT :: StateT MathStacks (Either EvalErr) ()
+updateOnceT = do
+  ms &lt;- get
+  ms' &lt;- lift $ exec ms
+  put ms'
+
+evalCharT :: (Char, Int) -&gt; StateT MathStacks (Either EvalErr) ()
+evalCharT (c, idx) = do
+  ms &lt;- get -- ms :: MathStacks
+  ms' &lt;- lift $ parse (c, idx) ms 
+  put ms'
+</code></pre>
+
+<p>There is a <a href="https://hackage.haskell.org/package/mtl-2.2.2/docs/Control-Monad-State-Lazy.html#v:modify" rel="nofollow noreferrer"><code>modify</code></a> combinator. But I would probably ditch the <code>StateT</code> altogether to begin with and either</p>
+
+<ol>
+<li><p>Build a non-monadic stack-based parser from scratch, simplify it and extend it. (You'll eventually end up with something that is somewhat equivalent to parser combinators, since they're also recursive descent parsers, but not explicitly recursive.)</p></li>
+<li><p>Build a parser using parser combinators (see below) and either construct a syntax tree or make the parser produce the evaluator directly.</p></li>
+</ol></li>
+<li><p>I'd recommend reading up on <a href="https://en.wikipedia.org/wiki/Separation_of_concerns" rel="nofollow noreferrer"><em>separation of concerns</em></a>.</p></li>
+</ul>
+
+<hr>
+
+<p><strong>Previous:</strong> <em>I wrote this suggestion to solve the problem by dividing the problem into parsing and evaluation, and to use other abstractions than a stack-based algorithm.</em></p>
+
+<p>What you can do is convert the expression into a syntax tree using a parser combinator library like <a href="http://akashagrawal.me/beginners-guide-to-megaparsec/" rel="nofollow noreferrer">Megaparsec</a> and evaluate that syntax tree. The author of Megaparsec, Mark Karpov, wrote a tutorial called <a href="https://markkarpov.com/megaparsec/parsing-simple-imperative-language.html" rel="nofollow noreferrer">Parsing a simple imperative language</a>. It has a section called <a href="https://markkarpov.com/megaparsec/parsing-simple-imperative-language.html#expressions" rel="nofollow noreferrer">Expressions</a> where he demonstrates the <code>makeExprParser</code> combinator:</p>
+
+<pre><code>aExpr :: Parser AExpr
+aExpr = makeExprParser aTerm aOperators
+
+aOperators :: [[Operator Parser AExpr]]
+aOperators =
+  [ [ Prefix (Neg &lt;$ symbol "-") ]
+  , [ InfixL (ABinary Multiply &lt;$ symbol "*")
+    , InfixL (ABinary Divide   &lt;$ symbol "/") ]
+  , [ InfixL (ABinary Add      &lt;$ symbol "+")
+    , InfixL (ABinary Subtract &lt;$ symbol "-") ]
+  ]
+</code></pre>
+
+<p>As for building a monadic evaluator, I'd read <a href="https://wiki.haskell.org/The_Monadic_Way/Part_I" rel="nofollow noreferrer">The Monadic Way</a> on the Haskell Wiki. It starts by building a regular evaluator and then adds features that are greatly complicated by the lack of monads, and then it introduces them.</p>
+
+<p>It seems that your examples do not mention division, which is a pretty good example of something that may fail during evaluation because of division by zero. If you had the following syntax tree,</p>
+
+<pre><code>data AExpr
+  = IntConst Integer
+  | Neg AExpr
+  | ABinary ABinOp AExpr AExpr
+  deriving (Show)
+
+data ABinOp
+  = Add
+  | Subtract
+  | Multiply
+  | Divide
+  deriving (Show, Eq)
+
+data Error
+  = DivisionByZero
+  deriving (Show, Eq)
+</code></pre>
+
+<p>you could write something like,</p>
+
+<pre><code>eval :: AExpr -&gt; Either Error Integer
+eval (IntConst i) = return i
+eval (Neg e) = negate &lt;$&gt; eval e
+eval (ABinary op e1 e2) = do
+  i1 &lt;- eval e1
+  i2 &lt;- eval e2
+  if op == Divide &amp;&amp; i2 == 0 then Left DivisionByZero else
+    return $ binop op i1 i2
+
+binop :: ABinOp -&gt; (Integer -&gt; Integer -&gt; Integer)
+binop Add = (+)
+binop Subtract = (-)
+binop Multiply = (*)
+binop Divide = quot
+</code></pre>
+
+<p>This separates the concerns of syntax analysis and evaluation. This also means that different kinds of errors are handled at different layers of abstraction. And it means you get a declarative, high-level way of expressing the precedence and associativity of your operators.</p>
+
+<hr>
+
+<p><strong>More:</strong> <em>I added this after to suggest a middle ground.</em></p>
+
+<p>If you think <code>makeExprParser</code> feels like cheating, and you think the intermediate syntax-tree representation is redundant, you can</p>
+
+<ol>
+<li><p>Make your life harder by writing your expression parser using the <a href="http://dev.stephendiehl.com/fun/002_parsers.html" rel="nofollow noreferrer"><code>chainl</code>, <code>chainr</code> etc.</a> combinators, or write your own hierarchy of nested combinators (makes precedence and associativity slightly more obscure, but much less so than an explicitly recursive function would).</p></li>
+<li><p>Make the program simpler by writing a parser that generates a function that evaluates:</p>
+
+<pre><code>evalP :: Parser (String -&gt; Integer)
+evalP = ...
+</code></pre></li>
+</ol>
+    </div>

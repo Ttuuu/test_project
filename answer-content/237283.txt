@@ -1,0 +1,93 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Make sure Doxygen picks up comments after struct members</h1>
+
+<p>It's good to add a comment after each member in a struct declaration to describe what that member does. To make Doxygen pick up the <a href="http://www.doxygen.nl/manual/docblocks.html#memberdoc" rel="noreferrer">member documentation</a> as well, use <code>//!&lt;</code> or <code>///&lt;</code> instead of <code>//</code> to start the comments with.</p>
+
+<h1>Use "filename" or "path", not "file" describe filenames</h1>
+
+<p>You will be dealing with both file handles (either a <code>FILE *</code> or something like <code>int fd</code>) as well as filenames in your code. To distinguish between the two, be consistent and name variables that hold names of files "filename", "filepath" or "path", so you can use "file" consistently to denote a handle to a file.</p>
+
+<p>Similarly, use "dirname", "dirpath", or "path" for variables holding directory names, to not get confused with a <code>DIR *</code> handle.</p>
+
+<h1>Move <code>launch()</code> and related functions into <code>worker.c</code></h1>
+
+<p>Some worker-related functionality is in <code>main.c</code> instead of in <code>worker.c</code>. It's best to keep all the worker-related functionality together, and expose as little as possible of its internal workings. In <code>main()</code> I see:</p>
+
+<pre><code>worker_t worker;
+worker_init(&amp;worker, location);
+int ret = launch(&amp;worker, requeue_sec);
+worker_destroy(&amp;worker);
+</code></pre>
+
+<p>Unless there is a reason to split running the worker into three functions, I think it would be simpler if you could just write:</p>
+
+<pre><code>int ret = worker_launch(location, requeue_sec);
+</code></pre>
+
+<p>The function <code>worker_launch()</code> should live in <code>worker.c</code>, and basically do the same as <code>worker_init()</code>, <code>launch()</code> and <code>worker_destroy()</code>.</p>
+
+<p>Then in principle only <code>worker_launch()</code> has to be declared in <code>worker.h</code>, and the rest of the functions could be made <code>static</code>.</p>
+
+<p>I see a similar pattern with tasks inside <code>worker_run_once()</code>. Perhaps you can do the same and just have <code>task_run()</code> call <code>task_init()</code> and <code>task_destroy()</code> internally?</p>
+
+<h1>Consider having the worker <code>chdir()</code> to the worker root</h1>
+
+<p>You are keeping track of a lot of directory names, and have to do a lot of path joining. It might make sense to just <code>chdir(root_dir)</code> in <code>worker_init()</code>. Then you don't have to store any of the directory names in <code>worker_t</code>.</p>
+
+<p>Of course, you have to be careful that this does not violate assumptions in other parts of your program. However, since starting the worker is the only thing you do in <code>main()</code>, this seems fine.</p>
+
+<h1>Why does <code>worker_requeue_check()</code> need to run as a separate process?</h1>
+
+<p>I don't see why you need to run a separate process to requeue tasks. You can do this deterministically. Run <code>worker_requeue_check()</code> after every call to <code>worker_run_once()</code> inside the loop in <code>worker_run_all()</code>. If you want to avoid rescanning the directory so often, you can just check the time and avoid calling it if the last time you called it is less than <code>requeue_interval / 2</code>. You also have to call it once with a <code>requeue_interval</code> of <code>0</code> after the loop, to ensure that if the task directory is empty and <code>worker_run_all()</code> would exit, that it immediately requeues the failed tasks.</p>
+
+<p>Alternatively, instead of rescanning <code>requeue_dir</code> every so often, you can keep a linked list of failed tasks along with the timestamp of failing. Then you just have to compare the timestamp of the first entry in the list to the current time to see if there is anything to requeue.</p>
+
+<h1>Don't use variable or function names starting with underscores</h1>
+
+<p>Identifiers starting with an underscore are reserved for use by the standard library. Not all combinations are reserved, but it's best to just not declare anything yourself that starts with one. So instead of <code>__run_app()</code>, just write <code>run_app()</code>.</p>
+
+<p>If you want to hide a symbol, the simplest way is to make it <code>static</code>. If it needs to be visible to other object files, but if you want to somehow indicate that some symbol is private, use underscores as a suffix.</p>
+
+<h1>Consider using <code>posix_spawn()</code> instead of <code>fork()</code>+<code>execl()</code></h1>
+
+<p>The function <a href="http://man7.org/linux/man-pages/man3/posix_spawn.3.html" rel="noreferrer"><code>posix_spawn()</code></a> is made to start a new executable, and it can do a lot of housekeeping necessary to ensure the new process starts with a fresh environment. There are helper functions, like <code>posix_spawn_file_actions_adddup2()</code>, that allow you to redirect I/O.</p>
+
+<h1>Consider using <code>asprintf()</code> to build strings</h1>
+
+<p>You are already using a lot of Linux-specific functions, so consider using <code>asprintf()</code> to build a new string instead of doing a lot of low-level string manipulation. For example, <code>filepath_join()</code> can be rewritten as:</p>
+
+<pre><code>#define _GNU_SOURCE
+#include &lt;stdio.h&gt;
+...
+char *filepath_join(const char *root_dir, const char *child) {
+  char *data = NULL;
+  asprintf(&amp;data, "%s/%s", root_dir, child);
+  return data;
+}
+</code></pre>
+
+<p>Having two consecutive slashes in a filename is not a problem, so I wouldn't waste code on trying to remove an extraneous slash after <code>root_dir</code>.</p>
+
+<h1>Use <code>basename()</code> instead of writing your own function</h1>
+
+<p>Again, since you are already writing Linux-specific code, consider using <a href="http://man7.org/linux/man-pages/man3/basename.3.html" rel="noreferrer"><code>basename()</code></a> directly.</p>
+
+<h1>Make the path to the executable explicit</h1>
+
+<p>It's very weird to see code that gets the first executable in a directory. There is no guarantee in which order directories are traversed. So if there is more than one, it is not deterministic what your task runner is going to do. Why not pass the full filename to the executable to the worker?</p>
+
+<h1>Confusing use of brackets in <code>usage()</code></h1>
+
+<p>In <code>usage()</code>, I see the following:</p>
+
+<pre><code>fprintf(stderr, "retask [flags]\n");
+fprintf(stderr, "    -c &lt;directory&gt; [default=.]  use specified directory as work dir\n");
+fprintf(stderr, "    -r &lt;seconds&gt;   [default=%li]  interval for requeue\n", DEFAULT_REQUEUE_INTERVAL);
+</code></pre>
+
+<p>In the first line, brackets are used to indicate optional arguments. That's indeed the standard way to represent those. But subsequent lines, you also write brackets around the default value. This is a bit confusing. I recommend you rewrite it to:</p>
+
+<pre><code>fprintf(stderr, "    -c &lt;directory&gt; Use specified directory as work dir. Default: %s\n", DEFAULT_LOCATION);
+fprintf(stderr, "    -r &lt;seconds&gt;   Interval for requeue. Default: %i\n", DEFAULT_REQUEUE_INTERVAL);
+</code></pre>
+    </div>

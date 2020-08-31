@@ -1,0 +1,551 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Having <a href="https://github.com/theraot/Theraot/blob/Develop_v2/Framework.Core/System/Lazy1.net35.cs" rel="noreferrer">backported Lazy to .NET 2.0</a>, I want to offer a variant...</p>
+<p>First of all, this looks a lot like <a href="https://docs.microsoft.com/en-us/dotnet/api/system.threading.lazyinitializer?view=netframework-4.7.2" rel="noreferrer">LazyInitializer</a>. If that works for you, then there is no need to go about creating a <code>Lazy&lt;T&gt;</code> variant.</p>
+<p>With that said, let's continue...</p>
+<hr>
+<p>Before going into the code, let us see some things that may go wrong:</p>
+<ul>
+<li>The <a href="https://en.wikipedia.org/wiki/ABA_problem" rel="noreferrer">ABA problem</a></li>
+<li>Thread visibility/Code reordering</li>
+<li>Double initialization</li>
+<li>Value factory recursion</li>
+<li>Failed initialization</li>
+<li>Preventing Garbage Collection</li>
+</ul>
+<p>The code on your question will fail on visibility. Other threads will not be aware that you changed <code>_Loaded</code>. In fact, it can fall victim to the value of <code>_Loaded</code> being optimized, so that it is only read once per method call. It will be problematic to have <code>create</code> call <code>Get&lt;T&gt;</code>, it would overwrite <code>_Value</code>... meaning that <code>_Value</code> can change after initialized.</p>
+<p>Also, execution order could be reordered to set <code>_Loaded</code> before calling <code>create</code>.</p>
+<hr>
+<p>The <a href="https://codereview.stackexchange.com/a/207794/21749">second version</a>:</p>
+<p><code>volatile</code> is not enough guarantee here. While you have <code>_Loaded</code> volatile, changes to <code>_Value</code> could not be visible. Thus, for another thread, it could reach the object in an state where it claims to be loaded but <code>_Value</code> appears unchanged. In fact, it could appear partially changed (torn read).</p>
+<p><strong>Note</strong>: A caveat, given that I am used to target multiple versions of .NET, I consider wrong something that would fail in any of them. And that includes .NET 2.0, .NET 3.0 and .NET 3.5. Which, have broken <code>volatile</code> semantics. This makes me extra careful around <code>volatile</code>.</p>
+<p>We still have to worry about <code>create</code> calling <code>Get</code>.</p>
+<p>I am glad to see <code>T</code> moved to the class level.</p>
+<hr>
+<p>The <a href="https://codereview.stackexchange.com/a/207865/21749">third version</a>:</p>
+<p>The initialization has been moved to the constructor. I think this defies the purpose, if you can have it in the constructor... why don't you use <code>Lazy&lt;T&gt;</code>?</p>
+<p>The partially changed problem is fixed by using <code>Boxed</code>. You could have used <a href="https://docs.microsoft.com/en-us/dotnet/api/system.runtime.compilerservices.strongbox-1?view=netframework-4.7.2" rel="noreferrer"><code>StrongBox&lt;T&gt;</code></a> here.</p>
+<p>I see you inherited some weirdness from the reference source... The reason they check <code>Boxed</code> that weirdly (also the reason why they do not use <code>StrongBox&lt;T&gt;</code>) is because it might not contain a value, but a cached Exception.</p>
+<p>In your previous version, when <code>create</code> throws, <code>Get</code> throws, and another thread gets a chance to initialize. However, it is possible to initialize <code>Lazy&lt;T&gt;</code> in such way that it stores the exception and throws it for every thread that tries to read it (see <a href="https://docs.microsoft.com/en-us/dotnet/api/system.threading.lazythreadsafetymode?view=netframework-4.7.2" rel="noreferrer"><code>LazyThreadSafetyMode</code></a>).</p>
+<p>Aside from that, the use of <code>Volatile</code> fixed the other visibility and reordering problems.</p>
+<p><strong>Note</strong>: When <code>factory</code> throws, <code>m_valueFactory</code> has already been set to the sentinel. Meaning that next thread to call will run the sentinel, resulting in the <code>Value</code> being initialized to <code>default(T)</code>. This is probably not what you want.</p>
+<ul>
+<li>
+<blockquote>
+<p>Can it be simplified to a <code>lock</code>?</p>
+</blockquote>
+<p>No. As you have already guessed.</p>
+</li>
+<li>
+<blockquote>
+<p>Can the sentinel be replaced by a boolean and a null assignment for the factory?</p>
+</blockquote>
+<p>Depending on what you want (see note above), yes. The reference source has it the way it has it because of <code>LazyThreadSafetyMode</code>.</p>
+</li>
+<li>
+<blockquote>
+<p>When you assume the logic is good, can the whole CreateValue() be replaced by an inline new Boxed(factory())?</p>
+</blockquote>
+<p>No. You could have <code>boxed = new Boxed(m_valueFactory());</code>. However, you are still holding a  reference to <code>m_valueFactory</code>, which might prevent garbage collection. Also, in case of recursion, this would be an <code>StackOverflowException</code>. You may set <code>m_valueFactory</code> to <code>null</code>... However, because of the possibility of recursion, that could lead to a <code>NullReferenceException</code>. Thus, we need to set it to a sentinel or set it to null and add a null check. Either way, <code>CreateValue</code> is not a one liner.</p>
+</li>
+</ul>
+<hr>
+<p>The <a href="https://codereview.stackexchange.com/a/207886/21749">fourth version</a>:</p>
+<p>Be careful with the writes to <code>_value</code>, they might not be atomic when it is a value type. There is a good reason why the prior version had boxed: another thread could see a partially initialized value (torn reads). This is safe in .NET Core, but not in .NET Framework.</p>
+<p><strong>Note</strong>: This code actually works well in modern .NET, in particular in .NET Core.</p>
+<p>I would fix this by using <code>StrongBox&lt;T&gt;</code>. Something similar to <a href="https://codereview.stackexchange.com/a/207820/21749">firda's answer</a>.</p>
+<p>About firda’s answer… It holds onto <code>valueFactory</code>, keeping that references after initialization keeps alive whatever it points to, preventing the garbage collector from taking it. This is by design. It might not be what you want. One possible path to modify it is to set <code>factory</code> to <code>null</code> at the end of the <code>lock</code> in <code>GetOrCreate</code> (before returning, of course).</p>
+<p>Back to the problem of torn reads, consider this demonstration:</p>
+<pre><code>public struct Long8
+{
+    public long D1;
+    public long D2;
+    public long D3;
+    public long D4;
+    public long D5;
+    public long D6;
+    public long D7;
+    public long D8;
+
+    public long Val =&gt; D1 + D8;
+}
+
+public class Program
+{
+    public static void Main()
+    {
+        // We are using Lonh8 because writing to it would not be atomic
+        // Here DataInit is poor man's lazy
+        var dataInit = new DataInit&lt;Long8&gt;();
+        // value will hold the values that the reader gets
+        var value = default(Long8);
+        // we use done to signal the writer to stop
+        var done = 0;
+        var reader = Task.Run
+        (
+            () =&gt;
+            {
+                // We are reading the values set by the writer
+                // We expect Val to be 1 because
+                // the writer does not write something that would give a different value
+                var spinWait = new SpinWait();
+                do
+                {
+                    // This loop is here to wait for the writer to set a value since the last call to invalidate
+                    while (!dataInit.TryGet(out value))
+                    {
+                        spinWait.SpinOnce();
+                    }
+                    // dataInit.Invalidate();
+                    // Console.Write(".");
+                    spinWait.SpinOnce();
+                } while (value.Val == 1);
+                // Console.WriteLine();
+            }
+        );
+        var writer = Task.Run
+        (
+            () =&gt;
+            {
+                // Here we will write { D1 = 1, D8 = 0 } and { D1 = 0, D8 = 1 }
+                // In either case Val should be 1
+                var spinWait = new SpinWait();
+                while (Volatile.Read(ref done) == 0)
+                {
+                    dataInit.Init(new Long8 { D1 = 1, D8 = 0 });
+                    spinWait.SpinOnce();
+                    dataInit.Invalidate();
+                    dataInit.Init(new Long8 { D1 = 0, D8 = 1 });
+                    spinWait.SpinOnce();
+                    dataInit.Invalidate();
+                }
+            }
+        );
+        reader.Wait();
+        System.Diagnostics.Debugger.Break();
+        Volatile.Write(ref done, 1);
+        writer.Wait();
+        Console.WriteLine(value.Val);
+    }
+
+    public class DataInit&lt;T&gt;
+    {
+        private T _data;
+        private volatile bool _initialized;
+
+        public void Init(T value)
+        {
+            // So, we write to a generic field
+            // And then to a volatile bool to notify that we did write to the field
+            // Yet, when T is a value type larger than the word size of the CPU
+            // Another thread may find that _initialized = true but _data is not what we would expect
+            _data = value;            // Write 1  &lt;----------------
+            _initialized = true;      // Write 2 (volatile) &lt;------
+        }
+
+        public void Invalidate()
+        {
+            _initialized = false;
+        }
+
+        public bool TryGet(out T value)
+        {
+            // Here we are reading the volatile before we read the other field...
+            // Does it make any difference?
+            if (_initialized)
+            {
+                value = _data;
+                if (_initialized)
+                {
+                    return true;
+                }
+            }
+            value = default(T);
+            return false;
+        }
+    }
+}
+</code></pre>
+<p>This code demonstrates a torn read. In either .NET Framework and .NET Core. What is shows is that can read <code>_data</code> in between <code>_initialised = false; _data = value; _initialised = true;</code> resulting is something partially set. To be more specific: The reader reads that the value is initialized and start reading, meanwhile the other thread is modifying the value. Your code does not suffer this particular fate as long as it does not have <code>Invalidate</code> (as firda mentions on the comments). This is something to be careful with.</p>
+<p>This is based <a href="https://stackoverflow.com/a/23263333/402022">Reproduce torn reads of decimal in c#</a> with some modifications introduced by VisualMelon, this is for demonstration purposes only, this is not something you want in production.</p>
+<p>Also consider the cases where <code>valueFactory</code> read <code>Value</code> and where <code>valueFactory</code> throws.</p>
+<ul>
+<li>
+<blockquote>
+<p>I expect that we can change it for object though? saving the seperate class.</p>
+</blockquote>
+<p>Yes, you can use <code>object</code> instead of <code>LazyHelper</code>.</p>
+</li>
+<li>
+<blockquote>
+<p>is it allowed to inline some other methods, like ViaFactory?</p>
+</blockquote>
+<p>Yes, in fact, the compiler may do this optimization.</p>
+</li>
+<li>
+<blockquote>
+<p>it feels to me a bit strange that Value being called recursively the first time but that might have to do with other code that I stripped - i.e. the Exception caching.</p>
+</blockquote>
+<p>I am not sure why they went with this design in corefx. However - at least for your code - it is a better design to have <code>ViaFactory</code> and <code>ExecutionAndPublication</code> return than to read the field again.</p>
+</li>
+<li>
+<blockquote>
+<p>Not sure if it is allowed, but if I even inline more you really get a 'normal' double checked lock with a volatile. The main difference is that the locker object is also being used as a _loaded flag.</p>
+</blockquote>
+<p>Yeah, sure. The first thread will set <code>_state = null;</code> and then the second thread gets to enter the <code>lock</code>, but you do not want it to call <code>_factory</code> again. So, you check if it is still what you set it to (it isn't, it is <code>null</code>) and that allows to correctly decide to not enter the <code>if</code>.</p>
+</li>
+</ul>
+<hr>
+<p>Alright, now I get to write one...</p>
+<p>The requirements I will take are:</p>
+<ul>
+<li>To be thread-safe</li>
+<li>To allow lazy initialization</li>
+<li>To allow invalidation</li>
+<li>To pass the <code>valueFactory</code> on <code>Get</code></li>
+</ul>
+<p>I will also add a <code>TryGet</code> method, for those threads that want to get the value if it is initialized but do not want to attempt to initialize it.</p>
+<p>First I have made one based on firda's:</p>
+<pre><code>public class MyLazy&lt;T&gt;
+{
+    private readonly object _syncroot = new object();
+    private StrongBox&lt;T&gt; _value;
+
+    public T Get(Func&lt;T&gt; valueFactory)
+    {
+        if (valueFactory == null)
+        {
+            throw new ArgumentNullException(nameof(valueFactory));
+        }
+        var box = Volatile.Read(ref _value);
+        return box != null ? box.Value : GetOrCreate();
+
+        T GetOrCreate()
+        {
+            lock (_syncroot)
+            {
+                box = Volatile.Read(ref _value);
+                if (box != null)
+                {
+                    return box.Value;
+                }
+                box = new StrongBox&lt;T&gt;(valueFactory());
+                Volatile.Write(ref _value, box);
+                return box.Value;
+            }
+        }
+    }
+
+    public void Invalidate()
+    {
+        Volatile.Write(ref _value, null);
+    }
+
+    public bool TryGet(out T value)
+    {
+        var box = Volatile.Read(ref _value);
+        if (box != null)
+        {
+            value = box.Value;
+            return true;
+        }
+        value = default(T);
+        return false;
+    }
+}
+</code></pre>
+<p>Let us be clear, firda's is a good solution. This one mainly differs in that I am not passing <code>valueFactory</code> to the constructor (I am also using <code>StrongBox&lt;T&gt;</code> because there is no reason to not use the provided API). As you mention in the question "95% of the cases" you can have <code>valueFactory</code> in the constructor, this is for the rest of the cases.</p>
+<p>Notice that when <code>Invalidate</code> is called, the next thread to enter will run the <code>valueFactory</code>.</p>
+<p>And for the kicks I have done one without monitor (<code>lock</code>). This version uses <a href="https://docs.microsoft.com/en-us/dotnet/api/system.threading.manualreseteventslim?view=netframework-4.7.2" rel="noreferrer">ManualResetEventSlim</a> instead. This means that it can awake threads all at once instead of one by one. Which would be good for the situation where there are many threads running in parallel. However, it requires extra work to work correctly. For starters, if <code>valueFactory</code> throws, we got to awake the threads, have one of them try to initialize, and have the rest go to wait again… do this until they all fail or one succeeds, meaning that we need to loop. Furthermore, with <code>lock</code> we get reentry handled for us automatically, with <code>ManualResetEventSlim</code> we got to handle that.</p>
+<p>Also, I recommend to have a look at <a href="https://docs.microsoft.com/en-us/dotnet/api/system.threading.interlocked.compareexchange?view=netframework-4.7.2" rel="noreferrer"><code>Interlocked.CompareExchange</code></a>.</p>
+<pre><code>public class Lazy&lt;T&gt;
+{
+    private readonly ManualResetEventSlim _event;
+    private Thread _ownerThread;
+    private int _status;
+    private StrongBox&lt;T&gt; _value;
+
+    public Lazy()
+    {
+        _event = new ManualResetEventSlim(false);
+    }
+
+    public T Get(Func&lt;T&gt; valueFactory)
+    {
+        // _status == 0 ::          Not Initialized
+        // _status == 1 ::                              Initializing or Initialized
+        // _ownerThread == null :: Not Initialized or                  Initialized
+        // _ownerThread != null ::                     Initializing
+        // _value == null ::        Not Initialized or  Initializing
+        // _value != null ::                                            Initialized
+        if (valueFactory == null)
+        {
+            throw new ArgumentNullException(nameof(valueFactory));
+        }
+        var ownerThread = Volatile.Read(ref _ownerThread);
+        if (ownerThread == Thread.CurrentThread)
+        {
+            // We have reentry, this is the same thread that is initializing on the value
+            // We could:
+            // 1. return default(T);
+            // 2. throw new LockRecursionException()
+            // 3. let it in
+            // We are doing that last one
+            return Create();
+        }
+        // Note: It is ok to loop here. Since Threads will only ever change _ownerThread to themselves...
+        // there is no chance that _ownerThread suddently changes to the current thread unexpectedly
+        // Why we loop? See at the bottom of the loop.
+        while (true)
+        {
+            ownerThread = Volatile.Read(ref _ownerThread);
+            if (ownerThread == null)
+            {
+                // There is no thread initializing currently
+                // Either the value has already been initialized or not
+                // Check status to tell
+                if (Volatile.Read(ref _status) == 1)
+                {
+                    // Value has already been initialized
+                    var box = Volatile.Read(ref _value);
+                    if (box == null)
+                    {
+                        // Another thread invalidated after we did read _status but before we got Value
+                        continue;
+                    }
+                    return box.Value;
+                }
+                // Value is yet to be initialized
+                // Try to get the right to initialize, Interlocked.CompareExchange only one thread gets in
+                var found = Interlocked.CompareExchange(ref _status, 1, 0);
+                if (found == 0)
+                {
+                    // We got the right to initialize
+                    var result = default(T);
+                    try
+                    {
+                        try
+                        {
+                            Volatile.Write(ref _ownerThread, Thread.CurrentThread);
+                            result = Create();
+                        }
+                        finally
+                        {
+                            // Other threads could be waiting. We need to let them advance.
+                            _event.Set();
+                            // We want to make sure _ownerThread is null so another thread can enter
+                            Volatile.Write(ref _ownerThread, null);
+                        }
+                    }
+                    catch (Exception exception) // Just appeasing the tools telling me I must put an exception here
+                    {
+                        GC.KeepAlive(exception); // Just appeasing the tools telling me I am not using the exception, this is a noop.
+                        // valueFactory did throw an exception
+                        // We have the option to device a method to cache it and throw it in every calling thread
+                        // However, I will be reverting to an uninitialized state
+                        Volatile.Write(ref _status, 0);
+                        // Reset event so that threads can wait for initialization
+                        _event.Reset();
+                        throw;
+                        // Note: I know this is a weird configuration. Why is this catch not in the inner try?
+                        // Because I want to make sure I set _status to 0 after the code from finally has run
+                        // This way I am also sure that another thread cannot enter while finally is running, even if there was an exception
+                        // In particular, I do not want Invalidate to call _event.Reset before we call _event.Set
+                    }
+                    return result;
+                }
+                // We didn't get the right to initialize
+                // Another thread managed to enter first
+            }
+            // Another thread is initializing the value
+            _event.Wait();
+            // Perhaps there was an exception during initialization
+            // We need to loop, if everything is ok, `ownerThread == null` and `Volatile.Read(ref _status) == 1`
+            // Otherwise, we would want a chance to try to initialize
+        }
+
+        T Create()
+        {
+            // calling valueFactory, it could throw
+            var created = valueFactory();
+            Volatile.Write(ref _value, new StrongBox&lt;T&gt;(created));
+            return created;
+        }
+    }
+
+    public T Get()
+    {
+        var ownerThread = Volatile.Read(ref _ownerThread);
+        if (ownerThread == Thread.CurrentThread)
+        {
+            // We have reentry, this is the same thread that is initializing on the value
+            // We could:
+            // 1. return default(T);
+            // 2. throw new LockRecursionException()
+            // We are doing the last one
+            throw new LockRecursionException();
+        }
+        // Note: It is ok to loop here. Since Threads will only ever change _ownerThread to themselves...
+        // there is no chance that _ownerThread suddently changes to the current thread unexpectedly
+        // Why we loop? See at the bottom of the loop.
+        while (true)
+        {
+            ownerThread = Volatile.Read(ref _ownerThread);
+            if (ownerThread == null)
+            {
+                // There is no thread initializing currently
+                // Either the value has already been initialized or not
+                // Check status to tell
+                if (Volatile.Read(ref _status) == 1)
+                {
+                    // Value has already been initialized
+                    var box = Volatile.Read(ref _value);
+                    if (box == null)
+                    {
+                        // Another thread invalidated after we did read _status but before we got Value
+                        continue;
+                    }
+                    return box.Value;
+                }
+            }
+            // Value is yet to be initialized, perhaps another thread is initializing the value
+            _event.Wait();
+            // Perhaps there was an exception during initialization
+            // We need to loop, if everything is ok, `ownerThread == null` and `Volatile.Read(ref _status) == 1`
+            // Otherwise, we keep waiting
+        }
+    }
+
+    public void Invalidate()
+    {
+        var ownerThread = Volatile.Read(ref _ownerThread);
+        if (ownerThread == null)
+        {
+            // There is no thread initializing currently
+            // Either the value has already been initialized or not
+            // Try to say it is not initialized
+            var found = Interlocked.CompareExchange(ref _status, 0, 1);
+            if (found == 1)
+            {
+                // We did set it to not intialized
+                // Now we have the responsability to notify the value is not set
+                _event.Reset();
+                // And the privilege to destroy the value &gt;:v (because we are using StrongBox&lt;T&gt; this is atomic)
+                Volatile.Write(ref _value, null);
+            }
+        }
+        // Either:
+        // 1. Another thread is initializing the value. In this case we pretend we got here before that other thread did enter.
+        // 2. The value is yet to be initialized. In this case we have nothing to do.
+        // 3. Another thread managed to invalidate first. Let us call it a job done.
+        // 4. This thread did invalidate. Good job.
+        // 5. We have reentry
+    }
+
+    public bool TryGet(out T value)
+    {
+        var ownerThread = Volatile.Read(ref _ownerThread);
+        if (ownerThread == null)
+        {
+            // There is no thread initializing currently
+            // Either the value has already been initialized or not
+            // Check status to tell
+            if (Volatile.Read(ref _status) == 1)
+            {
+                // Value has already been initialized
+                var box = Volatile.Read(ref _value);
+                if (box != null)
+                {
+                    value = box.Value;
+                    return true;
+                }
+            }
+        }
+        // Either:
+        // 1. Another thread invalidated after we did read _status but before we got Value
+        // 2. Value is yet to be initialized
+        // 3. Another thread is initializing the value
+        // 4. We have reentry
+        value = default(T);
+        return false;
+    }
+}
+</code></pre>
+<p>As you can see, this version is more complicated. It would be harder to maintain and harder to debug. Yet, it gives a greater level of control. <em>For example, I have managed to give you a <code>Get</code> method that waits for another thread to initialize. I agree, this is a bad API… it would be better if it was Task.</em></p>
+<p>I did try to implement it using <code>Task&lt;T&gt;</code> instead, however I could not get it right. I believe that it would only make sense with proper exception caching.</p>
+<p>So, let us add exception caching and use <code>Task&lt;T&gt;</code>.</p>
+<pre><code>public class TaskLazy&lt;T&gt;
+{
+    private Thread _ownerThread;
+    private TaskCompletionSource&lt;T&gt; _source;
+
+    public TaskLazy()
+    {
+        _source = new TaskCompletionSource&lt;T&gt;();
+    }
+
+    public Task&lt;T&gt; Get(Func&lt;T&gt; valueFactory)
+    {
+        if (valueFactory == null)
+        {
+            throw new ArgumentNullException(nameof(valueFactory));
+        }
+        var source = Volatile.Read(ref _source);
+        if (!source.Task.IsCompleted)
+        {
+            var ownerThread = Interlocked.CompareExchange(ref _ownerThread, Thread.CurrentThread, null);
+            if (ownerThread == Thread.CurrentThread)
+            {
+                return Task.Run(valueFactory);
+            }
+            if (ownerThread == null)
+            {
+                try
+                {
+                    source.SetResult(valueFactory());
+                }
+                catch (Exception exception)
+                {
+                    source.SetException(exception);
+                    throw; // &lt;-- you probably want to throw here, right?
+                }
+                finally
+                {
+                    Volatile.Write(ref _ownerThread, null);
+                }
+            }
+        }
+        return source.Task;
+    }
+
+    public Task&lt;T&gt; Get()
+    {
+        var source = Volatile.Read(ref _source);
+        if (!source.Task.IsCompleted)
+        {
+            var ownerThread = Volatile.Read(ref _ownerThread);
+            if (ownerThread == Thread.CurrentThread)
+            {
+                throw new LockRecursionException();
+            }
+        }
+        return source.Task;
+    }
+
+    public void Invalidate()
+    {
+        if (Volatile.Read(ref _source).Task.IsCompleted)
+        {
+            Volatile.Write(ref _source, new TaskCompletionSource&lt;T&gt;());
+        }
+    }
+}
+</code></pre>
+<p>Ah, beautiful. By removing the idea that if a <code>valueFactory</code> fails another one gets a chance to run, and replacing it with exception caching, we can remove looping, and this allow us to return <code>Task&lt;T&gt;</code>, and you get stuff like <code>Wait</code> and <code>ContinueWith</code> for free.</p>
+<hr>
+<p><strong>Addendum</strong>:</p>
+<p>About volatile, have a read of:</p>
+<ul>
+<li><a href="https://msdn.microsoft.com/en-us/magazine/jj883956.aspx" rel="noreferrer">The C# Memory Model in Theory and Practice, Part 2</a></li>
+<li><a href="http://www.albahari.com/threading/part4.aspx" rel="noreferrer">Threading in C#, Part 4 (Advanced Threading)</a></li>
+</ul>
+    </div>

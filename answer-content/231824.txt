@@ -1,0 +1,225 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>1) Simply don't pass large arrays, use some abstraction.</p>
+
+<p>2) Once you add the abstraction, you can provide db support.</p>
+
+<p>The following abstraction might show how to do it:</p>
+
+<p>EDIT: ok so i have added some more to point at the core of your problems:</p>
+
+<p>The paginator doesnt really need the setters to be part of its interface.</p>
+
+<p>Also see I use Iterator to represent the page items, instead of array. The array will only be used in specific implementation. You should avoid the array type in the abstraction.</p>
+
+<pre><code>interface PaginatorInterface
+{
+    public function getItems();
+
+    public function getCurrentPageNumber(): int;
+
+    public function getNumberOfPages(): int;
+
+    public function getTotal(): int;
+
+    public function getTotalOnCurrentPage(): int;
+
+    public function getTotalPerPage(): int;
+}
+</code></pre>
+
+<p>In fact, the class implementing that interface doesnt really need those setters too. It's actualy not even desired.</p>
+
+<p>Also the paginator can do simple computations. You dont have to precompute and assign static values which actualy opens space for corrupted state.</p>
+
+<pre><code>class Paginator implements PaginatorInterface
+{
+    private $pageNumber;
+    private $itemsPerPage;
+    private $items;
+    private $total;
+
+    public function __construct(int $pageNumber, int $itemsPerPage, \Iterator $pageItems, int $total)
+    {
+
+        if ($pageNumber &lt; 1) {
+            throw new \InvalidArgumentException();
+        }
+        if ($itemsPerPage &lt; 1) {
+            throw new \InvalidArgumentException();
+        }
+        $this-&gt;pageNumber = $pageNumber;
+        $this-&gt;itemsPerPage = $itemsPerPage;
+        $this-&gt;items = $pageItems;
+        $this-&gt;total = $total;
+    }
+
+    public function getItems(): \Iterator
+    {
+        return $this-&gt;items;
+    }
+
+    public function getCurrentPageNumber(): int
+    {
+        return $this-&gt;pageNumber;
+    }
+
+    public function getNumberOfPages(): int
+    {
+        return \ceil($this-&gt;getTotal() / $this-&gt;itemsPerPage);
+    }
+
+    public function getTotal(): int
+    {
+        return $this-&gt;total;
+    }
+
+    public function getTotalOnCurrentPage(): int
+    {
+        if ($this-&gt;items instanceof \Countable) {
+            return \count($this-&gt;items);
+        }
+        return \iterator_count($this-&gt;items);
+    }
+
+    public function getTotalPerPage(): int
+    {
+        return $this-&gt;itemsPerPage;
+    }
+}
+</code></pre>
+
+<p>Here I define the page provider (extended by getTotalCount method since my edit):</p>
+
+<pre><code>interface PageProviderInterface
+{
+    public function getTotalCount(): int;
+    public function getPage(int $offset, int $limit): \Iterator;
+}
+</code></pre>
+
+<p>You then use the page provider within a paginator factory (that is your pagination interface but it actualy is paginator factory so i named it that way).</p>
+
+<pre><code>interface PaginatorFactoryInterface
+{
+    public function createPaginator(int $page, int $pageSize): PaginatorInterface;
+}
+
+class PaginatorFactory implements PaginatorFactoryInterface
+{
+    /** @var PageProviderInterface */
+    private $pageProvider;
+
+    public function __construct(PageProviderInterface $pageProvider)
+    {
+        $this-&gt;pageProvider = $pageProvider;
+    }
+
+    public function createPaginator(int $page, int $pageSize): PaginatorInterface
+    {
+        $total = $this-&gt;pageProvider-&gt;getTotalCount();
+        $offset = ($page - 1) * $pageSize;
+        if ($offset &gt;= $total) {
+            $items = new \EmptyIterator();
+        } else {
+            $items = $this-&gt;pageProvider-&gt;getPage($offset, $pageSize);
+        }
+        return new Paginator($page, $pageSize, $items, $total);
+    }
+}
+
+</code></pre>
+
+<p>And lastly some implementation of the page provider. </p>
+
+<p>The array one which provider slices of an array that resides in memory:</p>
+
+<pre><code>
+class ArrayPageProvider implements PageProviderInterface
+{
+    private $items;
+
+    public function __construct(array $items) {
+
+        $this-&gt;items = $items;
+    }
+
+    public function getTotalCount(): int
+    {
+        return \count($this-&gt;items);
+    }
+
+    public function getPage(int $offset, int $limit): \Iterator
+    {
+        return new \ArrayIterator(\array_slice($this-&gt;items, $offset, $limit));
+    }
+}
+</code></pre>
+
+<p>And the silly PDO implementation, which would need some improvement to be actualy usable, but you should get the point:</p>
+
+<pre><code>class DbPageProvider implements PageProviderInterface
+{
+    private $pdo;
+    private $table;
+
+    public function __construct(\PDO $pdo, string $table) {
+        $this-&gt;pdo = $pdo;
+        $this-&gt;table = $table;
+    }
+
+    public function getTotalCount(): int
+    {
+        $statement = $this-&gt;pdo-&gt;prepare('select count(*) from ' . $this-&gt;table);
+        return $statement-&gt;fetchColumn();
+    }
+
+    public function getPage(int $offset, int $limit): \Iterator
+    {
+        $statement = $this-&gt;pdo-&gt;prepare('select * from ' . $this-&gt;table . ' limit ' . $offset . ',' . $limit);
+        $result = $statement-&gt;execute();
+        $i = 0;
+        while ($row = $result-&gt;fetch()) {
+            yield $i++ =&gt; $row;
+        }
+    }
+
+}
+
+</code></pre>
+
+<p>And that should actualy be all you need. No need for some crazy collection outsourcing or too much of new new new in one method. Keep it simple and remember the naming is really important for whoever wants to understand the code.</p>
+
+<p>Oh and one more, you hade a getViewData() method there, but that should be done by someone else:</p>
+
+<pre><code>function getPaginatorViewData(PaginatorInterface $paginator) {
+  return [
+    'elements' =&gt; $paginator-&gt;getItems(),
+    // ...
+
+  ];
+}
+</code></pre>
+
+<p>This could be a global function, or it could be static method of its own class, or could even be elevated to an interface level. But actualy i dont think it belong to the lib, it may be part of some framework bundle, or something like that, but not the lib itself. The moment it becomes shapeless array, it becomes hard to work with...</p>
+
+<p>And here is a simple example of usage:</p>
+
+<pre><code>// in DI container
+$pageProvider = new DbPageProvider($pdo, 'users');
+$usersPaginatorFactory = new PaginatorFactory($pageProvider);
+
+// in lets say /users/list constroller we have the paginator factory injected
+// $pageNumber is coming from request
+$paginator = $this-&gt;usersPaginatorFactory-&gt;createPaginator($pageNumber, 20);
+
+// maybe you wanna pass this to laravel view?
+return view('users.list', ['paginator' =&gt; $paginator]);
+// or maybe if you defined the getPaginatorViewData() function
+return view('users.list', getPaginatorViewData($paginator));
+</code></pre>
+
+<p>PS: try to avoid constructor with $options array. It really is better to name all the parameters separately, even omit default value, let the user or a factory (if there is one) decide. Default values usualy just complicate things even if it seems the opposite at first glance...</p>
+
+<p>oh and PS2: although this should have been a big warning on the beginning.
+Dont use eval(), avoid references, definitely dont return references, avoid instantiation of classes by string containing class name. The Pagination::factory is completly wrong. Immediately get rid of that file and never write anything like it again!!!</p>
+    </div>

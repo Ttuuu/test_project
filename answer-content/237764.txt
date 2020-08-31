@@ -1,0 +1,48 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>Using a power-of-10 base for extended precision is unusual, and only a good choice for specific use-cases</strong> (like if you mostly want to convert to decimal strings, or if multiplying / dividing by 10 is a major part of your workload).</p>
+
+<p><strong>Choosing 10^1 specifically wastes more than half the bits in a <code>char</code>, and leads to a huge amount of operations for large numbers.</strong> log2(10) = 3.3 useful bits of data per char.  But <code>char</code> is typically (and at least) 8-bit in C++.  You could have used base 100 in char elements.  (Then conversion to an ASCII string would convert each chunk to 2 decimal digits, with one normal-sized division per chunk.)</p>
+
+<p>Even if you were to choose base 10, you likely don't want to store as actual ASCII; your number isn't ready-to-print anyway so you have the worst of both worlds: overhead during each step, and you still have to reverse (and maybe print a leading <code>-</code>) to produce a std::string in printing order.  You could add <code>'0'</code> during the reversal.  (And do <code>out &lt;&lt; '-'</code> instead of prepending it to a potentially-long string.)  The one advantage of std::string over std::vector is that common implementations store the string bytes within the object for small strings, instead of as a separate allocation.</p>
+
+<p>(Related: <a href="https://stackoverflow.com/questions/61165307/vectorize-random-init-and-print-for-bigint-with-decimal-digit-array-with-avx2/61181913#61181913">Vectorize random init and print for BigInt with decimal digit array, with AVX2?</a> has C with Intel intrinsics for a cache-blocked byte-reverse of an array into a tmp buf for <code>fwrite</code>, and for converting a vectorized xorshift128+ PRNG result to a vector of decimal digits.  That part was an interesting problem to manually vectorize, but actual BigInt math ops can't easily be vectorized with SIMD.  See @Mysticial's answer on <a href="https://stackoverflow.com/q/8866973">Can long integer routines benefit from SSE?</a> for some techniques that do work.)</p>
+
+<hr>
+
+<p><strong>A more sensible choice if you still care about easy / fast conversion to decimal is base <code>10^9</code> in <code>uint32_t</code> chunks.</strong>  I used that in x86 asm for a code golf challenge of <a href="https://codegolf.stackexchange.com/questions/133618/extreme-fibonacci">printing the first 1000 digits of Fibonacci(10^9)</a> ; as the number got big, I could discard the least-significant 9 decimal digits by dropping one chunk, effectively dividing by 10^9 with a right shift by 1 chunk.</p>
+
+<p>Conversion to a decimal string can convert each chunk separately to 9 digits (including leading zeros), avoiding division of the entire BigInt by 10.  And letting you start with the most-significant chunk to get digit-groups in printing order.</p>
+
+<p><strong>Other than memory bandwidth / cache footprint, <code>+</code> between <code>uint32_t</code> integers costs about the same as (or less than) <code>+</code> between <code>unsigned char</code>,</strong> the way you're using it in a loop.  (i.e. where it compiles to a normal <code>add</code> instruction instead of optimizing into part of something else.)  <strong>Getting ~30 result bits for the same price as 3.3 bits is a huge win.</strong></p>
+
+<hr>
+
+<p><strong>You might want to take a look at how <a href="https://gmplib.org/" rel="noreferrer">GMP (the GNU MultiPrecision library)</a> is implemented.</strong>  Mostly with hand-written asm for the lowest levels, making efficient carry in/out easier, but with <em>binary</em> chunks (aka limbs) of the widest type the machine can do efficiently.  (That's often <code>unsigned long int</code>).  They do have pure C fallback implementations of everything, for platforms where they don't have asm.</p>
+
+<hr>
+
+<p>And/or you might want to look at how the CPython interpreter implements extended precision; <strong>without the benefit of asm to do carry in/out to a chunk that uses the full range of a type, it's easier to use chunks of base <code>2^30</code>.</strong>  Using <code>uint_least32_t</code> is probably a good idea; it's guaranteed to be large enough to hold values up to 2^30.  (And will typically be an efficient size like <code>unsigned int</code>, although you might consider loading array elements into local temporaries of <code>uint_fast32_t</code> inside your loop.  Or not; some x86-64 implementations unwisely make <code>uint_fast32_t</code> a 64-bit type.  You'll need a 64-bit type anyway for multiply and divide, though).</p>
+
+<p>(You don't want to use a type that could potentially be 64-bit if you're only using 30 bits; that would waste more than half the space instead of just a couple bits.)  CPython also has a fallback to using 15-bit chunks; I wouldn't bother with that especially for a toy implementation.</p>
+
+<p>For multiply, <code>full_result = x * (unsigned long long)y;</code> doesn't lose any bits.  If your compiler has <code>unsigned __int128</code>, using 64-bit chunks means half as many chunks, taking better advantage of 64-bit machines.</p>
+
+<p>For addition, you just do the add normally, then <code>sum &amp; ((1UL&lt;&lt;30) - 1)</code> to modulo this limb, and <code>sum &gt;&gt; 30</code> to get the carry-in for the next limb.</p>
+
+<ul>
+<li><a href="https://rushter.com/blog/python-integer-implementation/" rel="noreferrer">https://rushter.com/blog/python-integer-implementation/</a></li>
+<li><a href="https://hg.python.org/cpython/file/db842f730432/Include/longintrepr.h#l10" rel="noreferrer">https://hg.python.org/cpython/file/db842f730432/Include/longintrepr.h#l10</a> has useful comments, too.</li>
+</ul>
+
+<p>Unlike CPython, you probably don't need special fast-paths for single-limb integers.  Unless you expect people to use your class for numbers that are <em>usually</em> small but can be big.</p>
+
+<hr>
+
+<p>And BTW, your divide and modulo algorithms are really bad.  For a narrow (single-limb) divisor, you can use the remainder of one division as the high half of the dividend for the next lower limb.  You don't need repeated subtraction.  There are lots of assembly-language questions on Stack Overflow about how to implement large divisions in terms of a 2N / N =&gt; N-bit division.  (C++ of course doesn't have that, just use a 2N bit type and let your compiler (fail to) optimize it.)</p>
+
+<p>(The general case of extended-precision division is hard, though, where the divisor is multiple limbs.  Yet another reason to use large limbs so more divisors can be single-limb.)</p>
+
+<p>Also, when you do <code>% 2</code> as part of some other algorithm, you should just be looking at the low bit of the lowest limb!!  For divisors that are factors of your base (2 and 5 for your case for base 10), you only need to look at the low limb.  Numbers that end with an even digit are divisible by 2.  Numbers that end with 0 or 5 are divisible by 5.</p>
+
+<p>What should be checking a single bit in your multiply loop instead becomes a huge copy and iterate over the whole BigInt.</p>
+    </div>

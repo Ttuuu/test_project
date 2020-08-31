@@ -1,0 +1,223 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p>(I commented out the two implementations of quickselect because previous benchmarks had shown they took orders of magnitude more time than some of the other implementations).</p>
+</blockquote>
+
+<p>In my testing, for 50-element lists, <code>ns3</code> is an order of magnitude slower than <code>ns1</code>, and <code>ns4</code> is an order of magnitude slower than <code>ns3</code>. But I accidentally managed to speed up <code>ns4</code> by an order of magnitude when renaming the variables to be (IMO) more legible, and on investigating I discovered why:</p>
+
+<blockquote>
+<pre><code>def select2(lst, lft, rght, k):
+    while True:
+        if lft == rght:     #Return the sole element of the list if it is already sorted.
+            return lst[lft]
+        ...
+        elif k &lt; pvtIdx:    #Insert another element to its sorted position in the partition of the list that the desired element resides in.
+            right = pvtIdx - 1
+            ...
+</code></pre>
+</blockquote>
+
+<p>The problem with using mangled names is that if you forget to mangle one, it's not so easy to notice.</p>
+
+<hr>
+
+<p>Also, scale up to 5000-element lists and the same two functions become faster than <code>ns1</code>. If you're finding that the code times out for million-element lists, you need to profile with long lists, not really short ones.</p>
+
+<p>Further contributing to the benchmarking flaws, because the benchmarking approach shares the same list between all of the methods, it's not at all a fair test. Where you define <code>z</code>, add</p>
+
+<pre><code>lenz = len(z)
+</code></pre>
+
+<p>and then add</p>
+
+<pre><code>assert len(arr) == lenz
+</code></pre>
+
+<p>to the start of all of the <code>nS</code> functions. You'll find that the reason <code>nS6</code> is so much faster is that it's working on a shorter list.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>def nS6(lst = z, k = 16):
+    ...
+    st = set()
+    ...
+        current = heappop(lst)
+        if current not in st:
+            st.add(current)
+            ...
+</code></pre>
+</blockquote>
+
+<p>If the heap is buggy, this function is almost certainly buggy. If it isn't buggy, you don't need <code>st</code>. It suffices to track the previous element popped from the heap and compare to that. I find that this change gives about a 10% to 15% speedup.</p>
+
+<p>PS The same applies to <code>nS2</code>.</p>
+
+<hr>
+
+<p>My benchmark code:</p>
+
+<pre><code>from random import randint, random, seed
+from heapq import *
+import timeit
+
+t = timeit.timeit
+seed(12345)
+z0 = [randint(-2147483648, 2147483647) for i in range(0, 500000)]
+k0 = len(z0) // 2
+
+def nS1(arr = None, n = k0):
+    if arr == None:
+        arr = list(z0)
+
+    st = set(arr)
+    return sorted(st)[n-1] if n &lt;= len(st) else None
+
+###   and nS2, etc. with similar modifications   ###
+
+# A variant with the change I mention above
+def nS2b(arr = None, n = k0):
+    if arr == None:
+        arr = list(z0)
+
+    prev = None
+    count = 0
+    for i in sorted(arr):
+        if i != prev:
+            count += 1
+            if count == n:
+                return i
+            prev = i
+    return None
+
+# A variant on nS4 which special-cases when the range gets small.
+def nS4b(arr = None, k = k0):
+    if arr == None:
+        arr = list(z0)
+
+    st = set(arr)
+    ln = len(st)
+    if k &gt; ln: return None
+    arr = list(st)
+    left = 0
+    right = ln - 1
+    k -= 1
+    while True:
+        if right - left &lt; 10:
+            final = sorted(arr[left:right+1])
+            return final[k - left]
+        pivotIndex = left + int(random()*(right - left))
+        pivotIndex = partition(arr, left, right, pivotIndex)
+        if k == pivotIndex:
+            return arr[k]
+        elif k &lt; pivotIndex:
+            right = pivotIndex - 1
+        else:
+            left = pivotIndex + 1
+
+
+# A variant of nS6 with the change I suggest above
+def nS6(arr = None, k = k0):
+    if arr == None:
+        arr = list(z0)
+
+    heapify(arr)
+    count = 0
+    prev = None
+    while count &lt; k:
+        if not arr:
+            return None
+        current = heappop(arr)
+        if current != prev:
+            prev = current
+            count += 1
+    return current
+
+
+# My own idea for how to speed things up: radix select
+def nS8(arr = None, k = k0):
+    if arr == None:
+        arr = list(z0)
+
+    # Exploit the knowledge that we're working with 32-bit integers
+    offset = 2147483648
+    arr = [i + offset for i in set(arr)]
+    if k &gt; len(arr):
+        return None
+
+    shift = 30
+    while len(arr) &gt; 1:
+        buckets = [[] for i in range(8)]
+        for elt in arr:
+            buckets[(elt &gt;&gt; shift) &amp; 7].append(elt)
+        for bucket in buckets:
+            if k &lt;= len(bucket):
+                arr = bucket
+                break
+            else:
+                k -= len(bucket)
+        shift -= 3
+    return arr[0] - offset
+
+
+# Suggested in comments by Peilonrayz
+def Peilonrayz(arr = None, k = k0):
+    if arr == None:
+        arr = list(z0)
+
+    st = set(arr)
+    if k &gt; len(st):
+        return None
+
+    return nsmallest(k, st)[-1]
+
+
+# For benchmarking just list(set(arr))
+def uniq(k = k0):
+    arr = list(set(z0))
+    return arr[k - 1] if k &lt;= len(arr) else None
+
+
+def test(fn):
+    testcases  = [
+        ([1, 3, 4, 5], 7, None),
+        ([4, 3, 4, 5], 4, None),
+        ([45, -10, 4, 5, 4], 4, 45)
+    ]
+    for testcase in testcases:
+        result = fn(testcase[0], testcase[1])
+        if result != testcase[2]:
+            print(fn.__name__, "failed test case", testcase, "giving", result)
+            return float('+inf')
+
+    return t(fn, number = 100)
+
+
+if __name__ == "__main__":
+    implementations = [nS1, nS2, nS2b, nS3, nS4, nS4b,
+                       nS5, nS6, nS6b, nS8, Peilonrayz]
+    timed = [(test(fn), fn.__name__) for fn in implementations]
+    for result in sorted(timed):
+        print(result)
+
+    print("---")
+    print("t(uniq):\t", t(uniq, number = 100))
+</code></pre>
+
+<p>Output:</p>
+
+<pre><code>(24.560783660940388, 'nS8')
+(27.097620791058496, 'nS2b')
+(27.39887558242293, 'nS6b')
+(30.668106617453745, 'nS2')
+(32.12385269414622, 'nS1')
+(32.97220054667446, 'nS6')
+(36.23331559560749, 'nS3')
+(36.571778446890335, 'nS5')
+(37.13606558411453, 'nS4b')
+(37.48886835011808, 'nS4')
+(108.40215040129226, 'Peilonrayz')
+---
+t(uniq):         7.5451649473291695
+</code></pre>
+    </div>

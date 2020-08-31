@@ -1,0 +1,167 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Assert</h2>
+
+<p>I personally dislike using asserts. The problem for me is that they do different things in production and debug code. I want the same action in both.</p>
+
+<pre><code>  pos_type seekpos(pos_type const pos, ::std::ios_base::openmode const which) final
+  {
+    switch (which)
+    {
+      case ::std::ios_base::in:
+      case ::std::ios_base::out:
+      default:
+        assert(0);
+    }
+
+    return pos_type(off_type(-1));
+  }
+</code></pre>
+
+<p>So in this code if we get to the default action; the debug version will assert (and stop the application) while production code will return <code>-1</code>.</p>
+
+<p>In my opinion if you get to a point where your code should not then throw an exception that should not be caught. That will cause the application to exit (in a controlled way).</p>
+
+<p>But in this case I think the expected behavior is not to throw but to return -1. So I would make the default action a no-op.</p>
+
+<h3>seekpos which</h3>
+
+<p>The which in your <code>seekpos()</code> has basically three settings. You only check for two of the three.</p>
+
+<pre><code>    switch (which)
+    {
+      case ::std::ios_base::in:
+      case ::std::ios_base::out:
+
+      // You forgot this case
+      case ::std::ios_base::in | ::std::ios_base::out:
+
+      // it means set the position of the input and output stream.
+      // since this is the default value of `which` I would expect
+      // this to happen most often (and would assert in your code).
+
+      default:
+        assert(0);
+    }
+
+    return pos_type(off_type(-1));
+  }
+</code></pre>
+
+<h3>xsgetn/xsputn eof</h3>
+
+<p>I think you return result of these functions can be incorrect. You should only return <code>eof</code> if you did not get/put any values. You return <code>eof</code> if you have filled/emptied all the data.</p>
+
+<pre><code>  ::std::streamsize xsgetn(char_type* const s,
+    ::std::streamsize const count) final
+  {
+    // If there is no data to get then return eof
+    if (egptr() == gptr()) {
+        traits_type::eof();
+    }
+
+    auto const size(::std::min(egptr() - gptr(), count));
+
+    ::std::memcpy(s, gptr(), size);
+
+    gbump(size);
+
+    return size; // return the number of bytes read.
+  }
+</code></pre>
+
+<h3>Overall Design</h3>
+
+<p>The input and output use the same buffer but are not linked together. If you have not written anything into the buffer I would not expect you to be able to read from the buffer (as there is nothing to read).</p>
+
+<p>When you do write I would only expect you to be able to read only what has written (no more).</p>
+
+<pre><code>int main()
+{
+    memstream&lt;1024&gt;   buffer;
+
+    if (buffer.write("abcdef", 6))
+    {
+         std::cout &lt;&lt; "Write OK\n";
+    }
+
+    char data[100];
+    if (buffer.read(data, 10))
+    {
+        auto c = buffer.gcount();
+
+        std::cout &lt;&lt; "Count: " &lt;&lt; c &lt;&lt; "\n";
+        std::cout &lt;&lt; std::string(data, data+10) &lt;&lt; "\n";
+    }
+}
+</code></pre>
+
+<p>Result:</p>
+
+<pre><code>Write OK
+Count: 10
+abcdef
+</code></pre>
+
+<p>So I wrote 6 characters. But I managed to read 10 characters. What were the last 4 characters?</p>
+
+<h3>Circular Buffer</h3>
+
+<p>Once you have linked the two buffers correctly. You could get more from the buffer by making it circular. That means as you get to the end of the write buffer you can circle around and start writing at the beginning again if you have been reading from the buffer and there is space.</p>
+
+<h3>Inheriting from the buffer</h3>
+
+<pre><code>template &lt;::std::size_t N = 1024&gt;
+class memstream :
+  public memstreambuf&lt;N&gt;,    // This is unusual
+  public ::std::istream,
+  public ::std::ostream
+{
+public:
+  memstream() : ::std::istream(this),
+    ::std::ostream(this)
+  {
+  }
+};
+</code></pre>
+
+<p>Normally I have seen this as a member object rather than inheriting from the buffer. Though this technique saves a call to setbuffer. I can live with it.</p>
+
+<p><strong>BUT</strong>: if you are going to inherit from it then I would use private inheritance.</p>
+
+<pre><code>template &lt;::std::size_t N = 1024&gt;
+class memstream :
+  private memstreambuf&lt;N&gt;,    // Note the private
+  public ::std::istream,
+  public ::std::ostream
+{
+public:
+  memstream() : ::std::istream(this),
+    ::std::ostream(this)
+  {
+  }
+};
+</code></pre>
+
+<p>This is because I don't want my object to behave like a stream and a stream buffer to people who use it. That could be confusing. So hide the buffer properties from external users (by using private). They can always get a reference to the buffer using the method <code>rdbuf()</code>.</p>
+
+<h2>pragma once and include guards</h2>
+
+<p>There is no point in using both:</p>
+
+<pre><code>#ifndef MEMSTREAMBUF_HPP
+# define MEMSTREAMBUF_HPP
+# pragma once
+
+....
+
+#endif
+</code></pre>
+
+<p>I would use the header guards because not all compiler support <code>#pragma once</code>. </p>
+
+<p>Note the space between <code>#</code> and the <code>word</code> is non standard. Most compilers may be forgiving about it but not all so I would not do it.</p>
+
+<pre><code># define MEMSTREAMBUF_HPP
+ ^  // extra space.
+</code></pre>
+    </div>

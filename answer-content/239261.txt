@@ -1,0 +1,153 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<ol>
+<li>Your <code>main</code> is a classic arrow anti-pattern. You can use guard clauses to make the code flat and easier to understand.</li>
+<li>Bare excepts are normally not a good idea. Why would you want to print the usage if the code works fine but the user passes a keyboard interrupt? You may want to use <code>except Exception:</code>.</li>
+<li><p>I would prefer if <code>mask</code> and <code>unmask</code> were wrapped up in a class. I personally would leave them as static methods.</p>
+
+<p>This has the benefit that your <code>Manager</code> can be later changed to use any encryption. As long as there's an object that defines an <code>encrypt</code> and a <code>decrypt</code> method.</p></li>
+<li><p>Functions like <code>create_dirs_and_mask</code> are normally a really large red flag, to me, signalling that your constructor is doing too much.</p>
+
+<p>Your constructor is doing quite a lot, building three paths from root, building two directories, building a file if it doesn't exist, printing to the end user if a file already exists.</p>
+
+<p>Not only does this clearly break <a href="https://en.wikipedia.org/wiki/Single-responsibility_principle" rel="noreferrer">SRP</a>, it's needlessly locking down customizability of the class and making it more annoying to test.</p>
+
+<p>Just move the fancy bits into a class method and leave the constructor to be as dumb as possible.</p></li>
+<li><p>The name <code>update_mask_and_masked_tokens</code> is a mouthful and a half. I would just change this to be the setter of the token property.</p>
+
+<p>Since the function currently doesn't take an argument I would move the <code>new_passtoken()</code> call out of the method and as an argument.</p></li>
+<li><p>You have a confusing and useless line <code>masked = mask</code>.</p></li>
+<li><p>I would change <code>Manager</code> to act like a dict - changing <code>save_token</code> to <code>__setitem__</code>.</p>
+
+<p>Changing it to have the same interface as a dict allows for you to easily swap this out for a plain old dictionary to easily test code that uses this. It also ensures that you don't break SRP by adding bells or whistles that don't belong on Manager. For example <code>save_token</code> is currently merging business logic with its user interface, a generally pretty poor design choice.</p></li>
+<li>The special bells and whistles added to <code>Manager.save_token</code> are currently not used, you may want to follow YAGNI and just scrap that part of your code. Alternately you can expose the functionality as an external function.</li>
+<li>I'm not a fan of <code>python -m py.token --test</code>. I personally would just drop it as an option and use pytest.</li>
+<li>Rather than <code>mkdtemp</code> I would use <code>TemporaryDirectory</code> and use it as a context manager. This would remove the need to import <code>shutil.rmtree</code>.</li>
+</ol>
+
+<pre class="lang-py prettyprint-override"><code>from sys import argv
+from secrets import randbits
+from pathlib import Path
+from getpass import getpass
+from tempfile import TemporaryDirectory
+
+_USAGE = """usage:
+  python -m py.token "api name"
+  python -m py.token --test
+"""
+
+
+def main():
+    if len(argv) != 2:
+        print(_USAGE)
+        return
+
+    if argv[1] == '--test':
+        test()
+        return
+
+    try:
+        manager = TokenManager.load(new_passtoken)
+        print(manager[argv[1]])
+    except Exception:
+        print(_USAGE)
+        raise
+
+
+class Mask:
+    @staticmethod
+    def encrypt(token: bytes, passtoken: bytes) -&gt; bytes:
+        return int_to_bytes(bytes_to_int(token)
+                            ^ bytes_to_int(passtoken))
+
+    @staticmethod
+    def decrypt(masked_token: bytes, passtoken: bytes) -&gt; bytes:
+        return int_to_bytes(bytes_to_int(masked_token)
+                            ^ bytes_to_int(passtoken))
+
+
+class TokenManager:
+    def __init__(self, token_file, secrets_dir, crypto):
+        secrets_dir.mkdir(exist_ok=True)
+        self._secrets_dir = secrets_dir
+        self._token_file = token_file
+        self._token = token_file.read_bytes()
+        self._crypto = crypto
+
+    @classmethod
+    def load(cls, new_token=None, crypto=Mask, root=Path.home()):
+        base = root / 'pass'
+        base.mkdir(exist_ok=True)
+        secrets = base / 'secrets'
+        token = base / 'token'
+        if not token.exists():
+            if new_token is None:
+                raise ValueError('No existing token exists')
+            token.write_bytes(new_token())
+        return cls(token, secrets, crypto)
+
+    def __getitem__(self, api) -&gt; bytes:
+        encrypted = (self._secrets_dir / api).read_bytes()
+        return self._crypto.decrypt(encrypted, self.token)
+
+    def __setitem__(self, api, token) -&gt; None:
+        encrypted = self._crypto.encrypt(token, self.token)
+        (self._secrets_dir / api).write_bytes(encrypted)
+
+    @property
+    def token(self) -&gt; bytes:
+        return self._token
+
+    @token.setter
+    def token(self, token) -&gt; None:
+        for file in self._secrets_dir.iterdir():
+            token_ = self._crypto.decrypt(file.read_bytes(), self.token)
+            encrypted = self._crypto.encrypt(token_, token)
+            file.write_bytes(encrypted)
+        self._token = token
+        self._token_file.write_bytes(token)
+
+
+def new_passtoken() -&gt; bytes:
+    return int_to_bytes(randbits(8*256))
+
+
+def bytes_to_int(token) -&gt; int:
+    return int.from_bytes(token, 'big')
+
+
+def int_to_bytes(integer) -&gt; bytes:
+    # wish we didn't have to implement ourselves...
+    result = []
+    while integer:
+        result.append(integer &amp; 255)
+        integer &gt;&gt;= 8
+    return bytes(reversed(result))
+
+
+def save_token(manager, api_name='', token=b''):
+    if not api_name:
+        api_name = input('api name: ')
+    if not token:
+        token = bytes(getpass('input token (hidden): '), 'utf8')
+    manager[api_name] = token
+
+
+def test():
+    token = b'abc123}|{'
+    assert token == int_to_bytes(bytes_to_int(token))
+    passtoken = b'passtoken'
+    assert token == Mask.decrypt(Mask.encrypt(token, passtoken), passtoken)
+    with TemporaryDirectory() as tmp_dir:
+        manager = TokenManager.load(new_passtoken, crypto=Mask, root=Path(tmp_dir))
+        api = 'any api'
+        manager[api] = token
+        assert manager[api] == token
+        manager.token = new_passtoken()
+        assert manager[api] == token
+        globals().update(locals())
+
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+    </div>

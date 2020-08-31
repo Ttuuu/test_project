@@ -1,0 +1,385 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>ServerSocket</h1>
+
+<h2>self.handler</h2>
+
+<p>The handler evaluation in <code>__init__</code> can be accomplished with an <code>or</code> ternary operation. It's clearer to the reader as to what's going on. Also, the name could be changed to <code>HandlerClass</code>, since it represents a <code>class</code> rather than an instance:</p>
+
+<pre class="lang-py prettyprint-override"><code>    self.HandlerClass = handler or Handler
+</code></pre>
+
+<h2><code>self.handler</code> logging</h2>
+
+<p>The check against <code>handler_kwargs</code> makes the code a bit difficult to follow, since the <code>SocketServer</code> is now in charge of something that arguably the <code>handler</code> should be doing. If the <em>server</em> is who should be doing the logging, then I would leave the logging check out of the <code>handler_kwargs</code> entirely. Store <code>self.logging</code> as a boolean setting on the server instance, and just check against that:</p>
+
+<pre class="lang-py prettyprint-override"><code># for traceback handling
+import traceback 
+
+class SocketServer:
+    def __init__(self, address, handler=None, *args, **kwargs):
+        ~skipping some code~
+
+        # this is so you don't unpack logging from kwargs since
+        # it looks like you need it in your handler
+        self.logging = kwargs.get('logging', False)
+
+        ...
+
+    def handle(self):
+        try:
+            data = client.recv(1024)
+        except ConnectionResetError as e:
+            # use the more pythonic `if bool` check
+            # here, rather than comparing against a singleton
+            if self.logging:
+                print(f'{address[0]} unexpectedly quit: {e}', file=sys.stderr)
+                traceback.print_exception(*sys.exc_info(), file=sys.stderr)     
+</code></pre>
+
+<p>I've added a <code>sys.stderr</code> stream to your print statement, and added the exception to your print statement. I've also added a traceback print which points to stderr. </p>
+
+<h2><code>handle</code> Refactor</h2>
+
+<p>The <code>client.close(); return</code> statement can also be refactored using <code>try/except</code>'s <code>else</code> feature and a <code>finally</code> block, since you <em>always</em> want the client to close</p>
+
+<pre class="lang-py prettyprint-override"><code>        try:
+            data = client.recv(1024)
+        except ConnectionResetError as e:
+            if self.logging:
+                print(f'{address[0]} unexpectedly quit: {e}', file=sys.stderr)
+                traceback.print_exception(*sys.exc_info(), file=sys.stderr) 
+        # this is if no exception fired
+        else:
+            parsed = self.parse(data)
+            handler = self.HandlerClass()
+            handler.handle(client, parsed, address)
+        # this will always execute
+        finally:
+            client.close()
+</code></pre>
+
+<h2>Convert <code>bytes</code> to <code>str</code></h2>
+
+<h2><code>parse</code></h2>
+
+<p>First, when converting bytes to str, use <code>bytes.decode()</code> rather than <code>str(byte_obj, encoding)</code>. The <code>headers</code> and <code>content</code> evaluation can be handled using argument unpacking, and from there you can use an <code>or</code> expression with <code>any</code> on <code>contents</code> to either take the first result or create an empty list:</p>
+
+<pre class="lang-py prettyprint-override"><code>    def parse(self, data):
+        ''' Splits a packet into
+                the request,
+                the headers (which includes the request),
+                and contents
+        '''
+        stringed = data.decode().split('\r\n\r\n')
+
+        # The headers and content blocks can be handled also with argument
+        # unpacking and a ternary operator on content:
+
+        headers, *content = data.decode().split('\r\n\r\n')
+        content = content[0] if content else []
+
+        request = headers.split(' ')[0]
+
+        return request, headers, content
+</code></pre>
+
+<h1>Handler</h1>
+
+<h2>Adding to lists</h2>
+
+<p>There are lots of cases where you do this:</p>
+
+<pre class="lang-py prettyprint-override"><code>self.some_list += [some_value]
+</code></pre>
+
+<p>Just use <code>.append(some_value)</code>, it's faster since you don't have to create a list just to add the value to an existing list. For example:</p>
+
+<pre class="lang-py prettyprint-override"><code>    def set_header(self, header, content):
+        ''' Defines a custom header and adds it to the response
+        '''
+        # this is much quicker, do this instead
+        self.reply_headers.append(f'{header}: {content}')
+</code></pre>
+
+<h2>type-checking</h2>
+
+<p>Use <code>isinstance</code> rather than <code>type(object) == some_type</code>:</p>
+
+<pre class="lang-py prettyprint-override"><code># This
+    def response(self, content):
+        ''' Adds to the content of the response
+        '''
+        if type(content) == str:
+            self.reply_content += content.split('\n')
+        else:
+            self.reply_content += [content]
+
+# should be this
+    def response(self, content):
+        if isinstance(content, str):
+            self.reply_content.extend(content.split('\n'))
+        else:
+            self.reply_content.append(content)
+</code></pre>
+
+<p>Note that I'm also switching the addition of lists to appropriate calls to <code>append</code> and <code>extend</code>. Though, looking through the rest of your code, you only use this against <code>str</code> or <code>bytes</code> types, so I'd refactor to the following:</p>
+
+<pre class="lang-py prettyprint-override"><code>    def response(self, content):
+        # force everything to bytes-type for convenience, that way
+        # you never have to worry about TypeErrors later
+        content = content if isinstance(content, bytes) else content.encode()
+
+        self.reply_content.append(content)
+</code></pre>
+
+<h2>content-length calculation</h2>
+
+<p>Here, you can drop the creation of the <code>lengths</code> list, and just use <code>sum</code> on <code>map</code>:</p>
+
+<pre class="lang-py prettyprint-override"><code>    def calculate_content_length(self):
+        ''' Calculates the content length and adds it to the header
+        '''
+        length = len(self.reply_content) * 2
+
+        # sum will take any iterable, even generators and maps
+        # len in map is the function to be applied to each element
+        length += sum(map(len, self.reply_content))
+        self.set_header('Content-Length', length)
+</code></pre>
+
+<p>It's faster and doesn't build as many objects inside the function</p>
+
+<h1>Magic Numbers</h1>
+
+<p>In your <code>extract_file_name</code> function, you are slicing the file name from the first element, though it's not completely clear why:</p>
+
+<pre class="lang-py prettyprint-override"><code>    def extract_file_name(self, file_name=None):
+        if file_name:
+            f_name = file_name[1:]
+        else:
+            f_name = self.request_status.split(' ')[1][1:]
+        return f_name
+</code></pre>
+
+<p>This is usually a code smell and you should include a docstring and/or comments to explain why you slice that way. Otherwise, the index is a "magic number" and can be difficult for you or others to maintain later. You also never use the <code>file_name</code> argument at any point when calling this function, so I might just leave it out.</p>
+
+<h2>Sending Files</h2>
+
+<p>Most of the improvements here follow the ones that have been suggested above:</p>
+
+<h3>Ternary Operation or Use <code>or</code> for <code>file_name</code></h3>
+
+<pre class="lang-py prettyprint-override"><code>file_name = file_name or self.extract_file_name()
+
+## or 
+
+file_name = file_name if file_name else self.extract_file_name()
+</code></pre>
+
+<p>The latter mirrors your <code>if</code> statement a bit more</p>
+
+<h3>Checking an empty string</h3>
+
+<p>Use <code>if some_string</code> not <code>if some_string == ''</code>.</p>
+
+<h3>Checking string start and end values</h3>
+
+<p>The <code>str.startswith</code> and <code>str.endswith</code> methods will help here, and they avoid indexing or slicing which can impair readability:</p>
+
+<pre class="lang-py prettyprint-override"><code>if file_name.startswith('./'):
+    # do something
+
+
+if file_name.endswith('html'):
+    # do something
+</code></pre>
+
+<p>The logic in <code>send_file</code> could be cleaned up a bit. First, I think a <code>handle_error</code> method would do nicely to clean up some of the repeated code where you handle exceptions:</p>
+
+<pre class="lang-py prettyprint-override"><code>    def handle_error(self, code, short_reason, reason):
+        """
+        code: integer error code
+        short_reason: string denoting the short error reason
+        reason: string denoting the full error reason
+
+        example:
+            self.handle_error(404, 'Not Found', 'File Not Found')
+        """
+        self.set_status(code, short_reason)
+        self.set_header('Content-Type', 'text/html')
+        self.reply_content = [f'&lt;p&gt;Error {code}: {reason} &lt;/p&gt;']  
+</code></pre>
+
+<p>Next, I think the filename checking can be refactored to make a bit more sense. First, it seems a bit counterintuitive that a path that might start with <code>'.'</code> is forbidden. What about <code>./public/index.html</code>? If you're trying to avoid folder traversal such as paths with <code>.</code> and <code>..</code> in them, it might not be that bad to use a regex. For example, what if I tried to give you a path like `../../root_file.txt'? It would pass your test, even though it will traverse back directories. I would do something like the following:</p>
+
+<pre class="lang-py prettyprint-override"><code>import re
+~skipping lots of code~
+
+    @staticmethod
+    def valid_path(path):
+        """
+        Will take any unix-path and check for any '.' and '..' directories
+        in it. Example:
+
+            import re
+            re_path = re.compile('^\.+$')
+
+            some_path = '/root/path/to/../folder/./file.txt'
+            public_path = 'public/folder/../../../file.txt'
+
+            next(filter(re_path.match, some_path.split('/')))
+            # '..'
+
+            '/'.join(filter(re_path.match, some_path.split('/')))
+            # '..'
+            valid_path = '/path/to/file.txt'
+            next(filter(re_path.match, valid_path.split('/')))
+            StopIteration
+        """
+        path = path.lstrip('.').lstrip('/')
+        re_path = re.compile('^\.+$')
+        try:
+            match = next(filter(re_path.match, path.split('/')))
+        except StopIteration:
+            return True
+        return False
+</code></pre>
+
+<p>This way you can check if there are backout paths without colliding with something inocuous like <code>./public/file.txt</code>, and you can handle the following <code>FileNotFoundError</code>. Otherwise, you'll get a <code>None</code> on return, and then you can return an <code>AccessDenied</code>:</p>
+
+<pre class="lang-py prettyprint-override"><code>    def send_file(self, file_name=None):
+        ~snip~
+        # this is more pythonic than doing
+        # if file_name == ''
+        file_name = file_name or 'index.html'
+
+        # will either be True or False
+        if not self.valid_path(file_name):
+            # I've added the keywords here for clarity
+            self.handle_error(403, short_reason='Forbidden', reason='Forbidden')
+            return  
+
+        try:
+            # use and f-string here rather than string
+            # concatenation
+            with open(f'./public/{file_name}', 'rb') as fh:
+                file_contents = file.read()
+        except FileNotFoundError:
+            self.handle_error(404, short_reason='Not Found', reason='File Not Found')
+            return
+
+        file_type = self.get_type(file_name)
+        if file_type is not None:
+            self.set_header('Content-Type', file_type.MIME)
+        # use str.endswith here
+        elif file_name.endswith('html'):
+            self.set_header('Content-Type', 'text/html')
+        else:
+            self.set_header('Content-Type', 'text/txt')
+
+        self.response(file_contents)
+</code></pre>
+
+<h2>Redundant Methods</h2>
+
+<p>The method <code>get_request_address</code> in my opinion doesn't need to be there. Just access <code>self.address</code> wherever you call it.</p>
+
+<h2><code>parse_headers</code></h2>
+
+<p>If it were up to me, I'd make the headers a dictionary from the get-go, but this can be re-factored like so:</p>
+
+<pre class="lang-py prettyprint-override"><code>    # this can be static since you never access any self attributes
+    @staticmethod
+    def parse_headers(headers):
+        t = {}
+        for header in headers[1:]:
+            # unpack k and v from one call to split
+            k, v = header.split(': ')
+            t[k] = v
+        return t
+</code></pre>
+
+<p>Or, even more succinctly</p>
+
+<pre class="lang-py prettyprint-override"><code>    @staticmethod
+    def parse_headers(headers):
+        return dict(header.split(': ') for header in headers[1:])
+</code></pre>
+
+<h2><code>reply</code></h2>
+
+<p>Again, I'd force everything to <code>bytes</code>. You try to append to a <code>str</code> (<code>message</code>) with mixed types, which will fail:</p>
+
+<pre class="lang-py prettyprint-override"><code>    def reply(self):
+        ''' Assembles the response and sends it to the client
+        '''
+        if not self.reply_headers[0].startswith("HTTP"):
+            self.set_status(200, 'OK')
+            self.set_header('Content-Type', 'text/html')
+            self.reply_content = ['&lt;p&gt;Response Status unspecified&lt;/p&gt;']
+
+        self.calculate_content_length()
+
+        # here's how to coerce to bytes on reply_headers
+        message = b'\r\n'.join(map(str.encode, self.reply_headers))
+        message += b'\r\n\r\n'
+
+
+        message += b'\r\n'.join(x.encode() if isinstance(x, str) else x for x in self.reply_content))
+        message += b'\r\n'
+
+        # Now you don't have to type-check
+        try:
+            self.client.send(message)
+        except:
+            pass
+</code></pre>
+
+<p>Avoiding the type-checking entirely makes your code more streamlined and maintainable. </p>
+
+<p>Last, instead of using <code>pass</code> on an unexpected Exception, I'd raise some sort of <code>500</code>:</p>
+
+<pre class="lang-py prettyprint-override"><code>     try:
+         self.client.send(message)
+     except Exception as e:
+         traceback.print_exception(*sys.exc_info(), file=sys.stderr)
+         self.handle_error(500, 'Server Error', 'Internal Server Error')
+</code></pre>
+
+<p>Then at the very least there's some visibility either by the client or by you that something bad happened.</p>
+
+<h2><code>handle</code></h2>
+
+<p>This is a classic case of don't repeat yourself. Looking at the big block of <code>if</code> statements, your execution times will be slightly worse for a <code>PATCH</code> than a <code>GET</code>. To refactor, I would use a dictionary that binds the names of functions to operations, yielding a constant time lookup:</p>
+
+<pre><code>    def __init__(self, ...):
+        ~snip~
+        self.functions = {
+            'GET': self.get,
+            'POST': self.post,
+            'HEAD': self.head,
+            'PUT': self.put,
+            'DELETE': self.delete,
+            'CONNECT': self.connect,
+            'OPTIONS': self.options,
+            'TRACE': self.trace,
+            'PATCH': self.patch
+        }
+
+
+    def call_method(self, contents, request_type=None, headers=None):
+        headers = headers or {}
+
+        headers['Content-Type'] = headers.get('Content-Type', 'text/html')
+
+        self.set_status(200, 'OK')
+
+        for k, v in headers.items():
+            self.set_header(k, v)
+
+        func = self.functions.get(request_type.upper() if request_type else '', self.default)
+
+        func(headers, contents)
+        self.reply()
+</code></pre>
+    </div>

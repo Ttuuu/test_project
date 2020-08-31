@@ -1,0 +1,115 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>This code is fundamentally broken and has undefined behavior.</h2>
+<p>Your code is not correctly starting and ending the lifespan of objects of type T. So unless T is a very simplistic C type then your code will exhibit undefined behavior. You don't make any attempt to make sure that T is of this simplistic type so we must assume that T has a constructor/destructor.</p>
+<h2>Question</h2>
+<p>Why do the queues share a lock and condition variable? I don't understand why each queue is not independent from each other.</p>
+<h2>Observation</h2>
+<p>You are not implementing separation of concerns. Your class does both business logic and resource management. You should separate these out into two separate classes.</p>
+<p>The standard already has a class to handle the resource so you can replace:</p>
+<pre><code>  uint32_t head;
+  uint32_t tail;
+  uint32_t capacity;
+  T* buffer;
+</code></pre>
+<p>with <code>std::deque&lt;T&gt;</code></p>
+<h2>Breaking the rule of Three/Five</h2>
+<p>You are managing RAW pointers (this harks to back to separation on concerns point above). If you are managing resources you need to make sure you correctly implement all the constructors/assignment operators. Other wise you are likely to have problems.</p>
+<p>Currently the Copy constructor and copy assignment operator are defined and will not do the correct thing. Resulting in either problems during destruction or unexpected results when accessing one of the two copies.</p>
+<pre><code> // These are automatically define by the compiler.
+ // You may want to delete them or define the appropriately.
+ ThreadSafeQueue(ThreadSafeQueue const&amp;)
+ ThreadSafeQueue&amp; operator=(ThreadSafeQueue const&amp;)
+</code></pre>
+<h2>Thread Safety</h2>
+<p>If you want to avoid race conditions then <strong>ALL</strong> public methods must lock the mutex on entry to guarantee that other threads don't modify the state while the state is being accessed.</p>
+<pre><code>//
+// These methods don't lock the mutex.
+//
+void dequeueAll(std::vector&lt;T&gt;* vOut)
+bool is_empty() const
+uint32_t get_size() const
+</code></pre>
+<h2>Pointer Vs Reference</h2>
+<p>OK. I don't understand why you pass the condition variable into the object rather than just have them as members. But When you pass them you should pass them as references (not pointers).</p>
+<p>Pointers has no concept of ownership. So the object does not technically know if it should delete the pointer. In this case this is a bit more obvious than the general case but in general this is a bad design.</p>
+<p>Also you should never be allowed to pass a <code>nullptr</code>. Your code always assumes the pointers are non null. To prevent this your interface should be a a reference as this does not allow you to pass null.</p>
+<h2>Code Review</h2>
+<p>I see you ordered them alphabetically.</p>
+<pre><code>#include &lt;condition_variable&gt;
+#include &lt;cstdint&gt;
+#include &lt;iostream&gt;
+#include &lt;mutex&gt;
+#include &lt;vector&gt;
+</code></pre>
+<hr>
+<pre><code>        head(0),
+        tail(0),
+        capacity(capacity),
+</code></pre>
+<p>This does not look correct.<br>
+The buffer will and scratch will have a size of zero (get_size() return 0 when head and tail are equal).</p>
+<pre><code>        buffer((T*)malloc(get_size() * sizeof(T))),
+        scratch_space((T*)malloc(get_size() * sizeof(T))) {}
+</code></pre>
+<p>Are they not supposed to have a "capacity" elements pre-allocated?</p>
+<hr>
+<p>Why is this variable here?</p>
+<pre><code>  std::condition_variable* cond;
+</code></pre>
+<p>All the other variables are listed together in the private section. Yet this variable is here all by itself in the public section?</p>
+<hr>
+<p>This is broken.</p>
+<pre><code>  ~ThreadSafeQueue() {
+    free(scratch_space);
+    free(buffer);
+  }
+</code></pre>
+<p>These two buffers contain objects of type T. Calling <code>free()</code> will not call the destructors of the objects. Thus the lifespan of the objects are not ended correctly. You must manually call the destructor for each of these objects.</p>
+<hr>
+<p>In this function:</p>
+<pre><code>  void enqueue(const T&amp; value) {
+</code></pre>
+<p>This is broken:</p>
+<pre><code>    buffer[tail++] = value;
+</code></pre>
+<p>The object at <code>buffer[tail]</code> has not had its lifetime started by calling the constructor. Thus you can not use the assignment operator here. The solution to this is to use placement new:</p>
+<pre><code>    new (buffer + tail) T(value);
+</code></pre>
+<hr>
+<p>In here:</p>
+<pre><code>  void dequeueAll(std::vector&lt;T&gt;* vOut) {
+</code></pre>
+<p>Does this line not leak the current <code>scratch_space</code>?</p>
+<pre><code>      scratch_space = buffer;
+</code></pre>
+<hr>
+<p>In here:</p>
+<pre><code>  void copy_cyclical_queue() {
+</code></pre>
+<p>You can <strong>NOT</strong> use <code>memcpy()</code> to copy object of type T. Unless you first guarantee that the type T some very simplistic types with no constructor/destructor.</p>
+<pre><code>      memcpy(buffer, scratch_space + head, sizeof(T) * size);
+</code></pre>
+<p>And agains:</p>
+<pre><code>      memcpy(buffer, scratch_space + head, sizeof(T) * (cap - head));
+      memcpy(buffer + (cap - head), scratch_space, sizeof(T) * tail);
+</code></pre>
+<hr>
+<p>I don't think you want o generate output from a library.</p>
+<pre><code>  void check_params_resize(uint32_t new_cap) {
+    if (new_cap &lt; get_size()) {
+      std::cerr &lt;&lt; "ThreadSafeQueue: check_params_resize: size(" &lt;&lt; get_size()
+                &lt;&lt; ") &gt; new_cap(" &lt;&lt; new_cap
+                &lt;&lt; ")... data "
+                   "loss will occur if this happens. Prevented."
+                &lt;&lt; std::endl;
+    }
+  }
+</code></pre>
+<p>I would throw an exception. Let the library that is using your code catch the exception then let it decide how to display the error message to the user. Sometimes this is to an error log sometimes this will be in a dialog for the user etc.</p>
+<hr>
+<p>Stop doing this:</p>
+<pre><code>using namespace std;
+</code></pre>
+<p>Read this: <a href="https://stackoverflow.com/q/1452721/14065">Why is “using namespace std;” considered bad practice?</a></p>
+<hr>
+    </div>

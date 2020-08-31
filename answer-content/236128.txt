@@ -1,0 +1,203 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>Memory management</h3>
+
+<p>The use of <code>NSAutoreleasePool</code> makes it apparent that this code is compiled  <em>manual reference counting.</em> That is error-prone, as you'll see now: Here</p>
+
+<pre><code>NSString *string = [[NSString alloc] initWithUTF8String:filepath];
+NSString *relString = [[NSString alloc] initWithUTF8String:ref];
+NSURL *actual = [[NSURL alloc] initByResolvingBookmarkData ...];
+</code></pre>
+
+<p>are objects allocated but never released. That makes several memory leaks on each invocation of the method.</p>
+
+<p>The easiest fix would be to use <em>automatic reference counting (ARC)</em> instead. ARC is available since Mac OS 10.6, and there is no reason not to use it. You only have to adjust the compiler flags (i.e. do <em>not</em> pass <code>-fno-objc-arc</code> to the compiler) and replace (compare <a href="https://developer.apple.com/documentation/foundation/nsautoreleasepool" rel="nofollow noreferrer">this</a>)</p>
+
+<pre><code>NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+// ...
+[pool drain];
+</code></pre>
+
+<p>by </p>
+
+<pre><code>@autoreleasepool {
+    // ...
+}
+</code></pre>
+
+<p>The compiler takes care of everything else and inserts <code>retain</code> and <code>release</code> calls where appropriate.</p>
+
+<p>If – for whatever reason – switching to ARC is not feasible then you have to fix the above-mentioned issues. You can add the needed release calls, e.g. </p>
+
+<pre><code>NSString *string = [[NSString alloc] initWithUTF8String:filepath];
+// ...
+[string release];
+</code></pre>
+
+<p>or (perhaps simpler) create autoreleased objects (which are released on return of the function, when the autorelease pool is drained):</p>
+
+<pre><code>NSString *string = [NSString stringWithUTF8String:filepath];
+NSURL *actual = [NSURL URLByResolvingBookmarkData ...];
+</code></pre>
+
+<p><code>string</code> can also more simply be created as a <a href="https://clang.llvm.org/docs/ObjectiveCLiterals.html#boxed-c-strings" rel="nofollow noreferrer">“boxed C string”</a>:</p>
+
+<pre><code>NSString *string = @(filepath);
+</code></pre>
+
+<p>Another error is here:</p>
+
+<pre><code>char resolved[100]; /*resolved path in C; need to get length of the string, not arbitrarily 100 */
+strcpy(resolved, [actual fileSystemRepresentation]);
+// ...
+return tempPath;
+</code></pre>
+
+<p>because the function returns the address of a <em>local</em> variable, which is undefined behavior.</p>
+
+<p>You can make the character buffer static: That seems to be what similar functions in the blender project do. The disadvantage is that subsequent calls to the function overwrite the buffer.</p>
+
+<p>Or you can allocate a new string, and the caller has to release the memory eventually.</p>
+
+<h3>Error handling</h3>
+
+<p>The correct way to check for success or failure of Cocoa (Touch) methods is 
+documented in
+<a href="https://developer.apple.com/library/mac/documentation/cocoa/conceptual/ErrorHandlingCocoa/CreateCustomizeNSError/CreateCustomizeNSError.html#//apple_ref/doc/uid/TP40001806-CH204-SW1" rel="nofollow noreferrer">"Handling Error Objects Returned From Methods"</a> in the "Error Handling Programming Guide":</p>
+
+<blockquote>
+  <p><strong>Important:</strong> Success or failure is indicated by the return value of the
+  method. Although Cocoa methods that indirectly return error objects in
+  the Cocoa error domain are guaranteed to return such objects if the
+  method indicates failure by directly returning nil or NO, you should
+  always check that the return value is nil or NO before attempting to
+  do anything with the NSError object.</p>
+</blockquote>
+
+<p>In your case, the correct way to check for the success of </p>
+
+<pre><code>NSData *bmdata = [NSURL bookmarkDataWithContentsOfURL:url error:&amp;error];
+</code></pre>
+
+<p>would be</p>
+
+<pre><code>if (bmdata == nil) {
+    NSLog(@"Error: %@",error);
+}
+</code></pre>
+
+<p>But <code>NSLog()</code>ing the error is not sufficient: You have to report the failure to the caller, e.g. by returning a <code>nullptr</code>:</p>
+
+<pre><code>if (bmdata == nil) {
+    NSLog(@"Error reading bookmark data for %@: %@",url, error);
+    [pool drain];
+    return nullptr;
+}
+</code></pre>
+
+<p>Note that (if you keep the manual reference counting) you must take care that the autorelease pool is drained on any return from the function.</p>
+
+<p>The same error handling must be done when resolving the bookmark data, that is missing completely.</p>
+
+<h3>More remarks</h3>
+
+<ul>
+<li><code>relString</code> and <code>relativeURL</code> are not needed, you can simply pass <code>nil</code> to the <code>relativeToURL</code> argument.</li>
+<li><code>isStalePointer</code> is not needed, you can pass <code>&amp;isstale</code> directly to the <code>bookmarkDataIsStale</code> argument. Or pass <code>nil</code> is you are not interested in the outcome (at present, the staleness is not evaluated in your code).</li>
+</ul>
+
+<h3>File system paths conversions</h3>
+
+<p>The conversion from an <code>NSURL</code> back to a C string with</p>
+
+<pre><code>char resolved[100];
+strcpy(resolved, [actual fileSystemRepresentation]);
+</code></pre>
+
+<p>suggests that the C strings represent “file system paths” and in that case the correct counterpart for the conversion from the given <code>filepath</code> to an <code>NSURL</code> is </p>
+
+<pre><code>NSURL *url = [NSURL fileURLWithFileSystemRepresentation:filepath
+                                            isDirectory:NO
+                                          relativeToURL:nil];
+</code></pre>
+
+<p>But a buffer with 100 characters may be too short: Either determine the needed length dynamically, or use <code>MAXPATHLEN</code> from the system include files. Also <code>strcpy</code> does not check if the target buffer is large enough (potentially causing a memory corruption). Better use</p>
+
+<pre><code>static char resolved[MAXPATHLEN];
+if (![actual getFileSystemRepresentation:resolved maxLength:sizeof(resolved)]) {
+    NSLog(@"File system path too long for %@", url);
+    [pool drain];
+    return nullptr;
+}
+</code></pre>
+
+<h3>Putting it together</h3>
+
+<p>Putting all the above suggestions together, the code (with manual reference counting) would be</p>
+
+<pre><code>const char *YourClass::resolveAlias(const char *filepath) const {
+
+    NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+    NSURL *url = [NSURL fileURLWithFileSystemRepresentation:filepath
+                                                isDirectory:NO
+                                              relativeToURL:nil];
+    NSError *error = nil;
+    NSData *bmdata = [NSURL bookmarkDataWithContentsOfURL:url error:&amp;error];
+    if (bmdata == nil) {
+        NSLog(@"Error reading bookmark data for %@: %@",url, error);
+        [pool drain];
+        return nullptr;
+    }
+    NSURL *actual = [NSURL URLByResolvingBookmarkData:bmdata
+                                              options:NSURLBookmarkResolutionWithoutUI
+                                        relativeToURL:nil
+                                  bookmarkDataIsStale:nil
+                                                error:&amp;error];
+    if (actual == nil) {
+        NSLog(@"Error resolving bookmark data for %@: %@", url, error);
+        [pool drain];
+        return nullptr;
+    }
+
+    static char resolved[MAXPATHLEN];
+    if (![actual getFileSystemRepresentation:resolved maxLength:sizeof(resolved)]) {
+        NSLog(@"File system path too long for %@", url);
+        [pool drain];
+        return nullptr;
+    }
+
+    [pool drain];
+    return resolved;
+}
+</code></pre>
+
+<h3>Further simplification</h3>
+
+<p>As of macOS 10.10 the <code>NSURL</code> class has a </p>
+
+<pre><code>+ (instancetype)URLByResolvingAliasFileAtURL:(NSURL *)url 
+                                     options:(NSURLBookmarkResolutionOptions)options 
+                                       error:(NSError * _Nullable *)error;
+</code></pre>
+
+<p>initializer, which both reads and resolves the bookmark data. The function then simplifies to (now with automatic reference counting):</p>
+
+<pre><code>const char *YourClass::resolveAlias(const char *filepath) const {
+    static char resolved[MAXPATHLEN];
+    @autoreleasepool {
+
+        NSURL *url = [NSURL fileURLWithFileSystemRepresentation:filepath
+                                                    isDirectory:NO
+                                                  relativeToURL:nil];
+        NSError *error = nil;
+        NSURL *resolvedURL = [NSURL URLByResolvingAliasFileAtURL:url
+                                                      options:NSURLBookmarkResolutionWithoutUI
+                                                        error:&amp;error];
+        if (![resolvedURL getFileSystemRepresentation:resolved maxLength:sizeof(resolved)]) {
+            NSLog(@"File system path too long for %@", url);
+            return nullptr;
+        }
+    }
+    return resolved;
+}
+</code></pre>
+    </div>

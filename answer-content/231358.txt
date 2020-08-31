@@ -1,0 +1,308 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The current</p>
+
+<pre><code>foreach (IDataRecord record in reader as System.Collections.IEnumerable)...
+</code></pre>
+
+<p>seem complicated for no particular reason and is making assumptions about implementation concerns.</p>
+
+<p>With all that effort to make the function abstract I would suggest keep the reader traversal simple. </p>
+
+<pre><code>//...
+
+using (IDataReader reader = command.ExecuteReader()) {
+    var indices = Enumerable.Range(0, reader.FieldCount).ToArray();
+    while (reader.Read()) {
+        yield return indices.Select(i =&gt; reader[i]).ToArray();
+    }
+}
+
+//...
+</code></pre>
+
+<p>Parameter values check condition can be simplified using a null conditional to</p>
+
+<pre><code>//...
+
+if (parameterValues?.Length &gt; 0)
+    //...
+
+//...
+</code></pre>
+
+<p>If <code>parameterValues</code> is null the condition will default to <code>false</code></p>
+
+<p><code>command</code> should be wrapped in a <code>using</code> statement but cannot because of how it is passed and reassign in the supporting methods. </p>
+
+<p>Since all those method only modify the variable, they should be refactored to reflect that</p>
+
+<pre><code>private void SetCommandParameters(IDbCommand command, params KeyValuePair&lt;String, Object&gt;[] parameterValues) {
+    //can only derive parameters if it is a stored proc
+    if (this.deriveParameters &amp;&amp; command.CommandType == System.Data.CommandType.StoredProcedure) {
+
+        DerivedParameters parameterMapper = new DerivedParameters();
+        parameterMapper.AssignParameters(this.dbProvider, command, parameterValues);
+
+    } else if (!this.deriveParameters) {
+
+        AssummedParameters parameterMapper = new AssummedParameters();
+        parameterMapper.AssignParameters(command, parameterValues);
+
+    } else {
+        throw new System.ArgumentException("Parameter cannot be of type 'Text' if deriveParameters is set to true", "commandType");
+    }
+}
+</code></pre>
+
+<p>Note the name change.</p>
+
+<p>The <code>ExecuteQuery</code> becomes</p>
+
+<pre><code>public IEnumerable&lt;object[]&gt; ExecuteQuery(CommandType commandType, string commandText, string connectionString, params KeyValuePair&lt;String, Object&gt;[] parameterValues) {
+    using (IDbConnection connection = this.dbProvider.CreateConnection()) {
+        connection.ConnectionString = connectionString;
+        connection.Open();
+        using (IDbCommand command = connection.CreateCommand()) {
+            command.CommandText = commandText;
+            command.CommandType = commandType;
+            command.CommandTimeout = this.commandTimeOut;
+
+            if (parameterValues?.Length &gt; 0)
+                SetCommandParameters(command, parameterValues);
+
+            using (IDataReader reader = command.ExecuteReader()) {
+                var indices = Enumerable.Range(0, reader.FieldCount).ToArray();
+                while (reader.Read()) {
+                    yield return indices.Select(i =&gt; reader[i]).ToArray();
+                }
+            }
+        }
+    }
+}
+</code></pre>
+
+<p>While I applaud the effort to make the code abstract, it still tightly couples itself to implementation concerns.</p>
+
+<p>Based on a review of the current implementation's dependency on <code>DbProviderFactory</code>, the following abstraction and default implementation was derived.</p>
+
+<pre><code>public interface IDbProviderFactory {
+    IDbConnection CreateConnection(string connectionString);
+    DbCommandBuilder CreateCommandBuilder();
+}
+
+public class DefaultDbProviderFactory : IDbProviderFactory {
+    private readonly DbProviderFactory dbProvider;
+
+    public DefaultDbProviderFactory(string providerName) {
+        dbProvider = DbProviderFactories.GetFactory(providerName);
+    }
+
+    public DbCommandBuilder CreateCommandBuilder() =&gt; dbProvider.CreateCommandBuilder();
+
+    public IDbConnection CreateConnection(string connectionString) {
+        var connection = dbProvider.CreateConnection();
+        connection.ConnectionString = connectionString;
+        return connection;
+    }
+}
+</code></pre>
+
+<p>Along with an aggregation of the run-time dependencies into a POCO.</p>
+
+<pre><code>public class ADOWrapperOptions {
+    public string ConnectionString { get; set; }
+    public int CommandTimeOut { get; set; } = 0;
+    public bool DeriveParameters { get; set; } = false;
+}
+</code></pre>
+
+<p>With the parameter helpers also refactored accordingly </p>
+
+<p>DerivedParameters</p>
+
+<pre><code>internal class DerivedParameters {
+    public void AssignParameters(IDbProviderFactory dbProvider, IDbCommand command, KeyValuePair&lt;String, Object&gt;[] parameterValues) {
+
+        DbCommandBuilder commandBuilder = dbProvider.CreateCommandBuilder();
+        //uses reflection to get method
+        MethodInfo method = commandBuilder.GetType().GetMethod("DeriveParameters", BindingFlags.Public | BindingFlags.Static);
+        method.Invoke(null, new object[] { command });
+
+        if (command.Parameters.Count == 0)
+            return;
+
+        IDbDataParameter defaultParam = (IDbDataParameter)command.Parameters[0];
+
+        /*  
+        skip first value in collection if there exists a defualt 
+        return value 
+        */
+        int i = (defaultParam.ParameterName == "@RETURN_VALUE") ? 1 : 0;
+
+        foreach (KeyValuePair&lt;String, Object&gt; paramKVP in parameterValues) {
+
+            IDbDataParameter param = (IDbDataParameter)command.Parameters[i];
+
+            if (paramKVP.Key != param.ParameterName)
+                throw new System.ArgumentException("The specified parameter does not have a"
+                                                    + "corresponding match in the database",
+                                                    paramKVP.Key);
+
+            SetCommonProperties(param, paramKVP.Value.ToString());
+            param.Value = paramKVP.Value ?? System.DBNull.Value;
+            i++;
+        }
+    }
+
+    //... omitted for brevity
+}
+</code></pre>
+
+<p>AssummedParameters </p>
+
+<pre><code>internal class AssummedParameters {
+    public void AssignParameters(IDbCommand command, KeyValuePair&lt;String, Object&gt;[] parameterValues) {
+
+        foreach (KeyValuePair&lt;String, Object&gt; paramKVP in parameterValues) {
+            IDbDataParameter param = command.CreateParameter();
+            param.ParameterName = paramKVP.Key;
+            param.Value = paramKVP.Value ?? System.DBNull.Value;
+            param.Direction = ParameterDirection.Input;
+
+            SetCommonProperties(param, paramKVP.Value.ToString());
+
+            command.Parameters.Add(param);
+        }
+    }
+
+    //...omitted for brevity
+}
+</code></pre>
+
+<p>There is potential to create some form of strategy abstraction in a future refactor</p>
+
+<p>After refactoring, the wrapper becomes </p>
+
+<pre><code>public class ADOWrapper {
+    private readonly IDbProviderFactory dbProvider;
+    private readonly int commandTimeOut;
+    private readonly bool deriveParameters;
+    private readonly string connectionString;
+
+    //constructor
+    public ADOWrapper(IDbProviderFactory dbProvider, ADOWrapperOptions options) {
+        this.dbProvider = dbProvider;
+        commandTimeOut = options.CommandTimeOut;
+        deriveParameters = options.DeriveParameters;
+        connectionString = options.ConnectionString;
+    }
+
+    //Method
+    public IEnumerable&lt;object[]&gt; ExecuteQuery(CommandType commandType, string commandText, params KeyValuePair&lt;String, Object&gt;[] parameterValues) {
+        using (IDbConnection connection = dbProvider.CreateConnection(connectionString)) {
+            connection.Open();
+            using (IDbCommand command = connection.CreateCommand()) {
+                command.CommandText = commandText;
+                command.CommandType = commandType;
+                command.CommandTimeout = commandTimeOut;
+
+                if (parameterValues?.Length &gt; 0)
+                    SetCommandParameters(command, parameterValues);
+
+                using (IDataReader reader = command.ExecuteReader()) {
+                    var indices = Enumerable.Range(0, reader.FieldCount).ToArray();
+                    while (reader.Read()) {
+                        yield return indices.Select(i =&gt; reader[i]).ToArray();
+                    }
+                }
+            }
+        }
+    }
+
+    private void SetCommandParameters(IDbCommand command, params KeyValuePair&lt;String, Object&gt;[] parameterValues) {
+        //can only derive parameters if it is a stored proc
+        if (this.deriveParameters &amp;&amp; command.CommandType == System.Data.CommandType.StoredProcedure) {
+            DerivedParameters parameterMapper = new DerivedParameters();
+            parameterMapper.AssignParameters(this.dbProvider, command, parameterValues);
+        } else if (!this.deriveParameters) {
+            AssummedParameters parameterMapper = new AssummedParameters();
+            parameterMapper.AssignParameters(command, parameterValues);
+        } else {
+            throw new System.ArgumentException("Parameter cannot be of type 'Text' if deriveParameters is set to true", "commandType");
+        }
+    }
+}
+</code></pre>
+
+<p>The example usage now look like the following</p>
+
+<pre><code>string connString = "Persist Security Info=False;User ID=***;Password=***;Initial Catalog=***;Server=*****";
+
+IDbProviderFactory provider = new DefaultDbProviderFactory("System.Data.SqlClient");
+
+ADOWrapperOptions options = new ADOWrapperOptions() {
+    ConnectionString = connString
+};
+
+ADOWrapper SQLDataAdapter = new ADOWrapper(provider, options);
+
+var queryResult = SQLDataAdapter.ExecuteQuery(CommandType.Text, "Select * From TABLE_NAME").ToArray();
+
+object[,] twoDArray = new object[queryResult.Length, queryResult.Max(x =&gt; x.Length)];
+
+Get2dArrayFromJagged(queryResult, twoDArray);
+
+//...
+</code></pre>
+
+<p>And having the abstracted dependency allows the wrapper the flexibility to be tested in isolation.</p>
+
+<p>Simple example</p>
+
+<pre><code>[TestClass]
+public class ADOWrapperTests {
+    [TestMethod]
+    public void ExecuteQuery_Should_Return_One_Row_Two_Columns() {
+        //Arrange - Using Moq
+        var reader = new Mock&lt;IDataReader&gt;();
+        reader.Setup(_ =&gt; _.FieldCount).Returns(2);
+        reader.Setup(_ =&gt; _[0]).Returns("Hello World");
+        reader.Setup(_ =&gt; _[1]).Returns("I am working");
+        reader.SetupSequence(_ =&gt; _.Read())
+            .Returns(true)
+            .Returns(false);
+
+        var provider = Mock.Of&lt;IDbProviderFactory&gt;(dbpf =&gt;
+            dbpf.CreateConnection(It.IsAny&lt;string&gt;()) == Mock.Of&lt;IDbConnection&gt;(c =&gt;
+                c.CreateCommand() == Mock.Of&lt;IDbCommand&gt;(cmd =&gt;
+                    cmd.ExecuteReader() == reader.Object
+                )
+            )
+        );
+
+        ADOWrapperOptions options = new ADOWrapperOptions() {
+            ConnectionString = "Fake connectino string"
+        };
+
+        ADOWrapper SQLDataAdapter = new ADOWrapper(provider, options);
+
+        //Act
+        var queryResult = SQLDataAdapter.ExecuteQuery(CommandType.Text, "Select * From TABLE_NAME").ToArray();
+        object[,] twoDArray = new object[queryResult.Length, queryResult.Max(x =&gt; x.Length)];
+        Get2dArrayFromJagged(queryResult, twoDArray);
+
+        //Assert - FluentAssertions
+        twoDArray.Should().HaveCount(2);            
+    }
+
+    public static void Get2dArrayFromJagged(object[][] jaggedArray, object[,] returnArray) {
+
+        for (int i = 0; i &lt; jaggedArray.Length; i++) {
+            for (int j = 0; j &lt; jaggedArray[i].Length; j++) {
+                returnArray[i, j] = jaggedArray[i][j];
+            }
+        }
+    }
+}
+</code></pre>
+    </div>

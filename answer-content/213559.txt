@@ -1,0 +1,83 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Line-by-line:</h2>
+
+<ul>
+<li><p><strong><code>xor rax, rax</code></strong></p>
+
+<p>The only time you should ever explicitly clear a 64-bit register by XORing it with itself is when you <em>want</em> the extra code size for alignment reasons. Otherwise, just write the XOR to operate on the 32-bit register; <a href="https://stackoverflow.com/questions/11177137/why-do-x86-64-instructions-on-32-bit-registers-zero-the-upper-part-of-the-full-6">the upper 32 bits will be automatically zeroed</a>. Therefore, this should just be <code>xor eax, eax</code>. This saves you 1 byte (the <code>REX.W</code> prefix, <code>0x48</code>).</p></li>
+<li><p><strong><code>xor rax, rax
+add al, 0x3e</code></strong></p>
+
+<p>This is an inefficient way of setting <code>RAX</code> to <code>0x3e</code>. The only reason you would ever want to do this is when you're optimizing strictly for code size; otherwise, you would just write <code>mov eax, 0x3e</code>. And if you're optimizing strictly for code size, you would be better off writing:</p>
+
+<pre><code>push 0x3e
+pop  rax
+</code></pre>
+
+<p>to save 1 byte.</p></li>
+<li><p><strong><code>dec rdi</code></strong></p>
+
+<p>As <a href="https://codereview.stackexchange.com/a/212980">Fifoernik suggested</a>, if you know that you only care about the lower 32 bytes of the register, then you can replace this with <code>dec edi</code> to save 1 byte (the <code>REX.W</code> prefix). But this is a <em>risky</em> optimization, so undertake it only if you are certain that the preconditions are met, and <em>document it carefully</em>!</p>
+
+<p>Your code is making the assumption that <code>RDI</code> will be 0, and thus decrementing it will result in the value −1. That is a dangerous assumption. While <a href="https://elixir.bootlin.com/linux/latest/source/arch/x86/include/asm/elf.h#L108" rel="nofollow noreferrer">the current Linux kernel does initialize all registers to 0 when launching an ELF binary</a>, this is <em>not</em> required by the ABI. <a href="https://github.com/hjl-tools/x86-psABI/wiki/x86-64-psABI-1.0.pdf" rel="nofollow noreferrer">The x86-64 ABI</a> guarantees only that <code>RSP</code> points to the stack and <code>RDX</code> is a function pointer that the application should register with <code>atexit</code> (see section 3.4.1: "Initial Stack and Register State"). Furthermore, you can only rely on the registers being zeroed at startup for a <em>statically-linked</em> executable; in a dynamically-linked executable, the dynamic linker gets called before <code>_start</code> is executed and leaves garbage in the registers.</p>
+
+<p>The safe, efficient, standard way to write this code would be <code>mov edi, -1</code>, but that is relatively large in terms of bytes.</p>
+
+<p>If you were optimizing for size above all else, you could do <code>push -1</code>+<code>pop rdi</code>, which is shorter but inefficient. A better option when optimizing for size would be <code>or edi, -1</code>. This is the same size as <code>push</code>+<code>pop</code> (3 bytes), but will be slightly faster. (It is still slower than a <code>mov</code> because it introduces a false dependency on the previous value of the source register; in this case, <code>edi</code>.)</p></li>
+<li><p><strong><code>push 0x9
+pop rsi</code></strong></p>
+
+<p>Again, as before, this is an inefficient way of setting <code>RSI</code> to <code>0x9</code>. If you were not optimizing strictly for code size, you would be better (clearer and faster) to write <code>mov esi, 0x9</code>.</p></li>
+<li><p><strong><code>syscall</code></strong></p>
+
+<p>There is not much you can do with this instruction. You could use <code>int 0x80</code> instead, but that is the same size (2 bytes), and slower than <code>syscall</code>, so you might as well stick with <code>syscall</code>.</p></li>
+</ul>
+
+<h2>Big picture:</h2>
+
+<ul>
+<li><p><strong>Line up</strong> your code in vertical columns for ease of readability, like so:</p>
+
+<pre><code>xor     rax, rax
+add     al,  0x3e
+dec     rdi
+push    0x9
+pop     rsi
+syscall
+</code></pre></li>
+<li><p>Introduce <strong>named constants</strong> in order to avoid the presence of <a href="https://en.wikipedia.org/wiki/Magic_number_(programming)" rel="nofollow noreferrer">"magic numbers"</a> in your code. In Gnu syntax (which you appear to be using), a constant can be declared by using the <code>.set</code> directive, like so:</p>
+
+<pre><code>.set SYSCALL_KILL, 0x3e
+.set PROCESS_ID,   -1
+.set SIGKILL,      0x9
+</code></pre>
+
+<p>(Or, equivalently, <code>.equ</code>, which matches the syntax used by other popular x86 assemblers.)</p>
+
+<p>Then, in your code, you would use these symbolic constants instead of the literals. The assembler will fold them so that exactly the same code is produced.</p>
+
+<p>As an alternative, you could use <code>.equiv</code>, which works just like <code>.set</code>/<code>.equ</code>, except that the assembler will raise an error if you try to redefine a symbol that is already defined. That can be a nice diagnostic to have in certain cases.</p></li>
+<li><p>Add <strong>descriptive comments</strong> to your code. Comments are always important in well-written code, but they're <em>especially</em> important when writing in assembly because the language is not self-documenting.</p>
+
+<p>A common convention in assembly is to write short summary comments out to the right of each instruction. If you have something longer to say (like an explanation of <em>why</em> you're doing something, or a warning about a potentially-dangerous assumption), write it in a paragraph on lines of its own above the relevant instructions.</p></li>
+</ul>
+
+<h2>Alternative:</h2>
+
+<p>If you want the <em>shortest possible</em> shellcode that will wreak havoc, consider a fork bomb:</p>
+
+<pre><code>global _start
+section .text
+
+.equ SYSCALL_FORK, 0x02
+.equ INT_SYSCALL,  0x80
+
+_start:
+    push  SYSCALL_FORK
+    pop   rax             ; rax &lt;= fork() system call
+    int   INT_SYSCALL     ; call kernel
+    jmp   _start          ; loop back to beginning
+</code></pre>
+
+<p>That's only 6 bytes!</p>
+    </div>

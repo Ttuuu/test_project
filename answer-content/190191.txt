@@ -1,0 +1,240 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Handle an edge case</h1>
+<p>Firstly, let's fix this compiler warning:</p>
+<pre class="lang-none prettyprint-override"><code>190179.cpp: In function ‘itVector2D findeNextVertex(std::vector&lt;Vector2D&gt;&amp;, itVector2D)’:
+190179.cpp:150:1: warning: control reaches end of non-void function [-Wreturn-type]
+ }
+</code></pre>
+<p>We should only reach this in the degenerate case where there are no candidate points (e.g. we've provided only 1 input to the algorithm).  In that case, the most appropriate iterator to return is the starting point:</p>
+<pre><code>return itSource;
+</code></pre>
+<h1>A convenience for debugging</h1>
+<p>To save depending on an external resource, I embedded test data into the program (just to make it easier to experiment):</p>
+<pre><code>#ifdef DEBUG
+    std::istringstream file{""
+            "12\n"
+            "5 19\n"
+            "33 2\n"
+            "-5 88\n"
+            "54 5\n"
+            "12 13\n"
+            "18 39\n"
+            "15 42\n"
+            "17 -5\n"
+            "-3 23\n"
+            "9 29\n"
+            "-8 17\n"
+            "-1 25\n"
+            };
+#else
+    std::ifstream file;
+    file.open("data.txt");
+    if (!file.is_open())
+    {
+        std::cerr &lt;&lt; "unable to open file" &lt;&lt; std::endl;
+        return 1;
+    }
+#endif
+</code></pre>
+<p>I'm not suggesting you do the same - but you might find it useful, so I'm showing it here.</p>
+<p>Something that might be worthwhile, though, is to separate the input and output from your processing.  In this case, consider the benefit of</p>
+<pre><code>const std::vector&lt;Vector2D&gt; coords = readInputPoints();
+</code></pre>
+<p>We can easily replace that function to read from a different source, and it's enabled us to have an <em>immutable</em> list of coordinates, reducing the potential for accidentally modifying them.</p>
+<h1>Check errors when reading inputs</h1>
+<p>After <code>file &gt;&gt; nPoints</code>, it's essential to check that this succeeded before attempting to use <code>nPoints</code>.  Fortunately the streaming operator returns a reference to the input stream, and that converts to <code>bool</code>, so we can use a simple <code>if</code> statement, like this:</p>
+<pre><code>uint nPoints = 0;
+if (file &gt;&gt; nPoints) {
+    coords.reserve(nPoints);
+    // then read each point and insert it
+}
+</code></pre>
+<p>We should do the same for each point, as well:</p>
+<pre><code>    for (uint i = 0; i &lt; nPoints; ++i) {
+        int x, y;
+        if (file &gt;&gt; x &gt;&gt; y) {
+            coords.emplace_back(x, y);
+        }
+    }
+</code></pre>
+<p>In passing, here I've used <code>emplace_back</code> to create the object directly in the vector.</p>
+<h1><code>Vector2D</code> structure</h1>
+<p>This structure is the minimum necessary for this application (possibly too minimal; as I'll show), but the name is popular, and may collide if used in a larger program.  We can put it into a namespace to avoid this problem.  For this program, an anonymous namespace will be sufficient.</p>
+<p>We can add some members to make the rest of the code simpler.  Let's start with an ordering, that allows us to remove the lambda function from our <code>std::max_element()</code> call:</p>
+<pre><code>auto tie() const { return std::tie(y_, x_); }
+
+// "less-than" means lower, with leftmost breaking ties
+bool operator&lt;(const Vector2D&amp; other) const
+{
+    return tie() &lt; other.tie();
+}
+</code></pre>
+<p>We really could do with a print operator:</p>
+<pre><code>friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; os, const Vector2D&amp; v)
+{
+    return os &lt;&lt; v.x_ &lt;&lt; ' ' &lt;&lt; v.y_ &lt;&lt; '\n';
+}
+</code></pre>
+<p>The other computation that requires access to the member variables is calculating direction.  Let's make that a member, too:</p>
+<pre><code>bool is_clockwise_to(const Vector2D&amp; other) const
+{
+    // a positive determinant indicates clockwise, and negative anticlockwise
+    // zero implies collinear
+    return y_ * other.x_ - x_ * other.y_ &gt; 0;
+}
+</code></pre>
+<p>Now we can make <code>x_</code> and <code>y_</code> private.</p>
+<h1>Prefer using values to iterators</h1>
+<p>We actually care more about the <em>values</em> of the points we're bounding than their <em>identities</em>.  By that, I mean that in tests such as <code>(itReference == itTarget || itReference == itSource)</code>, we actually want to reject any points on those spots, not just the specific instances.  This obviously isn't a problem if there are no duplicates in the input, but we don't know that to be true.</p>
+<h1>Simplify with a standard algorithm</h1>
+<p>We have a loop updating <code>allCC</code>, which we can replace with a <code>std::all_of()</code> call.</p>
+<h1>Minor quibbles</h1>
+<ul>
+<li>Spelling - there's an extra <code>e</code> in <code>findeNextVertex()</code></li>
+<li>I prefer not to have trailing underscores - if you need a reminder of what's a member in your classes, it suggests that you have too many members, probably doing more than it should (read about the <em>Single-Responsibility Principle</em> of OO design).</li>
+<li><code>std::size_t</code> is the natural type for counts of things, rather than <code>unsigned int</code> (though if you have more than 65536 points, you've likely chosen the wrong algorithm).</li>
+<li>Prefer to use <code>std::endl</code> only when you need the stream to be flushed, and plain old <code>'\n'</code> otherwise.  Unnecessary flushing can be a real performance killer at times!</li>
+</ul>
+<hr>
+<h1>Modified code</h1>
+<pre><code>#include &lt;fstream&gt;
+#include &lt;iostream&gt;
+#include &lt;string&gt;
+#include &lt;tuple&gt;
+#include &lt;vector&gt;
+#include &lt;algorithm&gt;
+
+namespace {
+
+    class Vector2D
+    {
+        int x;
+        int y;
+
+        // For sorting - lowest y first, then lowest x
+        auto tie() const { return std::tie(y, x); }
+
+    public:
+        Vector2D(int x, int y) : x(x), y(y) {}
+
+        Vector2D operator-(const Vector2D&amp; other) const
+        {
+            return {x - other.x, y - other.y};
+        }
+
+        bool operator&lt;(const Vector2D&amp; other) const
+        {
+            return tie() &lt; other.tie();
+        }
+        bool operator==(const Vector2D&amp; other) const
+        {
+            return tie() == other.tie();
+        }
+
+        bool is_clockwise_to(const Vector2D&amp; other) const
+        {
+            // a positive determinant indicates clockwise, and negative anticlockwise
+            // zero means collinear (which we consider "not clockwise")
+            return y * other.x - x * other.y &gt; 0;
+        }
+
+        friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; os, const Vector2D&amp; v)
+        {
+            return os &lt;&lt; v.x &lt;&lt; ' ' &lt;&lt; v.y &lt;&lt; '\n';
+        }
+    };
+
+    using namespace std::rel_ops;
+}
+
+// find next convex hull vertex
+Vector2D nextVertex(const std::vector&lt;Vector2D&gt; &amp; coords, const Vector2D&amp; source)
+{
+    for (auto const&amp; target: coords)
+    {
+        auto const vecTarget = target - source;
+        if (vecTarget != Vector2D{ 0, 0 } &amp;&amp;
+            std::all_of(coords.begin(), coords.end(),
+                        [&amp;](const auto&amp; c) {
+                            return c == target
+                                || c == source
+                                || (c - source).is_clockwise_to(vecTarget);}))
+        {
+            return target;
+        }
+     }
+
+    // degenerate case
+    return source;
+}
+
+
+std::vector&lt;Vector2D&gt; readInputPoints()
+{
+    std::ifstream file;
+    file.open("data.txt");
+    if (!file.is_open()) {
+        std::cerr &lt;&lt; "unable to open file" &lt;&lt; std::endl;
+        return {};
+    }
+
+    std::vector&lt;Vector2D&gt; coords;
+
+    // total number of points
+    std::size_t nPoints = 0;
+    file &gt;&gt; nPoints;
+    if (!file) return {};
+
+    coords.reserve(nPoints);
+
+    while (--nPoints) {
+        int x, y;
+        file &gt;&gt; x &gt;&gt; y;
+        if (!file) return {};
+
+        coords.emplace_back(x, y);
+    }
+
+    return coords;
+}
+
+
+int main()
+{
+    const std::vector&lt;Vector2D&gt; coords = readInputPoints();
+
+    if (coords.empty()) {
+        std::cerr &lt;&lt; "Could not read inputs!" &lt;&lt; std::endl;
+        return 1;
+    }
+
+    // find the topmost
+    auto const&amp; topMost = *std::max_element(coords.begin(), coords.end());
+    auto current = topMost;
+
+    do {
+        current = nextVertex(coords, current);
+        std::cout &lt;&lt; current;
+    } while (current != topMost);
+}
+</code></pre>
+<hr>
+<h1>Improve the algorithm</h1>
+<p>The current algorithm looks at the next two points from each vertex, so it scales as <em>O(hn²)</em> where <em>n</em> is the number of points and <em>h</em> the number of bounding points.</p>
+<p>We can use the knowledge that all points lie on the same side of some line through any bounding point to only test each candidate once - if it's further to the left (or right, depending which way round the hull we want to go) of the previous best candidate, then it's a better choice.  This, of course, is simply choosing the maximum of a new criterion, and it makes our code scale as <em>O(hn)</em>.</p>
+<p>Here's what I mean:</p>
+<pre><code>Vector2D nextVertex(const std::vector&lt;Vector2D&gt; &amp; coords, const Vector2D&amp; source)
+{
+    // order by direction from source - this works because we know that all
+    // points lie on the same side of a line through source.
+    auto const by_angle = [&amp;source](const Vector2D&amp; a, const Vector2D&amp; b) {
+        return (a - source).is_clockwise_to(b - source);
+    };
+
+    return *max_element(coords.begin(), coords.end(), by_angle);
+}
+</code></pre>
+<p>Notice that this came out simpler than my first improved version above, and <em>much</em> simpler than the original.  (The lambda that captures a reference to <code>source</code> might be more advanced than you're used to, though).</p>
+<p>You might want to make a refinement so that collinear points sort in order of distance from <code>point</code> (use <code>std::hypot()</code> in the <code>&lt;cmath&gt;</code> header to add a member to <code>Vector2D</code>).  Without that, we could have <code>source</code> be directly between two other bounding points, and they would compare equal.</p>
+<p>Consider adding some test cases with collinear bounding points and some with trivial point sets (1 or 2 points), as these will probably require minor modifications.</p>
+    </div>

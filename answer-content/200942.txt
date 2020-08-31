@@ -1,0 +1,280 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Looks like the examples you give don't work as intended.</p>
+
+<pre><code>&gt; let myTree = new Tree({a:{b:{k:2}}});
+undefined
+&gt; myTree.a.b;                         // { k: 2 }
+Proxy [ { __isbranch__: true, k: 2 },
+  { set: [Function: set],
+    setProxy: [Function: setProxy],
+    get: [Function: get] } ]
+&gt; myTree.a === myTree.a.b.__parent__; // true
+true
+&gt; myTree.c = {d:{l:5}};               // {d: {l: 5}}
+{ d: { l: 5 } }
+&gt; myTree.c.__parent__ === myTree;     // true
+false
+&gt; myTree.a.b.__parent__ = myTree.c;   // {d: {l: 5}}
+TypeError: Cannot set property '__parent__' of undefined
+&gt; myTree.c.b.k;                       // 2
+TypeError: Cannot read property 'k' of undefined
+&gt; myTree.a.b;                         // undefined
+undefined
+&gt; let anotherTree = new Tree({});
+undefined
+&gt; myTree.a.l = 3;
+3
+&gt; myTree.a.l;     // 3
+3
+&gt; myTree.a.__parent__ = anotherTree;
+Proxy [ { __istree__: true, a: Proxy [ [Object], [Object] ] },
+  { set: [Function: set],
+    setProxy: [Function: setProxy],
+    get: [Function: get] } ]
+&gt; anotherTree.a;  // {l: 3}
+Proxy [ { __isbranch__: true, l: 3 },
+  { set: [Function: set],
+    setProxy: [Function: setProxy],
+    get: [Function: get] } ]
+&gt; myTree.a;       // undefined
+undefined
+&gt; anotherTree.a.__parent__ === anotherTree; // true
+false
+&gt; myTree.__raw__();
+RangeError: Maximum call stack size exceeded
+</code></pre>
+
+<p>I'm thinking of one thing: what if the objects you operate were immutable, yet it was possible to operate on parent nodes of any of them? For example, in DOM, if you get an element and pass it as an argument to a function, the function has access to this element's properties, one of them is "parent". So technically you can go up from that node, until you reach <code>document</code>. I'm totally sure it might be useful, but querying object properties shouldn't affect its context.</p>
+
+<p>So, taking the metaphor of DOM element, I thought of this:</p>
+
+<pre><code>class Element {
+  constructor(object) {
+    Object.entries(object).map(([property, value]) =&gt; {
+      if (typeof value === 'object') {
+        this[property] = new Element(value);
+        this[property].__parent__ = this;
+      } else {
+        this[property] = value;
+      }
+    });
+
+    this.__current__ = this;
+  }
+
+  current() {
+    return this.__current__;
+  }
+
+  parent() {
+    return this.__parent__;
+  }
+
+  get(property) {
+    if (!this[property]) {
+      throw new Error('No such property:', property);
+    }
+
+    return this[property];
+  }
+}
+</code></pre>
+
+<p>Take note that there are no Proxy or Symbol things for simplicity of the representation. In fact, I see <code>__parent__</code> property being reassigned in your example, too, so I assume there's no need to wrap it into a Symbol.</p>
+
+<p>Given that, we can make an instance of Element object:</p>
+
+<pre><code>let e = new Element({ a: 1, b: { c: 2, d: { e: 3, f: { g: 4, h: { i: 5, j: {} } } } } });
+</code></pre>
+
+<p>so that it has the properties that we want to have:</p>
+
+<pre><code>&gt; e.current() === e
+true
+&gt; e.get('b').parent() === e
+true
+&gt; e.get('b').get('d').parent() === e.get('b')
+true
+&gt; e.get('b').current() === e.get('b')
+true
+&gt; e.b === e.get('b')
+true
+&gt; e.b.d === e.get('b').get('d').get('f').get('h').parent().parent()
+true
+</code></pre>
+
+<p>We can safely pass a certain property within the object to a function and get the parent of that property. So given a function</p>
+
+<pre><code>function getParent(element) {
+  return element.parent();
+}
+</code></pre>
+
+<p>we get</p>
+
+<pre><code>&gt; getParent(e.b.d) === e.b
+true
+</code></pre>
+
+<p>But the thing I was talking about was circularity. In case of this simplistic structure, we can make it circular easily:</p>
+
+<pre><code>e.e = e;
+</code></pre>
+
+<p>so that</p>
+
+<pre><code>&gt; e.e.e === e.e
+true
+&gt; e.e.e.e.e.e.e.e === e.e.e.e
+true
+</code></pre>
+
+<p>which supports your use case, too: we can assign another instance of this object to some property and enjoy the traversable structure:</p>
+
+<pre><code>&gt; e.b.another = new Element({ abc: 'xyz' })
+Element { abc: 'xyz', __current__: [Circular] }
+&gt; e.b
+Element {
+  c: 2,
+  d:
+   Element {
+     e: 3,
+     f:
+      Element {
+        g: 4,
+        h: [Element],
+        __current__: [Circular],
+        __parent__: [Circular] },
+     __current__: [Circular],
+     __parent__: [Circular] },
+  __current__: [Circular],
+  __parent__:
+   Element { a: 1, b: [Circular], __current__: [Circular], e: [Circular] },
+  another: Element { abc: 'xyz', __current__: [Circular] } }
+&gt; e.b.another.e = e
+Element {
+  a: 1,
+  b:
+   Element {
+     c: 2,
+     d:
+      Element {
+        e: 3,
+        f: [Element],
+        __current__: [Circular],
+        __parent__: [Circular] },
+     __current__: [Circular],
+     __parent__: [Circular],
+     another:
+      Element { abc: 'xyz', __current__: [Circular], e: [Circular] } },
+  __current__: [Circular],
+  e: [Circular] }
+&gt; e.b.another.e.b.another === e.b.another
+true
+</code></pre>
+
+<p>as well as we can assign a certain position in our tree to another variable and check if they are the same:</p>
+
+<pre><code>&gt; let copyOfE = e.b.another.e; copyOfE === e
+true
+</code></pre>
+
+<p>However, you might have noticed that we operate on pointers here, so any assignment to a property is destructive:</p>
+
+<pre><code>&gt; copyOfE.b = 2
+2
+&gt; e.b
+2
+</code></pre>
+
+<p>I'm not sure if you're looking after this behavior, too, but if we go full on OOP, that's what we get by default.</p>
+
+<p>Now, the raw thing. If you call this method <code>toJSON</code>, it will be <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/stringify#Description" rel="nofollow noreferrer">guaranteed to be called by <code>JSON.stringify</code></a>. So we add this method to our class:</p>
+
+<pre><code>class Element {
+  constructor(object) {
+    Object.entries(object).map(([property, value]) =&gt; {
+      if (typeof value === 'object') {
+        this[property] = new Element(value);
+        this[property].__parent__ = this;
+      } else {
+        this[property] = value;
+      }
+    });
+
+    this.__current__ = this;
+  }
+
+  current() {
+    return this.__current__;
+  }
+
+  parent() {
+    return this.__parent__;
+  }
+
+  get(property) {
+    if (!this[property]) {
+      throw new Error('No such property:', property);
+    }
+
+    return this[property];
+  }
+
+  toJSON() {
+    const reducer = element =&gt; {
+      let output = {};
+
+      for (let property in element) {
+        if (property.slice(0, 2) === property.slice(-2) &amp;&amp; property.slice(-2) === '__') {
+          continue;
+        } else if (typeof element[property] !== 'object') {
+          output[property] = element[property];
+        } else {
+          output[property] = reducer(element[property]);
+        }
+      }
+
+      return output;
+    };    
+    return reducer(this);
+  }
+}
+</code></pre>
+
+<p>and enjoy output without circular references:</p>
+
+<pre><code>&gt; JSON.stringify(new Element({ a: 1, b: { c: 2, d: { e: 3, f: { g: 4, h: { i: 5, j: {} } } } } }))
+'{"a":1,"b":{"c":2,"d":{"e":3,"f":{"g":4,"h":{"i":5,"j":{}}}}}}'
+</code></pre>
+
+<p>However, it's still prone to stack overflows:</p>
+
+<pre><code>&gt; e.e = e
+Element {
+  a: 1,
+  b:
+   Element {
+     c: 2,
+     d:
+      Element {
+        e: 3,
+        f: [Element],
+        __current__: [Circular],
+        __parent__: [Circular] },
+     __current__: [Circular],
+     __parent__: [Circular] },
+  __current__: [Circular],
+  e: [Circular] }
+&gt; JSON.stringify(e)
+RangeError: Maximum call stack size exceeded
+</code></pre>
+
+<p>There's a good Q&amp;A on StackOverflow about this topic, <a href="https://stackoverflow.com/questions/11616630/json-stringify-avoid-typeerror-converting-circular-structure-to-json">check it out</a>.</p>
+
+<p>All in all, I think you are right about being defensive and using proxy objects, but still the code could be simplified a little bit, split into separate small utility functions, organized in a way to be easy to read from top to bottom, and such.</p>
+
+<p>If the structure is circular, like a tree, you can treat every node as a tree or as a branch, unless it really provides value to the user to distinguish between the two.</p>
+
+<p>And if after a couple months you find yourself struggling to understand what your code does after reading it once or twice (just like I did), it puts you at potential risk of having real hard time maintaining the code. So hopefully I provided an idea or two on how it could be optimized for maintainability. Cheers!</p>
+    </div>

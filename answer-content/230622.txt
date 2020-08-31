@@ -1,0 +1,206 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The first and easiest option is to turn your loops inside-out. In your inner loop, you reverse the corrupt numbers. That shouldn't even be done in your main loop - just do it once, making a <code>reversedIDs</code> after initializing your <code>corruptIDNumbers</code>.</p>
+
+<p>Your <code>for (int i = 0; i &lt; 1; i++)</code> doesn't make a lot of sense, and is probably just you manually truncating the program due to the runtime. But it should go away completely. Instead, make a <code>HashSet</code> containing your <code>reversedIDs</code>, and do not iterate over this set. On every randomly generated number, test to see if the generated number is a member of the set.</p>
+
+<p>Another important thing to do, since your brute-force approach is CPU-bound and highly parallelizable, is to multi-thread. Here is a suggested multi-threaded brute-force approach that completes for me in 5 seconds.</p>
+
+<p>You'll of course want to change the number of workers to suit your CPU.</p>
+
+<pre><code>import java.io.FileInputStream;
+import java.io.IOException;
+import java.util.HashSet;
+import java.util.NoSuchElementException;
+import java.util.Random;
+import java.util.Scanner;
+import java.util.Set;
+
+
+public class IDResolver implements AutoCloseable {
+    // This class is intended to be instantiated. main() is a thin entry point.
+
+    // The set of all IDs as read from the file. Modern RAM capacity will easily
+    // fit hundreds of thousands of IDs at once.
+    private final Set&lt;Long&gt; ids = new HashSet&lt;&gt;();
+
+    // The number of threads to run. Do not increase this beyond the hyperthread
+    // capacity of your CPU or you will see steeply diminishing returns.
+    private final int nworkers = 8;
+
+    // The array of all Thread worker objects.
+    private final Worker[] workers = new Worker[nworkers];
+
+    // The upper and lower bound of the seed search space.
+    private final long seedMin = 100_000_000,
+                       seedMax = 1_000_000_000;
+
+    // The constructor; accepts the name of the file containing IDs, one per
+    // line.
+    public IDResolver(String filename) throws IOException {
+        populate(filename);
+
+        // The start of each worker's seed search space; computed incrementally.
+        long start = seedMin;
+
+        System.out.println("Workers:");
+
+        // Loop to create each worker and print its summary.
+        for (int w = 0; w &lt; nworkers; w++) {
+            long end;
+            if (w == nworkers-1)
+                end = seedMax;
+             else
+                end = (seedMax - seedMin)*(w + 1)/nworkers + seedMin;
+
+            workers[w] = new Worker(w, w==nworkers-1, start, end);
+            System.out.println(workers[w]);
+            start = end;
+        }
+        System.out.println();
+    }
+
+    // Populate the ID set from the ID file. Each ID is string-reversed before
+    // being added to the set.
+    private void populate(String filename) throws IOException {
+        try (var stream = new FileInputStream(filename);
+             var scanner = new Scanner(stream)) {
+             var sb = new StringBuilder();
+
+             while (true) {
+                String line;
+                try {
+                    line = scanner.nextLine();
+                } catch (NoSuchElementException e) {
+                    break;
+                }
+                sb.append(line);
+                long id = Long.valueOf(sb.reverse().toString());
+                ids.add(id);
+                sb.setLength(0);
+             }
+        }
+    }
+
+    // Entry point for the program. This program accepts one argument, the ID
+    // file name.
+    public static void main(String[] args) throws Exception {
+        try (var resolver = new IDResolver(args[0])) {
+            resolver.resolve();
+            resolver.join();
+        }
+    }
+
+    // Resolve all IDs by starting the worker threads.
+    public void resolve() {
+        for (Worker w: workers)
+            w.start();
+    }
+
+    // Wait until all of the worker threads are done.
+    public void join() throws InterruptedException {
+        for (Worker w: workers)
+            w.join();
+    }
+
+    // When this class is used as an AutoCloseable within a try-with-resources,
+    // and close() is called, cancel the worker threads.
+    public void close() throws InterruptedException {
+        for (Worker w: workers) {
+            w.cancel();
+            w.join();
+        }
+    }
+
+    // This is the "black box" function that needs to be replaced with your own.
+    // It accepts a seed and returns an ID.
+    private static long transform(long seed) {
+        // todo: replace me
+        var rand = new Random(seed);
+        return rand.nextLong();
+    }
+
+    // The worker thread class. This supports all of the methods of Thread,
+    // notably start().
+    private class Worker extends Thread {
+        // This is used to control the frequency of progress updates. Change the
+        // 24, increasing it for slower updates.
+        final long updateMask = (1L &lt;&lt; 24) - 1;
+
+        final int worker; // The worker's ID
+        final long start; // The start of this worker's seed range
+        long end; // The (exclusive) end of this worker's seed range
+        final boolean last; // Whether this is the last worker
+
+        public Worker(int worker, boolean last, long start, long end) {
+            this.worker = worker;
+            this.last = last;
+            this.start = start;
+            this.end = end;
+        }
+
+        // Used to show a summary of this worker
+        @Override
+        public String toString() {
+            return String.format("ID=%d range %10d - %10d", worker, start, end);
+        }
+
+        // Show progress - only used on the last worker
+        private void tick(long seed) {
+            if (last) {
+                System.out.print(String.format(
+                    "seed=%,d/%,d %.2f%%\r", seed, end,
+                    (seed - start)*100. / (end - start)
+                ));
+            }
+        }
+
+        // The worker thread routine.
+        public void run() {
+            // Loop through all seeds for this worker.
+            for (long seed = start; seed &lt; end; seed++) {
+                // The candidate ID, as transformed from the current seed.
+                long id = transform(seed);
+                // Does this candidate ID exist in the set of all known IDs from
+                // the file?
+                if (ids.contains(id))
+                    // If so, print the seed and the ID that it produced.
+                    System.out.println(String.format(
+                        "seed=%d id=%d", seed, id));
+                // Show progress.
+                if ((seed&amp;updateMask) == 0)
+                    tick(seed);
+            }
+
+            tick(end);
+            if (last)
+                System.out.println();
+        }
+
+        // Cancel this worker by setting its seed range end to zero.
+        public void cancel() {
+            end = 0;
+        }
+    }
+}
+</code></pre>
+
+<p>Invocation and output:</p>
+
+<pre class="lang-none prettyprint-override"><code>$ javac IDResolver.java &amp;&amp; time java IDResolver corrupted.txt 
+Workers:
+ID=0 range  100000000 -  212500000
+ID=1 range  212500000 -  325000000
+ID=2 range  325000000 -  437500000
+ID=3 range  437500000 -  550000000
+ID=4 range  550000000 -  662500000
+ID=5 range  662500000 -  775000000
+ID=6 range  775000000 -  887500000
+ID=7 range  887500000 - 1000000000
+
+seed=1,000,000,000/1,000,000,000 100.00%
+
+real    0m4.784s
+user    0m36.266s
+sys 0m0.308s
+</code></pre>
+    </div>

@@ -1,0 +1,213 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>Fully Refactored Code:</strong> <a href="https://gist.github.com/Kittoes0124/d3b78a5c94a2bb0801ccbc50f51596d7" rel="nofollow noreferrer">see this Gist</a></p>
+
+<p><strong>Example Usage:</strong></p>
+
+<pre><code>static void Main(string[] args) {
+    var generator = new PasswordGenerator(new PasswordGeneratorOptions {
+        MinimumNumberOfLowerCaseCharacters = 1,
+        MinimumNumberOfNumericCharacters = 1,
+        MinimumNumberOfUpperCaseCharacters = 1,
+        OutputLength = 8,
+        SpecialCharacters = new char[0] { },
+    });
+
+    Console.WriteLine(generator.Next());
+}
+</code></pre>
+
+<p><strong>Review Comments:</strong></p>
+
+<p>First off, using <code>Random</code> as a source of entropy probably isn't the best idea since it is <em>possible</em> (however unlikely) that an attacker could gain the underlying seed; with it they would trivially be able to deduce all of the outputs used to generate our passwords. Let's implement a generator that uses a static instance of the <code>RNGCryptoServiceProvider</code> class instead:</p>
+
+<pre><code>// makes it easier to replace the implementation I demonstrate with something better
+public interface ISecureRandom
+{
+    uint Next(uint x, uint y);
+}
+
+// a possible implementation of a secure RNG, not exhaustively tested...
+public sealed class SecureRandom : ISecureRandom
+{
+    private static readonly RandomNumberGenerator DefaultRandomNumberGenerator = new RNGCryptoServiceProvider();
+
+    public static SecureRandom DefaultInstance =&gt; new SecureRandom(DefaultRandomNumberGenerator);
+
+    private readonly RandomNumberGenerator m_randomNumberGenerator;
+
+    public SecureRandom(RandomNumberGenerator randomNumberGenerator) {
+        if (null == randomNumberGenerator) {
+            throw new ArgumentNullException(paramName: nameof(randomNumberGenerator));
+        }
+
+        m_randomNumberGenerator = randomNumberGenerator;
+    }
+
+    public byte[] GetBytes(byte[] buffer) {
+        m_randomNumberGenerator.GetBytes(buffer);
+
+        return buffer;
+    }
+    public byte[] GetBytes(int count) =&gt; GetBytes(new byte[count]);
+    public uint Next() =&gt; BitConverter.ToUInt32(GetBytes(sizeof(uint)), 0);
+    public uint Next(uint x, uint y) {
+        if (x &gt; y) {
+            var z = x;
+
+            x = y;
+            y = z;
+        }
+
+        var range = (y - x);
+
+        if (range == 0) {
+            return x;
+        }
+        else if (range == uint.MaxValue) {
+            return Next();
+        }
+        else {
+            return (Next(exclusiveHigh: range) + x);
+        }
+    }
+
+    private uint Next(uint exclusiveHigh) {
+        var range = (uint.MaxValue - (((uint.MaxValue % exclusiveHigh) + 1) % exclusiveHigh));
+        var result = 0U;
+
+        do {
+            result = Next();
+        } while (result &gt; range);
+
+        return (result % exclusiveHigh);
+    }
+}
+</code></pre>
+
+<p>Regarding maintainability, we could start by creating a proper class to encapsulate all of our settings:</p>
+
+<pre><code>public sealed class PasswordGeneratorOptions
+{
+    private static readonly char[] DefaultSpecialChars = new[] { '!', '@', '#', '$', '%', '^', '&amp;', '*', '(', ')', '-', '=', '`', '~', '_', '+', ',', '.', '\'', '"', ';', ':', '?', '|', '/', '\\', '[', ']', '{', '}', '&lt;', '&gt;' };
+
+    public int MinimumNumberOfNumericCharacters { get; set; }
+    public int MinimumNumberOfLowerCaseCharacters { get; set; }
+    public int MinimumNumberOfSpecialCharacters { get; set; }
+    public int MinimumNumberOfUpperCaseCharacters { get; set; }
+    public int OutputLength { get; set; }
+    public ISecureRandom RandomNumberGenerator { get; set; }
+    public IReadOnlyList&lt;char&gt; SpecialCharacters { get; set; }
+
+    public PasswordGeneratorOptions() {
+        MinimumNumberOfLowerCaseCharacters = 0;
+        MinimumNumberOfNumericCharacters = 0;
+        MinimumNumberOfSpecialCharacters = 0;
+        MinimumNumberOfUpperCaseCharacters = 0;
+        RandomNumberGenerator = SecureRandom.DefaultInstance;
+        SpecialCharacters = DefaultSpecialChars;
+    }
+}
+</code></pre>
+
+<p>Then we can declare a <code>PasswordGenerator</code> class that consumes our options:</p>
+
+<pre><code>public sealed class PasswordGenerator
+{
+    private readonly PasswordGeneratorOptions m_options;
+
+    public PasswordGenerator(PasswordGeneratorOptions options) {
+        if (options.OutputLength &lt; (options.MinimumNumberOfLowerCaseCharacters + options.MinimumNumberOfNumericCharacters + options.MinimumNumberOfSpecialCharacters + options.MinimumNumberOfUpperCaseCharacters)) {
+            throw new ArgumentOutOfRangeException(message: "output length must be greater than or equal to the sum of all MinimumNumber* properties", actualValue: options.OutputLength, paramName: nameof(options.OutputLength));
+        }
+
+        m_options = options;
+    }
+}
+</code></pre>
+
+<p>Now we can start thinking about implementation details, I personally like the idea of breaking things up into various categories so that we can provide more complex configuration options later. Let's try classifying your characters into <code>lower-case</code>, <code>upper-case</code>, <code>number</code>, and <code>special</code>. The ASCII encoding has largely taken care of all of this for us "for free" since three of these four classes have contiguous regions in the specification; we can write a simple generator for each like so:</p>
+
+<pre><code>var randomNumberGenerator = new SecureRandom();
+
+Func&lt;char&gt; GetAsciiLetterLowerCase = () =&gt; ((char)randomNumberGenerator.Next(97, 123));
+Func&lt;char&gt; GetAsciiLetterUpperCase = () =&gt; ((char)randomNumberGenerator.Next(65, 91));
+Func&lt;char&gt; GetAsciiNumber = () =&gt; ((char)randomNumberGenerator.Next(48, 58));
+</code></pre>
+
+<p>Special characters aren't as easy so we'll resort to using a table of values:</p>
+
+<pre><code>var specialCharacters = new char[] { '!', '@', '#', };
+
+Func&lt;char&gt; GetAsciiSpecial = () =&gt; specialCharacters[randomNumberGenerator.Next(0U, ((uint)specialCharacters.Count))];
+</code></pre>
+
+<p>The only remaining thing left to do is implement the generator function. This can be accomplished by more or less following the same strategy you already have in place. I chose to implement <a href="https://en.wikipedia.org/wiki/Fisher%E2%80%93Yates_shuffle" rel="nofollow noreferrer">Fisher–Yates shuffle</a> instead of using <code>LINQ</code> for the final randomization step:</p>
+
+<pre><code>public string Next() {
+    var index = 0;
+    var length = m_options.OutputLength;
+    var randomNumberGenerator = m_options.RandomNumberGenerator;
+    var result = new char[length];
+    var useSpecial = (0 &lt; m_options.SpecialCharacters.Count);
+
+    for (var i = 0; (i &lt; m_options.MinimumNumberOfLowerCaseCharacters); i++) {
+        result[index++] = m_getAsciiLetterLowerCase();
+    }
+
+    for (var i = 0; (i &lt; m_options.MinimumNumberOfNumericCharacters); i++) {
+        result[index++] = m_getAsciiNumeric();
+    }
+
+    for (var i = 0; (i &lt; m_options.MinimumNumberOfSpecialCharacters); i++) {
+        result[index++] = m_getAsciiSpecial();
+    }
+
+    for (var i = 0; (i &lt; m_options.MinimumNumberOfUpperCaseCharacters); i++) {
+        result[index++] = m_getAsciiLetterUpperCase();
+    }
+
+    for (var i = index; (i &lt; length); i++) {
+        char c;
+
+        switch (randomNumberGenerator.Next(0U, (useSpecial ? 4U : 3U))) {
+            case 3U:
+                c = m_getAsciiSpecial();
+                break;
+            case 2U:
+                c = m_getAsciiNumeric();
+                break;
+            case 1U:
+                c = m_getAsciiLetterLowerCase();
+                break;
+            case 0U:
+                c = m_getAsciiLetterUpperCase();
+                break;
+            default:
+                throw new InvalidOperationException();
+        }
+
+        result[i] = c;
+    }
+
+    FisherYatesShuffle(randomNumberGenerator, result);
+
+    return new string(result);
+}
+
+private static void SwapRandom&lt;T&gt;(ISecureRandom randomNumberGenerator, IList&lt;T&gt; list, uint indexLowerBound, uint indexUpperBound) {
+    var randomIndex = randomNumberGenerator.Next(indexLowerBound, indexUpperBound);
+    var tempValue = list[(int)randomIndex];
+
+    list[(int)randomIndex] = list[(int)indexUpperBound];
+    list[(int)indexUpperBound] = tempValue;
+}
+private static void FisherYatesShuffle&lt;T&gt;(ISecureRandom randomNumberGenerator, IList&lt;T&gt; list) {
+    var length = list.Count;
+    var offset = 0U;
+
+    while (offset &lt; length) {
+        SwapRandom(randomNumberGenerator, list, 0U, offset++);
+    }
+}
+</code></pre>
+    </div>

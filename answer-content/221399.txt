@@ -1,0 +1,218 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Let's start with a bug: If a node has a right but no left child then the right subtree is traversed twice. As an example, the tree</p>
+
+<pre><code>//      1
+//        \
+//         2
+//        / \
+//       3   4
+return B(1, nil, B(2, B(3), B(4)))
+</code></pre>
+
+<p>produces the output</p>
+
+<pre><code>[1, 2, 3, 4, 2, 3, 4]
+</code></pre>
+
+<p>The reason is that for the (empty) left child of node ①, the right child node ② is added twice to the stack, in <code>func advanceState()</code> at</p>
+
+<pre><code>case .visitLeft:  setNextActionOnLastNode(.visitRight)
+</code></pre>
+
+<p>and in the “main loop” at</p>
+
+<pre><code>else if let rightChild = lastState().node.right {
+    self.visitNext(rightChild)
+}
+</code></pre>
+
+<p>The solution is simple: Remove that else case in <code>case .visitLeft:</code>. Which means that you call just <code>tryMarkingLeftToVisitNext()</code>, as intended:</p>
+
+<pre><code>        case .visitLeft:
+            tryMarkingLeftToVisitNext()
+
+        case .visitRight:
+            tryMarkingRightToVisitNext()
+</code></pre>
+
+<p>or inline those two functions, since each of them is called only once.</p>
+
+<hr>
+
+<p>What I don't like is how the stack is treated in the main loop:</p>
+
+<pre><code>while let popped = backtrackStack.last {
+    advanceState()
+    switch (popped.nextAction) {
+        // ...
+    }
+}
+</code></pre>
+
+<p>The variable name <code>popped</code> suggests that the element is <em>removed</em> from the stack, but it isn't: It remains on the stack and is mutated or removed in <code>func advanceState()</code>.</p>
+
+<p>I would also suggest to have a single place where the current state is acted upon, not two places (which can cause subtle bugs, as we saw above).</p>
+
+<p>The main loop then would look like this</p>
+
+<pre><code>while let popped = backtrackStack.popLast() {
+    switch (popped.nextAction) {
+        // ...
+    }
+}
+</code></pre>
+
+<p>where the switch handles the different cases, and appends new states to the stack where necessary. This </p>
+
+<ul>
+<li>simplifies the code and the logic,</li>
+<li>makes various utility functions obsolete,</li>
+<li>makes the <code>.removeToParent</code> case obsolete,</li>
+<li>makes the forced unwrapping in <code>last!</code> and the checks for a non-empty stack obsolete at various places.</li>
+</ul>
+
+<p>This leads to the following implementation of <code>struct BinaryPreorderIterator</code>:</p>
+
+<pre><code>public struct BinaryPreorderIterator&lt;Tree: BinaryTreeNodeProtocol&gt;: IteratorProtocol {
+    private var backtrackStack: [(node: Tree, nextAction: NextAction)]
+    private enum NextAction { case visitRoot, visitLeft, visitRight }
+
+    public init(tree: Tree) {
+        backtrackStack = [(tree, .visitRoot)]
+    }
+
+    public mutating func next() -&gt; Tree.Payload? {
+        while let popped = backtrackStack.popLast() {
+            switch (popped.nextAction) {
+            case .visitRoot:
+                backtrackStack.append((popped.node, .visitLeft))
+                return popped.node.payload
+
+            case .visitLeft:
+                backtrackStack.append((popped.node, .visitRight))
+                if let leftChild = popped.node.left {
+                    backtrackStack.append((leftChild, .visitRoot))
+                }
+
+            case .visitRight:
+                if let rightChild = popped.node.right {
+                    backtrackStack.append((rightChild, .visitRoot))
+                }
+            }
+        }
+
+        return nil
+    }
+}
+</code></pre>
+
+<hr>
+
+<p>And now we see that the stack actually just identifies the nodes which have to be visited later. If we push left and right child nodes onto the stack immediately when a node is encountered then the <code>enum NextAction</code> and the while-loop are not needed anymore:</p>
+
+<pre><code>public struct BinaryPreorderIterator&lt;Tree: BinaryTreeNodeProtocol&gt;: IteratorProtocol {
+    private var backtrackStack: [Tree]
+
+    public init(tree: Tree) {
+        backtrackStack = [tree]
+    }
+
+    public mutating func next() -&gt; Tree.Payload? {
+        guard let node = backtrackStack.popLast() else {
+            return nil // Stack is empty.
+        }
+        if let rightChild = node.right {
+            backtrackStack.append(rightChild)
+        }
+        if let leftChild = node.left {
+            backtrackStack.append(leftChild)
+        }
+        return node.payload
+    }
+}
+</code></pre>
+
+<p>Note that we have reduced the implementation of <code>struct BinaryPreorderIterator</code> from 75 lines to 20 lines (not counting the debug output) and simplified it considerably. It also takes less memory and is more efficient.</p>
+
+<p><em>Remark:</em> <code>func next()</code>could be more compactly written using <code>Optional.map</code>:</p>
+
+<pre><code>    public mutating func next() -&gt; Tree.Payload? {
+        guard let node = backtrackStack.popLast() else {
+            return nil
+        }
+        node.left.map { backtrackStack.append($0) }
+        node.right.map { backtrackStack.append($0) }
+        return node.payload
+    }
+</code></pre>
+
+<p>or even</p>
+
+<pre><code>    public mutating func next() -&gt; Tree.Payload? {
+        return backtrackStack.popLast().map { node in
+            node.left.map { backtrackStack.append($0) }
+            node.right.map { backtrackStack.append($0) }
+            return node.payload
+        }
+    }
+</code></pre>
+
+<p>but that does not make it better readable or understandable.</p>
+
+<hr>
+
+<p>Some further suggestions:</p>
+
+<p>It suffices to implement the <code>IteratorProtocol</code> protocol and to <em>declare</em> the <code>Sequence</code> conformance, making <code>struct BinaryTreePreorderSequence</code> obsolete:</p>
+
+<pre><code>public extension BinaryTreeNodeProtocol {
+    var preorderTraversal: BinaryPreorderIterator&lt;Self&gt; {
+        return BinaryPreorderIterator(tree: self) }
+}
+
+public struct BinaryPreorderIterator&lt;Tree: BinaryTreeNodeProtocol&gt;: IteratorProtocol, Sequence {
+    private var backtrackStack: [Tree]
+
+    public init(tree: Tree) {
+        backtrackStack = [tree]
+    }
+
+    public mutating func next() -&gt; Tree.Payload? {
+        guard let node = backtrackStack.popLast() else {
+            return nil
+        }
+        if let rightChild = node.right {
+            backtrackStack.append(rightChild)
+        }
+        if let leftChild = node.left {
+            backtrackStack.append(leftChild)
+        }
+        return node.payload
+    }
+}
+</code></pre>
+
+<p>This works because there is a default implementation of <code>func makeIterator()</code> for <code>IteratorProtocol</code>.</p>
+
+<p>Finally, I would <em>not</em> use empty argument labels in the init method of <code>class BinaryTreeNode</code>:</p>
+
+<pre><code>public final class BinaryTreeNode&lt;T&gt;: BinaryTreeNodeProtocol {
+    // ...
+
+    init(
+        _ payload: T,
+        left: BinaryTreeNode&lt;T&gt;? = nil,
+        right: BinaryTreeNode&lt;T&gt;? = nil
+        ) {
+        // ...
+    }
+}
+</code></pre>
+
+<p>This requires more typing, but may be easier to read, and allows to create nodes with a right subtree only, without having to use a <code>nil</code> argument for the left subtree:</p>
+
+<pre><code>B(1, right: B(2, left: B(3), right: B(4)))
+// versus
+B(1, nil, B(2, B(3), B(4)))
+</code></pre>
+    </div>

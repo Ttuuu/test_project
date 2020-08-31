@@ -1,0 +1,83 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'm not an expert on multithreading at all, but I've attempted refactoring your code a bit.
+First of all, to code defensively, I suggest adding the <code>readonly</code> modifier to your lock object. It's not required but will prevent accidental assignments:</p>
+
+<pre><code>private static readonly object syncRoot = new object();
+</code></pre>
+
+<p>I'm against incurring the complexity of an <code>out</code> argument: let's just check if the timer exists. We can stop it and remove it if it does; setting <code>DispatcherTimer.IsEnabled</code> isn't necessary because <code>DispatcherTimer.Stop()</code> <a href="https://stackoverflow.com/a/3163314/1106367">sets it to false anyway</a>:</p>
+
+<pre><code>if (timers.ContainsKey(namedInvocation))
+{
+    timers[namedInvocation].Stop();
+    timers.Remove(namedInvocation);
+}
+</code></pre>
+
+<p>We can get rid of the object initializer because <code>DispatcherTimer</code> has the perfect constructor for us anyway; this has the added benefit of inlining the lambda: </p>
+
+<pre><code>var timer = new DispatcherTimer(delay, priority, (s, e) =&gt; action(), dispatcher);
+timer.Start();
+timers.Add(namedInvocation, timer);
+</code></pre>
+
+<p>Again, remember we don't need to set <code>IsEnabled</code> because <code>DispatcherTimer.Start()</code> sets it to true for us (alternatively, you can leave it in place but remove the call to <code>Start()</code>. But the method call seems more intuitive to me; setting a property doesn't make it obvious that the timer has been started).</p>
+
+<p>You may have noticed I used <code>var</code> wherever it seemed appropriate; it's just as type safe as using the actual type but takes up less space, both on the page in in my brain.</p>
+
+<p>That leaves us with the following end result:</p>
+
+<pre><code>public static class DispatcherExtensions
+{
+    private static Dictionary&lt;string, DispatcherTimer&gt; timers = 
+        new Dictionary&lt;string, DispatcherTimer&gt;();
+    private static readonly object syncRoot = new object();
+
+    public static void DelayInvoke(this Dispatcher dispatcher, string namedInvocation,
+        Action action, TimeSpan delay, 
+        DispatcherPriority priority = DispatcherPriority.Normal)
+    {
+        lock (syncRoot)
+        {
+            if (timers.ContainsKey(namedInvocation))
+            {
+                timers[namedInvocation].Stop();
+                timers.Remove(namedInvocation);
+            }
+            var timer = new DispatcherTimer(delay, priority, (s,e) =&gt; action(), dispatcher);
+            timer.Start();
+            timers.Add(namedInvocation, timer);
+        }
+    }
+}
+</code></pre>
+
+<p>In case I introduced a bug or if you have improvements, let me know in the comments.</p>
+
+<hr>
+
+<h1>Edit: supporting cancellation</h1>
+
+<p><em>(@svick's suggestion)</em></p>
+
+<p>To provide the possibility of cancelling your timers, you would factor out the timer removing logic (I inverted the condition to reduce nesting...) into a new method that is called at the beginning of <code>DelayInvoke</code>.</p>
+
+<pre><code>private static void RemoveTimer(string namedInvocation)
+{
+    if (!timers.ContainsKey(namedInvocation)) return;
+    timers[namedInvocation].Stop();
+    timers.Remove(namedInvocation);
+}
+</code></pre>
+
+<p>Then, you'd create another extension method (first parameter is useless, but calling the method via the Dispatcher is consistent and convenient, so I left it there). Something like this:</p>
+
+<pre><code>public static void CancelNamedInvocation(this Dispatcher dispatcher, string namedInvocation)
+{
+    lock(syncRoot)
+    {
+        RemoveTimer(namedInvocation);
+    }
+}
+</code></pre>
+    </div>

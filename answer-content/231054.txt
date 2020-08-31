@@ -1,0 +1,108 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>template &lt;typename EventType&gt;
+Message(EventType &amp;&amp;event, EventHandler event_handler):
+    m_event(std::make_unique&lt;EventType&gt;(std::move(event))),
+    m_event_handler(event_handler) {}
+</code></pre>
+
+<p>Requiring an r-value <code>event</code> seems unnecessary here; we should probably take it by value.</p>
+
+<hr>
+
+<pre><code>  template &lt;typename EventType&gt;
+  Message(Message&amp;&amp; message) :
+    m_event(std::move(message.m_event)),
+    m_event_handler(message.m_event_handler) {}
+</code></pre>
+
+<p><strong>bug:</strong> This move constructor shouldn't have a template parameter.</p>
+
+<hr>
+
+<pre><code>  template&lt;class EventType&gt;
+  void add_event_listener(std::function&lt;void(EventType&amp;)&gt; event_listener) {
+    ...
+
+    if (m_event_listeners.find(event_type) == m_event_listeners.end()) {
+        m_event_listeners[event_type] = {
+            [event_listener](Event&amp; e) { event_listener(static_cast&lt;EventType&amp;&gt;(e)); }
+        };
+    }
+    else {
+        m_event_listeners[event_type].push_back([&amp;event_listener] (Event&amp; e) {
+            event_listener(static_cast&lt;EventType&amp;&gt;(e));
+        });
+    }
+  }
+</code></pre>
+
+<p><strong>bug:</strong> <code>event_listener</code> <em>must</em> be captured by value, not by reference, in both these lambdas (as a local variable it will be dead before the reference is used).</p>
+
+<p>Note that we don't need the <code>find</code> and two separate branches; <code>operator[]</code> will add an empty vector for us so we can just do:</p>
+
+<pre><code>    m_event_listeners[event_type].push_back([event_listener] (Event&amp; e) {
+        event_listener(static_cast&lt;EventType&amp;&gt;(e));
+    });
+</code></pre>
+
+<hr>
+
+<pre><code>[[noreturn]] void run() {
+    while (true) {
+        ...
+        m_event_cv.notify_one();
+        ...
+    }
+}
+</code></pre>
+
+<p>I don't understand the reason for calling <code>m_event_cv.notify_one()</code> here. Are we trying to allow multiple threads to call <code>run()</code>? </p>
+
+<p>If so, they'll miss out on messages, since we've removed one from the queue.</p>
+
+<p>If not, the next iteration of the <code>run()</code> loop will carry on processing if there are messages on the queue, since the <a href="https://en.cppreference.com/w/cpp/thread/condition_variable/wait" rel="nofollow noreferrer">predicate is checked before waiting</a>. So there should be no need to call notify again.</p>
+
+<hr>
+
+<pre><code>template &lt;class EventType, typename ...EventParamsType&gt;
+void inject_event(EventParamsType&amp;&amp;... event_params) {
+</code></pre>
+
+<p>The perfect forwarding here seems more complicated than passing in an <code>EventType</code> argument.</p>
+
+<hr>
+
+<pre><code>typedef std::function&lt;void(Event&amp;)&gt; EventHandler;
+...
+Message(EventType event, EventHandler event_handler):
+...
+void add_event_listener(std::function&lt;void(EventType&amp;)&gt; event_listener) {
+...
+    std::for_each(listeners.begin(), listeners.end(), [this, &amp;event](EventHandler &amp;listener) {
+</code></pre>
+
+<p>Consistency: we should choose either "listener" or "handler", and stick with it.</p>
+
+<hr>
+
+<pre><code>...
+    std::for_each(listeners.begin(), listeners.end(), [this, &amp;event_params...](EventHandler &amp;listener) {
+        EventType event = EventType(std::forward&lt;EventParamsType&gt;(event_params)...);
+        m_message_queue.emplace(std::move(event), listener);
+    });
+
+...
+
+std::queue&lt;Message&gt; m_message_queue;
+</code></pre>
+
+<p>We could perhaps:</p>
+
+<ul>
+<li>Make the <code>Event</code> argument to <code>EventHandler</code> a <code>const&amp;</code>.</li>
+<li>Have an <code>Event</code> queue, instead of a <code>Message</code> queue (or technically a <code>std::queue&lt;std::pair&lt;std::unique_ptr&lt;Event&gt;, std::type_index&gt;&gt;</code> queue).</li>
+<li>Lock, copy, unlock, and call the relevant listeners for the event in the <code>run()</code> function.</li>
+</ul>
+
+<p>This would allow us to avoid storing and copying the <code>Event</code> so many times. We'd also have one iteration of <code>run()</code> per event, instead of one iteration per listener per event.</p>
+    </div>

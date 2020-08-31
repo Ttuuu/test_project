@@ -1,0 +1,180 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>I'm mostly reviewing the code-gen choices, <em>not</em> the style / implementation of the compiler itself.</strong></p>
+
+<p>The compiler itself mostly looks fine in the parts I've skimmed over (looking for how it uses the format strings).  The design is pretty clear and easy to dive into, and the C is well-formatted.  It could be simpler and/or more efficient in some cases.  (e.g. an array instead of linked-list for the stack would be faster, but without a C++ std::vector to handle reallocation for you you'd have to pick an arbitrary large size.  But that's normally fine because untouched virtual memory normally doesn't cost anything.)</p>
+
+<hr>
+
+<p>Writing an optimizing compiler is a huge task. If you want efficient asm, by far your best bet is to take advantage of an existing optimizing compiler back-end like LLVM or GCC.</p>
+
+<p>For example, compile to LLVM-IR instead of x86 asm directly, and let LLVM-end produce optimized asm for whatever target platform. (This also gets you portability to multiple platforms, like ARM, MIPS, and/or different OSes, except for your dependence on x86 Linux system calls.)  LLVM-IR looks like an assembly language, and can be compiled from a stand-alone file by clang, similar to how as + ld can compile a <code>.s</code></p>
+
+<p>Or see <a href="https://llvm.org/docs/tutorial/index.html" rel="noreferrer">https://llvm.org/docs/tutorial/index.html</a> for a (possibly out-of-date) tutorial on implementing a language with LLVM as a back end, where you write the front-end. (Writing your compiler as a gcc front-end is also an option, using the GCC back-end instead of LLVM.) </p>
+
+<p>It's kind of fun that BF is such a simple language that you can get non-terrible performance by transliterating it into x86 asm, though, with only local optimizations like collapsing a sequence if increments into a single add/sub.</p>
+
+<p><strong>Another option is to transliterate to C, and feed that to an optimizing C compiler.</strong>  Let it optimize a few frequently-used memory cells (array elements) into registers.  Or even auto-vectorize a sequence of INCREMENT and INCREMENT_POINTER into <code>paddb</code> instructions.</p>
+
+<hr>
+
+<h3>32-bit Linux <code>int 0x80</code> is low-performance</h3>
+
+<p>If you're going to make a lot of system calls, x86-64 <code>syscall</code> has lower overhead than 32-bit <code>int 0x80</code>, both intrinsically (the <code>int</code> instruction itself is slower than <code>syscall</code>) and a little bit inside the kernel with slightly more efficient dispatch for native system calls instead of compat 32-bit.  However, this is pretty minor compared to system call overhead with Spectre + Meltdown mitigation enabled on current CPUs, though (that makes adds enough overhead to make simple system calls maybe 10x more expensive than before, dwarfing the difference between <code>int 0x80</code> vs. <code>syscall</code> or <code>sysenter</code>)</p>
+
+<p>If you do want to keep using 32-bit code, calling into the VDSO so it can use <code>sysenter</code> is faster than using the simple / slow 32-bit x86 <code>int 0x80</code> ABI.</p>
+
+<p><strong>Or better, use libc's stdio to buffer I/O.</strong>  emit code to call <a href="http://man7.org/linux/man-pages/man3/unlocked_stdio.3.html" rel="noreferrer"><code>putchar_unlocked</code> and <code>getchar_unlocked</code></a>.  (The 32-bit ABI sucks, passing args on the stack.  The x86-64 ABI uses register args.  In x86-64 System V, <code>rdi</code> is a call-clobbered register so you'd probably want to use <code>rbx</code> for your pointer.)</p>
+
+<p>You might have to call <code>fflush_unlocked(stdout)</code> before <code>getchar</code>, because (unlike C++ cin/cout), getchar doesn't automatically flush buffered output before blocking to read input, and a BF program might print a prompt that doesn't end with <code>\n</code> before reading input.  To keep the generated code compact, you might want to emit a definition (at the top of the asm) for a helper function that sets up the arg-passing and calls the real libc function.</p>
+
+<p>In I/O intensive BF programs, buffered stdio could maybe give you a speedup by a factor of 100 or 1000, with getchar / <code>putchar_unlocked</code> being nearly free compared to a system call that's only needed much less frequently.</p>
+
+<hr>
+
+<h2>Code-gen choices</h2>
+
+<p><code>xor ebx,ebx</code> / <code>inc ebx</code> saves 2 bytes but isn't generally faster than <code>mov ebx, 1</code>.  But you're only doing this as part of a system-call sequence, and you're potentially compiling large programs into big straight-line sequences of code, so this is not bad.  <strong>You actually have a register with a known value of <code>1</code> (EDX) at all times other than inside the ALLOC block, so <code>mov ebx, edx</code> is by far your best bet.</strong></p>
+
+<p><code>add eax,30000</code> / <code>mov ebx,eax</code> to EBX should be done with <code>lea ebx, [eax + 30000]</code> since you overwrite EAX afterwards anyway.  The LEA instruction is good as a copy-and-add.</p>
+
+<p>You can also use LEA to put small constants in registers, given a known base.  You have EDX=1, so you can do <code>lea eax, [edx-1 + 0x04]</code> for <code>__NR_write</code>.  This is a 3-byte instruction, same as <code>xor-zero</code>/<code>inc</code> or <code>push imm8</code>/<code>pop</code>, but almost as efficient as <code>mov eax, 0x04</code>.  (Runs on fewer possible ports on many CPUs, but still only 1 single-uop instruction with single-cycle latency on all relevant CPUs.  <a href="https://agner.org/optimize/" rel="noreferrer">https://agner.org/optimize/</a>)</p>
+
+<hr>
+
+<h2>ALLOCATE_MEMORY: use the BSS unless you want dynamic growth</h2>
+
+<p>You allocate this at program startup, and never dynamically allocate more.  <em>If</em> you wanted to support that (e.g. handle SIGSEGV if the program uses more memory than had allocated), then yes, <code>brk</code> is a decent choice for allocating more contiguous memory.  (<code>mmap(MAP_ANONYMOUS)</code> does let you give a hint address, which the kernel will use if there aren't any conflicting mappings, but <code>brk</code> leaves room to grow.)</p>
+
+<p>But for your current simple design, where you allocate it all up front, you might as well use the BSS and let the kernel's ELF program loader do the allocation for you.</p>
+
+<p>You're targeting Linux, which like other modern OSes does lazy allocation.  <strong>Allocated virtual pages aren't backed by real physical pages until they're written.</strong>  They're often not even wired into the hardware page table.  Thus <strong>it costs you basically nothing to use a large-ish BSS array like 2MB, and won't waste physical RAM for programs that only touch the first 4k of it.</strong>  2MB is the size of an x86-64 hugepage, so a BF program that uses most of its 2MB might get fewer TLB misses if the kernel decides to use one hugepage instead of separate 4k pages.  (Linux can use transparent hugepages for the BSS, I think.)</p>
+
+<pre><code>const char PROGRAM_INIT[] = ".intel_syntax noprefix\n"
+                         ".global _start\n"
+                         "_start:\n"
+                         ".lcomm bf_memory, 2 * 1024 * 1024\n"
+                         "mov    edx, 1\n"
+                         "mov    edi, OFFSET bf_memory\n"
+</code></pre>
+
+<p><strong>Note I changed the variable name from <code>ALLOCATE_MEMORY</code>, because that doesn't clearly imply once-at-startup</strong>, and some of the stuff in that string is definitely only once.</p>
+
+<p><code>.lcomm</code> allocates space in the BSS without needing to use <code>.section .bss</code>.  (And unlike <code>.comm</code>, the label is a file-scoped local label.)</p>
+
+<p>I tested this, and it correctly assembles to a program that maps <code>0x200000</code> bytes of virtual memory.  You can see the segment in the program headers with <code>readelf -a</code>.</p>
+
+<hr>
+
+<h2>ADD vs. SUB decision</h2>
+
+<pre><code>        if (counter &gt; 0)
+            fprintf(outputfp, INCREMENT, counter);
+        else if (counter &lt; 0)
+            fprintf(outputfp, DECREMENT, (-counter));
+</code></pre>
+
+<p>This is unnecessary: x86's ADD instruction works with negative immediates.  For the plain <code>INCREMENT</code> (memory-destination), the operand-size is <code>byte</code> so it's always going to be an 8-bit immediate, even if it has to be truncated at assemble time.  (Which is fine; it means the BF program wrapped its counter, and that truncation by the assembler does the same modulo-256 that you want to implement for BF, I assume.)  So there's no saving from using <code>sub</code> -128 instead of <code>add</code> 128 to allow a narrower immediate.  8-bit <code>128</code> and <code>-128</code> are the same number.</p>
+
+<p>You might as well just <code>ADD</code> the signed count, unless you care about how CF and OF flags are set.</p>
+
+<pre><code>        if (counter &amp; 0xFF != 0)
+            fprintf(outputfp, INCREMENT, counter);
+        // else optimize away cancelling / wrapping operations
+</code></pre>
+
+<p><strong>For the <code>INCREMENT_POINTER</code> version of this, you <em>want</em> to use <code>add edi, -128</code> instead of sub 128, because -128 can use a more compact signed 8-bit <code>imm8</code> encoding</strong>.   Immediates in the <code>[-128, 127]</code> range can use the <code>add r/m32, sign_extended_imm8</code> encoding.</p>
+
+<p>It's worth considering keeping your pointer in EAX so the compact <code>add/sub 
+eax, imm32</code> encoding is available (saving 1 byte vs. the generic <code>add/sub r/m32, imm32</code> encoding that uses a ModRM to encode the register or addressing mode instead of implicit EAX).  But EAX is used for system calls, so they'd need to <code>mov eax, ecx</code> after system calls to put the pointer back.  Since pointer increments of more than 128 are probably rare in most BF programs, and it only saves 1 byte of code-size then, it's not worth it.</p>
+
+<p><strong>The Linux <code>int 0x80</code> ABI does <em>not</em> clobber any registers other than the return value in EAX, so your best bet is to keep your pointer in ECX, not EDI.</strong>  Then you don't need any <code>mov ecx, edi</code> instructions.</p>
+
+<p>So for the pointer version, you might want to do</p>
+
+<pre><code>        if (counter &gt; 0)
+            fprintf(outputfp, DECREMENT_POINTER, -counter);  // Prefer negative immediates for code-size
+        else if (counter &lt; 0)
+            fprintf(outputfp, INCREMENT_POINTER, counter);
+        // else no net offset: optimize away
+</code></pre>
+
+<p>Passing signed negative counts to printf means that for correctness we should change the format strings to use decimal counts, <code>%d</code>, not <code>0x%02x</code>.  (And BTW, you can get printf to print the <code>0x</code> part by using <code>%#02x</code>).  GCC prints asm using signed decimal integers, so there's precedent there for simplicity of doing it this way, even though hex is a more efficient format to write and to parse.</p>
+
+<p>(Your version with <code>%02x</code> was not strictly correct: <code>counter</code> is a signed <code>int</code> but you're passing it a format string that expects <code>unsigned int</code>.  On a 2's complement system where they're the same width with no padding, that's equivalent, but you don't need to assume that if you make your types match your format string.  Compile with <code>-Wall</code> to get gcc/clang to  warn about format string mismatches.  You might need to enable optimization to get warnings to work with global variables instead of string literals.)</p>
+
+<hr>
+
+<h2>Pointer scaling??</h2>
+
+<pre><code>        if (counter &gt; 0)
+            fprintf(outputfp, INCREMENT_POINTER, (unsigned int)(counter * sizeof(char) * 4));
+        else if (counter &lt; 0)
+            fprintf(outputfp, DECREMENT_POINTER, (unsigned int)((-counter) * sizeof(char) * 4));
+        break;
+</code></pre>
+
+<p><strong>Scaling the <em>target</em> count by the host <code>sizeof(char)</code> is a bug</strong>: it will compile differently depending on what platform you're cross-compiling from.  Or it would if <code>sizeof(char)</code> wasn't fixed at 1 by ISO C.</p>
+
+<p>It's still a logical error, unless your program is only supposed to work when running on the target machine (not cross-compiling).  (If that was the case, you could avoid hard-coding the system-call numbers, and <code>#include &lt;unistd_32.h&gt;</code> and use <code>__NR_write</code> instead of <code>0x04</code>.  But there's no reason this compiler shouldn't itself be portable C and run on PowerPC Windows NT for example, still producing the same x86 asm.)</p>
+
+<p><strong>I don't understand why we're scaling by 4, though, because you're using <code>add/sub byte ptr [edi]</code>, so your cells are only 1 byte wide in the target machine's memory</strong>.  Maybe I missed something elsewhere, and you're using the other 3 bytes of each cell for something?</p>
+
+<hr>
+
+<p><strong>For most modern CPUs, <code>inc</code>/<code>dec</code> are not slower than add/sub on registers</strong>, so (if remove the scale factor) you could look for that peephole optimization on <code>INCREMENT_POINTER</code> / <code>DECREMENT_POINTER</code>.  (<a href="https://stackoverflow.com/questions/36510095/inc-instruction-vs-add-1-does-it-matter">INC instruction vs ADD 1: Does it matter?</a>).  This will save you 2 bytes in 32-bit mode, or 1 byte in 64-bit mode.  (Although instruction-fetch in the front-end is probably not a bottleneck when executing code generated by this compiler.)</p>
+
+<p>But on modern Intel CPUs <code>inc</code>/<code>dec [mem]</code> is 3 uops vs. 2 for add/sub 1, so you <em>don't</em> want to look for inc/dec as a peephole optimization for <code>INCREMENT</code>.  That's why I didn't mention it in the previous section.</p>
+
+<p><strong>Thus <code>inc edi</code>/<code>dec edi</code> is a peephole optimization we can look for</strong>.  I've renamed the format-strings to x86-specific instruction names.  If you're planning ports to other targets, you might keep the ADD/SUB names and have a name like <code>SUB1_POINTER</code> for that special case.  But some ISAs like MIPS for example don't have a sub-immediate instruction at all: just add-immediate with a sign-extended immediate.  (Some MIPS assemblers support <code>subi</code> as a pseudo-instruction).</p>
+
+<pre><code>    // look for the inc / dec peephole optimization.
+        if (counter &gt; 0) {
+            if (counter == 1) {       // &amp;&amp; tune != silvermont or P4
+                fprintf(outputfp, INC_POINTER);
+            } else {
+                fprintf(outputfp, SUB_POINTER, -counter);  // Prefer negative immediates for larger range with imm8
+            }
+        } else if (counter &lt; 0) {
+            if (counter == -1) {
+                fprintf(outputfp, DEC_POINTER);
+            } else {
+                fprintf(outputfp, ADD_POINTER, counter);
+            }
+        }
+        // else no net offset: optimize away
+</code></pre>
+
+<hr>
+
+<h2>Using FLAGS results</h2>
+
+<p><strong><code>LOOP_START</code> / <code>LOOP_END</code> can omit the <code>cmp byte ptr [edi],0x00</code> if ZF is already set according to the 0 / non-zero status of <code>[edi]</code></strong>.  This is the case after a non-zero <code>counter</code> for INCREMENT / DECREMENT, because add/sub set ZF according to the zero / non-zero status of the result.</p>
+
+<p>Looking for this optimization might be as easy as keeping a <code>flags_good</code> local variable that's set to <code>true</code> inside the <code>if(counter &amp; 0xFF != 0)</code> to emit a memory-destination add, and cleared by any ADD_POINTER/DEC_POINTER / etc.</p>
+
+<hr>
+
+<h3>Optimizing for multi-byte I/O with one system call</h3>
+
+<p>If we can look for patterns like inc / write / inc / write, we can turn that into an <code>n</code>-byte <code>sys_write</code>.  (Or if you decide to use libc stdio, an <code>fwrite</code> function call, but with stdio buffering this optimization becomes <em>much</em> less valuable.)</p>
+
+<p>Maybe after a <code>'.'</code>, look-ahead for a sequence of <code>+.</code>.  This might miss the optimization in some cases like <code>-++</code> instead of <code>+</code>, but dumb source defeating optimizing compilers is not your problem if there's no reason anyone would ever write that in a BF program.</p>
+
+<hr>
+
+<h3>stdio lookahead in the compiler</h3>
+
+<p>Instead of using <code>fseek</code> to rewind, you can use <a href="http://man7.org/linux/man-pages/man3/fgetc.3.html" rel="noreferrer"><code>ungetc(c, stdin);</code></a> to <em>put back</em> a char you read.  ISO C guarantees that at least 1 char of pushback is supported, which is all you need.  I assume glibc usually supports more.</p>
+
+<p>Another option might be to put reading the next character at the bottom of the loop, separate from the loop condition, so you could use <code>continue;</code>.  That might be kind of ugly, though.</p>
+
+<p>Or since it's not rare for your parser to want lookahead, bake that in to the main loop.</p>
+
+<pre><code>int c, next_c = fgetc(inputfp);
+while (c = next_c, next_c = fgetc(inputfp), c != EOF) {
+    ...
+}
+</code></pre>
+
+<p>The loop body will run with <code>c = last_char</code> and <code>next_c = EOF</code>.  I'm not sure if there's a better idiom for this; I just made this up and I'm not sure it's as clean as I'd like.  Perhaps a <code>do{}while()</code> loop structure would be better, with the <code>c = next_c</code> stuff at the top.</p>
+    </div>

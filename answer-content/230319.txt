@@ -1,0 +1,240 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Implemented Henrik Hansen's suggested edits:</p>
+
+<ul>
+<li>Removed <code>goto</code> statements in <code>switch</code> statements of indexer</li>
+<li><code>HexToString()</code> now uses <code>Encoding.UTF.GetString()</code> to convert hex to strings</li>
+<li><code>StringToHex()</code> now uses LINQ <code>.SELECT(...)</code> to convert bytes of <code>byte[]</code> to string </li>
+<li>Added default constructor to initialize <code>_hasciiData</code> to string of 70 empty zeros</li>
+</ul>
+
+<p>Structural changes to come. </p>
+
+<h2>Code</h2>
+
+<pre><code>using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+
+using ByteSpecification = System.Collections.Generic.Dictionary&lt;string, (int, int)&gt;;
+using CastOperation = System.Collections.Generic.Dictionary&lt;string, System.Func&lt;string, object&gt;&gt;;
+
+namespace ByteParsing
+{
+    public class HasciiParser
+    {
+        public static string HexToString(string hascii)
+        {
+            byte[] bytes = new byte[hascii.Length / 2];
+            for (int i = 0; i &lt; hascii.Length; i += 2)
+            {
+                bytes[i / 2] = byte.Parse(hascii.Substring(i, 2), NumberStyles.HexNumber);
+            }
+            return Encoding.UTF8.GetString(bytes);  // Or use Encoding.Default
+        }
+
+        public static string StringToHex(string str, int maxWidth)
+        {
+            byte[] bytes = Encoding.UTF8.GetBytes(str);
+            return string.Join("", bytes.Select(b =&gt; b.ToString("X2"))).PadLeft(maxWidth, '0');
+        }
+
+        public DateTime HexToDatetime(string hascii)
+        {
+            int year = Convert.ToInt32(hascii.Substring(0, 4), 16);
+            int month = Convert.ToInt32(hascii.Substring(4, 2), 16);
+            int day = Convert.ToInt32(hascii.Substring(6, 2), 16);
+            return new DateTime(year, month, day);
+        }
+
+        public static float HexToFloat(string hascii)
+        {
+            // https://stackoverflow.com/a/7903300/3396951
+            uint num = uint.Parse(hascii, System.Globalization.NumberStyles.AllowHexSpecifier);
+            byte[] floatVals = BitConverter.GetBytes(num);
+            return BitConverter.ToSingle(floatVals, 0);
+        }
+    }
+
+    public class PD0Format
+    {
+        public string _hasciiData; // Normally private
+
+        public PD0Format()
+        {
+            _hasciiData = "0000000000000000000000000000000000000000000000000000000000000000000000";
+        }
+
+        public PD0Format(string hasciiData)
+        {
+            _hasciiData = hasciiData;
+        }
+
+        protected CastOperation castop = new CastOperation()
+        {
+            {"Year", (hascii_str) =&gt; Convert.ToInt32(hascii_str, 16)},
+            {"Month", (hascii_str) =&gt; Convert.ToInt32(hascii_str, 16)},
+            {"Day", (hascii_str) =&gt; Convert.ToInt32(hascii_str, 16)},
+            {"Pi", (hascii_str) =&gt; HasciiParser.HexToFloat(hascii_str)},
+            {"EulersNumber", (hascii_str) =&gt; HasciiParser.HexToFloat(hascii_str)},
+            {"SecretValue", (hascii_str) =&gt; Convert.ToInt32(hascii_str, 16)},
+            {"SecretMessage", (hascii_str) =&gt; HasciiParser.HexToString(hascii_str)},
+            {"BigInt", (hascii_str) =&gt; Convert.ToInt64(hascii_str, 16)}
+        };
+
+        protected ByteSpecification dateSpec = new ByteSpecification()
+        {
+            {"Year", (1, 2)},
+            {"Month", (3, 1)},
+            {"Day", (4, 1)},
+        };
+
+        protected ByteSpecification mathConstantsSpec = new ByteSpecification()
+        {
+            {"Pi", (5, 4)},
+            {"EulersNumber", (9, 4)}
+        };
+
+        protected ByteSpecification secretsSpec = new ByteSpecification()
+        {
+            {"SecretValue", (13, 4)},
+            {"SecretMessage", (17, 11)},
+            {"BigInt", (28, 8)}
+        };
+
+        private string GetHasciiBytes(ByteSpecification byteSpec, string fieldName)
+        {
+            // ByteSpecification assumes base-1 indexing. Substring requires base-0 indexing so we must subtract 2 (reason below).
+            //      Because there are two hex characters to a byte, we have to multiply the startIndex of string.Substring
+            //      by 2. To get to the startIndex of a byte, we must substract by multiples of 2.
+            // Item2 of ByteSpecification's dictionary value represents the number of bytes. Since two hex characters represent
+            //      a byte, the number of characters to extract using string.Substring is Item2 * 2
+            return _hasciiData.Substring(byteSpec[fieldName].Item1 * 2 - 2, byteSpec[fieldName].Item2 * 2);
+        }
+
+        public dynamic this[string category, string fieldName]
+        {
+            get
+            {
+                ByteSpecification spec = null;
+                switch (category.ToLower())
+                {
+                    case "date":
+                        spec = dateSpec;
+                        break;
+                    case "constants":
+                        spec = mathConstantsSpec;
+                        break;
+                    case "secrets":
+                        spec = secretsSpec;
+                        break;
+                    default:
+                        throw new ArgumentException($"Unimplemented specification category `{category}`");
+                }
+                string hasciiBytes = GetHasciiBytes(spec, fieldName); // Retrieve bytes from underlying string
+                return castop[fieldName](hasciiBytes); // Cast to appropriate type, according to mapping defined in CastOperation
+            }
+
+            set
+            {
+                switch (category.ToLower())
+                {
+                    case "secrets":
+                        int insertLocation = secretsSpec[fieldName].Item1 * 2 - 2;
+                        int maxCharFieldWidth = secretsSpec[fieldName].Item2 * 2; // Used for padding when the number of hex chars isn't even
+                        string val = null;
+                        switch (fieldName)
+                        {
+                            case "SecretValue":
+                                val = String.Format("{0:X}", value).PadLeft(maxCharFieldWidth, '0'); // Convert value to hascii representation
+                                break;
+                            case "SecretMessage":
+                                val = HasciiParser.StringToHex(value, maxCharFieldWidth);
+                                break;
+                            case "BigInt":
+                                val = String.Format("{0:X}", value).PadLeft(maxCharFieldWidth, '0');
+                                break;
+                        }
+                        _hasciiData = _hasciiData.Remove(insertLocation, maxCharFieldWidth); // Remove the characters currently present
+                        _hasciiData = _hasciiData.Insert(insertLocation, val ?? throw new InvalidOperationException());
+                        Debug.WriteLine(_hasciiData);
+                        break;
+                    case "date":
+                        throw new NotImplementedException();
+                    case "constants":
+                        throw new NotImplementedException();
+                }
+            }
+        }
+    }
+
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            /*
+            string _year = "07E3"; // 2019  16-bit int, 0x07E3
+            string _month = "0A"; // 10   8-bit int, 0x0A
+            string _day = "02"; // 2   8-bit int, 0x02
+            string _pi = "40490FD8"; // IEEE-754 Single Precision Float, 0x4049 0FD8
+            string _eulers = "402DF854"; // IEEE-754 Single Precision Float, 0x402D F854
+            string _secretValue = "80000000"; // 32-bit int, 0x80000000 (Decimal -2147483648)
+            string _secretMsg = "48656C6C6F576F726C6421"; // ASCII string "HelloWorld!", 0x48656C6C6F576F726C6421 
+            string _bigInt = "8000000000000000"; // 64-bit int, 0x8000 0000 0000 0000 (Decimal -9223372036854775808)
+            */
+
+            string hasciiData = "07E30A0240490FD8402df8548000000048656C6C6F576F726C64218000000000000000";
+
+            PD0Format ensemble = new PD0Format(hasciiData);
+
+            int recordYear = ensemble["date", "Year"];
+            int recordMonth = ensemble["date", "Month"];
+            int recordDay = ensemble["date", "Day"];
+            Debug.WriteLine(new DateTime(recordYear, recordMonth, recordDay));
+
+            float Pi = ensemble["constants", "Pi"];
+            float exp1 = ensemble["Constants", "EulersNumber"];
+            Debug.WriteLine($"Pi: {Pi}\nEuler's Number: {exp1}");
+
+            int secretValue = ensemble["secrets", "SecretValue"];
+            string secretMsg = ensemble["secrets", "SecretMessage"];
+            long bigInt = ensemble["secrets", "BigInt"];
+            Debug.WriteLine($"Secret Value: {secretValue}\nSecret Msg: {secretMsg}\nbigInt: {bigInt}");
+
+            //  Usage: Writing
+            PD0Format defaultRecord = new PD0Format();
+
+            // 35791394 corresponds to 0x02222222 written as "02222222" in hascii
+            defaultRecord["secrets", "SecretValue"] = 35791394;
+            // "FooBarBaz" corresponds to 0x00 0046 6F6F 4261 7242 617A written as "0000466F6F42617242617A" in hascii
+            defaultRecord["secrets", "SecretMessage"] = "FooBarBaz";
+            // 1229782938247303441 corresponds to 0x1111 1111 1111 1111 written as "1111111111111111" in hascii
+            defaultRecord["secrets", "BigInt"] = 1229782938247303441;
+
+            // Original defaultData: "0000000000000000000000000000000000000000000000000000000000000000000000"
+            // Modified defaultData: "000000000000000000000000022222220000466F6F42617242617A1111111111111111"
+            Debug.WriteLine(defaultRecord._hasciiData);
+
+            Console.ReadLine(); // Prevent console from closing
+        }
+    }
+}
+</code></pre>
+
+<h2>Output</h2>
+
+<pre><code>10/2/2019 00:00:00
+Pi: 3.141592
+Euler's Number: 2.718282
+Secret Value: -2147483648
+Secret Msg: HelloWorld!
+bigInt: -9223372036854775808
+0000000000000000000000000222222200000000000000000000000000000000000000
+000000000000000000000000022222220000466F6F42617242617A0000000000000000
+000000000000000000000000022222220000466F6F42617242617A1111111111111111
+000000000000000000000000022222220000466F6F42617242617A1111111111111111
+</code></pre>
+    </div>

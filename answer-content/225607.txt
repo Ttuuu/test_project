@@ -1,0 +1,241 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This was great work, especially for a first project. 
+I made a bunch of changes and tried to comment my reasoning where things stood out. Here's a few things to note:</p>
+
+<ul>
+<li>Your code was at the size where you could go either way, but I decided to split it up into modules.</li>
+<li>I made <code>Point</code> and <code>Rgb</code> implement <code>Copy</code> since they are just very small collections of numbers. Now you can have functions take those by value, rather than reference.</li>
+<li>I store the color data as bytes rather than <code>Rgb</code>s, which lets you write that data directly to the ppm. Another possible way to do it is to use <code>unsafe</code> to change a <code>&amp;[Rgb]</code> into a <code>&amp;[u8]</code>, but it's trickier and you have to be very careful.</li>
+<li>You should generally try to use <code>usize</code> when describing the size of something.</li>
+<li>Make it a goal to have doc comments on at least everything public. You can add <code>#![warn(missing_docs)]</code> to the top of <code>main.rs</code> to help you with this.</li>
+<li>Check out the tools <code>rustfmt</code> and <code>clippy</code>.</li>
+</ul>
+
+<p><code>main.rs</code></p>
+
+<pre><code>mod canvas;
+mod point;
+mod rgb;
+
+pub use canvas::Canvas;
+pub use point::Point;
+pub use rgb::Rgb;
+
+fn main() {
+    const WIDTH: usize = 1500;
+    const HEIGHT: usize = 1500;
+
+    let mut picture = Canvas::new(WIDTH, HEIGHT);
+
+    draw_tree(
+        &amp;mut picture,
+        Point {
+            x: WIDTH as i32 / 2,
+            y: HEIGHT as i32,
+        },
+        Point {
+            x: WIDTH as i32 / 2,
+            y: 3 * HEIGHT as i32 / 4,
+        },
+        15,
+        Rgb::WHITE,
+        0.6,
+        2,
+    );
+
+    if let Err(e) = picture.save("test".as_ref()) {
+        eprintln!("Error saving image: {}", e);
+        // Lets the caller know that our program failed.
+        std::process::exit(1);
+    }
+}
+
+fn draw_tree(
+    canvas: &amp;mut Canvas,
+    prev: Point,
+    next: Point,
+    iter: i32,
+    colour: Rgb,
+    angle: f64,
+    branches: usize,
+) {
+    if iter == 0 {
+        return;
+    }
+    canvas.draw_line(prev, next, 1, colour);
+    let prev = Point {
+        x: 2 * next.x - prev.x,
+        y: 2 * next.y - prev.y,
+    };
+
+    if branches % 2 == 1 {
+        let straight = next.rotate_and_scale(prev, 0.0);
+        draw_tree(canvas, next, straight, iter - 1, colour, angle, branches);
+    }
+
+    for i in 1..=branches / 2 {
+        let left = next.rotate_and_scale(prev, i as f64 * angle);
+        draw_tree(canvas, next, left, iter - 1, Rgb::LEFT, angle, branches);
+
+        let right = next.rotate_and_scale(prev, -(i as f64) * angle);
+        draw_tree(canvas, next, right, iter - 1, Rgb::RIGHT, angle, branches);
+    }
+}
+</code></pre>
+
+<p><code>canvas.rs</code></p>
+
+<pre><code>use std::{cmp, fs::File, io::Write, path::Path};
+
+use crate::{Point, Rgb};
+
+#[derive(Clone, Debug)]
+pub struct Canvas {
+    // Since we don't need to resize data, we can store a boxed slice, which will prevent us from
+    // accidently pushing, poping, resizing, etc since those are Vec methods.
+    // We can store the bytes rather than the colors, which makes writing it easier.
+    data: Box&lt;[u8]&gt;,
+    // Use usize or at least an unsigned type whereever it makes sense to do so, such as a size or
+    // count. I would've changed more things to unsigned, but some of your logic depends on signed.
+    width: usize,
+    height: usize,
+}
+
+impl Canvas {
+    pub fn set_colour(&amp;mut self, x: usize, y: usize, colour: Rgb) {
+        // Using usize for parameters, we don't have to check against negative.
+        if x &lt; self.width &amp;&amp; y &lt; self.height {
+            // Make sure to multiply by 3 here to account for directly storing the bytes...
+            let offset = (self.width * y + x) * std::mem::size_of::&lt;Rgb&gt;();
+            self.data[offset] = colour.red;
+            self.data[offset + 1] = colour.green;
+            self.data[offset + 2] = colour.blue;
+        }
+    }
+
+    // Rather than panicing, we should return a Result, especially since it is easy because all
+    // operations return io::Result.
+    // Using a Path for the filename is more precise.
+    pub fn save(&amp;mut self, filename: &amp;Path) -&gt; std::io::Result&lt;()&gt; {
+        let mut file = File::create(filename.with_extension("ppm"))?;
+
+        write!(file, "P6 {} {} 255 ", self.width, self.height)?;
+        file.write_all(&amp;self.data)?;
+
+        Ok(())
+    }
+
+    pub fn new(width: usize, height: usize) -&gt; Canvas {
+        Canvas {
+            width,
+            height,
+            data: vec![0; width * height * std::mem::size_of::&lt;Rgb&gt;()].into_boxed_slice(),
+        }
+    }
+
+    // I didn't look much at draw_square or draw_line...
+    pub fn draw_square(&amp;mut self, center: Point, width: i32, colour: Rgb) {
+        for y in cmp::max(0, center.y - width)..cmp::min(self.height as i32, center.y + width) {
+            for x in cmp::max(0, center.x - width)..cmp::min(self.width as i32, center.x + width) {
+                self.set_colour(x as usize, y as usize, colour);
+            }
+        }
+    }
+
+    pub fn draw_line(&amp;mut self, from: Point, to: Point, width: i32, colour: Rgb) {
+        if from.x == to.x {
+            let startx = cmp::max(from.x - width, 0);
+            let endx = cmp::min(from.x + width, self.width as i32);
+            let endy = cmp::max(from.y, to.y) + 1;
+            let starty = cmp::min(from.y, to.y);
+            for y in starty..endy {
+                for x in startx..endx {
+                    self.set_colour(x as usize, y as usize, colour);
+                }
+            }
+        } else {
+            let k = f64::from(to.y - from.y) / f64::from(to.x - from.x);
+            let n = f64::from(to.y) - k * f64::from(to.x);
+            let lower = cmp::min(from.x, to.x);
+            let upper = cmp::max(from.x, to.x) + 1;
+            for x in lower..upper {
+                self.draw_square(
+                    Point {
+                        x,
+                        y: (k * f64::from(x) + n) as i32,
+                    },
+                    width,
+                    colour,
+                );
+            }
+            if k.abs() &gt; 1.0 {
+                let lower = cmp::min(from.y, to.y);
+                let upper = cmp::max(from.y, to.y) + 1;
+                for y in lower..upper {
+                    self.draw_square(
+                        Point {
+                            x: ((f64::from(y) - n) / k) as i32,
+                            y,
+                        },
+                        width,
+                        colour,
+                    );
+                }
+            }
+        }
+    }
+}
+</code></pre>
+
+<p><code>point.rs</code></p>
+
+<pre><code>const SCALING_FACTOR: f64 = 1.4 as f64;
+
+#[derive(Copy, Clone, Debug)]
+pub struct Point {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl Point {
+    /// Rotates a point around self by the given angle, and scales it down.
+    pub fn rotate_and_scale(self, point: Point, angle: f64) -&gt; Point {
+        // also scales down a bit
+        let (sin, cos) = angle.sin_cos();
+        let translated = Point {
+            x: ((point.x - self.x) as f64 / SCALING_FACTOR) as i32,
+            y: ((point.y - self.y) as f64 / SCALING_FACTOR) as i32,
+        };
+        let rotated = Point {
+            x: (translated.x as f64 * cos - translated.y as f64 * sin) as i32,
+            y: (translated.x as f64 * sin + translated.y as f64 * cos) as i32,
+        };
+        Point {
+            x: rotated.x + self.x,
+            y: rotated.y + self.y,
+        }
+    }
+}
+</code></pre>
+
+<p><code>rgb.rs</code></p>
+
+<pre><code>#[derive(Copy, Clone, Debug)]
+pub struct Rgb {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+impl Rgb {
+    // Makes it a little nicer to create colors, IMO.
+    pub const fn new(red: u8, green: u8, blue: u8) -&gt; Self {
+        Self { red, green, blue }
+    }
+
+    pub const WHITE: Self = Self::new(255, 255, 255);
+    pub const LEFT: Self = Self::new(247, 97, 74);
+    pub const RIGHT: Self = Self::new(26, 121, 244);
+}
+</code></pre>
+    </div>

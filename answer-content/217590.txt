@@ -1,0 +1,223 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><a href="https://codereview.stackexchange.com/a/217493/106818">Graipher's answer</a> already addresses some of the higher-level issues with your Python solution. Like him, I cannot speak to the Scala solution.</p>
+
+<p>Instead, I'll focus on your core function and how to improve the speed of "C Python" code (that is, Python run under the standard <code>python</code> executable written in C).</p>
+
+<h1>The function:</h1>
+
+<pre><code>def computeResultDS(chunk,avgTimeSpentDict,defaultTimeOut):
+    countPos,totTmPos,openTmPos,closeTmPos,nextEventPos = 0,1,2,3,4
+    for rows in chunk.splitlines():
+        if len(rows.split(",")) != 3:
+            continue
+        userKeyID = rows.split(",")[0]
+        try:
+            curTimeStamp = int(rows.split(",")[1])
+        except ValueError:
+            print("Invalid Timestamp for ID:" + str(userKeyID))
+            continue
+        curEvent = rows.split(",")[2]
+        if userKeyID in avgTimeSpentDict.keys() and avgTimeSpentDict[userKeyID][nextEventPos]==1 and curEvent == "close": 
+        #Check if already existing userID with expected Close event 0 - Open; 1 - Close
+        #Array value within dictionary stores [No. of pair events, total time spent (Close tm-Open tm), Last Open Tm, Last Close Tm, Next expected Event]
+            curTotalTime = curTimeStamp - avgTimeSpentDict[userKeyID][openTmPos]
+            totalTime = curTotalTime + avgTimeSpentDict[userKeyID][totTmPos]
+            eventCount = avgTimeSpentDict[userKeyID][countPos] + 1
+            avgTimeSpentDict[userKeyID][countPos] = eventCount
+            avgTimeSpentDict[userKeyID][totTmPos] = totalTime
+            avgTimeSpentDict[userKeyID][closeTmPos] = curTimeStamp
+            avgTimeSpentDict[userKeyID][nextEventPos] = 0 #Change next expected event to Open
+
+        elif userKeyID in avgTimeSpentDict.keys() and avgTimeSpentDict[userKeyID][nextEventPos]==0 and curEvent == "open":
+            avgTimeSpentDict[userKeyID][openTmPos] = curTimeStamp
+            avgTimeSpentDict[userKeyID][nextEventPos] = 1 #Change next expected event to Close
+
+        elif userKeyID in avgTimeSpentDict.keys() and avgTimeSpentDict[userKeyID][nextEventPos]==1 and curEvent == "open":
+            curTotalTime,closeTime = missingHandler(defaultTimeOut,avgTimeSpentDict[userKeyID][openTmPos],curTimeStamp)
+            totalTime = curTotalTime + avgTimeSpentDict[userKeyID][totTmPos]
+            avgTimeSpentDict[userKeyID][totTmPos]=totalTime
+            avgTimeSpentDict[userKeyID][closeTmPos]=closeTime
+            avgTimeSpentDict[userKeyID][openTmPos]=curTimeStamp
+            eventCount = avgTimeSpentDict[userKeyID][countPos] + 1
+            avgTimeSpentDict[userKeyID][countPos] = eventCount          
+
+        elif userKeyID in avgTimeSpentDict.keys() and avgTimeSpentDict[userKeyID][nextEventPos]==0 and curEvent == "close": 
+            curTotalTime,openTime = missingHandler(defaultTimeOut,avgTimeSpentDict[userKeyID][closeTmPos],curTimeStamp)
+            totalTime = curTotalTime + avgTimeSpentDict[userKeyID][totTmPos]
+            avgTimeSpentDict[userKeyID][totTmPos]=totalTime
+            avgTimeSpentDict[userKeyID][openTmPos]=openTime
+            eventCount = avgTimeSpentDict[userKeyID][countPos] + 1
+            avgTimeSpentDict[userKeyID][countPos] = eventCount
+
+        elif curEvent == "open":
+            #Initialize userid with Open event
+            avgTimeSpentDict[userKeyID] = [0,0,curTimeStamp,0,1]
+
+        elif curEvent == "close":
+            #Initialize userid with missing handler function since there is no Open event for this User
+            totaltime,OpenTime = missingHandler(defaultTimeOut,0,curTimeStamp)
+            avgTimeSpentDict[userKeyID] = [1,totaltime,OpenTime,curTimeStamp,0]
+</code></pre>
+
+<h1>The Rules</h1>
+
+<p>The rules of performance-hunting in CPython are as follows:</p>
+
+<p><code>0.</code> Don't. CPython is slow, so the easiest way to improve performance is to not use CPython. Use Cython, pypy, or some other language.</p>
+
+<p><code>1.</code> Always go for the 'big O'. The best way to gain performance is by <em>algorithmic improvements.</em> If you can convert from <span class="math-container">\$O(n^2)\$</span> to <span class="math-container">\$O(n log n)\$</span> you will be better off than you would be trying to squeeze out incremental improvements.</p>
+
+<p><code>2.</code> Never do in Python that which you can do in 'C'. This is particularly relevant to your code because you have written I/O buffering code. For reading a text file. In Python. Don't do that. Let C handle it, and just use line-at-a-time mode for reading the file. (The exception to this would be rule #1. If you could convert from reading the entire file in C to bsearching the file in Python, it might be a win.)</p>
+
+<p><code>2a.</code> You can get a surprising amount of performance by switching to <a href="https://pypi.org/project/numpy/" rel="nofollow noreferrer"><code>numpy</code></a> or <a href="https://pypi.org/project/pandas/" rel="nofollow noreferrer"><code>pandas</code></a>. It's worth the learning curve if you really want to process large amounts of data in CPython.</p>
+
+<p><code>3.</code> It's all about the lookups. The Python spec defines a language that is basically impossible to optimize. Every name, including attribute and method names, has to be looked up every time. The compiler will only do the most rudimentary of expression folding, on the off chance that an invocation in one statement has caused the <code>__iadd__</code> method to be replaced in a subsequent statement, so things like:</p>
+
+<pre><code>x += 1
+x += 2
+</code></pre>
+
+<p>won't be folded. And things like:</p>
+
+<pre><code>avgTimeSpentDict[userKeyID][countPos] = eventCount
+avgTimeSpentDict[userKeyID][totTmPos] = totalTime
+avgTimeSpentDict[userKeyID][closeTmPos] = curTimeStamp
+avgTimeSpentDict[userKeyID][nextEventPos] = 0 #Change next expected event to Open
+</code></pre>
+
+<p>Repeat the same lookups over, and over, and over, and over again. The solution to this is caching in local variables, which I'll demonstrate below.</p>
+
+<p><code>4.</code> Provide hard timings or get out! Some opcodes are faster than others. Some things pipeline better than others. Sometimes smaller code fits in the cache better than larger-but-theoretically-faster code. </p>
+
+<p>If you are concerned about performance, the very first thing you must do is build a timing framework, or you're not really concerned about performance. In many cases, the current date/time before and after is enough- if your code doesn't take at least 1 second to run, you either don't have enough data in your test data set, or you don't really have a performance problem!</p>
+
+<h1>The changes</h1>
+
+<h2>Memory usage</h2>
+
+<p>Graipher pointed out that your code doesn't follow the constraints you laid down. So let's talk about that first.</p>
+
+<p>In order to try to honor your constraint about the aggregate user data not fitting in available memory, you should focus on building a pipeline. Let the first stage of your pipeline be something like this program. Unix provides the <code>sort</code> utility which can handle files that are larger than available memory, so if you focus on cleaning up the data and constructing a series of elapsed-time records with associated user id, you can then <code>sort</code> by the user id to get them adjacent, and the third stage of your pipeline could sum and average intervals for one user at a time. In Unix terms:</p>
+
+<pre><code>$ make-interval-records &lt; infile | sort (by userid) | sum-and-average &gt; outfile
+</code></pre>
+
+<p>Or, as with Graipher's answer, we could ignore this constraint. That's more relevant, I think.</p>
+
+<h2>Lookups</h2>
+
+<p>Here's a REPL session I just ran. I defined a function with the first few lines of your inner loop, and used the built-in module <code>dis</code> to dump the generated byte codes. As a rule, some bytecodes are slower than others, but more bytecodes is generally slower than less bytes codes.</p>
+
+<pre><code>h[1] &gt;&gt;&gt; def f(chunk):
+...     for rows in chunk:
+...         if len(rows.split(",")) != 3:
+...             continue
+...         userKeyID = rows.split(",")[0]
+...         try:
+...             curTimeStamp = int(rows.split(",")[1])
+...         except ValueError:
+...             print("Invalid Timestamp for ID:" + str(userKeyID))
+...             continue
+...
+h[1] &gt;&gt;&gt; dis.dis(f)
+  2           0 SETUP_LOOP             108 (to 110)
+              2 LOAD_FAST                0 (chunk)
+              4 GET_ITER
+        &gt;&gt;    6 FOR_ITER               100 (to 108)
+              8 STORE_FAST               1 (rows)
+</code></pre>
+
+<p>Ignore the opcodes above ^^ as they are just faked-up to model your loop.</p>
+
+<pre><code>  3          10 LOAD_GLOBAL              0 (len)
+             12 LOAD_FAST                1 (rows)
+             14 LOAD_METHOD              1 (split)
+             16 LOAD_CONST               1 (',')
+             18 CALL_METHOD              1
+             20 CALL_FUNCTION            1
+             22 LOAD_CONST               2 (3)
+             24 COMPARE_OP               3 (!=)
+             26 POP_JUMP_IF_FALSE       30
+</code></pre>
+
+<p>Notice that the first thing we do here is a <em>global</em> lookup for the name <code>len</code>. Yes, it's a built-in function. But Python allows for that function to be overridden at the module level, so it checks to see if it was overridden. Every. Single. Time.</p>
+
+<p>On the other hand, the very next opcode is a <code>LOAD_FAST</code> of the <code>rows</code> variable. You might think that this was a faster operation than the <code>LOAD_GLOBAL</code>. I could not possibly comment.</p>
+
+<p>When you're inside the innermost loop of your code and you want performance, you need to put <em>every single thing</em> in local variables. Especially the functions.</p>
+
+<pre><code>  4          28 JUMP_ABSOLUTE            6
+
+  5     &gt;&gt;   30 LOAD_FAST                1 (rows)
+             32 LOAD_METHOD              1 (split)
+             34 LOAD_CONST               1 (',')
+             36 CALL_METHOD              1
+             38 LOAD_CONST               3 (0)
+             40 BINARY_SUBSCR
+             42 STORE_FAST               2 (userKeyID)
+</code></pre>
+
+<p>Notice the lookup and call to <code>split</code>? Remember that you did the same call to <code>split</code> on the previous line? Rule 3 strikes again! Lookups are repeated every single time. Function calls are not memoized unless you do it, or unless you're using a library whose documentation says "function calls are memoized." </p>
+
+<p>If you compute a result, save it in a local variable until you're sure you're done with it.</p>
+
+<pre><code>  6          44 SETUP_EXCEPT            22 (to 68)
+
+  7          46 LOAD_GLOBAL              2 (int)
+             48 LOAD_FAST                1 (rows)
+             50 LOAD_METHOD              1 (split)
+             52 LOAD_CONST               1 (',')
+             54 CALL_METHOD              1
+             56 LOAD_CONST               4 (1)
+             58 BINARY_SUBSCR
+             60 CALL_FUNCTION            1
+             62 STORE_FAST               3 (curTimeStamp)
+             64 POP_BLOCK
+             66 JUMP_ABSOLUTE            6
+
+  8     &gt;&gt;   68 DUP_TOP
+             70 LOAD_GLOBAL              3 (ValueError)
+             72 COMPARE_OP              10 (exception match)
+             74 POP_JUMP_IF_FALSE      104
+             76 POP_TOP
+             78 POP_TOP
+             80 POP_TOP
+</code></pre>
+
+<p>The immediately preceding paragraph is "exception matching". It's a comparison of the exception received versus the exception expected. If you simply do <code>except: ...</code> there is no matching. It's probably worth it for situations where you absolutely know what exceptions are going to be raised.</p>
+
+<pre><code>  9          82 LOAD_GLOBAL              4 (print)
+             84 LOAD_CONST               5 ('Invalid Timestamp for ID:')
+             86 LOAD_GLOBAL              5 (str)
+             88 LOAD_FAST                2 (userKeyID)
+             90 CALL_FUNCTION            1
+             92 BINARY_ADD
+             94 CALL_FUNCTION            1
+             96 POP_TOP
+</code></pre>
+
+<p>Lots of lookups and stuff to process this error. If errors are common, just append the relevant data to a list and post-process the errors.</p>
+
+<pre><code> 10          98 CONTINUE_LOOP            6
+            100 POP_EXCEPT
+            102 JUMP_ABSOLUTE            6
+        &gt;&gt;  104 END_FINALLY
+            106 JUMP_ABSOLUTE            6
+        &gt;&gt;  108 POP_BLOCK
+        &gt;&gt;  110 LOAD_CONST               0 (None)
+            112 RETURN_VALUE
+</code></pre>
+
+<p>I'm not going to bother with the remainder of the function -- you can do it yourself with your own REPL. But I'll point out two glaring issues:</p>
+
+<pre><code>    if userKeyID in avgTimeSpentDict.keys() and avgTimeSpentDict[userKeyID][nextEventPos]==1 and curEvent == "close": 
+
+    elif userKeyID in avgTimeSpentDict.keys() and avgTimeSpentDict[userKeyID][nextEventPos]==0 and curEvent == "open":
+</code></pre>
+
+<p>First: never throw away data. In this case, you're checking if the user id is in the dictionary (in a pathologically bad way, see Graipher's answer) and then discarding that information. Also, you compare the event with "open" or "closed" in multiple places, and then throw it away. Stop doing that.</p>
+
+<p>Next: Never repeat a lookup. Every time you write <code>avgTimeSpentDict[userKeyID]...</code> a kitten is murdered. </p>
+
+<p>You should be striving to accomplish as much as you can with as few lookups as possible. Every significant function and data structure should be accessible through a single local variable. In many cases, bound methods can be loaded into variables as long as the underlying object is not changing. (Thus, the <code>rows</code> variable is not a candidate, but a list of errors' <code>append</code> method would be a candidate.)</p>
+    </div>

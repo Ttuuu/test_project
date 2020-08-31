@@ -1,0 +1,362 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This is interesting! Very good first stab at this.</p>
+
+<p>I'm going to recommend rewriting a lot of this, but I want to call out an important mistake in your code that hides a serious issue. It's your <code>try</code>/<code>except</code> block:</p>
+
+<pre><code>try:
+    sign.bind(*partial.args, **partial.keywords)
+    return partial()
+except TypeError as e:
+    return curry(copy(partial))
+</code></pre>
+
+<p>Because your <code>return partial()</code> is inside the <code>try</code>, if actually calling the function produces a <code>TypeError</code> (consider <code>abs('a')</code>), you suppress it and continue to curry. This is incorrect; you only want to catch <code>TypeError</code> from <code>sign.bind(...)</code></p>
+
+<pre><code>try:
+    sign.bind(*partial.args, **partial.keywords)
+except TypeError as e:
+    return curry(copy(partial))
+else:
+    return partial()
+</code></pre>
+
+<p>Okay, now onto the deeper issues:</p>
+
+<p>Currying in Python is tricky (if not maybe undefined in some cases) because of optional args and kwargs. And to complicate things your "syntax" for it is inconsistent.</p>
+
+<p>Consider your <code>f</code>. While you can do something like:</p>
+
+<pre><code>curry(f)(2, 3, info='A')(4)
+curry(f)(2, 3)(info='A')(4)
+curry(f)(2)(3)(info='A')(4)
+</code></pre>
+
+<p>You <strong>can't</strong> do:</p>
+
+<pre><code>curry(f)(2, 3, 4)(info='A')
+curry(f)(2)(3, 4)(info='A')
+curry(f)(2)(3)(4)(info='A')
+</code></pre>
+
+<p>Because providing the 3rd argument (<code>4</code>) you are satisfying the function signature despite perhaps wanting to provide <code>info='A'</code>.</p>
+
+<p>There isn't a good way to work around this. Your curry also behaves unexpectedly with <code>*args</code> or <code>**kwargs</code> functions. Namely, they don't really curry. You can only call them once:</p>
+
+<pre><code>def foo(*args):
+    print(args)
+
+def bar(**kwargs):
+    print(kwargs)
+
+# While we can do this...
+curry(foo)(1, 2, 3)
+curry(bar)(a=1, b=2, c=3)
+
+# We can't do this, which is perhaps confusing
+curry(foo)(1)(2)(3)
+curry(bar)(a=1)(b=2)(c=3)
+</code></pre>
+
+<p>Consider also <code>curry(list)</code> or <code>curry(set)</code>.</p>
+
+<p>Knowing that this won't work relies on you understanding the inner workings of the function you are calling. Some functions opt to take advantage of Python's dynamism  and use args/kwargs to accept several different signatures. Some functions are also much more complicated than they let on or are builtin, which leads to the next problem:</p>
+
+<p><code>inspect.signature</code> doesn't work for some builtins (which are very valid candidates for currying):</p>
+
+<pre><code>&gt;&gt;&gt; signature(map)
+ValueError: no signature found for builtin type &lt;class 'map'&gt;
+&gt;&gt;&gt; signature(filter)
+ValueError: no signature found for builtin type &lt;class 'filter'&gt;
+</code></pre>
+
+<p>While some support it, support is flaky and something unintuitive.</p>
+
+<pre><code>&gt;&gt;&gt; builtin_functions = [x for x in dir(__builtins__) if x[0] == x[0].lower() and x[0] != '_']
+&gt;&gt;&gt; builtin_functions
+['abs', 'all', 'any', 'ascii', 'bin', 'bool', 'breakpoint', 'bytearray', 'bytes', 'callable',
+ 'chr', 'classmethod', 'compile', 'complex', 'copyright', 'credits', 'delattr', 'dict', 'dir',
+ 'divmod', 'enumerate', 'eval', 'exec', 'exit', 'filter', 'float', 'format', 'frozenset',
+ 'getattr', 'globals', 'hasattr', 'hash', 'help', 'hex', 'id', 'input', 'int', 'isinstance',
+ 'issubclass', 'iter', 'len', 'license', 'list', 'locals', 'map', 'max', 'memoryview', 'min',
+ 'next', 'object', 'oct', 'open', 'ord', 'pow', 'print', 'property', 'quit', 'range', 'repr',
+ 'reversed', 'round', 'set', 'setattr', 'slice', 'sorted', 'staticmethod', 'str', 'sum', 'super',
+ 'tuple', 'type', 'vars', 'zip']
+
+&gt;&gt;&gt; def supports_signature(f):
+...   try:
+...     signature(f)
+...     return True
+...   except ValueError:
+...     return False
+...
+&gt;&gt;&gt; [x for x in builtin_functions if not supports_signature(getattr(__builtins__, x))]
+['bool', 'breakpoint', 'bytearray', 'bytes', 'classmethod', 'dict', 'dir', 'filter', 'frozenset',
+ 'getattr', 'int', 'iter', 'map', 'max', 'min', 'next', 'print', 'range', 'set', 'slice',
+ 'staticmethod', 'str', 'super', 'type', 'vars', 'zip']
+</code></pre>
+
+<p>A quick look over this also makes me suspect that some of these signatures may not be correct (or rather, they don't encompass all possible signatures of a function).</p>
+
+<p>Here's another problem: your implementation continues to curry if you pass too many args.</p>
+
+<pre><code>&gt;&gt;&gt; def foo(a, b):
+...   print('foo', a, b)
+...
+&gt;&gt;&gt; curry(foo)(1, 2, 3)
+&lt;function curry.&lt;locals&gt;.inner at 0x10ec2ee18&gt;
+</code></pre>
+
+<p>This is almost certainly going to bite you. You definitely want a type error here like you would get if you called it normally:</p>
+
+<pre><code>&gt;&gt;&gt; foo(1, 2, 3)
+TypeError: foo() takes 2 positional arguments but 3 were given
+</code></pre>
+
+<p>Of course, handling this conflicts with allowing <code>*args</code> (or at least makes it more complicated).</p>
+
+<p>All of these problems compounding, I'd say it may not be wise to use such a pattern for anything more than experimentation or a functional exercise.</p>
+
+<p>But let's say you still want to. Hopefully, the above illustrates that you need to greatly simplify <code>curry</code> for it to be at all useful. Because after all, if something is confusing to implement, unless you have been exceedingly clever, the API you expose probably will also be confusing.</p>
+
+<p>With that out of the way, given all of these issues, I'd recommend placing the following reasonable restriction on your currying (which closely matches currying in functional languages):</p>
+
+<blockquote>
+  <p>You cannot curry a function with default arguments, <code>*args</code>, or <code>**kwargs</code></p>
+</blockquote>
+
+<p>Implicitly, this includes things that you can't call <code>signature</code> on. I'd recommend one exception to this: required keyword-only arguments.</p>
+
+<pre><code>def foo(a, *, b, c):
+    pass
+</code></pre>
+
+<p>This doesn't have the same issue as optional kwargs, because you must provide <code>b</code> and <code>c</code> (but you must do so as <code>b=2, c=3</code>, instead of positionally):</p>
+
+<pre><code>foo(1, b=2, c=3)
+</code></pre>
+
+<p>But note that you cannot include positional arguments after these required kwargs, so we should additionally add this restriction to our currying:</p>
+
+<pre><code>&gt;&gt;&gt; foo(b=2, c=3, 1)
+SyntaxError: positional argument follows keyword argument
+</code></pre>
+
+<p>Also note that we still want to be able to pass any arg as a kwargs (as long as we don't then later pass a positional arg).</p>
+
+<p>Such an approach also allows us to easily check if we need to <code>raise TypeError</code> if too many args are provided.</p>
+
+<p>In keeping with this idea of simplicity, we can also avoid the (unnecessary) call to <code>sign.bind()</code> and <code>signature</code> on every call to the curried function and eliminate <code>partial</code> entirely.</p>
+
+<p>There's one consequence of this approach, though. It requires to reimplement a lot of Python's calling logic. Why? To know if we have been passed too many parameters we have to keep track of what parameters have been passed. And to do that we need to understand what valid combinations of parameters can be passed. This is the only sane approach, though, in my opinion because otherwise you'll get strange errors (likely far away from their source) if <code>curry</code> did not immediately return an error when an invalid parameter was provided (a keyword arg that doesn't exist or too many positionals, for example).</p>
+
+<p>That said, I got a bit nerdsniped by this so I went ahead and implemented all of that logic :) My approach is decently commented and has doctests, I've posted a <a href="https://gist.github.com/baileyparker/f7cb4c00298e7947ca7dc89cac190367" rel="nofollow noreferrer">gist</a> of it so if I plan to update tests, etc. I'll update it there:</p>
+
+<pre><code>from collections import OrderedDict
+from inspect import signature, Parameter
+from itertools import chain
+
+
+def curry(func, *args, **kwargs):
+    """
+    Allows a callable to be passed arguments incrementally, executing it only
+    once all arguments have been provided--in the style of functional currying.
+
+    To avoid corner cases, callables with *args, **kwargs, or default arguments
+    cannot be curried. This includes some builtins that have multiple
+    signatures.
+
+    &gt;&gt;&gt; def print_three(a, b, c):
+    ...     print(a, b, c)
+
+    &gt;&gt;&gt; curry(print_three, 1, 2, 3)
+    1 2 3
+    &gt;&gt;&gt; curry(print_three)(1, 2, 3)
+    1 2 3
+    &gt;&gt;&gt; curry(print_three)(1)(2, 3)
+    1 2 3
+    &gt;&gt;&gt; curry(print_three)(1)(2)(3)
+    1 2 3
+    &gt;&gt;&gt; curry(print_three)(1, 2)(3)
+    1 2 3
+    &gt;&gt;&gt; curry(print_three)()(1)()(2)()(3)
+    1 2 3
+    &gt;&gt;&gt; curry(print_three)(1, 2)(3, 4)
+    Traceback (most recent call last):
+      ...
+    TypeError: print_three() takes 3 positional arguments but 4 were given
+    &gt;&gt;&gt; curry(print_three)(1, 2)(c=3)
+    1 2 3
+    &gt;&gt;&gt; curry(print_three)(1)(c=3)(b=2)
+    1 2 3
+    &gt;&gt;&gt; curry(print_three)(1, 2)(d=3)
+    Traceback (most recent call last):
+      ...
+    TypeError: print_three() got an unexpected keyword argument 'd'
+
+    &gt;&gt;&gt; curry(curry(print_three)(1))(2, 3)
+    1 2 3
+
+    &gt;&gt;&gt; def required_keyword(a, b, *, c):
+    ...     print(a, b, c)
+
+    &gt;&gt;&gt; curry(required_keyword)(1, 2, 3)
+    Traceback (most recent call last):
+      ...
+    TypeError: required_keyword() takes 2 positional arguments but 3 were given
+    &gt;&gt;&gt; curry(required_keyword)(1, 2, c=3)
+    1 2 3
+    &gt;&gt;&gt; curry(required_keyword)(1, 2)(c=3)
+    1 2 3
+    &gt;&gt;&gt; curry(required_keyword)(c=3)(a=1, b=2)
+    1 2 3
+
+    &gt;&gt;&gt; def has_starargs(a, *args):
+    ...     pass
+    &gt;&gt;&gt; curry(has_starargs)
+    Traceback (most recent call last):
+      ...
+    TypeError: cannot curry a function with *args or **kwargs
+
+    &gt;&gt;&gt; def has_kwargs(a, **kwargs):
+    ...     pass
+    &gt;&gt;&gt; curry(has_kwargs)
+    Traceback (most recent call last):
+      ...
+    TypeError: cannot curry a function with *args or **kwargs
+
+    &gt;&gt;&gt; def has_default(a, b=1):
+    ...     pass
+    &gt;&gt;&gt; curry(has_default)
+    Traceback (most recent call last):
+      ...
+    TypeError: cannot curry a function with default arguments
+    """
+    # Cannot curry an already curried function since our __call__ has *args
+    # and **kwargs, which violates our currying rules.
+    if isinstance(func, _curry):
+        # Since curry objects are immutable, we can return the same curry
+        return func
+
+    params = signature(func).parameters
+
+    if any(_is_star_param(param) for param in params.values()):
+        raise TypeError('cannot curry a function with *args or **kwargs')
+
+    if any(param.default != Parameter.empty for param in params.values()):
+        raise TypeError('cannot curry a function with default arguments')
+
+    curried = _curry(func, params, (), OrderedDict())
+
+    if args or kwargs:
+        return curried(*args, **kwargs)
+
+    return curried
+
+
+class _curry:
+    def __init__(self, func, remaining_params, args, kwargs):
+        self._func = func
+        self._remaining_params = remaining_params
+        self._args = args
+        self._kwargs = kwargs
+
+    def __call__(self, *args, **kwargs):
+        if not args and not kwargs:
+            return self
+
+        if self._kwargs and args:
+            raise SyntaxError('positional argument follows keyword argument')
+
+        # Ensure we haven't been passed too many positional arguments
+        remaining_params_iter = iter(self._remaining_params.items())
+
+        try:
+            for _, (_, expected) in _zip_first(args, remaining_params_iter):
+                if not _is_positional_param(expected):
+                    raise self._positional_error(len(args))
+        except ShortIteratorError:
+            raise self._positional_error(len(args))
+
+        # _zip_first will have consumed all of the positional arguments passed.
+        # What remains is the positional and keyword argument that haven't been
+        # provided.
+        new_remaining_params = OrderedDict(remaining_params_iter)
+
+        # Ensure all passed keyword arguments are expected (and eliminate all
+        # remaining parameters that are passed)
+        for name in kwargs:
+            try:
+                del new_remaining_params[name]
+            except KeyError:
+                raise self._type_error(f'got an unexpected keyword argument '
+                                       f'\'{name}\'')
+
+        # If all arguments have been provided, call then function
+        new_args = self._args + args
+        new_kwargs = OrderedDict(chain(self._kwargs.items(), kwargs.items()))
+
+        if not new_remaining_params:
+            return self._func(*new_args, **new_kwargs)
+
+        # Otherwise, add the new arguments and return a new curryable function
+        return self.__class__(self._func, new_remaining_params, new_args,
+                              new_kwargs)
+
+    def _positional_error(self, extra_given):
+        remaining_positional = filter(_is_positional_param,
+                                      self._remaining_params.values())
+        expected = len(self._args) + len(list(remaining_positional))
+        s = 's' if expected != 1 else ''
+
+        given = len(self._args) + extra_given
+
+        return self._type_error(f'takes {expected} positional argument{s} but '
+                                f'{given} were given')
+
+    def _type_error(self, msg):
+        return TypeError(f'{self._func.__name__}() {msg}')
+
+
+def _is_star_param(param):
+    return param.kind in (Parameter.VAR_POSITIONAL, Parameter.VAR_KEYWORD)
+
+
+def _is_positional_param(param):
+    return param.kind in (Parameter.POSITIONAL_ONLY,
+                          Parameter.POSITIONAL_OR_KEYWORD)
+
+
+def _zip_first(first, *rest):
+    """Zips arguments until the first iterator is consumed.
+
+    Raises ShortIteratorError if any of the other iterators stop before the
+    first is finished.
+
+    &gt;&gt;&gt; list(_zip_first([1, 2], [3, 4, 5]))
+    [(1, 3), (2, 4)]
+
+    &gt;&gt;&gt; list(_zip_first([1, 2], [3]))
+    Traceback (most recent call last):
+      ...
+    curry.ShortIteratorError: iterator unexpectedly stopped
+    """
+    first = iter(first)
+    rest = tuple(map(iter, rest))
+
+    for item in first:
+        other_items = tuple(map(next, rest))
+        if len(other_items) != len(rest):
+            raise ShortIteratorError()
+
+        yield (item, *other_items)
+
+
+class ShortIteratorError(Exception):
+    """
+    Signals that one of the other iterators ended before the first in a call to
+    _zip_first.
+    """
+    def __init__(self):
+        super().__init__('iterator unexpectedly stopped')
+</code></pre>
+    </div>

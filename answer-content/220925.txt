@@ -1,0 +1,53 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>The point of this answer is to illustrate that the most efficient way to do things in other languages can be different from Python, and in this case is.</strong>  IDK if this different low-level perspective on the problem is a good code-review answer, but putting it here in case people find it interesting.</p>
+
+<hr>
+
+<p>In an efficient compiled language, all that casting to string, char, and int that you find strange <em>would</em> be inefficient.  <strong>The reason to do that in Python is to get access to an efficient compiled C loop for breaking down a number into its base 10 digits, using <code>str()</code><sup>1</sup></strong>.  Presumably this will be well optimized because it's something that gets a lot of use in real programs.</p>
+
+<p>In a compiled language you <em>would</em> just do repeated division / modulo by 10 to get decimal digits one at a time (LSD first), and add up their low bits as you go.  Or since you want the count of digits that have their low bit = 0 (even numbers), count odds and subtract from the total count outside the loop.  Or since our caller gives us the total digit count for no apparent reason (we'll find that out anyway when generating the decimal digits), we can take advantage and count down from that and save 1 operation inside the loop.</p>
+
+<p>e.g.  in C (assuming fixed-width integers, not like Python's arbitrary-precision integers which can have more than one 32-bit chunk):</p>
+
+<pre class="lang-C prettyprint-override"><code>// unsigned division by a constant is more efficient, and the number is non-negative
+int count_evens(unsigned x, int ndigits) {
+    int count = ndigits;   // we don't need the caller to tell us how many decimal digits
+                           // but take advantage if we have it.
+    do {
+        count -= (x%10) &amp; 1;    // remove odd digits from the count
+        x /= 10;                // remove the least significant decimal digit
+    } while (x!=0);
+    return count;
+}
+</code></pre>
+
+<p>(This is written to "optimistically" not bother checking <code>x==0</code> before the first iteration, because running 1 iteration of the loop instead of zero still gives the right answer in that special case.  Leaving out the check runs fewer instructions for the common(?) case, non-zero inputs.  Thinking about the ideal asm you want while writing in C is optional, but I enjoy it.)</p>
+
+<hr>
+
+<p>Fun fact: C compilers won't actually use an integer-division instruction, because <code>10</code> is a compile-time constant.  They'll use <a href="https://stackoverflow.com/questions/41183935/why-does-gcc-use-multiplication-by-a-strange-number-in-implementing-integer-divi">a multiplicative inverse</a> which is much more efficient on modern CPUs.  So writing the loop this way is probably <em>only</em> good in C or other compiled languages, not Python.</p>
+
+<p>Fun fact #2: gcc spotted an optimization I didn't think of when <a href="https://godbolt.org/#g:!((g:!((g:!((h:codeEditor,i:(j:1,lang:c%2B%2B,source:'int+count_evens(unsigned+x,+unsigned+ndigits)+%7B%0A++++int+count+%3D+ndigits%3B+++//+we+don!'t+need+the+caller+to+tell+us+how+many+decimal+digits%0A+++++++++++++++++++++++++++//+but+take+advantage+if+we+have+it.%0A++++do+%7B%0A++++++++count+-%3D+(x%2510)+%26+1%3B++++//+remove+odd+digits+from+the+count%0A++++++++x+/%3D+10%3B++++++++++++++++//+remove+the+least+significant+decimal+digit%0A++++%7D+while+(x!!%3D0)%3B%0A++++return+count%3B%0A%7D%0A'),l:'5',n:'0',o:'C%2B%2B+source+%231',t:'0')),k:33.333333333333336,l:'4',n:'0',o:'',s:0,t:'0'),(g:!((h:compiler,i:(compiler:arm64g820,filters:(b:'0',binary:'1',commentOnly:'0',demangle:'0',directives:'0',execute:'1',intel:'1',libraryCode:'1',trim:'1'),lang:c%2B%2B,libs:!(),options:'-xc+-O3',source:1),l:'5',n:'0',o:'ARM64+gcc+8.2+(Editor+%231,+Compiler+%231)+C%2B%2B',t:'0')),k:33.333333333333336,l:'4',n:'0',o:'',s:0,t:'0'),(g:!((h:compiler,i:(compiler:g91,filters:(b:'0',binary:'1',commentOnly:'0',demangle:'0',directives:'0',execute:'1',intel:'0',libraryCode:'1',trim:'1'),lang:c%2B%2B,libs:!(),options:'-xc+-O3',source:1),l:'5',n:'0',o:'x86-64+gcc+9.1+(Editor+%231,+Compiler+%232)+C%2B%2B',t:'0')),k:33.33333333333333,l:'4',n:'0',o:'',s:0,t:'0')),l:'2',n:'0',o:'',t:'0')),version:4" rel="nofollow noreferrer">compiling for x86-64 and AArch64 on the Godbolt compiler explorer</a>: <code>x%10</code> is redundant.  If <code>x%10</code> is odd, so is <code>x</code>.  Because <code>10</code> is a multiple of 2.  So it only needs to check the low bit of <code>x</code>, not actually calculate the remainder from the quotient &amp; divisor.  (The fixed-point multiplicative-inverse trick only gives you the quotient, remainder is separate.)</p>
+
+<hr>
+
+<p>Also GCC loops on <code>x&gt;=9</code> from <em>before</em> the division, so out-of-order execution can detect the loop-end condition sooner.  Using <code>while(--ndigits)</code> would maybe have helped let CPUs figure out when the loop ends and reduce / avoid a branch mispredict penalty for the last loop iteration.</p>
+
+<p>But it's kind of silly because there's no way for the caller to know how many decimal digits without having either done some of the work of this function (or maybe just comparing against powers of 10), or have converted it from a decimal string.</p>
+
+<p>If the caller ever had a decimal string, counting odd/even digits in <em>that</em> would have been much more efficient.  e.g. if it was 8 digits long, in asm you could load all 8 bytes with one load, AND with <code>0x0101010101010101</code> and popcnt to horizontally sum those bytes.  (For variable length, you could do a wide load and use a shift to shift out bytes whose value isn't part of the string.)</p>
+
+<hr>
+
+<p><strong>Footnote 1:</strong></p>
+
+<p>Python supports integers much larger than 2^32.  <strong>It stores them in a base 2^30 format, in 32-bit chunks</strong>. (<a href="https://rushter.com/blog/python-integer-implementation/" rel="nofollow noreferrer">https://rushter.com/blog/python-integer-implementation/</a>)</p>
+
+<p>A base 10^9 format would allow more efficient division by (powers of) 10, and especially converting to decimal could process each 32-bit chunk separately into 9 decimal digits, doing only 32-bit divisions.</p>
+
+<p>But 2^30 allows more efficient left/right shifts.  And efficient conversion to/from native C 64-bit integers!</p>
+
+<p>Either way, using something less than the full width of a 32-bit integer makes it much easier to implement add-with-carry (carry-in <em>and</em> carry-out) in pure C.  But means that the optimal asm is significantly worse on machines that do have add-with-carry instructions, especially 64-bit machines which can operate on 64-bit chunks.</p>
+
+<p>Anyway, actual division by 10 of the whole number has to look at <em>all</em> the higher bits, because 10 isn't a power of 2.  I'm not sure if there are any good tricks that <code>str()</code> could or does use, but it's not surprising that <code>divmod</code> by 10 in a Python loop isn't very efficient.</p>
+    </div>

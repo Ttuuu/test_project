@@ -1,0 +1,185 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Using dmoonfire's idea of returning a new object, I created an interface which will contain the value and itself implement the disposal that releases the read-lock. This way you can still do <code>(using var obj = Impersonator.GetObject())</code> to both get your value and enter the lock, you simply now use obj.Value in your code. This gets rid of <code>IPretendDispose</code><br>
+I've also changed the ordering inside the write-lock to avoid the failure case where <code>_currentKey</code> gets updated but then <code>_currentSharedObject</code>'s creation fails. </p>
+
+<p>As an aside, for domain principal impersonation this is entirely unnecessary. Impersonation is on a per-thread basis, so at most you need a <code>[ThreadStatic]</code> variable or to check that you're already impersonating the correct user.</p>
+
+<pre><code>public interface IWrappedDisposable&lt;out T&gt; : IDisposable
+{
+    T Value { get; }
+}
+
+public abstract class SharedDisposable&lt;TSharedObject, TKey&gt; where TSharedObject : IDisposable
+{
+    private class DisposableWrapper : IWrappedDisposable&lt;TSharedObject&gt;
+    {
+        private readonly ReaderWriterLockSlim _readLock;
+        public TSharedObject Value { get; }
+
+        public DisposableWrapper(TSharedObject value, ReaderWriterLockSlim readLock)
+        {
+            Value = value;
+            _readLock = readLock;
+        }
+
+        public void Dispose()
+        {
+            _readLock.ExitReadLock();
+        }
+    }
+
+    protected abstract TSharedObject Create(TKey key);
+
+    private TSharedObject _currentSharedObject;
+    private TKey _currentKey;
+    private readonly ReaderWriterLockSlim _sharedObjectLock = new ReaderWriterLockSlim();
+
+    public IWrappedDisposable&lt;TSharedObject&gt; GetObject(TKey key)
+    {
+        var earlyReturn = false;
+        _sharedObjectLock.EnterReadLock();
+        try
+        {
+            if (key.Equals(_currentKey))
+            {
+                earlyReturn = true;
+                return new DisposableWrapper(_currentSharedObject, _sharedObjectLock);
+            }
+        }
+        finally
+        {
+            if (!earlyReturn)
+            {
+                _sharedObjectLock.ExitReadLock();
+            }
+        }
+
+        //We use this flag otherwise we won't have exited the write lock before we enter the read lock.
+        //It is ok to enter the read lock while we are still in the upgradeablereadlock. That's how you downgrade.
+        var success = false;
+        _sharedObjectLock.EnterUpgradeableReadLock();
+        try
+        {
+            //We've waited for our chance to change the instance.
+            //First check if another waiting thread made the change for us.
+            //Like double-checked locking
+            if (key.Equals(_currentKey))
+            {
+                success = true;
+                return new DisposableWrapper(_currentSharedObject, _sharedObjectLock);
+            }
+
+            _sharedObjectLock.EnterWriteLock();
+            try
+            {
+                var oldObject = _currentSharedObject;
+
+                _currentSharedObject = Create(key);
+                _currentKey = key;
+
+                oldObject?.Dispose();
+
+                success = true;
+                return new DisposableWrapper(_currentSharedObject, _sharedObjectLock);
+            }
+            finally
+            {
+                //The spot that needs to execute before the succes check
+                _sharedObjectLock.ExitWriteLock();
+            }
+        }
+        finally
+        {
+            if (success)
+            {
+                _sharedObjectLock.EnterReadLock();
+            }
+
+            _sharedObjectLock.ExitUpgradeableReadLock();
+        }
+    }
+}
+
+public class DomainImpersonator : IDisposable
+{
+    private readonly WindowsImpersonationContext _impersonationContext;
+    public DomainImpersonator(string userName, string domainName, string password)
+    {
+        var token = IntPtr.Zero;
+        var tokenDuplicate = IntPtr.Zero;
+
+        try
+        {
+            if (RevertToSelf()
+                &amp;&amp; LogonUser(userName, domainName, password, Logon32LogonInteractive, Logon32ProviderDefault, ref token) != 0
+                &amp;&amp; DuplicateToken(token, 2, ref tokenDuplicate) != 0)
+            {
+                var tempWindowsIdentity = new WindowsIdentity(tokenDuplicate);
+                _impersonationContext = tempWindowsIdentity.Impersonate();
+            }
+            else
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+        }
+        finally
+        {
+            if (token != IntPtr.Zero)
+            {
+                CloseHandle(token);
+            }
+
+            if (tokenDuplicate != IntPtr.Zero)
+            {
+                CloseHandle(tokenDuplicate);
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        _impersonationContext?.Undo();
+    }
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern int LogonUser(
+        string lpszUserName,
+        string lpszDomain,
+        string lpszPassword,
+        int dwLogonType,
+        int dwLogonProvider,
+        ref IntPtr phToken);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern int DuplicateToken(
+        IntPtr hToken,
+        int impersonationLevel,
+        ref IntPtr hNewToken);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+    private static extern bool RevertToSelf();
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    private const int Logon32LogonInteractive = 2;
+    private const int Logon32ProviderDefault = 0;
+}
+
+public class SharedDomainImpersonator : SharedDisposable&lt;DomainImpersonator, Tuple&lt;string, string&gt;&gt;
+{
+    //Assume this is set safely before-hand
+    public readonly Dictionary&lt;Tuple&lt;string, string&gt;, string&gt; DomainImpersonationProfiles = new Dictionary&lt;Tuple&lt;string, string&gt;, string&gt;();
+    protected override DomainImpersonator Create(Tuple&lt;string, string&gt; key)
+    {
+        string password;
+        if (!DomainImpersonationProfiles.TryGetValue(key, out password))
+        {
+            throw new Exception("This won't break the locking mechanism.");
+        }
+
+        return new DomainImpersonator(key.Item1, key.Item2, password);
+    }
+}
+</code></pre>
+    </div>

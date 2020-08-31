@@ -1,0 +1,256 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I use a <a href="https://github.com/dmoonfire/mfgames-cil/tree/master/src/MfGames/Locking" rel="nofollow noreferrer">locking pattern</a> that let's me use <code>using</code> with various <code>ReaderWriterLockSlim</code> classes.</p>
+
+<pre><code>ReaderWriterLockSlim locker;
+
+using (new ReadLock(locker)) { }
+</code></pre>
+
+<p>That idea would let you have a simple <code>IDisposable</code> that only gets the shared lock, but then put the rest of your code inside the <code>using () {}</code> without having other classes be aware of it. (Makes Single Responsibility Principle happy.)</p>
+
+<p>With that pattern, you would create a simple <code>SharedKeyLock</code>:</p>
+
+<pre><code>namespace SharedLock
+{
+    using System;
+    using System.Collections.Generic;
+    using System.Threading;
+    using System.Threading.Tasks;
+
+    public class Class1
+    {
+        public static void Main()
+        {
+            // Set up the shared lock.
+            var shared = new SharedKeyLock&lt;string&gt;();
+            Console.WriteLine("Set up the string-based shared lock.");
+
+            // Perform the serial test.
+            Console.WriteLine("Serial Test:");
+
+            using (shared.Lock("Bob"))
+            {
+                Console.WriteLine("Serial: Bob 1");
+            }
+
+            using (shared.Lock("Bob"))
+            {
+                Console.WriteLine("Serial: Bob 2");
+            }
+
+            using (shared.Lock("Steve"))
+            {
+                Console.WriteLine("Serial: Steve 1");
+            }
+
+            // Multi-threaded.
+            var tasks = new List&lt;Task&gt;
+            {
+                Task.Run(
+                    () =&gt;
+                    {
+                        using (shared.Lock("Bob"))
+                        {
+                            Console.WriteLine("Threaded: Bob 1 Start");
+                            Thread.Sleep(5000);
+                            Console.WriteLine("Threaded: Bob 1 Stop");
+                        }
+                    }),
+                Task.Run(
+                    () =&gt;
+                    {
+                        using (shared.Lock("Bob"))
+                        {
+                            Console.WriteLine("Threaded: Bob 2 Start");
+                            Thread.Sleep(500); // Shorter!
+                            Console.WriteLine("Threaded: Bob 2 Stop");
+                        }
+                    }),
+                Task.Run(
+                    () =&gt;
+                    {
+                        using (shared.Lock("Steve"))
+                        {
+                            Console.WriteLine("Threaded: Steve 1 Start");
+                            Thread.Sleep(5000);
+                            Console.WriteLine("Threaded: Steve 1 Stop");
+                        }
+                    }),
+                Task.Run(
+                    () =&gt;
+                    {
+                        using (shared.Lock("Gary"))
+                        {
+                            Console.WriteLine("Threaded: Gary 1 Start");
+                            Thread.Sleep(5000);
+                            Console.WriteLine("Threaded: Gary 1 Stop");
+                        }
+                    }),
+            };
+
+            Task.WaitAll(tasks.ToArray());
+
+            // For debugging.
+            Console.Write("Press return to continue&gt; ");
+            Console.ReadLine();
+        }
+    }
+
+    /// &lt;summary&gt;
+    /// Implements the manager for a shared key where multiple threads with the same key are allowed
+    /// to run at the same time but different keys have to wait.
+    /// &lt;/summary&gt;
+    /// &lt;typeparam name="TKey"&gt;The type of the key.&lt;/typeparam&gt;
+    public class SharedKeyLock&lt;TKey&gt;
+        where TKey : IEquatable&lt;TKey&gt;
+    {
+        /// &lt;summary&gt;
+        /// Controls access when we have to change current or the lock.
+        /// &lt;/summary&gt;
+        private readonly ReaderWriterLockSlim currentLock = new ReaderWriterLockSlim(LockRecursionPolicy.NoRecursion);
+
+        /// &lt;summary&gt;
+        /// Keeps track of how many threads are currently using the key.
+        /// &lt;/summary&gt;
+        private int currentCount;
+
+        /// &lt;summary&gt;
+        /// Keeps track of the currently processing key.
+        /// &lt;/summary&gt;
+        private TKey currentKey;
+
+        public IDisposable Lock(TKey key)
+        {
+            // Do this in an infinite loop. This has the possibility of being a tight loop, so
+            // we have a short sleep with the continue.
+            while (true)
+            {
+                // Use a read lock to do a quick test to see if we can continue forward.
+                // This is used when the current key is the key being processed.
+                using (new ReadLock(this.currentLock))
+                {
+                    if (key.Equals(this.currentKey))
+                    {
+                        return new KeyLock&lt;TKey&gt;(this);
+                    }
+                }
+
+                // Get an upgradable lock to see if we can acquire the lock.
+                using (new UpgradableLock(this.currentLock))
+                {
+                    // Check again to see if we are the current key. Because of locking, this can
+                    // happen between the two loops easily.
+                    if (key.Equals(this.currentKey))
+                    {
+                        return new KeyLock&lt;TKey&gt;(this);
+                    }
+
+                    // We aren't the current key and we know no one else is using it. For everything
+                    // else, we have to upgrade to a write lock.
+                    using (new WriteLock(this.currentLock))
+                    {
+                        // We don't have to retest the current key because nothing else will get
+                        // through the above upgradable lock. First we check to see if there is something
+                        // else currently holding the shared lock. If there is, try again.
+                        if (this.currentCount &gt; 0)
+                        {
+                            Thread.Sleep(10);
+                            continue;
+                        }
+
+                        // If we got this far, there is no thread using the current lock which means we can
+                        // steal it.
+                        this.currentKey = key;
+
+                        // Return an instance to the key.
+                        return new KeyLock&lt;TKey&gt;(this);
+                    }
+                }
+            }
+        }
+
+        /// &lt;summary&gt;
+        /// Represents an instance of a lock with a specific key.
+        /// &lt;/summary&gt;
+        private class KeyLock&lt;TLockKey&gt; : IDisposable
+            where TLockKey : IEquatable&lt;TLockKey&gt;
+        {
+            private readonly SharedKeyLock&lt;TLockKey&gt; sharedLock;
+
+            internal KeyLock(SharedKeyLock&lt;TLockKey&gt; sharedLock)
+            {
+                this.sharedLock = sharedLock;
+                Interlocked.Increment(ref this.sharedLock.currentCount);
+            }
+
+            public void Dispose()
+            {
+                Interlocked.Decrement(ref this.sharedLock.currentCount);
+            }
+        }
+    }
+
+    /// &lt;summary&gt;
+    /// Defines a ReaderWriterLockSlim read-only lock.
+    /// &lt;/summary&gt;
+    public class ReadLock : IDisposable
+    {
+        private readonly ReaderWriterLockSlim readerWriterLockSlim;
+
+        public ReadLock(ReaderWriterLockSlim readerWriterLockSlim)
+        {
+            this.readerWriterLockSlim = readerWriterLockSlim;
+            readerWriterLockSlim.EnterReadLock();
+        }
+
+        public void Dispose()
+        {
+            this.readerWriterLockSlim.ExitReadLock();
+        }
+    }
+
+    public class UpgradableLock : IDisposable
+    {
+        private readonly ReaderWriterLockSlim readerWriterLockSlim;
+
+        public UpgradableLock(ReaderWriterLockSlim readerWriterLockSlim)
+        {
+            this.readerWriterLockSlim = readerWriterLockSlim;
+            readerWriterLockSlim.EnterUpgradeableReadLock();
+        }
+
+        public void Dispose()
+        {
+            this.readerWriterLockSlim.ExitUpgradeableReadLock();
+        }
+    }
+
+    public class WriteLock : IDisposable
+    {
+        private readonly ReaderWriterLockSlim readerWriterLockSlim;
+
+        public WriteLock(ReaderWriterLockSlim readerWriterLockSlim)
+        {
+            this.readerWriterLockSlim = readerWriterLockSlim;
+            readerWriterLockSlim.EnterWriteLock();
+        }
+
+        public void Dispose()
+        {
+            this.readerWriterLockSlim.ExitWriteLock();
+        }
+    }
+}
+</code></pre>
+
+<p>The <code>ReadLock</code>, <code>UpgradableLock</code>, and <code>WriteLock</code> are just pulled in from my library. It's MIT, doesn't matter. Basically with the above classes, you can do this:</p>
+
+<pre><code>var shared = new SharedKeyLock&lt;string&gt;();
+
+using (shared.Lock(SomeStringKey)) {
+    // Write code knowing it will only run if you have the same key.
+}
+</code></pre>
+
+<p>This ends up being SRP-friendly because the code you are running doesn't have to be aware of its locking status.</p>
+    </div>

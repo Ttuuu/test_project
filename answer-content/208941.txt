@@ -1,0 +1,184 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>looping</h1>
+
+<p>Don't loop over indices. the iterattion used by Python is of such simplicity and elegance, and there are some really useful builtin helper functions, that looping over the index (or keys for a dict) is hardly ever necessary </p>
+
+<p>I suggest you check out the excellent 'Looping like a Pro' talk by David Baumgold</p>
+
+<pre><code>def seek_and_convert(json_array, conversions):
+    """seeks all data in a json array"""
+    converted = []
+    for item in json_array:
+        if isinstance(item, dict):
+            converted.append(seek_and_convert(item, conversions))
+        elif isinstance(json_array[it_list], list):
+            converted.append(seek_in_array(item, conversions))
+        else:
+            converted.append(item)
+    return(converted)
+</code></pre>
+
+<p>the same for the dict</p>
+
+<pre><code>def seek_in_array(json_file, conversions):
+    """seeks all data in a json file an converts it"""
+    converted = {}
+    for key, item in json_file.items():
+        if conversions.has_option('CONVERSIONS', key):
+            option = conversions.get('CONVERSIONS', key)
+        else:
+            option = key
+        if isinstance(item, dict):
+            converted[option] = seek_and_convert(item, conversions)
+        elif isinstance(item, list):
+            converted[option] = seek_in_array(item, conversions)
+        else:
+            converted[option] = item
+    return(converted)
+</code></pre>
+
+<h1>conversions.get</h1>
+
+<p><code>ConfigParser.get</code> has a <code>fallback</code> argument, so instead of </p>
+
+<pre><code>if conversions.has_option('CONVERSIONS', key):
+    option = conversions.get('CONVERSIONS', key)
+else:
+    option = key
+</code></pre>
+
+<p>This, together with the use of keyword arguments, can be converted to:</p>
+
+<pre><code>option = conversions.get(section='CONVERSIONS', option=key, fallback=key)
+</code></pre>
+
+<p>For testing and future expansio, it would also make more sense to pass the conversions on as a dict, instead as a <code>ConfigParser</code> object. You use it as a dict anyway.
+Together with <a href="https://rhodesmill.org/brandon/talks/#hoist" rel="nofollow noreferrer">Hoist the IO</a>, you get something like:</p>
+
+<pre><code>with StringIO(config_str) as config_file:
+    config_parser = ConfigParser()
+    config_parser.read_file(config_file)
+    conversions = dict(config_parser.items(section="CONVERSIONS"))
+</code></pre>
+
+<p>In your real app, you can use <code>with open(file, "r") as config_file</code> instead of the <code>StringIO</code></p>
+
+<p>Then further on, all of this:</p>
+
+<pre><code>if conversions.has_option('CONVERSIONS', key):
+    option = conversions.get('CONVERSIONS', key)
+else:
+    option = key
+</code></pre>
+
+<p>becomes:</p>
+
+<pre><code>option = conversions.get(key, key)
+</code></pre>
+
+<p>In contrast to your current <code>load_conversion_table</code> method, where you've hardcoded the filename, return a <code>ConfigParser</code>, and need to specify the section each time.</p>
+
+<h1>generators</h1>
+
+<p>Instead of keeping an intermediary <code>dict</code> or <code>list</code>, you can also <code>yield</code> the items:</p>
+
+<pre><code>def convert_dict(json_file, conversions):
+    """seeks all data in a json file an converts it"""
+    for key, item in json_file.items():
+        option = conversions.get(key, key)
+        if isinstance(item, dict):
+            yield option, dict(seek_and_convert(item, conversions))
+        elif isinstance(item, list):
+            yield option, list(seek_in_array(item, conversions))
+        else:
+            yield option, item
+</code></pre>
+
+<h1>dispatching</h1>
+
+<p>Instead of a chain of <code>isinstance</code> conditions, where depending on the type, a certain method is called with the same arguments, you can use the fact that functions are first-class citizens in Python and build a dict of parsers:</p>
+
+<pre><code>from collections import defaultdict
+
+
+def fallback_parser():
+    def parser(item, conversion):
+        """parser that just returns the item, without conversion"""
+        return item
+    return parser
+
+
+PARSERS = defaultdict(fallback_parser)
+PARSERS[dict] = lambda item, conversion: dict(convert_dict(item, conversion))
+PARSERS[list] = lambda item, conversion: list(convert_array(item, conversion))
+PARSERS
+</code></pre>
+
+<p>and the parser functions become as simple as:</p>
+
+<pre><code>def convert_dict(json_dict, conversions):
+    for key, item in json_dict.items():
+        option = conversions.get(key, key)
+        yield option, PARSERS[type(item)](item, conversions)
+
+def convert_array(json_array, conversions):
+    for item in json_array:
+        yield PARSERS[type(item)](item, conversions)
+</code></pre>
+
+<p>If, later, you want support for <code>datetime</code> or other types, etc, this can be added by simply writing the parser and extending the <code>PARSERS</code> dict.</p>
+
+<h1><code>functools.singledispatch</code></h1>
+
+<p>An alternative is <a href="https://docs.python.org/3/library/functools.html#functools.singledispatch" rel="nofollow noreferrer"><code>functools.singledispatch</code></a></p>
+
+<pre><code>from functools import singledispatch
+@singledispatch
+def parser(item, conversions):
+    """parser that just returns the item, without conversion"""
+    return item
+
+@parser.register
+def _(json_dict: dict, conversions):
+    result = {}
+    for key, item in json_dict.items():
+        option = conversions.get(key, key)
+        result[option] = parser(item, conversions)
+    return result
+
+@parser.register 
+def _(json_array: list, conversions):
+    result = []
+    for item in json_array:
+        result.append(parser(item, conversions))
+    return result
+</code></pre>
+
+<p>If you prefer the generator approach, you can do something like:</p>
+
+<pre><code>@singledispatch
+def parser(item, conversions=None):
+    """parser that just returns the item, without conversion"""
+    return item
+
+
+def convert_dict(json_dict: dict, conversions: dict = None):
+    conversions = {} if conversions is None else conversions
+    for key, item in json_dict.items():
+        option = conversions.get(key, key)
+        yield option, parser(item, conversions)
+
+
+def convert_array(json_array: list, conversions: dict = None):
+    for item in json_array:
+        yield parser(item, conversions)
+
+
+parser.register(
+    dict, lambda item, conversions=None: dict(convert_dict(item, conversions))
+)
+parser.register(
+    list, lambda item, conversions=None: list(convert_array(item, conversions))
+)
+</code></pre>
+    </div>

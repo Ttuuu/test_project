@@ -1,0 +1,219 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>There is an improvement that can be made to the <code>map</code> function. Your version:</p>
+
+<pre><code>/. {bind def} bind def
+
+%...
+
+/rup {3 1 roll}.
+
+%...
+
+/map { [ rup forall ] }.
+% [1 2 3 4] {1 add} map
+</code></pre>
+
+<p>The problem here is building the new array on the stack. While normally this is a perfectly sound technique in postscript, it places severe restrictions on how the procedure must behave. Using <a href="https://github.com/luser-dr00g/debug.ps" rel="nofollow">debug.ps</a> to produce a trace (caveat: I had to remove all the <code>bind</code> calls because the debugger has a bug with binding, apparently) illustrates how the execution proceeds through the example <code>[1 2 3 4] {1 add} map</code>. (I know you know how it executes, this is for the audience. ;)</p>
+
+<pre><code>[  %|- -mark- 
+1  %|- -mark- 1 
+2  %|- -mark- 1 2 
+3  %|- -mark- 1 2 3 
+4  %|- -mark- 1 2 3 4 
+]  %|- [1 2 3 4] 
+{1 add}  %|- [1 2 3 4] {1 add} 
+map  %|- [1 2 3 4] {1 add} 
+[  %|- [1 2 3 4] {1 add} -mark- 
+rup  %|- [1 2 3 4] {1 add} -mark- 
+3  %|- [1 2 3 4] {1 add} -mark- 3 
+1  %|- [1 2 3 4] {1 add} -mark- 3 1 
+roll  %|- -mark- [1 2 3 4] {1 add} 
+forall  %|- -mark- 1 
+1  %|- -mark- 1 1 
+add  %|- -mark- 2 
+[2 3 4]  %|- -mark- 2 [2 3 4] 
+{1 add}  %|- -mark- 2 [2 3 4] {1 add} 
+forall  %|- -mark- 2 2 
+1  %|- -mark- 2 2 1 
+add  %|- -mark- 2 3 
+[3 4]  %|- -mark- 2 3 [3 4] 
+{1 add}  %|- -mark- 2 3 [3 4] {1 add} 
+forall  %|- -mark- 2 3 3 
+1  %|- -mark- 2 3 3 1 
+add  %|- -mark- 2 3 4 
+[4]  %|- -mark- 2 3 4 [4] 
+{1 add}  %|- -mark- 2 3 4 [4] {1 add} 
+forall  %|- -mark- 2 3 4 4 
+1  %|- -mark- 2 3 4 4 1 
+add  %|- -mark- 2 3 4 5 
+[]  %|- -mark- 2 3 4 5 [] 
+{1 add}  %|- -mark- 2 3 4 5 [] {1 add} 
+forall  %|- -mark- 2 3 4 5
+</code></pre>
+
+<p>So whenever the procedure (the loop body) executes, the rest of the array is on the stack.</p>
+
+<pre><code>1  %|- -mark- 1 1 
+add  %|- -mark- 2 
+% ...
+1  %|- -mark- 2 2 1 
+add  %|- -mark- 2 3 
+% ...
+1  %|- -mark- 2 3 3 1 
+add  %|- -mark- 2 3 4 
+% ...
+1  %|- -mark- 2 3 4 4 1 
+add  %|- -mark- 2 3 4 5 
+</code></pre>
+
+<p>So you can't do something like this to add a constant to each element. Because the array-building gets in the way.</p>
+
+<pre><code>5 [1 2 3 4] {1 index add} map
+</code></pre>
+
+<p>A good attempt at removing this difficulty came from <a href="https://groups.google.com/d/msg/comp.lang.postscript/SjXE6-Azoz0/ZOWFzblMsrkJ" rel="nofollow">Carlos</a> in a comp.lang.postscript thread. Instead of using a <code>forall</code> loop directly, he uses a <code>for</code> loop running through the indices of the array and calls the user proc by name, managing the extraction and re-insertion of the the values in the array in the loop body. </p>
+
+<p>The problem there is that we've simply passed-off the interference to a different stack. The operand stack is now clear and usable, but the dictionary stack now has our bookkeeping dictionary on top (or worse: everything is <em>global</em> in <code>userdict</code>). So we're very prone to name-collision and unintended scoping issues when trying to use the function in an application.</p>
+
+<p>A couple of little-known features of the postscript language combine to offer a solution: dynamic code-generation. So we want a map that roughly does this:</p>
+
+<pre><code>/map { % arr proc  map  arr'
+    10 dict begin           % arr proc
+    /proc exch def          % arr
+    /arr exch def           % &lt;empty&gt;
+    0 1 arr length 1 sub {  % i
+        /i exch def         % &lt;empty&gt;
+        arr i get           % arr_i
+        proc                % proc(arr_i)
+        arr exch i exch put % &lt;empty&gt;
+    } for                   % &lt;empty&gt;
+    arr                     % arr'
+    end                     % arr'
+} def
+</code></pre>
+
+<p>But without having this local dictionary on the stack while <code>proc</code> is executing. </p>
+
+<p>What we can do to accomplish this is to generate a loop-body with these names <em>hard-bound</em> to their values. Postscript provides its scanner as the <code>token</code> operator which can produce a complete procedure-body from a string <em>template</em>.</p>
+
+<pre><code>({1 1 add =} remainder) token  %  ( remainder) {1 1 add =} true
+pop                            %  ( remainder) {1 1 add =}
+exch                           %  {1 1 add =} ( remainder)
+pop                            %  {1 1 add =}
+</code></pre>
+
+<p>And the scanner will also substitute names prefixed with a double-slash <code>//</code> when they are encountered. So we can do this, too:</p>
+
+<pre><code>/val 5 def
+({//val =}) token pop exch pop %  {5 =}
+</code></pre>
+
+<p>Now the name doesn't need to be defined for the procedure to execute.</p>
+
+<pre><code>/val 5 def
+({//val =}) token pop exch pop %  {5 =}
+currentdict /val undef
+exec  % prints: 5
+</code></pre>
+
+<p>So finally we get something like this:</p>
+
+<pre><code>/map { % arr proc  map  arr'
+    10 dict begin           % arr proc
+    /mydict currentdict def % arr proc
+    /proc exch def          % arr
+    /arr exch def           % &lt;empty&gt;
+    0 1 arr length 1 sub    % 0 1 n-1
+    ({
+    {  % i
+        //mydict exch /i exch put  % &lt;empty&gt;
+        //arr                      % arr
+        //mydict /i get            % arr i
+        get                        % arr_i
+        //mydict /proc get         % arr_i proc
+        exec                       % proc(arr_i)
+        //arr exch                 % arr proc(arr_i)
+        //mydict /i get exch       % arr i proc(arr_i)
+        put                        % &lt;empty&gt;
+    } for                          % &lt;empty&gt;
+    //arr                          % arr'
+    }) token pop exch pop   % 0 1 n-1 {{...}for...}
+    end                     %   &lt;-- remove dictionary
+    exec                    %   &lt;-- execute dynamic proc
+} def
+</code></pre>
+
+<p>You can also <code>bind</code> the procedure just before <code>exec</code>ing, to factor-out name lookups for the operators. </p>
+
+<p>This version changes the existing array and returns that as the result. <a href="https://groups.google.com/d/msg/comp.lang.postscript/SjXE6-Azoz0/uq-4r5FfVM4J" rel="nofollow">Carlos' final version</a> creates a new array for the result, which is closer to the behavior of your original function.</p>
+
+<hr>
+
+<p>It was not Carlos' final version. After I discovered possible problems with applying <code>bind</code> to the user-procedure, Carlos realized that the whole technique of calling <code>token</code> on a string containing a procedure (my big gimmick) was inherently prone to goofs with <code>bind</code>, and he produced this <a href="https://groups.google.com/d/msg/comp.lang.postscript/SjXE6-Azoz0/4e9qaKYZm7sJ" rel="nofollow"><em>final</em> final version</a>. The string trick is gone. Instead all library functions (including the <em>dynamic loop body</em>) have <code>bind</code> applied at "library load time". The behavior is thus independent of the user redefining any operator names.</p>
+
+<p>The string-token trick has been replaced by two procedures, <code>deepcopy</code> which makes a modifiable copy of the loop-body (<code>bind</code> makes the original loop-body -- as it does to all subarrays of the function -- <strong>readonly</strong>, so we need a copy in order to patch the variables), and <code>replaceall</code> which takes an array and a dictionary and maps the array (recursively) through the dictionary (it patches the variables). So this is now a much more robust function.</p>
+
+<pre><code>% &lt;array/string&gt; &lt;proc&gt; map &lt;new array/string&gt; 
+/map { 
+    4 dict begin 
+
+        /,proc exch def 
+        /,arr exch def 
+        /,res ,arr length 
+             ,arr type /stringtype eq { string } { array } ifelse 
+        def 
+        /,i 1 array def 
+        { 
+            0 1 /,arr length 1 sub { % for 
+                dup /,i 0  3 -1 roll  put 
+                /,arr exch get 
+                /,proc exec 
+                /,res /,i 0 get  3 -1 roll  put 
+            } for 
+            /,res 
+        } deepcopy dup currentdict replaceall 
+    end exec 
+} bind def 
+
+% copies array recursively 
+% &lt;array&gt; deepcopy &lt;new array&gt; 
+/deepcopy { 
+    dup xcheck exch 
+    dup length array copy 
+    dup length 1 sub 0 exch 1 exch { % for       % a i 
+        2 copy 2 copy get dup type /arraytype eq % a i a i e ? 
+        { % ifelse 
+            deepcopy put 
+        } 
+        { 
+            pop pop pop 
+        } ifelse 
+        pop 
+    } for 
+    exch { cvx } if 
+} bind def 
+
+% recursively replaces elements in &lt;array&gt; found in &lt;dict&gt; 
+% &lt;array&gt; &lt;dict&gt; replaceall - 
+/replaceall { 
+    1 index length 1 sub  0 1  3 -1 roll { % for 0 1 length-1 
+        3 copy  3 -1 roll  exch    % a d i d a i 
+        get                        % a d i d e 
+        2 copy known               % a d i d e ? 
+        % ifelse 
+        {                          % a d i d e 
+            get                    % a d i v 
+            3 index  3 1 roll      % a d a i v 
+            put 
+        } % else 
+        {                          % a d i d e 
+            dup type /arraytype eq % a d i d e ? 
+            { exch replaceall } 
+            { pop pop } ifelse 
+            pop 
+        } ifelse                   % a d 
+    } for 
+    pop pop 
+} bind def 
+</code></pre>
+    </div>

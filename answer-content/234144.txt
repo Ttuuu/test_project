@@ -1,0 +1,142 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I agree with everything in Kunal's answer. I'd like to add:</p>
+
+<h1>Consider using fmtlib for formatting strings</h1>
+
+<p><a href="https://github.com/fmtlib/fmt" rel="nofollow noreferrer">Fmtlib</a> is an excellent library for formatting strings, and part of it will become standard in C++20. The library itself supports printing to a <code>std::ostream</code> directly, so you can write something like:</p>
+
+<pre><code>#include &lt;fmt/ostream.h&gt;
+...
+fmt::print(os, "[sp - {}]", -self._value);
+</code></pre>
+
+<h1>Use (static) asserts</h1>
+
+<p>It is always good to put the assumptions you have in the code, so these assumptions can be checked at compile- and/or runtime. For example, in your overload of <code>operator&lt;&lt;()</code>, it is easy to add a <code>NULL</code> too little or too many in the array, and if you ever add a new opcode, but forget to append it to <code>opcode_names[]</code>, the program might crash when trying to format the opcode. So here you could add:</p>
+
+<pre><code>assert(self._opcode &lt; sizeof opcode_names / sizeof *opcode_names);
+static_assert(opcode_names[Opcode::HALT]);
+</code></pre>
+
+<p>If you can use C++17, the first assert can be written as:</p>
+
+<pre><code>assert(self._opcode &lt; std::size(opcode_names));
+</code></pre>
+
+<p>Some basic rules:</p>
+
+<ul>
+<li><code>static_assert()</code> is safe to use anywhere, but it only works for things the compiler can check.</li>
+<li><code>assert()</code> should be used for anything that should really never happen, but you want to check for it in debug builds, but not pay the price for it in release builds.</li>
+<li>For things that should not but might happen, like malformed input, return an error or throw an exception. You are already doing this, great!</li>
+</ul>
+
+<h1>Use <code>nullptr</code> instead of <code>NULL</code></h1>
+
+<p>The main reason is that <code>NULL</code> is implicitly convertible to integral types. Good compilers will warn about them, but if you use <code>nullptr</code> it becomes an error.</p>
+
+<p>When initializing pointers, you can also write <code>Sometype *ptr = {}</code> to ensure it is zeroed. This would also work in the initialization of arrays like <code>opcode_names[]</code>.</p>
+
+<h1>Member variable initialization</h1>
+
+<p>When initializing member variables to a <em>constant</em> value, prefer doing this at the point you declare the member variable, rather than in the constructor. For example:</p>
+
+<pre><code>class Cpu {
+    Cpu(std::ostream&amp; out = std::cout, std::istream&amp; in = std::cin)
+        : _out(out), _in(in) {}
+    ...
+private:
+    size_t _pc = 0;
+    size_t _sp = 0;
+    std::ostream &amp;out;
+    std::istream &amp;in;
+    ...
+};
+</code></pre>
+
+<p>Note that since you don't initialize <code>out</code> and <code>in</code> with constants, adding a default for those member variables' declarations is useless.</p>
+
+<h1>Always check the state of <code>std::ifstream</code> when you reached the end of the input</h1>
+
+<p>A loop like:</p>
+
+<pre><code>while (fp &gt;&gt; arg) {
+    ...
+}
+</code></pre>
+
+<p>Will exit when the end of the file is reached, but also when any error condition is encountered. So before closing the file, check its state and return an error if it's not as expected:</p>
+
+<pre><code>if (fp.fail()) {
+    throw std::runtime_error("error parsing input file");
+}
+</code></pre>
+
+<h1>Use a class hierarchy</h1>
+
+<p>Your program currently declares all types in the global namespace, even ones with very generic names like <code>Mode</code> and <code>Argument</code>. You can use the <code>namespace</code> keyword to put everything into its own namespace, but you can also nest classes. For example, an <code>Instruction</code> is specific to a <code>Cpu</code>, so you could declare <code>class Instruction</code> inside <code>class Cpu</code>. Going further, <code>Opcode</code> and <code>Argument</code> are part of <code>Instruction</code>, and <code>Mode</code> is something specific to <code>Argument</code>s.</p>
+
+<p>Another issue is that your <code>Cpu</code> handles both the execution of instructions, as well as the memory. However, memory is normally something that is separate from a CPU, so it might be an idea to create a <code>class Memory</code> to represent the memory, and somehow pass a reference to the memory to <code>Cpu</code>.</p>
+
+<p>Finally, everything together forms a computer, so you could use that as the outermost class, so you can have multiple instances of an Intcode computer in your C++ program.
+Here's a proposed sketch:</p>
+
+<pre><code>class IntcodeMachine {
+  using Int = long;
+
+  class Memory {
+    std::vector&lt;Int&gt; data;
+    ...
+    public:
+    Int &amp;operator[](size_t pc) {
+      return data[pc];
+    }
+
+    void load(const std::string &amp;file_name) {
+      ...
+    }
+  };
+
+  class Cpu {
+    class Instruction {
+      enum Opcode {...};
+      class Argument {
+        enum Mode {...};
+      };
+    };
+
+    public:
+    void run(Memory &amp;memory) {...}
+    bool is_halted() {...}
+  };
+
+  Memory memory;
+  Cpu cpu;
+
+public:
+  void load(const std::string &amp;file_name) {
+    memory.load(file_name);
+  }
+
+  void run() {
+    cpu.run(memory);
+  }
+
+  bool is_halted() {
+    return cpu.is_halted();
+  }
+};
+
+int main() {
+   IntcodeMachine machine;
+   machine.load("day09.in");
+   machine.run();
+}
+</code></pre>
+
+<h1>Storing <code>Argument</code>s in an <code>Instruction</code></h1>
+
+<p>There are various ways to optimize the storage of small arrays. You could indeed use the suggested <code>std::basic_string&lt;Argument&gt;</code> and rely on its small-string optimization, however it will not win any beauty contests. You could also use a <code>std::array&lt;&gt;</code> sized to hold the maximum possible number of arguments, and add another integer variable to track the actual number of arguments. The proper solution would be something like the proposed <code>std::dynarray&lt;&gt;</code>, but unfortunately it never made it into the standard.</p>
+
+<p>If performance is not yet a concern, I suggest you keep using <code>std::vector&lt;&gt;</code>. If performance is an issue, then try out the alternatives and benchmark them to see which one is best for you.</p>
+    </div>

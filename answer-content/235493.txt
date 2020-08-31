@@ -1,0 +1,171 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Simplification</h2>
+
+<p>In <code>path</code>, notice how the code gets more nested as you try each possible path (either from start to end, or end to start, or from end to root and root to start). You can use the Alternative instance for <code>Maybe</code> to simplify this code:</p>
+
+<pre class="lang-hs prettyprint-override"><code>let maybeStartEndPath = pathFromRoot childrenMap start end
+    maybeEndStartPath = pathFromRoot childrenMap end start
+    maybeRootPath = [...] -- see below
+in 
+      maybeStartEndPath
+  &lt;|&gt; fmap reverse maybeEndStartPath
+  &lt;|&gt; maybeRootPath
+
+</code></pre>
+
+<p>This code will try <code>maybeStartEndPath</code> first. If it returns <code>Nothing</code>, it will move on to the next option and so on.</p>
+
+<p>For your final case (which I've named <code>maybeRootPath</code>), you do the following check:</p>
+
+<pre class="lang-hs prettyprint-override"><code>if isNothing rootPathToStart || isNothing rootPathToEnd
+    then Nothing
+    else connectedPath (fromJust rootPathToStart) (fromJust rootPathToEnd)
+
+</code></pre>
+
+<p>This is more consicely done with <code>liftA2</code> from <code>Control.Applicative</code>. <code>liftA2</code> lifts a binary function into an applicative context:</p>
+
+<pre><code>λ :set -XTypeApplications
+λ :t liftA2 @Maybe
+liftA2 @Maybe :: (a -&gt; b -&gt; c) -&gt; (Maybe a -&gt; Maybe b -&gt; Maybe c)
+</code></pre>
+
+<p>Then, if either argument is <code>Nothing</code>, the function will return <code>Nothing</code> without having to pattern match. So we can fill in <code>maybeRootPath</code> above with</p>
+
+<pre class="lang-hs prettyprint-override"><code>        maybeRootPath = join $ liftA2 connectedPath rootPathToStart rootPathToEnd
+          where
+            rootPathToStart = pathFromRoot childrenMap root start
+            rootPathToEnd = pathFromRoot childrenMap root end
+
+</code></pre>
+
+<p>The <code>join</code> is needed because <code>connectedPath</code> returns a <code>Maybe</code> already, and we've lifted it into <code>Maybe</code>, which leaves us with a return value of <code>Maybe (Maybe [a])</code>. <code>join</code> flattens nested monads, bringing us back to <code>Maybe [a]</code></p>
+
+<hr>
+
+<h2>Minor points</h2>
+
+<p>Your function <code>applyToSecondElement</code> is <code>second</code> from <code>Control.Arrow</code></p>
+
+<pre><code>λ :t second @(-&gt;)
+second @(-&gt;) :: (b -&gt; c) -&gt; (d, b) -&gt; (d, c)
+</code></pre>
+
+<hr>
+
+<p><code>toSingleElementList</code> can also be written as <code>(:[])</code> or <code>return</code></p>
+
+<p>So <code>orbitMap</code> can be written</p>
+
+<pre class="lang-hs prettyprint-override"><code>orbitMap = Map.fromListWith (++) . map (second (:[]))
+</code></pre>
+
+<p>To your credit, your naming made both of these functions clear anyway, but it's more recognizable if you use functions that already exist.</p>
+
+<hr>
+
+<h2>Algorithm</h2>
+
+<p>I was going to suggest keeping each edge bidirectional instead of one-directional, so that you can directly check for a path from start to end instead of checking 3 cases. After reviewing the code, I think your approach is better from a functional perspective because it eliminates the need for you to check for cycles and keep a set as you search the graph. Good work.</p>
+
+<hr>
+
+<h2>Revised Code</h2>
+
+<pre class="lang-hs prettyprint-override"><code>import Control.Applicative
+import Control.Monad
+import Control.Arrow
+import System.IO
+import Data.List.Split
+import Data.List
+import Data.Maybe
+import Data.Hashable
+import qualified Data.HashMap.Strict as Map
+
+
+main :: IO ()
+main = do
+    inputText &lt;- readFile "Advent20191206_1_input.txt"
+    let orbitList = catMaybes $ (map orbit . lines) inputText
+    let orbits = orbitMap orbitList
+    let pathToSanta = fromJust $ path orbits "COM" "YOU" "SAN"
+    let requiredTransfers = length pathToSanta - 3
+    print requiredTransfers
+
+type OrbitSpecification = (String,String)
+type ChildrenMap a = Map.HashMap a [a]
+
+children :: (Eq a, Hashable a) =&gt; ChildrenMap a -&gt; a -&gt; [a]
+children childrenMap = fromMaybe [] . flip Map.lookup childrenMap
+
+orbit :: String -&gt; Maybe OrbitSpecification
+orbit str =
+    case orbit_specification of
+        [x,y] -&gt; Just (x, y)
+        _ -&gt; Nothing
+    where orbit_specification = splitOn ")" str
+
+orbitMap :: [OrbitSpecification] -&gt; ChildrenMap String
+orbitMap = Map.fromListWith (++) . map (second (:[]))
+
+childrenAggregate :: (Eq a, Hashable a) =&gt; ([a] -&gt; b) -&gt; ChildrenMap a -&gt; a -&gt; b
+childrenAggregate aggregatorFnc childrenMap = aggregatorFnc . children childrenMap
+
+decendantAggregate :: (Eq a, Hashable a) =&gt; (b -&gt; b -&gt; b) -&gt; (ChildrenMap a -&gt; a -&gt; b) -&gt; ChildrenMap a -&gt; a -&gt; b
+decendantAggregate resultFoldFnc nodeFnc childrenMap node =
+    foldl' resultFoldFnc nodeValue childResults
+    where
+        nodeValue = nodeFnc childrenMap node
+        childFnc = decendantAggregate resultFoldFnc nodeFnc childrenMap
+        childResults = map childFnc $ children childrenMap node
+
+childrenCount :: (Eq a, Hashable a) =&gt; ChildrenMap a -&gt; a -&gt; Int
+childrenCount = childrenAggregate length
+
+decendantCount ::  (Eq a, Hashable a) =&gt; ChildrenMap a -&gt; a -&gt; Int
+decendantCount = decendantAggregate (+) childrenCount
+
+totalDecendantCount :: (Eq a, Hashable a) =&gt; ChildrenMap a -&gt; a -&gt; Int
+totalDecendantCount = decendantAggregate (+) decendantCount
+
+pathFromRoot :: (Eq a, Hashable a) =&gt; ChildrenMap a -&gt; a -&gt; a -&gt; Maybe [a]
+pathFromRoot childrenMap root destination
+    | destination == root = Just [root]
+    | null childPaths = Nothing
+    | otherwise = Just $ root:(head childPaths)
+    where
+        rootChildren = children childrenMap root
+        pathFromNewRoot newRoot = pathFromRoot childrenMap newRoot destination
+        childPaths = mapMaybe pathFromNewRoot rootChildren
+
+path :: (Eq a, Hashable a) =&gt; ChildrenMap a -&gt; a -&gt; a -&gt; a -&gt; Maybe [a]
+path childrenMap root start end =
+    let maybeStartEndPath = pathFromRoot childrenMap start end
+        maybeEndStartPath = pathFromRoot childrenMap end start
+
+        maybeRootPath = join $ liftA2 connectedPath rootPathToStart rootPathToEnd
+          where
+            rootPathToStart = pathFromRoot childrenMap root start
+            rootPathToEnd = pathFromRoot childrenMap root end
+    in
+          maybeStartEndPath
+      &lt;|&gt; fmap reverse maybeEndStartPath
+      &lt;|&gt; maybeRootPath
+
+connectedPath :: Eq a =&gt; [a] -&gt; [a] -&gt; Maybe [a]
+connectedPath rootToStart rootToEnd =
+    case pathPieces of
+        Nothing -&gt; Nothing
+        Just (middle, middleToStart, middleToEnd) -&gt;
+            Just $ (reverse middleToStart) ++ [middle] ++ middleToEnd
+    where pathPieces = distinctPathPieces rootToStart rootToEnd
+
+distinctPathPieces :: Eq a =&gt; [a] -&gt; [a] -&gt; Maybe (a, [a], [a])
+distinctPathPieces [x] [y] = if x == y then Just (x, [], []) else Nothing
+distinctPathPieces (x1:y1:z1) (x2:y2:z2)
+  | x1 /= x2 = Nothing
+  | y1 /= y2 = Just (x1, y1:z1, y2:z2)
+  | otherwise = distinctPathPieces (y1:z1) (y2:z2)
+distinctPathPieces _ _ = Nothing
+</code></pre>
+    </div>

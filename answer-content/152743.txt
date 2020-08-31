@@ -1,0 +1,387 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>For the moment, I'm ignoring the C# code (and its speed), and reviewing the C++ code for ways it might be open to improvement in readability (but with a decent compiler, what I'm suggesting shouldn't affect its speed).</p>
+
+<h3>Cell</h3>
+
+<p>Rather than having code in <code>main</code> that reads in components, then composes them into a <code>cell</code>, I'd rather the <code>cell</code> knew how to read itself in from a stream:</p>
+
+<pre><code>struct cell {
+    bool occupied;
+    bool walkableSurface;
+
+    friend std::istream &amp;operator&gt;&gt;(std::istream &amp;is, cell &amp;c) {
+        return is &gt;&gt; c.occupied &gt;&gt; c.walkableSurface;
+    }
+};
+</code></pre>
+
+<h3>Grid</h3>
+
+<p>Likewise, it seems to me that right now, you have knowledge of the structure of your 3D grid distributed throughout a lot of the code. <code>main</code> reads data into the grid, <code>vec3::get_index</code> converts from a 3D vector to a grid index, and so on.</p>
+
+<p>I'd rather centralize that into one class that provides a more convenient interface, something on this order:</p>
+
+<pre><code>class Grid {
+    std::vector&lt;cell&gt; data;
+public:
+    int sx, sy, sz;
+
+    cell &amp;operator[](vec3 const &amp;index) {
+        return data[index.x * sy * sz + index.y * sz + index.z];
+    }
+
+    friend std::istream &amp;operator&gt;&gt;(std::istream &amp;is, Grid &amp;g) {
+        is &gt;&gt; g.sx &gt;&gt; g.sy &gt;&gt; g.sz;
+
+        int i = 0;
+        g.data.resize(g.sx * g.sy * g.sz);
+
+        is &gt;&gt; std::boolalpha;
+
+        for (int x = 0; x &lt; g.sx; x++) {
+            for (int y = 0; y &lt; g.sy; y++) {
+                for (int z = 0; z &lt; g.sz; z++) {
+                    is &gt;&gt; g.data[i++];
+                }
+            }
+        }
+        return is;
+    }
+
+    bool contains(vec3 const &amp;coord) {
+        return coord.x &gt;= 0 &amp;&amp; coord.x &lt; sx &amp;&amp; coord.y &gt;= 0 &amp;&amp; coord.y &lt; sy &amp;&amp; coord.z &gt;= 0 &amp;&amp; coord.x &lt; sz;
+    }
+} grid;
+</code></pre>
+
+<p>With these in place, <code>main</code> reads in the grid something like this:</p>
+
+<pre><code>std::ifstream gridFile("grid.txt");
+
+gridFile &gt;&gt; grid;
+</code></pre>
+
+<p>...and <code>isFloor</code> turns into something like this:</p>
+
+<pre><code>return pos.y &gt; 0 &amp;&amp; !grid[pos].occupied &amp;&amp; grid[(pos + vec3{ 0, -1, 0 })].walkableSurface;
+</code></pre>
+
+<p>...and the computation of <code>withinGrid</code> in <code>get_neighbors</code> simplifies to:</p>
+
+<pre><code>bool withinGrid = grid.contains(coord);
+</code></pre>
+
+<h3><code>queue_node</code></h3>
+
+<p>Looking at <code>queue_node</code>, I think I'd try to encapsulate its comparison criteria with a fairly minor rewrite:</p>
+
+<pre><code>struct queue_node {
+    vec3 value;
+    float dist;
+
+    bool operator&lt;(queue_node const &amp;other) const {
+        return other.dist &lt; dist;
+    }
+};
+</code></pre>
+
+<p>With this, we can simplify the <code>priority_queue</code> a bit, to become:</p>
+
+<pre><code>std::priority_queue&lt;queue_node&gt; Q;
+</code></pre>
+
+<h3>Naming</h3>
+
+<p>I think some of the names could be improved. The most obvious would be <code>cellFilter</code>--it tends to indicate that we're interested in whether a cell meets some set of criteria, but doesn't tell us anything about the criteria we want it to meet.</p>
+
+<h3>Timing</h3>
+
+<p>Maybe it's because I've <strike>wasted</strike> spent far too much of my time answering questions both here and on Stack Overflow, but I find it convenient to have a timing function that lets me time a function without re-writing the timing code every time. I use this:</p>
+
+<pre><code>template &lt;typename F, typename ...Args&gt;
+auto timer(F f, std::string const &amp;label, Args &amp;&amp; ...args) {
+    using namespace std::chrono;
+
+    auto start = high_resolution_clock::now();
+    auto holder = f(std::forward&lt;Args&gt;(args)...);
+    auto stop = high_resolution_clock::now();
+    std::cout &lt;&lt; label &lt;&lt; " time: " &lt;&lt; duration_cast&lt;microseconds&gt;(stop - start).count() &lt;&lt; "\n";
+
+    return holder;
+}
+</code></pre>
+
+<p>With this, timing your code becomes something like this:</p>
+
+<pre><code>#include "timer"
+
+// ...
+
+auto path = timer(find_path, "Find path", start, end, cellFilter);
+std::cout &lt;&lt; "best path is " &lt;&lt; path.size() &lt;&lt; " cells long\n";
+</code></pre>
+
+<h3>Using <code>endl</code></h3>
+
+<p>I'd recommend against (ever) using <code>std::endl</code>. Along with inserting a new-line character, it flushes the stream. This is rarely desired. In the rare circumstance that it really is desired, I think it's better to make that explicit, with code like:</p>
+
+<pre><code>std::cout &lt;&lt; '\n' &lt;&lt; std::flush;
+</code></pre>
+
+<p>In this particular case, it won't make a significant difference, but it's still a bad habit that can slow code by a factor of 10 or so for little real gain.</p>
+
+<h3>Final code</h3>
+
+<p>(For simplicity, I've included the timing code inline instead of using a separate header as I normally would.)</p>
+
+<pre><code>#include &lt;iostream&gt;
+#include &lt;fstream&gt;
+#include &lt;algorithm&gt;
+#include &lt;vector&gt;
+#include &lt;functional&gt;
+#include &lt;stdexcept&gt;
+#include &lt;queue&gt;
+#include &lt;unordered_map&gt;
+#include &lt;chrono&gt;
+#include &lt;string&gt;
+
+struct vec3 {
+    int x, y, z;
+
+    bool operator==(const vec3&amp; other) const {
+        return x == other.x &amp;&amp; y == other.y &amp;&amp; z == other.z;
+    }
+
+    vec3 operator+(const vec3&amp; other) const {
+        return{x + other.x, y + other.y, z + other.z};
+    }
+
+    static vec3 min(const vec3&amp; a, const vec3&amp; b) {
+        return{std::min(a.x, b.x), std::min(a.y, b.y), std::min(a.z, b.z)};
+    }
+
+    static vec3 max(const vec3&amp; a, const vec3&amp; b) {
+        return{std::max(a.x, b.x), std::max(a.y, b.y), std::max(a.z, b.z)};
+    }
+
+    static float dist(const vec3&amp; a, const vec3&amp; b) {
+        auto dx = static_cast&lt;float&gt;(a.x - b.x);
+        auto dy = static_cast&lt;float&gt;(a.y - b.y);
+        auto dz = static_cast&lt;float&gt;(a.z - b.z);
+
+        return sqrtf(dx*dx + dy*dy + dz*dz);
+    }
+};
+
+namespace std {
+    template&lt;&gt;
+    struct hash&lt;vec3&gt; {
+        size_t operator()(const vec3&amp; k) const {
+            return ((hash&lt;int&gt;()(k.x)
+                ^ (hash&lt;int&gt;()(k.y) &lt;&lt; 1)) &gt;&gt; 1)
+                ^ (hash&lt;int&gt;()(k.z) &lt;&lt; 1);
+        }
+    };
+}
+
+struct cell {
+    bool occupied;
+    bool walkableSurface;
+
+    friend std::istream &amp;operator&gt;&gt;(std::istream &amp;is, cell &amp;c) {
+        return is &gt;&gt; c.occupied &gt;&gt; c.walkableSurface;
+    }
+};
+
+class Grid {
+    std::vector&lt;cell&gt; data;
+public:
+    int sx, sy, sz;
+
+    cell &amp;operator[](vec3 const &amp;index) {
+        return data[index.x * sy * sz + index.y * sz + index.z];
+    }
+
+    friend std::istream &amp;operator&gt;&gt;(std::istream &amp;is, Grid &amp;g) {
+        is &gt;&gt; g.sx &gt;&gt; g.sy &gt;&gt; g.sz;
+
+        int i = 0;
+        g.data.resize(g.sx * g.sy * g.sz);
+
+        is &gt;&gt; std::boolalpha;
+
+        for (int x = 0; x &lt; g.sx; x++) {
+            for (int y = 0; y &lt; g.sy; y++) {
+                for (int z = 0; z &lt; g.sz; z++) {
+                    is &gt;&gt; g.data[i++];
+                }
+            }
+        }
+        return is;
+    }
+
+    bool contains(vec3 const &amp;coord) {
+        return coord.x &gt;= 0 &amp;&amp; coord.x &lt; sx &amp;&amp; coord.y &gt;= 0 &amp;&amp; coord.y &lt; sy &amp;&amp; coord.z &gt;= 0 &amp;&amp; coord.z &lt; sz;
+    }
+} grid;
+
+std::vector&lt;vec3&gt; get_neighbours(const vec3&amp; cell) {
+    std::vector&lt;vec3&gt; neighbours;
+
+    for (int dx = -1; dx &lt;= 1; dx++) {
+        for (int dy = -1; dy &lt;= 1; dy++) {
+            for (int dz = -1; dz &lt;= 1; dz++) {
+                auto coord = cell + vec3{dx, dy, dz};
+
+                bool notSelf = !(dx == 0 &amp;&amp; dy == 0 &amp;&amp; dz == 0);
+                bool connectivity = abs(dx) + abs(dy) + abs(dz) &lt;= 2;
+                bool withinGrid = grid.contains(coord); 
+
+                if (notSelf &amp;&amp; connectivity &amp;&amp; withinGrid) {
+                    neighbours.push_back(coord);
+                }
+            }
+        }
+    }
+
+    return neighbours;
+}
+
+std::vector&lt;vec3&gt; find_path(const vec3&amp; start, const vec3&amp; end, bool(*cellFilter)(const vec3&amp;, const vec3&amp;)) {
+    if (!cellFilter(start, start) || !cellFilter(end, end)) {
+        throw std::invalid_argument("start and/or end fail cell filter!");
+    }
+
+    // Initialize data structures
+    std::unordered_map&lt;vec3, float&gt; dist;
+    std::unordered_map&lt;vec3, vec3&gt; prev;
+
+    struct queue_node {
+        vec3 value;
+        float dist;
+
+        bool operator&lt;(queue_node const &amp;other) const {
+            return other.dist &lt; dist;
+        }
+    };
+
+    std::priority_queue&lt;queue_node&gt; Q;
+
+    for (int x = 0; x &lt; grid.sx; x++) {
+        for (int y = 0; y &lt; grid.sy; y++) {
+            for (int z = 0; z &lt; grid.sz; z++) {
+                vec3 coord = {x, y, z};
+
+                if (cellFilter(coord, coord)) {
+                    dist[coord] = std::numeric_limits&lt;float&gt;::max();
+                    Q.push({coord, std::numeric_limits&lt;float&gt;::max()});
+
+                    prev[coord] = vec3{-1, -1, -1};
+                }
+            }
+        }
+    }
+
+    dist[start] = 0;
+    Q.push({start, 0});
+
+    // Search loop
+    while (!Q.empty()) {
+        auto u = Q.top();
+        Q.pop();
+
+        // Old priority queue value
+        if (u.dist != dist[u.value]) {
+            continue;
+        }
+
+        if (u.value == end) {
+            break;
+        }
+
+        for (const vec3&amp; v : get_neighbours(u.value)) {
+            if (cellFilter(u.value, v)) {
+                float alt = dist[u.value] + vec3::dist(u.value, v);
+                if (alt &lt; dist[v]) {
+                    dist[v] = alt;
+                    Q.push({v, alt});
+
+                    prev[v] = u.value;
+                }
+            }
+        }
+    }
+
+    // Trace path - if there is one
+    std::vector&lt;vec3&gt; path;
+
+    if (prev[end].x != -1) {
+        vec3 current = end;
+
+        while (current.x != -1) {
+            path.push_back(current);
+            current = prev[current];
+        }
+        std::reverse(path.begin(), path.end());
+    }
+    return path;
+}
+
+bool isFloor(const vec3&amp; pos) {
+    return pos.y &gt; 0 &amp;&amp; !grid[pos].occupied &amp;&amp; grid[(pos + vec3{ 0, -1, 0 })].walkableSurface;
+}
+
+bool cellFilter(const vec3&amp; from, const vec3&amp; to) {
+    if (from.y == to.y) {
+        // Check if all cells we're moving through are floors (important when moving diagonally)
+        auto min = vec3::min(from, to);
+        auto max = vec3::max(from, to);
+
+        for (int x = min.x; x &lt;= max.x; x++) {
+            for (int z = min.z; z &lt;= max.z; z++) {
+                if (!isFloor({x, min.y, z})) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    } else {
+        // If the movement is vertical, then perform no diagonal check
+        return isFloor(to);
+    }
+}
+
+template &lt;typename F, typename ...Args&gt;
+auto timer(F f, std::string const &amp;label, Args &amp;&amp; ...args) {
+    using namespace std::chrono;
+
+    auto start = high_resolution_clock::now();
+    auto holder = f(std::forward&lt;Args&gt;(args)...);
+    auto stop = high_resolution_clock::now();
+    std::cout &lt;&lt; label &lt;&lt; " time: " &lt;&lt; duration_cast&lt;microseconds&gt;(stop - start).count() &lt;&lt; "\n";
+
+    return holder;
+}
+
+int main() {
+    // Read grid
+    std::ifstream gridFile("grid.txt");
+
+    gridFile &gt;&gt; grid;
+
+    // Do pathfinding
+    vec3 start = {9, 2, 6};
+    vec3 end = {45, 2, 0};
+
+    try {
+        auto path = timer(find_path, "Find Path", start, end, cellFilter);
+        std::cout &lt;&lt; "best path is " &lt;&lt; path.size() &lt;&lt; " cells long\n";
+    } catch (std::exception&amp; e) {
+        std::cout &lt;&lt; "exception: " &lt;&lt; e.what() &lt;&lt; '\n';
+    }
+
+    return 0;
+}
+</code></pre>
+    </div>

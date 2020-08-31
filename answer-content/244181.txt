@@ -1,0 +1,193 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I’m afraid you have some very serious, game-breaking bugs in this class, mostly to do with your use of a union. But I’ll do the review from top to bottom to keep everything in order.</p>
+<p>Before I begin: In my opinion, the biggest problem with this code—the problem that would first make me reject it out of hand before even bothering to try reading it—is the near-complete lack of useful comments. There are one or two comments that are useful, but there are many more things in the code that just make no sense at all at first glance, and with no comments to explain your thinking, I have no idea whether I’m looking at the most ingenious piece of software engineering ever committed, or an incoherent mess. Why are you using a union? Why is the array inside a <code>struct</code>? Why are some special member functions defined while others are not? 🤷🏼 All mysteries. Some I can (somewhat) guess at. Others are just ciphers.</p>
+<p>One major thing that isn’t explained anywhere (that comes up as an issue over and over in the review) is whether this queue is intended to be used with non-trivial types (like <code>std::string</code>). That makes a huge difference in the complexity of the problem. If I saw a comment explaining that only trivial types should be used (or even better, a <code>static_assert</code>), then fine. But without that, I have to assume the intention is to use non-trivial types. And that’s going to make things a lot more complicated, and the review a lot more brutal.</p>
+<pre><code>template&lt;class T ,std::size_t N /*Max capacity*/, 
+typename Idxtype = std::size_t /*Integral type to store indices. May change,
+like to uint_least16_t, to lower space usage*/,
+typename = typename std::enable_if&lt;std::is_integral&lt;Idxtype&gt;::value&gt;::type&gt;
+</code></pre>
+<p>I’m not sure <code>enable_if</code> is what you want to use here.</p>
+<p><code>enable_if</code>/SFINAE is the mechanism to use when you want to disable particular template instantiations <em>while leaving other options available</em>. In other words, if your intention was that the class you’ve written will only work for integral indexes… <em>but there is another class that will work for non-integral indexes</em>… then SFINAE would be the way go.</p>
+<p>But I don’t think that’s your intention. I think you just want to ban non-integral indexes, and that’s that. For that, it’s simpler just to use <code>static_assert</code>:</p>
+<pre><code>template&lt;class T ,std::size_t N /*Max capacity*/, 
+typename Idxtype = std::size_t /*Integral type to store indices. May change,
+like to uint_least16_t, to lower space usage*/&gt;
+class circularQueue
+{
+    static_assert(std::is_integral_v&lt;Idxtype&gt;);
+</code></pre>
+<p>(Also, you’re using <code>enable_if</code> wrong. What you want is to have an undefined (or <code>static_assert</code>-ed) primary template with the selection parameter defaulted, and then use <code>enable_if</code> in the real template, like so:</p>
+<pre><code>// Primary template is undefined so it will trigger a compile error.
+// You could also define it with a static_assert to get a clearer
+// error message.
+template &lt;
+    class T,
+    std::size_t N,
+    typename Idxtype = std::size_t,
+    typename = void&gt;
+class circularQueue;
+
+template &lt;
+    class T,
+    std::size_t N,
+    typename Idxtype&gt;
+class circularQueue&lt;T, N, Idxtype, typename std::enable_if&lt;std::is_integral&lt;Idxtype&gt;::value&gt;::type&gt;
+{
+   // ...
+</code></pre>
+<p>The way you’re using <code>enable_if</code>, I could use a non-integral type as the index by doing this:</p>
+<pre><code>// A std::string index!
+circularQueue&lt;T, std::size_t, std::string, void&gt;
+</code></pre>
+<p>The two-step dance shown above—with the empty primary template—is how you prevent such abuses.)</p>
+<pre><code>union myUnion{
+    bool forConstexprCtor;
+    T value;
+    constexpr myUnion() : forConstexprCtor{true} {}
+
+    template&lt;class PossibleUnion,typename = typename std::enable_if&lt;std::is_same&lt;PossibleUnion, myUnion&gt;::value &gt;::type&gt;
+    constexpr myUnion(PossibleUnion&amp;&amp; other) : value{other.value} {}
+
+    template&lt;typename... Args,typename = typename std::enable_if&lt;std::is_constructible_v&lt;T,Args&gt;...&gt;::type&gt; 
+    constexpr myUnion(Args&amp;&amp;... args) : value(std::forward&lt;Args&gt;(args)...) {}
+
+    template&lt;typename AnotherUnion&gt;
+    constexpr void operator=(const AnotherUnion&amp;&amp; other){
+        value = other.value;
+    }
+};
+</code></pre>
+<p>This is a clever way to have correctly sized and aligned storage for an uninitialized <code>T</code> while still being <code>constexpr</code>, but there are lot of problems… so many, in fact, that I don’t know if you could reasonably fix them in C++17.</p>
+<p>First, you shouldn’t use <code>bool</code> for the “alternate” object. <code>bool</code> is not necessarily 1 byte, nor is its alignment necessarily 1. It’s entirely possible and legal for <code>bool</code> to be 4 bytes (and that actually was the case in older versions of Visual C++). You could end up with a situation where you’ve created a circular buffer for 10 <code>char</code>s, and it turns out to be 40 bytes in size.</p>
+<p>You can use any flavour of <code>char</code> (<code>signed</code>, <code>unsigned</code>, or not), or <code>std::byte</code>. But a better solution is to use an empty class. Why? Because:</p>
+<pre><code>   bool forConstexprCtor; // or use char
+   constexpr myUnion() : forConstexprCtor{true /* or '\0' for char */} {}
+</code></pre>
+<p>is not a no-op default construction, because it has to set <code>forConstexprCtor</code> to <code>true</code> (or zero). But this is a no-op:</p>
+<pre><code>   // struct empty_t {};
+   empty_t forConstexprCtor;
+   constexpr myUnion() : forConstexprCtor{} {}
+</code></pre>
+<p>If you made a circular buffer with 100 elements, the constructor has to initializer 100 <code>bool</code>s to <code>true</code>. With an empty type, it has to theoretically initialize those 100 objects… but since initialization is zero-cost, that means nothing actually needs to be done in practice.</p>
+<pre><code>template&lt;class PossibleUnion,typename = typename std::enable_if&lt;std::is_same&lt;PossibleUnion, myUnion&gt;::value &gt;::type&gt;
+constexpr myUnion(PossibleUnion&amp;&amp; other) : value{other.value} {}
+</code></pre>
+<p>Okay, so what I think you’re trying to do here is write both your move and copy constructors in a single function. That’s… not a great idea on any given day. But it’s especially bad here because of the surrounding context.</p>
+<p>Let’s start with asking why you even <em>need</em> to define the move and copy constructors. I can think of two reasons:</p>
+<ol>
+<li>You want to use non-trivial <code>T</code>s. A non-trivial <code>T</code> will probably cause the move and copy constructors to be deleted.</li>
+<li>The following constructor template “swallows” the move/copy operations, so you need to reclaim them.</li>
+</ol>
+<p>So let’s assume you need to rewrite the move and copy constructors. What’s wrong with doing it this way? Well, a lot of things.</p>
+<p>To start with, the code above turns the copy and move constructors into two copy constructors. You lose move ops: <code>myUnion</code>’s move constructor invokes <code>value</code>’s copy constructor… not its move constructor. You can “fix” this problem by using <code>std::forward()</code>, I suppose.</p>
+<p>But there’s other problems. Move ops should always be <code>noexcept</code> whenever possible. And most types are <code>noexcept</code> moveable. But if we put one of those types in this union, then it won’t be anymore. You could probably fix this with type traits.</p>
+<p>But you also lose triviality. This, too, might be able to be “fixed”… but certainly not easily.</p>
+<p>My advice is to forget trying to be clever. You’re only shooting yourself in the foot, not to mention making it more difficult for others to understand and maintain the class. You want copy and move constructors? Write copy and move constructors. Individually, as the good Bjarne intended.</p>
+<p>But that brings us to the biggest problem here: you impement the copy/move by assuming that <code>value</code> is the active object in the union. Why would you assume that? It certainly won’t be true for a default-constructed circular queue:</p>
+<pre><code>auto cq1 = circularQueue&lt;std::string, 32&gt;{};
+// cq1 internally has an array of 32 myUnion objects, all with active
+// object set to "forConstexprCtor"... not "value".
+
+auto cq2 = cq1;
+// This calls the copy constructor of myUnion 32 times, which copies 32
+// nonexistent "value" objects, triggering UB (and, likely, a
+// spectacular crash the first time you try to do anything with any of
+// those strings).
+</code></pre>
+<p>You can’t fix this within the union. You need an external discriminator of some sort, to keep track of which <code>myUnion</code> objects have <code>forConstexprCtor</code> active, and which have <code>value</code> active. And then you need to write the copy constructor <em>in <code>circularQueue</code></em>… <em>not</em> <code>myUnion</code>… to properly move/copy each <code>myUnion</code> object according to its active member.</p>
+<p>What a complicated mess, eh?</p>
+<pre><code>template&lt;typename... Args,typename = typename std::enable_if&lt;std::is_constructible_v&lt;T,Args&gt;...&gt;::type&gt; 
+constexpr myUnion(Args&amp;&amp;... args) : value(std::forward&lt;Args&gt;(args)...) {}
+</code></pre>
+<p>This seems like a simple and obvious implementation, but… consider what happens if <code>T</code> is a <code>vector&lt;int&gt;</code>, and you do this:</p>
+<pre><code>auto v1 = std::vector&lt;int&gt;{4, 4};
+std::cout &lt;&lt; v1.size(); // prints 2
+
+auto v2 = circularQueue&lt;std::vector&lt;int&gt;, N&gt;::myUnion{4, 4};
+std::cout &lt;&lt; v2.value.size(); // what do you think this prints?
+</code></pre>
+<p>The problem here is that you don’t support initializer lists with <code>myUnion</code>. Perhaps that’s not a problem. Perhaps you’re okay with preventing in-place construction with initializer lists. But it’s something you should think about.</p>
+<p>Aside from that, I think implementing a direct-construction constructor for <code>value</code> like this is a terrible idea. Of the many headaches it introduces, the fact that it “swallows” the copy and move constructors is just the tip of the iceberg.</p>
+<p>If you really want a function like this (and, I can’t imagine why you think you need it), you really should use a tagged constructor instead:</p>
+<pre><code>struct value_construct_tag_t {} value_construct_tag;
+
+template&lt;typename... Args,typename = typename std::enable_if&lt;std::is_constructible_v&lt;T,Args&gt;...&gt;::type&gt; 
+constexpr myUnion(value_construct_tag_t, Args&amp;&amp;... args) : value(std::forward&lt;Args&gt;(args)...) {}
+
+// used as:
+myUnion(value_construct_tag, args...);
+</code></pre>
+<p>Next up is the copy/move assignment dual-purpose function, which basically has all the same problems as the copy/move constructor chimera.</p>
+<p>Okay, so <code>myUnion</code> is just <em>riddled</em> with problems. In my opinion, all of them are due to you trying to be too clever, and trying to make <code>myUnion</code> a “perfect”, self-contained, self-aware type. My advice? Throw it all out. <code>myUnion</code> should be nothing more than a union of <code>T</code> and some dummy, empty type (along with dummy operations if necessary to make it work with non-trivial <code>T</code>s). Don’t try to make <code>myUnion</code> a container in its own right. It’s nothing more than an internal storage type; an implementation detail. All the <em>real</em> work should be done by <code>circularQueue</code>.</p>
+<pre><code>struct myStruct{
+    myUnion theArray[N];
+    template&lt;typename... t&gt;
+    constexpr myStruct(t&amp;&amp;... theList) : theArray{(theList)...} {}
+} mS;
+</code></pre>
+<p>I honestly don’t see the purpose of this internal <code>struct</code>. Am I missing something? It looks it all you need it for is that constructor, but that constructor is trivial to write in place where you need it (and you only need it in one place).</p>
+<pre><code>Idxtype head, tail, theSize;
+</code></pre>
+<p>Declaring all your variables on one line like this is terrible practice in general. You should never do it.</p>
+<p>And in this case, it’s actually self-defeating. If you gave <code>myUnion</code> a default constructor that activated <code>forConstexprCtor</code>, and defined your member variables like this:</p>
+<pre><code>myUnion theArray[N] = {};
+Idxtype head = {};
+Idxtype tail = {};
+Idxtype theSize = {};
+</code></pre>
+<p>then your default constructor could be defaulted:</p>
+<pre><code>constexpr circularQueue() noexcept = default;
+</code></pre>
+<p>Next up is the copy constructor, and this (along with the move constructor, which you don’t have but should) is where the rubber really hits the road.</p>
+<p>When you are coping a <code>circularQueue</code>, none, some, or all of the elements in <code>other</code> will be present. You need to correctly handle all cases. You need to do <code>this-&gt;theArray[i].value = other.theArray[i].value;</code> for all elements that are present, and <code>this-&gt;theArray[i].forConstexprCtor = {};</code> for all elements that are not.</p>
+<p>Figuring out how to do that correctly is the real trick of writing this type.</p>
+<p>As an aside… why is your copy constructor <code>explicit</code>? What do you think that is accomplishing?</p>
+<p>And I am completely baffled as to why you have a constructor that copies from a non-<code>const</code> <code>circularQueue</code>. Is this because the following template constructor swallowed the copy/move ops? If so, there is an easier fix.</p>
+<pre><code>template&lt;typename... Args&gt;
+explicit constexpr circularQueue(Args&amp;&amp;... theList) : mS{(theList)...}, head{0},
+tail{sizeof...(theList)}, theSize{sizeof...(theList)}{}
+</code></pre>
+<p>I’m guessing the intention here is to be able to write code like:</p>
+<pre><code>auto c = circularQueue&lt;int, 4&gt;{1, 2, 3, 4};
+// c is a queue with 1,2,3,4 in it.
+</code></pre>
+<p>That’s cool, but as you may or may not have noticed, this function swallows your default constructor, and your copy and move constructors. I’m blindly guessing that’s why you implemented a non-<code>const</code> lvalue reference copy constructor. If that’s the case, there’s a better way.</p>
+<p>First, note that it doesn’t make sense to have zero args. That would be the default constructor. So you only need to consider cases with one or more args. So you can do this:</p>
+<pre><code>template &lt;typename T, typename... Args&gt;
+circularQueue(T&amp;&amp; t, Args&amp;&amp;... theList)
+</code></pre>
+<p>Now the default constructor is safe. (It was anyway, but bear with me.)</p>
+<p>Next up you want to rescue the copy and move constructors. That’s easy: that’s the case where <code>T&amp;&amp;</code> is <code>circularQueue</code> with or without <code>const</code> and either an lvalue or rvalue reference, and <code>args</code> is empty. No problem (using concepts… to do this with <code>enable_if</code>, you’re on your own—perhaps use a non-type template parameter?):</p>
+<pre><code>template &lt;typename T, typename... Args&gt;
+requires requires(sizeof...(Args) &gt; 0 or not std::is_same_v&lt;circularQueue, std::remove_cv_ref_t&lt;T&gt;&gt;)
+circularQueue(T&amp;&amp; t, Args&amp;&amp;... theList)
+</code></pre>
+<p>Now this constructor will not step on the toes of either the default constructor, or the copy or move constructor.</p>
+<pre><code>constexpr bool push(const T theObj)
+</code></pre>
+<p>I’m not a fan of interfaces that let you just ignore errors. If you fail you push an object to the queue, that’s not just an “oh, well, doesn’t matter” kind of thing. That’s a <em>critical</em> error! You’ve lost data. You really want to know when that happens.</p>
+<p>At the very <em>least</em>, you should mark the return value here as <code>[[nodiscard]]</code>. But honestly, this seems like something that warrants an exception.</p>
+<p>Also… why is <code>theObj</code> <code>const</code>? There doesn’t seem to be any point. Worse, making it <code>const</code> means it’s impossible to move it. So this line:</p>
+<pre><code>mS.theArray[(tail == N ? (tail = 0)++ : tail++)] = myUnion(std::move(theObj));
+</code></pre>
+<p>doesn’t do what you apparently think it does. The <code>std::move()</code> in there does absolutely nothing.</p>
+<p>(And I’m not even talking about the gastly ternary op going on in there. That indexing operation is one of the most important parts of your whole class! It’s what makes your circular queue circular! It even gets repeated in both <code>push()</code> and <code>emplace()</code>! It shouldn’t be buried in a mess of operations like that! That should be its own function.)</p>
+<pre><code>constexpr const T&amp; front() const noexcept
+</code></pre>
+<p>This shouldn’t be a <code>noexcept</code> function, because <code>noexcept</code> means a function cannot fail. But this function <em>can</em> fail; it can fail if the queue is empty. You don’t <em>necessarily</em> need to throw an exception here (or you could throw one in debug mode, and just do UB in release mode). But you do need to not give the impression the function can’t fail.</p>
+<pre><code>constexpr std::size_t maxCapacity() const noexcept
+</code></pre>
+<p>Unless you have a reason not to, you should follow the conventions of the standard library. In the standard library, this function would be called <code>capacity()</code>. (Plus “max capacity” is redundant. A thing’s “capacity” is the maximum it can hold, by definition.)</p>
+<pre><code>constexpr circularQueue&amp; operator=(const circularQueue&lt;T,N&gt;&amp; other)
+</code></pre>
+<p>The copy/move assignment operations have all the complexity of the copy/move constructors… and then some, because you <em>also</em> have to handle the existing elements in <code>this</code>, all while giving the strong exception guarantee (if possible).</p>
+<p>As it stands, you have the same serious bugs in the assignment ops as in the constructors, plus more. The comment in the function says “[o]nly need to copy elements from <code>other.head</code> to <code>other.tail</code>”… except that’s wrong. Yes, you do only need to copy the active elements and not the inactive ones… but you also need to <em>de</em>activate the inactive ones in <code>this</code>.</p>
+<pre><code>constexpr circularQueue&amp; operator=(const circularQueue&lt;T,N&gt;&amp;&amp; other)
+</code></pre>
+<p>Why is this taking a <code>const</code> rvalue reference? That breaks moving; it’s no long a move assignment, and all the <code>std::move()</code>s in there do nothing.</p>
+<p>Finally, this class doesn’t have a destructor, but it needs one, because you need to manually call the <code>T</code> destructors for active elements, and the dummy destructors for the inactive ones.</p>
+<p>Overall, I think the biggest source of bugs here is the fact that you’re not keeping track of which elements are active in your unions. Even when you’re dealing with trivial types, you can’t do that. It is UB to access the non-active member of a union (though it is usually <em>silent</em> UB, meaning your program is broken, but you’ll never know because everything <em>appears</em> to “work”). And when it’s a non-trivial type, you’re pretty much cruising for a crash.</p>
+<p>Normally you’d use a flag to keep track of which part of the union is active—that’s what <code>std::variant</code> does. But you can actually get away without a flag, because you can tell which elements are active and which aren’t by whether they’re in the live part of the queue or not.</p>
+<p>But there’s still the complexity of handling non-trivial types. It may be necessary to have two different union types: one for trivial types, and one for non-trivial types—that’s how I’ve seen it done for implementations of <code>variant</code> anyway.</p>
+    </div>

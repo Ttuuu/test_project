@@ -1,0 +1,287 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>There are a few things that in my opinion should be changed. </p>
+
+<p><strong>Design</strong></p>
+
+<p>The class' private fields seem to be only read (except the constructor which initializes them). In this case they should be transformed into constants or readonly fields. After you've transformed them into constant/readonly fields you should transform them into properties. The end result of this step should change the fields into something like the following:</p>
+
+<pre><code>private readonly int _referenceIntBase = 96;
+public int ReferenceIntBase
+{
+    get { return _referenceIntBase; }
+}
+
+private readonly int _referenceIntFloorCode = (int)' ';
+public int ReferenceIntFloorCode
+{
+    get { return _referenceIntFloorCode; }
+}
+
+public int ReferenceIntCeilCode 
+{
+    get { return ReferenceIntBase + ReferenceIntFloorCode; }
+}
+
+// and so on with the other fields
+</code></pre>
+
+<p>Another thing from the design point of view: The class doesn't seem to need instance methods. You don't actually need to create <code>StringLZ77</code> or <code>LZ77</code> objects (at least, so it seems). In that case the class should be declared static and the constructor goes away and the actual instance methods and properties have to be transformed to <code>static</code> ones (the current <code>static</code> methods just create a <code>StringLZ77</code> object that calls the instance methods anyway).</p>
+
+<p>Regarding the <code>Stopwatch</code> object, what's it doing there? Is it actually needed for the algorithm? If it's there for debugging purposes use it in <code>#if DEBUG ... #endif</code> directives. The same for the <code>Console.WriteLine()</code> bit.</p>
+
+<p><strong>Performance</strong></p>
+
+<p>Regarding the performance bottleneck on <code>m1</code> and <code>m2</code> I'd suggest two changes (besides changing the name into something more meaningful):</p>
+
+<ul>
+<li>Declare <code>IList&lt;byte&gt; m1</code> and <code>IList&lt;byte&gt; m2</code> out of the cycle and instantiate them in the cycle. The same goes for the other variables that are declared inside the cycle.</li>
+<li>Change the type from <code>IList&lt;byte&gt;</code> to <code>IEnumerable&lt;byte&gt;</code> so you don't have to enumerate all the items before you actually use them. In this way you don't have to call <code>ToList()</code> in the end (which is what enumerates the elements).</li>
+</ul>
+
+<p>You declare variables inside cycles in a lot of cases. Bring the declaration outside of the cycles and assign them values in the cycles, in this way you create the object only once.</p>
+
+<p>Also, don't concatenate strings using the <code>+</code> operator when you are in a cycle. Use the <code>StringBuilder</code> object.</p>
+
+<p>You also do some operations that are not optimal, like <code>(int)Math.Pow(_referenceIntBase, 1)</code> which is equal to <code>_referenceIntBase</code>. Also, <code>(int)Math.Pow(_referenceIntBase, 2) - 1</code> can be written as <code>_referenceIntBase * _referenceIntBase - 1</code> which could also be put inside a <code>check { ... }</code> block to catch overflows if it's needed.</p>
+
+<p>Regarding the <code>List</code> objects, try to replace them with <code>IEnumerable</code>s. In the case of the <code>ForEach</code> method that you use in the code, you could just define a <code>ForEach</code> extension method for <code>IEnumerable</code>s.</p>
+
+<p>After this refactoring the code would look like the following:</p>
+
+<pre><code>public static class EnumerableExtensions
+{
+    public static void ForEach&lt;T&gt;(this IEnumerable&lt;T&gt; source, Action&lt;T&gt; action)
+    {
+        foreach (var item in source)
+        {
+            action(item);
+        }
+    }
+}
+
+internal static class LZ77
+{
+    private static readonly byte _referencePrefix = (byte)'`';
+    public static byte ReferencePrefix { get { return _referencePrefix; } }
+
+    private static readonly int _referenceIntBase = 96;
+    public static int ReferenceIntBase { get { return _referenceIntBase; } }
+
+    private static readonly int _referenceIntFloorCode = 32;
+    public static int ReferenceIntFloorCode { get { return _referenceIntFloorCode; } }
+
+    public static int ReferenceIntCeilCode { get { return ReferenceIntBase + ReferenceIntFloorCode; } }
+
+    public static int MaxStringDistance { get { return _referenceIntBase * _referenceIntBase - 1; } }
+
+    private static readonly int _minStringLength = 5;
+    public static int MinStringLength { get { return _minStringLength; } }
+
+    public static int MaxStringLength { get { return _referenceIntBase - 1 + _minStringLength; } }
+
+    private static readonly int _defaultWindowLength = CompressionLevel.Low;
+    public static int DefaultWindowLength { get { return _defaultWindowLength; } }
+
+    public static int MaxWindowLength { get { return MaxStringDistance + _minStringLength; } }
+
+    public static byte[] Compress(byte[] data, int windowLength)
+    {
+        if (windowLength == -1)
+        {
+            windowLength = DefaultWindowLength;
+        }
+
+        if (windowLength &gt; MaxWindowLength)
+        {
+            throw new ArgumentException("Window length is too large.");
+        }
+
+        List&lt;byte&gt; compressed = new List&lt;byte&gt;();
+        int pos = 0;
+        int lastPos = data.Length - _minStringLength;
+        int searchStart, matchLength, bestMatchDistance, bestMatchLength, 
+            sourceWindowEnd, targetWindowEnd, realMatchLength;
+        bool foundMatch, isValidMatch;
+        List&lt;byte&gt; newCompressed;
+        IEnumerable&lt;byte&gt; m1, m2;
+
+        while (pos &lt; lastPos)
+        {
+            searchStart = Math.Max(pos - windowLength, 0);
+            matchLength = _minStringLength;
+            foundMatch = false;
+            bestMatchDistance = MaxStringDistance;
+            bestMatchLength = 0;
+            newCompressed = new List&lt;byte&gt;();
+
+            while ((searchStart + matchLength) &lt; pos)
+            {
+                sourceWindowEnd = Math.Min(searchStart + matchLength, data.Length);
+                targetWindowEnd = Math.Min(pos + matchLength, data.Length);
+                m1 = data.Skip(searchStart).Take(sourceWindowEnd - searchStart);
+                m2 = data.Skip(pos).Take(targetWindowEnd - pos);
+                isValidMatch = m1.SequenceEqual(m2) &amp;&amp; matchLength &lt; MaxStringLength;
+
+                if (isValidMatch)
+                {
+                    matchLength++;
+                    foundMatch = true;
+                }
+                else
+                {
+                    realMatchLength = matchLength - 1;
+
+                    if (foundMatch &amp;&amp; (realMatchLength &gt; bestMatchLength))
+                    {
+                        bestMatchDistance = pos - searchStart - realMatchLength;
+                        bestMatchLength = realMatchLength;
+                    }
+
+                    matchLength = _minStringLength;
+                    searchStart++;
+                    foundMatch = false;
+                }
+            }
+
+            if (bestMatchLength != 0)
+            {
+                newCompressed.Add(ReferencePrefix);
+                newCompressed.AddRange(EncodeReferenceInt(bestMatchDistance, 2));
+                newCompressed.AddRange(EncodeReferenceLength(bestMatchLength));
+
+                pos += bestMatchLength;
+            }
+            else
+            {
+                if (data[pos] != _referencePrefix)
+                {
+                    newCompressed = new List&lt;byte&gt;(new byte[] { data[pos] });
+                }
+                else
+                {
+                    newCompressed = new List&lt;byte&gt;(new byte[] { _referencePrefix, _referencePrefix });
+                }
+
+                pos++;
+            }
+
+            compressed.AddRange(newCompressed);
+        }
+
+        data.Skip(pos)
+            .Take(data.Length - pos)
+            .Where(x =&gt; x == _referencePrefix)
+            .ForEach
+            (
+                x =&gt; compressed
+                        .AddRange
+                        (
+                            new byte[]
+                            {
+                                _referencePrefix,
+                                _referencePrefix
+                            }
+                        )
+            );
+
+        return compressed.ToArray();
+    }
+
+    public static byte[] Decompress(byte[] data)
+    {
+        List&lt;byte&gt; decompressed = new List&lt;byte&gt;();
+        int pos = 0;
+        byte currentByte, nextChar;
+        int distance, length, start, end;
+
+        while (pos &lt; data.Length)
+        {
+            currentByte = data[pos];
+
+            if (currentByte != _referencePrefix)
+            {
+                decompressed.Add(currentByte);
+                pos++;
+            }
+            else
+            {
+                nextChar = data[pos + 1];
+
+                if (nextChar != _referencePrefix)
+                {
+                    distance = DecodeReferenceInt(data.Skip(pos + 1).Take(2).ToList(), 2);
+                    length = DecodeReferenceLength(data.Skip(pos + 3).Take(1).ToList());
+                    start = decompressed.Count - distance - length;
+                    end = start + length;
+
+                    decompressed.AddRange(decompressed.Skip(start).Take(end - start));
+                    pos += _minStringLength - 1;
+                }
+                else
+                {
+                    decompressed.Add((byte)_referencePrefix);
+                    pos += 2;
+                }
+            }
+        }
+
+        return decompressed.ToArray();
+    }
+
+    private static IList&lt;byte&gt; EncodeReferenceInt(int value, int width)
+    {
+        if (!((value &gt;= 0) &amp;&amp; (value &lt; (Math.Pow(_referenceIntBase, width) - 1))))
+        {
+            throw new ArgumentException(string.Format("Reference int out of range: {0} (width = {1})", value, width));
+        }
+
+        IList&lt;byte&gt; encoded = new List&lt;byte&gt;();
+
+        while (value &gt; 0)
+        {
+            encoded.Insert(0, (byte)((value % _referenceIntBase) + _referenceIntFloorCode));
+            value = (int)Math.Floor((double)value / _referenceIntBase);
+        }
+
+        int missingLength = width - encoded.Count;
+
+        for (int i = 0; i &lt; missingLength; i++)
+        {
+            encoded.Insert(0, (byte)ReferenceIntFloorCode);
+        }
+
+        return encoded;
+    }
+
+    private static IList&lt;byte&gt; EncodeReferenceLength(int length)
+    {
+        return EncodeReferenceInt(length - _minStringLength, 1);
+    }
+
+    private static int DecodeReferenceInt(IList&lt;byte&gt; data, int width)
+    {
+        int value = 0, charCode;
+
+        for (int i = 0; i &lt; width; i++)
+        {
+            value *= _referenceIntBase;
+            charCode = data[i];
+
+            if (!((charCode &gt;= _referenceIntFloorCode) &amp;&amp; (charCode &lt;= ReferenceIntCeilCode)))
+            {
+                throw new ArgumentException("Invalid char code in reference int: " + charCode);
+            }
+
+            value += charCode - _referenceIntFloorCode;
+        }
+
+        return value;
+    }
+
+    private static int DecodeReferenceLength(IList&lt;byte&gt; data)
+    {
+        return DecodeReferenceInt(data, 1) + _minStringLength;
+    }
+}
+</code></pre>
+    </div>

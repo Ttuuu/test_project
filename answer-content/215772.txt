@@ -1,0 +1,103 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This isn't quite true:</p>
+
+<blockquote>
+  <p>sends eight images per second </p>
+</blockquote>
+
+<p>The 125ms sleep means that your code will sit around blocking a thread for about ~1/8th of a second (<code>Thread.Sleep</code> shouldn't be use for accurate timing ever) after it sends every image. This means that the time between images is ~125ms plus the time to actually send an image (i.e. no more than ~8 images per second, could be much fewer). This pretty much guarantees that you will drop a frame now and then.</p>
+
+<p>You say that <code>getImage()</code> may or may not be providing a new image, and there is no nice way to check if a new image is available; however, you might consider interrogating the image received and checking if it is the same the one you last sent (and then don't send it); you can do this cheaply enough by taking a hash of the data stream. If <code>getImage()</code> itself isn't too expensive, then this would enable a quicker response rate, and ensure 8fps, rather than the 7-or-8 fps that a method like this will give you (assuming sending the image data is reasonably fast). If this makes sense will depend on the resource available, and how much you care about receiving every frame.</p>
+
+<p>It would also be nice if you could avoid locking up a whole thread, as that sort of methodology does not scale (you run out of threads). An asynchronous <code>HandleServer</code>/<code>HandleImage</code> combination which makes use of <code>Task.Delay()</code> to schedule work might be a good solution, and would not significantly increase the complexity of the implementation.</p>
+
+<hr>
+
+<p>Don't leave comments to rot:</p>
+
+
+
+<pre class="lang-cs prettyprint-override"><code>// Save to memory using the bmp format
+bmp.Save(ms, System.Drawing.Imaging.ImageFormat.Jpeg);
+</code></pre>
+
+<p>Such a comment is probably not worth the space it consumes, and it's unhelpful when it is out of date like this.</p>
+
+<hr>
+
+<p>Calling <code>HandleServer()</code> within <code>HandleImage()</code> means that every exception will consume a little more of the stack frame, until eventually the program crashes. You might consider putting the logic for handling exceptions outside of both of these methods, and putting it in a loop; for example, something like:</p>
+
+<pre class="lang-cs prettyprint-override"><code>while (keepRunning)
+{
+    try
+    {
+        HandleServer();
+    }
+    catch (Exception ex)
+    {
+        // do whatever
+    }        
+}
+</code></pre>
+
+<p>Not only will this save slowly filling the stack, but it means that <code>HandleImage</code> can focus on <em>handling images</em> and not restarting the server when it goes wrong.</p>
+
+<p>The difficulty with this is that you currently print some information when catching an exception, to which this alternative does not lend itself. (you could catch the expcetion, print everything out, and then throw it again: this way <code>HandleImage</code> is still only concerned with sending lots of images, and the code above it takes the role of deciding how to deal with other failures (e.g. network errors)).</p>
+
+<p>You include the exception in your <code>catch</code> clause, but you don't report anything about it. It would be much better to print out the exception rather than the assumption that it is a network error: that way, when something goes wrong in production there is some hope of debugging it.</p>
+
+<hr>
+
+<p>This code needlessly allocates an extra <code>byte[]</code>.</p>
+
+<pre class="lang-cs prettyprint-override"><code>byte[] datasize = new byte[4];
+datasize = BitConverter.GetBytes(size);
+</code></pre>
+
+<p>It can be simplified to this:</p>
+
+<pre class="lang-cs prettyprint-override"><code>byte[] dataSize = BitConverter.GetBytes(size);
+</code></pre>
+
+<hr>
+
+<p>Your code to send the data to the server is suspect: when sending the size-data, you don't check the return value, but you have a corresponding loop to send the image data. I'm not sure how socket and TCP get along, but if you don't trust <code>data</code> to send in one go, you should be giving <code>sizeData</code> the same treatment (you can put the loop in it's own method to keep it simple).</p>
+
+<hr>
+
+<p>Consider using the <a href="https://docs.microsoft.com/en-us/dotnet/csharp/language-reference/keywords/using-statement" rel="noreferrer"><code>using</code> statement</a> (as suggested by Jesse C. Slicer in the comments) to ensure proper disposal of disposables. For example, in <code>HandleImage</code>:</p>
+
+<pre class="lang-cs prettyprint-override"><code>byte[] bmpBytes;
+
+using (Image bmp = getImage())
+using (MemoryStream ms = new MemoryStream())
+{
+    bmp.Save(ms, System.Drawing.Imaging.ImageFormat.Jpeg);
+    bmpBytes = ms.ToArray();
+}
+</code></pre>
+
+<p>This will dispose the resources in the event that an exception if thrown in there somehow, and moves the released resources into a different scope, which means they can't be misused as easily (you can't forget to dispose them, and you can't use once when are disposed).</p>
+
+<hr>
+
+<p>It's generally a good idea to define variables as close to their usage as possible. <code>sent</code> in <code>HandleImage</code>, for example, is declared on the first line of the method, but only used inside the <code>while</code> loop; it's purpose would be clearer if it was defined and assigned on the same line, and it would be impossible to use outside of its meaningful scope. <code>total</code> in <code>SendVarData</code> is also initialised first thing, but has no role in first piece of logic in the method.</p>
+
+<hr>
+
+<p>These methods would really benefit from some <a href="https://docs.microsoft.com/en-us/dotnet/csharp/language-reference/language-specification/documentation-comments" rel="noreferrer">inline-documentation</a> (<code>///</code>) explaining what their role and behaviour is: I would not assume a method called <code>HandleImage()</code> could ever start a TCP server, so this needs to be written down somewhere (though ideally that would be changed, either as suggested above or through some other refactoring).</p>
+
+<hr>
+
+<p>Small things:</p>
+
+<ul>
+<li><p>Your 'bytes sent' reporting doesn't include the 4 bytes sent for the length-prefix.</p></li>
+<li><p>The past-participle of 'catch' is 'caught', rather than 'catched'.</p></li>
+<li><p>The variable <code>data</code> in <code>HandleServer</code> is never used.</p></li>
+<li><p>Be consistent with your use of white-space (e.g. the gaps between methods, and indentation in <code>HandleServer</code>, etc.)</p></li>
+<li><p>You might consider reusing the memory stream; we don't know how large the files are, but taking a new memory stream for each image may ruin your program's memory characteristics, and will necessarily degrade performance to some extent.</p></li>
+<li><p><code>static void HandleServer()</code> is missing an accessibility modifier (which are otherwise present)</p></li>
+<li><p><code>double totalSize = 0;</code> should not be a <code>double</code> (64bit float-point); did you mean <code>long</code> (64-bit integer)?</p></li>
+</ul>
+    </div>

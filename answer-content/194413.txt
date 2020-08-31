@@ -1,0 +1,328 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'm going to admit right off the bat here that I've never written a parser using combinator functions before. I have quite a bit of experience with Clojure though, so I'll be primarily focusing on idiomatic Clojure, and proper functional practice.</p>
+
+<p>I have a few main concerns with your code:</p>
+
+<ul>
+<li><p>You're using <code>def</code> inside of <code>defn</code>! This is a very bad idea. <code>def</code> (and by extension, <code>defn</code>) create(s) globals that persist even after the function they're in has returned! Run your <code>-main</code>, then check what the value of <code>digit</code> is. You're in for a surprise. It's in scope, and has the last value that was assigned to it. From a functional perspective especially, this is bad. <code>def</code> carries out side effects and is leaking the internal state of your functions into the global scope. Use <code>let</code> instead.</p>
+
+<p>Instead of writing:</p>
+
+<pre><code>(def a 1)
+(def b 2)
+(println (+ a b))
+</code></pre>
+
+<p>Write:</p>
+
+<pre><code>(let [a 1
+      b 2]
+  (println (+ a b)))
+</code></pre>
+
+<p><code>let</code> creates a restricted scope, and just generally looks much cleaner.</p></li>
+<li><p>Your brace placement is very reminiscent of imperative style curly brace placement. This is causing a lot of bloat and making your code more verbose than it needs to be.</p>
+
+<p>I'm guessing you're doing this to make matching braces easier for you. If this is the case, don't make your life unnecessarily difficult! Lisps are quite difficult to write unassisted. If you're going to write Clojure, you should spend an afternoon getting familiar with Par-Infer. It infers parenthesis placement based on indentation, so you can write Clojure like it's Python. This is <em>huge</em>. Besides the odd edge case, I never need to manually add a closing brace, or worry about its placement.</p>
+
+<p>I <strong><em>highly</em></strong> recommend IntelliJ with the Cursive plugin; both of which have free community versions. I've been using them for roughly 2 years now, and it's a phenomenal environment to write in. </p>
+
+<p>Just to show the difference, this is what your <code>many</code> function automatically gets formatted as when I paste it into IntelliJ:</p>
+
+<pre><code>(defn many [p0]
+  (fn [stream]
+    ((fn inner [stm]
+       ((fn [res]
+          (if res
+            ((fn [r1]
+               (if r1
+                 (list (concat (nth res 0) (nth r1 0)) (nth r1 1))
+                 res))
+
+             (inner (nth res 1)))
+            res))
+        (p0 stm)))
+     stream)))
+</code></pre>
+
+<p>No more needing to carefully place trailing braces to make debugging brace placement issues easier. Just let Par-Infer handle it for you.</p></li>
+<li><p>Your variable names are bad. Names like <code>r1</code> and <code>p0</code> give very little information, and are the kind of names I'd expect to see post-decompilation. For the sake of you and those who may read your code, more descriptive names are a must.</p></li>
+<li><p>You have what appears to be documentation as comments above your functions. <code>defn</code> has a built-in ability to handle documentation:</p>
+
+<pre><code>(defn alt
+  "Returns first successful parse"
+  [&amp; ps]
+  (fn [stream]
+    (reduce #(or %1 %2) error (map #(% stream) ps))))
+</code></pre>
+
+<p>You use this for <code>-main</code>, but nowhere else.</p></li>
+</ul>
+
+<p>After taking the above suggestions into consideration (except for the variable names), your code would look more like:</p>
+
+<pre><code>(ns main.core
+  (:gen-class))
+
+(def error "The error message for the parser functions"
+  false)
+
+(defn lit
+  "Parses a single charactor"
+  [c]
+  (fn [stream]
+    (if (= (first stream) (first (seq c)))
+      (list (seq c) (rest stream))
+      error)))
+
+(defn alt
+  "Returns first successful parse"
+  [&amp; ps]
+  (fn [stream]
+    (reduce #(or %1 %2) error (map #(% stream) ps))))
+
+(defn seqn
+  "Tries to parse in series, error if any have an error"
+  [&amp; ps]
+  (fn [stream]
+    (apply
+      (letfn [(inner ([stm p0] ; Letfn is the local equivilent of defn
+                      (p0 stm))
+
+                     ([stm p0 p1]
+                      ((fn [r0]
+                         (if r0
+                           ((fn [r1]
+                              (if r1
+                                (list (list (nth r0 0) (nth r1 0)) (nth r1 1))
+                                error)
+                             (p1 (nth r0 1))))
+                           error)
+                        (p0 stm))))
+
+                     ([stm p0 p1 &amp; p]
+                      (let [r0 (p0 stm)]
+                        (if r0
+                          ((fn [r1]
+                             (if r1
+                               ((fn [res]
+                                  (list (list (nth r0 0) (nth r1 0) (nth res 0)) (nth res 1))
+                                 (apply inner (nth r1 1) p)))
+                               error)
+                            (p1 (nth r0 1))))
+                          error))))])
+
+      stream ps)))
+
+(defn many
+  "Parser that parses as many times as it can, at least once though, or it is an error"
+  [p0]
+  (fn [stream]
+    ((fn inner [stm]
+       ((fn [res]
+          (if res
+            ((fn [r1]
+               (if r1
+                 (list (concat (nth res 0) (nth r1 0)) (nth r1 1))
+                 res)
+
+              (inner (nth res 1))))
+            res)
+         (p0 stm)))
+      stream))))
+
+(defn func
+  "Parser that applies a function to the result of another parser."
+  [p0 f]
+  (fn [stream]
+    ((fn [res]
+       (list (f (nth res 0)) (nth res 1))
+      (p0 stream)))))
+
+(defn num-to-int [n]
+  (Integer/parseInt (apply str n)))
+
+(defn get-val [[res remains]]
+  res)
+
+(defn -main
+  "Main function, this computes the number 1904 from the string '34*56'"
+  [&amp; args]
+
+  (let [digit (alt (lit "1") (lit "2") (lit "3") (lit "4") (lit "5") (lit "6") (lit "7") (lit "8") (lit "9") (lit "0"))
+        number (func (many digit) num-to-int)
+        mul (func (seqn number (lit "*") number), (fn [[a b c]] (* a c)))]
+
+    (println (get-val (mul "34*56")))))
+</code></pre>
+
+<hr>
+
+<hr>
+
+<p>These were the main things. Now I'll just comment on more nitpicky things:</p>
+
+<p><code>nil</code> is more commonly used to represent bad data, instead of <code>false</code>. Also, unless you think you may want to change the value of <code>error</code> later, I'd also just write <code>nil</code> directly instead of labeling it as <code>error</code>. It's generally understood that <code>nil</code> represents the lack of usable data, which appears to be your intent here.</p>
+
+<hr>
+
+<p><code>list</code> is most commonly used when writing macros to create code in the macro (because lisps are homoiconic). Consider just using a vector literal (<code>[]</code>) instead unless you absolutely need <code>list</code> behavior:</p>
+
+<pre><code>(list (seq c) (rest stream))
+</code></pre>
+
+<p>to</p>
+
+<pre><code>[(seq c) (rest stream)]
+</code></pre>
+
+<hr>
+
+<p>Some of your functions are <em>huge</em>! I would definitely consider breaking them down. For example, I don't see why <code>inner</code> is defined inside of <code>seqn</code>; it doesn't form a closure over any local variables. From the looks of it, it's quite complicated and makes up the majority of the functionality of <code>seqn</code>. I'd make it it's own function, then have <code>seqn</code> use it. That will leave you with two smaller, easier to test functions. Also, are you <em>sure</em> <code>inner</code> should be a giant function with multiple arities? It wouldn't be cleaner to have it with fewer arities, or even make it multiple smaller functions? Remember, when programming functionally, the function is considered the smallest unit of code. Functions should be as large as necessary, but <em>as small as possible</em>. If you look at my repositories, I have a <em>ton</em> of small, bite-sized functions that each have an extremely focused, narrow scope. This makes testing very easy, and prevents you from needing to go over a giant wall of code making up a function trying to decipher what it's doing <em>in it's entirety</em>.</p>
+
+<hr>
+
+<p>For <code>num-to-int</code>, <code>long</code> is the native number type that Clojure uses. If you cast to <code>int</code>, it's just going to be converted to <code>long</code> somewhere down the road, and that could <em>potentially</em> lead to a performance hit. You might also want to make it clearer that "<code>n</code>" is actually a seq. Calling the parameter <code>n</code> then writing <code>(apply str n)</code> is very confusing, since I wouldn't expect <code>n</code> to be a sequence. I would change it to:</p>
+
+<pre><code>(defn num-to-int [n-seq]
+  (Long/parseLong (apply str n-seq)))
+</code></pre>
+
+<hr>
+
+<p><code>get-val</code> is basically just <code>first</code>. Unless you really like how the name helps readability, I'd just use <code>first</code>.</p>
+
+<hr>
+
+<pre><code>(alt (lit "1") (lit "2") (lit "3") (lit "4") (lit "5") (lit "6") (lit "7") (lit "8") (lit "9") (lit "0"))
+</code></pre>
+
+<p>has a ton of repetition. There's a lot of ways to fix this. I'd lean towards something like this though:</p>
+
+<pre><code>(-&gt;&gt; "1234567890"
+  (map str) ; Turn each char into a string
+  (map lit) ; Turn each string into a literal f
+  (apply alt)) ; Then give them to alt
+</code></pre>
+
+<p>Note that even though <code>map</code> is used twice, this only does a single iteration due to laziness! This could also be shortened using <code>comp</code>:</p>
+
+<pre><code>(-&gt;&gt; "1234567890"
+  (map (comp lit str)) ; Turn each char into a string, then give to lit
+  (apply alt)) ; Then give them to alt
+</code></pre>
+
+<p>Although I find the former more readable.</p>
+
+<hr>
+
+<p>I'm trusting that your constant return of anonymous functions is necessary for the algorithm. I've never seen so many functions being returned from other functions! If it's necessary, it's necessary, but while trying to debug a issue, I got a mess of an error like this:</p>
+
+<blockquote>
+  <p>ArityException Wrong number of args (0) passed to: parser-review-fixed/func/fn--1421/fn--1422  clojure.lang.AFn.throwArity (AFn.java:429)</p>
+</blockquote>
+
+<p>The function inside of the function inside of <code>func</code> threw an arity error! Good luck debugging that!</p>
+
+<hr>
+
+<p>The recursive call inside of <code>inner</code> inside of <code>many</code> could/should be "optimized". Change:</p>
+
+<pre><code>(inner (nth res 1))
+</code></pre>
+
+<p>to</p>
+
+<pre><code>(recur (nth res 1))
+</code></pre>
+
+<p>Use of <code>recur</code> prevents Stack Overflows by essentially making use of Tail-Call Optimization (although, from what I understand, the inner workings are far more complicated than that).</p>
+
+<hr>
+
+<p>I personally <em>love</em> threading macros (<code>-&gt;</code> and <code>-&gt;&gt;</code> mainly). I'd lean towards writing your <code>alt</code> function as:</p>
+
+<pre><code>(defn alt
+  "Returns first successful parse"
+  [&amp; ps]
+  (fn [stream]
+    (-&gt;&gt; ps
+         (map #(% stream))
+         (reduce #(or %1 %2) error)))) ; %1 can just be written as %
+</code></pre>
+
+<p>That's nice (imho), but it's not optimized. <code>reduce</code> actually allows for early exit using <code>reduced</code>! It would be more efficient (but more verbose) to write:</p>
+
+<pre><code>(defn alt
+  "Returns first successful parse"
+  [&amp; ps]
+  (fn [stream]
+    (-&gt;&gt; ps
+         (map #(% stream))
+         (reduce (fn [acc x]
+                   (if x
+                     (reduced x)
+                     acc))
+                 error))))
+</code></pre>
+
+<p>As soon as an accumulator for <code>reduce</code> becomes <code>reduced</code>, the reduction ends, and the <code>reduced</code> value is returned. This prevents the entire sequence from needing to be checked if, say, the first value is truthy.</p>
+
+<p>But, the core already has a function that basically does this: <code>some</code>. Since you don't need to do any conversion prior to testing for thruthiness though, you can use <code>identity</code> to "forward" the value in place of a predicate. Then <code>alt</code> just becomes:</p>
+
+<pre><code>(defn alt
+  "Returns first successful parse"
+  [&amp; ps]
+  (fn [stream]
+    (-&gt;&gt; ps
+         (map #(% stream))
+         (some identity)))) ; some returns the first truthy value
+</code></pre>
+
+<p>I came back to this and realized it can be reduced further! You can get rid of the call to map and make the <code>#(% stream)</code> the predicate of <code>some</code>. This makes it trivial:</p>
+
+<pre><code>(defn alt
+  "Returns first successful parse"
+  [&amp; ps]
+  (fn [stream]
+    (some #(% stream) ps)))
+</code></pre>
+
+<hr>
+
+<p>Regarding your recent edit clarifying what <code>seqn</code> is doing, these are the two options I'd choose between:</p>
+
+<pre><code>(defn sequence-parser1 [&amp; parsers]
+  (fn [stream]
+    (reduce (fn [[res acc-stream] p]
+              (let [[r stream'] (p acc-stream)]
+                [(conj res r) stream']))
+            [[] stream]
+            parsers)))
+
+(defn sequence-parser2 [&amp; parsers]
+  (fn [stream]
+    (loop [[p &amp; rest-parsers] parsers
+           acc-stream stream
+           res []]
+      (if p
+        (let [[r stream'] (p acc-stream)]
+          (recur rest-parsers stream' (conj res r)))
+
+        [res acc-stream]))))
+</code></pre>
+
+<p>Both are basically the same code; just a reduction over <code>parsers</code>. I tend to lean towards using <code>loop</code> when I have multiple accumulators though, as I find constant pairing/deconstruction in the reducing function to be messy.</p>
+
+<p>If you didn't need to accumulate a <code>stream</code> while iterating the parsers, this could be done very succinctly using <code>map</code>, but alas, that wouldn't work here unfortunately.</p>
+
+<hr>
+
+<hr>
+
+<hr>
+
+<h1>WARNING!</h1>
+
+<p>I have to admit, I have basically no clue what most of this code is doing, and because of the unidiomatic way that it's written, it confused the hell out of my IDE. Because of the indentation and the constant application of temporary functions, this was extraordinarily difficult to make runnable after I fixed it up. If you try to run that first "touched up" code dump I posted, you'll get an error. There's a mismatched brace somewhere in the <code>seqn</code> I posted, but I can't for the life of me find the issue. Use what I posted here more as a general guide instead of copying and pasting it and trying to use it. </p>
+    </div>

@@ -1,0 +1,144 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I think that in order to be a good review candidate, this should be more than an "outline." Like, there should be an example of how you intend to use it.</p>
+
+<p>But here's some stylistic feedback:</p>
+
+<ul>
+<li><code>CamelCase</code> your template parameter names: <code>IntType</code> (or just <code>T</code>), <code>Alloc</code>.</li>
+<li>You can (and should) use the injected class-name <code>uses_custom_buffers</code> inside the class itself, rather than typing out <code>uses_custom_buffers&lt;int_type, alloc&gt;</code> every time.</li>
+<li>Don't define multiple (member) variables on the same line.</li>
+<li>Mark your constructors <code>explicit</code> unless you <em>want</em> to enable the implicit conversion for some specific reason.</li>
+<li>Explicitly mark your base classes <code>public</code> and <code>private</code>, for clarity.</li>
+<li>Writing <code>std::size_t</code> instead of <code>size_t</code>, or <code>typename</code> instead of <code>class</code>, is just extra keyboard practice. Personally, I always go for the shorter versions.</li>
+<li>Always brace your <code>if</code> and <code>for</code> bodies. Don't <a href="https://nakedsecurity.sophos.com/2014/02/24/anatomy-of-a-goto-fail-apples-ssl-bug-explained-plus-an-unofficial-patch/" rel="nofollow noreferrer">goto fail</a>!</li>
+</ul>
+
+<hr>
+
+<pre><code>    this-&gt;uses_custom_buffers&lt;int_type, void&gt;::set_buffer(count, buffer, size);
+</code></pre>
+
+<p>This seems complicated. Ideally we'd just write</p>
+
+<pre><code>    set_buffer(count, buffer, size);
+</code></pre>
+
+<p>But since that <code>set_buffer</code> is located in a dependent base class, we actually have to write <code>this-&gt;</code> in front:</p>
+
+<pre><code>    this-&gt;set_buffer(count, buffer, size);
+</code></pre>
+
+<p>And then we <em>still</em> have trouble, because the declaration of <code>set_buffer</code> in <code>uses_custom_buffers&lt;int_type, alloc&gt;</code> <em>hides</em> the declaration of <code>set_buffer</code> in <code>uses_custom_buffers&lt;int_type, void&gt;</code>! There are two clean ways to fix this, depending on what you want to do. <a href="https://godbolt.org/z/kzAApY" rel="nofollow noreferrer">The first</a> is to bring the hidden <code>set_buffer</code> back into scope with a <a href="https://en.cppreference.com/w/cpp/language/using_declaration" rel="nofollow noreferrer">using-declaration</a>:</p>
+
+<pre><code>using uses_custom_buffers&lt;int_type, void&gt;::set_buffer;
+</code></pre>
+
+<p>The second is to pick a different name for one or both of the functions in this overload set.</p>
+
+<blockquote>
+  <p><em>"If you have two [functions] that are doing something very very different, please, name them differently."</em> —<a href="https://www.youtube.com/watch?v=xTdeZ4MxbKo&amp;t=6m07s" rel="nofollow noreferrer">Titus Winters, 2018</a></p>
+</blockquote>
+
+<hr>
+
+<p>I would even argue that <code>uses_custom_buffers&lt;int_type, void&gt;</code> is doing something "very very different" from <code>uses_custom_buffers&lt;int_type, alloc&gt;</code>, and therefore it should be named differently.</p>
+
+<hr>
+
+<p>Very important:</p>
+
+<pre><code>typename alloc::rebind&lt;int_type*&gt;::other pointer_alloc;
+</code></pre>
+
+<p>This is (A) missing a <code>template</code> keyword, and (B) waaay too complicated for one line of code. Break it down by using a typedef:</p>
+
+<pre><code>using PointerAlloc = typename alloc::template rebind&lt;int_type *&gt;::other;
+PointerAlloc pointer_alloc;
+</code></pre>
+
+<p>However, this is (C) still broken, because it fails to use <code>allocator_traits</code>. You need to write this instead:</p>
+
+<pre><code>using PointerTraits = typename std::allocator_traits&lt;alloc&gt;::template rebind_traits&lt;int_type *&gt;;
+using PointerAlloc = typename std::allocator_traits&lt;alloc&gt;::template rebind_alloc&lt;int_type *&gt;;
+PointerAlloc pointer_alloc;
+</code></pre>
+
+<p>And then on the next line:</p>
+
+<pre><code>int_type** buffer = pointer_alloc.allocate(count);
+</code></pre>
+
+<p>should be</p>
+
+<pre><code>int_type **buffer = PointerTraits::allocate(pointer_alloc, count);
+</code></pre>
+
+<p>However, after all that, I am <em>still</em> super duper confused about where your allocator is supposed to come from! You just default-constructed it and immediately used it to allocate some memory? Where is the memory supposed to come from?</p>
+
+<p>If you want to use the standard allocator model, you need to provide a way for the user to <em>pass in</em> an allocator for you to use. You can't just default-construct one and expect it to magically know where its heap is located. (That happens to work for <code>std::allocator</code> because it just uses <code>new</code> and <code>delete</code>, which are global; but it is highly unlikely to work for any user-provided allocator type.)</p>
+
+<hr>
+
+<p>Let's put it all together and see how it looks:</p>
+
+<pre><code>template&lt;class T&gt;
+class use_custom_buffers_base {
+public:
+    use_custom_buffers_base *set_buffers(size_t count, T **buffers, size_t size) {
+        this-&gt;m_buf   = buffers;
+        this-&gt;m_count = count;
+        this-&gt;m_size  = size;
+        return this;
+    }
+
+private:
+    T **m_buf;
+    size_t m_count;
+    size_t m_size;
+};
+
+template&lt;class T, class Alloc&gt;
+class use_custom_buffers : private use_custom_buffers_base&lt;T&gt;
+{
+    using Base = use_custom_buffers_base&lt;T&gt;;
+    using ATraits = std::allocator_traits&lt;Alloc&gt;;
+    using PTraits = typename ATraits::template rebind_traits&lt;T*&gt;;
+    using PAlloc = typename PTraits::allocator_type;
+
+public:
+    explicit use_custom_buffers(Alloc alloc) : m_alloc(std::move(alloc)) {}
+
+    use_custom_buffers *set_buffers(size_t count, size_t size) {
+        PAlloc pointer_alloc(m_alloc);
+        T **buffers = PTraits::allocate(pointer_alloc, count);
+        for (size_t i = 0; i &lt; count; ++i) {
+            buffers[i] = ATraits::allocate(m_alloc, size);
+        }
+        this-&gt;Base::set_buffers(count, buffers, size);
+        return this;
+    }
+
+private:
+    Alloc m_alloc;
+};
+</code></pre>
+
+<p>There's still work to do. <code>count</code> and <code>size</code> are strange names, especially since <code>size</code> is <em>also</em> a count (of <code>T</code> objects), not the "size" of any entity in the program. I decided to punt on the question of what to call <code>Base::set_buffers</code>. The arguments to <code>set_buffers</code> are in a weird order (length, pointer, other-length). It is unclear from your description whether anyone in the codebase actually cares about <code>use_custom_buffers_base</code> or whether it could be completely hidden away in a detail namespace — or, indeed, inlined into <code>use_custom_buffers</code>, since the inheritance relationship here seems like it's doing more harm than good.</p>
+
+<hr>
+
+<p>Finally, a possible performance issue: Why are you calling <code>allocate</code> in a loop?</p>
+
+<pre><code>        for (size_t i = 0; i &lt; count; ++i) {
+            buffers[i] = ATraits::allocate(m_alloc, size);
+        }
+</code></pre>
+
+<p>Surely it would be more performant to allocate just <em>once</em> and then use pointers into different parts of that buffer?</p>
+
+<pre><code>        auto ptr = ATraits::allocate(m_alloc, count * size);
+        for (size_t i = 0; i &lt; count; ++i) {
+            buffers[i] = ptr + (i * size);
+        }
+</code></pre>
+    </div>

@@ -1,0 +1,169 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Now for something completely different: an implementation in C.</p>
+
+<p>This is somewhat simple and stupid, and for all intents and purposes it executes instantly. It does not have any hash maps or hash sets. It tracks, for each pet, a letter frequency counting array that is sparse - it technically tracks the whole ASCII-extended range for efficiency's sake.</p>
+
+<p>This makes some blatant assumptions:</p>
+
+<ul>
+<li>Locale is ignored</li>
+<li>Letter case is ignored</li>
+<li><code>words.txt</code> is assumed to have already been downloaded</li>
+<li>This is possibly only compatible with Unix-like operating systems due to the file calls</li>
+<li>Punctuation, spaces, etc. count as "characters that can be removed" to satisfy the criteria</li>
+</ul>
+
+<pre class="lang-c prettyprint-override"><code>#include &lt;fcntl.h&gt;
+#include &lt;stdbool.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;string.h&gt;
+#include &lt;sys/stat.h&gt;
+#include &lt;unistd.h&gt;
+
+#define FILENAME "words.txt"
+
+typedef struct {
+    const bool common; // Is this a common pet?
+    const char *name;  // Pet's name, capitalized
+    int len,           // Length of pet's name, excluding null
+        *counts;       // Array of letter frequencies
+} Pet;
+
+// Assume ASCII everywhere; this is the number of symbols whose frequency we count
+#define N_COUNTS 256
+// The size of a frequency-counting array for the above character set
+#define N_COUNT_BYTES (N_COUNTS * sizeof(int))
+// The number of bytes if we only care about counting the upper-case alphabet
+#define BYTES_TO_Z ((1 + (int)'Z') * sizeof(int))
+// The number of letters that the word must lose to get to the pet name
+#define COUNT_DIFF 2
+
+static Pet pets[] = {
+    { true, "DOG"     },
+    { true, "CAT"     },
+    { true, "LIZARD"  },
+    { true, "RABBIT"  },
+    { true, "HAMSTER" },
+    { true, "FISH"    },
+    { false, "BEAR"  },
+    { false, "RHINO" },
+    { false, "LION"  },
+    { false, "TIGER" },
+    { false, "VIPER" },
+    { false, "HYENA" },
+};
+#define N_PETS (sizeof(pets)/sizeof(Pet))
+
+static void init_pet(Pet *restrict pet) {
+    pet-&gt;len = strlen(pet-&gt;name);
+
+    pet-&gt;counts = aligned_alloc(16, BYTES_TO_Z);
+    if (!pet-&gt;counts) {
+        perror("Failed to allocate buffer");
+        exit(1);
+    }
+    memset(pet-&gt;counts, 0, BYTES_TO_Z);
+    for (int i = 0; i &lt; pet-&gt;len; i++)
+        pet-&gt;counts[(uint8_t)pet-&gt;name[i]]++;
+}
+
+static bool compare(
+    const Pet *restrict p,     // The pet whose name we will compare
+    const char *restrict word, // The dictionary word
+    int wlen,                  // Length of the dictionary word
+    int *restrict counts       // Memory we use for count differences
+ ) {
+    // The word must have more letters than the pet, in total
+    if (wlen != p-&gt;len + COUNT_DIFF)
+        return false;
+
+    memcpy(counts, p-&gt;counts, BYTES_TO_Z);
+
+    for (const char *w = word; *w; w++) {
+        // This difference is effectively:
+        // frequency of this letter in pet - frequency of this letter in word
+        // It starts off at the pet# and decreases.
+        // Its permissible range for a valid word is -COUNT_DIFF &lt;= c &lt;= 0.
+        int *c = counts + (uint8_t)*w;
+        (*c)--;
+        // Does the word have greater than COUNT_DIFF of this letter more than
+        // the pet name?
+        if (*c &lt; -COUNT_DIFF)
+            return false;
+    }
+
+    // There cannot be any counts left over that are positive. Loop over the
+    // letters of the pet name, which in nearly all cases are unique; so this is
+    // more efficient than looping over the whole alphabet.
+    for (const char *c = p-&gt;name; *c; c++)
+        if (counts[(uint8_t)*c] &gt; 0)
+            return false;
+
+    return true;
+}
+
+static char *read_file(const char **restrict end) {
+    int fdes = open(FILENAME, O_RDONLY);
+    if (fdes == -1) {
+        perror("Failed to open " FILENAME);
+        exit(1);
+    }
+    struct stat fs;
+    if (fstat(fdes, &amp;fs) == -1) {
+        perror("Failed to get size of " FILENAME);
+        exit(1);
+    }
+
+    char *start = malloc(fs.st_size+1);
+    if (!start) {
+        perror("Failed to allocate dictionary buffer");
+        exit(1);
+    }
+
+    ssize_t nread = read(fdes, start, fs.st_size);
+    if (nread != fs.st_size) {
+        perror("Failed to read " FILENAME);
+        exit(1);
+    }
+
+    *end = start + fs.st_size;
+    start[fs.st_size] = '\0';
+    return start;
+}
+
+static int upper_and_len(char *restrict str) {
+    // Capitalize all letters, find non-printable newline
+    int n;
+    for (n = 0; str[n] &gt;= ' '; n++)
+        if (str[n] &gt;= 'a' &amp;&amp; str[n] &lt;= 'z')
+            str[n] &amp;= ~('A' ^ 'a');
+    str[n] = '\0'; // Replace newline with null
+    return n;      // Return length of string to the null
+}
+
+int main() {
+    for (Pet *p = pets; p &lt; pets+N_PETS; p++)
+        init_pet(p);
+
+    int *counts = aligned_alloc(16, N_COUNT_BYTES);
+    if (!counts) {
+        perror("Failed to allocate working memory buffer");
+        exit(1);
+    }
+
+    const char *words_end;
+    int wlen;
+    for (char *word = read_file(&amp;words_end); word &lt; words_end; word += wlen + 1) {
+        wlen = upper_and_len(word);
+        for (Pet *p = pets; p &lt; pets+N_PETS; p++)
+            if (compare(p, word, wlen, counts))
+                    printf("%s -&gt; %s = %s Pet\n",
+                        word, p-&gt;name, p-&gt;common ? "Common" : "Uncommon");
+    }
+
+    return 0;
+}
+</code></pre>
+    </div>

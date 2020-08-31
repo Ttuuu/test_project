@@ -1,0 +1,196 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This is the code that <strong>Toby Speight</strong> suggested in his answer:</p>
+
+<pre class="lang-c prettyprint-override"><code>/*
+ * int  sbprintf(char buff[restrict], int *restrict written,
+ *                              const char *restrict format, ...);
+ */
+#define sbprintf(buff, written, format, ...)    (                       \
+{                                                                       \
+        int     len_;                                                   \
+                                                                        \
+        alx_static_assert_array(buff);                                  \
+                                                                        \
+        len_    = snprintf((buff), sizeof(buff), format, ##__VA_ARGS__);\
+        if (written != NULL)                                            \
+                *written = len_;                                        \
+        len_ &gt;= (int)sizeof(buff);                                      \
+}                                                                       \
+)
+</code></pre>
+
+<hr>
+
+<p>I have tested it and works as expected:</p>
+
+<ul>
+<li>If <code>written</code> is <code>NULL</code> it doesn't write into it.</li>
+<li>The return value is <code>true</code> when the string is truncated and <code>false</code> otherwise.</li>
+<li>It doesn't compile if <code>buff</code> is not an array.</li>
+<li>It accepts a variable number of arguments after <code>format</code>, including no arguments.</li>
+</ul>
+
+<p>The comment above the macro is the prototype that a user should see, to better understand the usage, although a real function with that prototype wouldn't work because of the array decaying to a pointer.</p>
+
+<hr>
+
+<p>Comments about the style:</p>
+
+<p>I tried to follow the Linux Kernel Coding Style, but there have been exceptions:</p>
+
+<p><code>if (written != NULL)</code> is used instead of <code>if (written)</code> to avoid the compiler complaining:</p>
+
+<pre><code>main.c:22:23: error: the address of ‘w1’ will always evaluate as ‘true’ [-Werror=address]
+  if (alx_sbprintf(b1, &amp;w1, test))
+                       ^
+.../libalx/base/stdio/sbprintf.h:36:6: note: in definition of macro ‘alx_sbprintf’
+  if (written)       \
+      ^~~~~~~
+</code></pre>
+
+<hr>
+
+<p><strong>EDIT:</strong></p>
+
+<p>Given that <code>snprintf</code> sets <code>errno</code> (at least in <a href="https://pubs.opengroup.org/onlinepubs/9699919799/functions/snprintf.html" rel="nofollow noreferrer">POSIX</a>), it would be good to set <code>errno</code> to <code>ENOMEM</code> on truncation.</p>
+
+<hr>
+
+<p><strong>EDIT:</strong></p>
+
+<p>This version includes the improvements suggested by <strong>Toby Speight</strong> and  <strong>chux</strong>, as well as setting <code>errno</code> on error.  First I added code to the macro, but it proved to have <a href="https://stackoverflow.com/q/56825271/6872717">some problems</a> (at least it didn't compile, so no dangerous bugs).  Now it's an <code>extern</code> function enclosed in a simple macro.</p>
+
+<p>Now the code relies less on GCC extensions.</p>
+
+<p>Properties:</p>
+
+<ul>
+<li>If <code>written</code> is <code>NULL</code> it doesn't write into it.</li>
+<li>It doesn't compile if <code>buff</code> is not an array.</li>
+<li>It accepts a variable number of arguments after <code>format</code>, including no arguments.</li>
+<li>Sets <code>errno</code> on any error.</li>
+<li>If there's a <code>snprintf</code> internal error, the error code is negative (<code>-errno</code>), and <code>written</code> is also negative.</li>
+<li>If the string is truncated, the error code is positive (<code>ENOMEM</code>).</li>
+<li>If the error code is negative, the string should not be trusted;  if it's positive, it's been truncated, but it's a valid string.</li>
+</ul>
+
+<p>Code:</p>
+
+<p><code>sbprintf.h</code>:</p>
+
+<pre class="lang-c prettyprint-override"><code>#ifndef ALX_STDIO_PRINTF_SBPRINTF_H
+#define ALX_STDIO_PRINTF_SBPRINTF_H
+
+
+#include "libalx/base/assert/assert.h"
+#include "libalx/base/stdio/printf/swnprintf.h"
+
+
+/*
+ * int  sbprintf(char buff[restrict], ptrdiff_t *restrict written,
+ *              const char *restrict format, ...);
+ */
+#define sbprintf(buff, written, fmt, ...)   (                           \
+{                                                                       \
+                                                                        \
+        alx_static_assert_array(buff);                                  \
+        swnprintf(buff, written, sizeof(buff), fmt, ##__VA_ARGS__);     \
+}                                                                       \
+)
+
+
+#endif      /* libalx/base/stdio/printf/sbprintf.h */
+</code></pre>
+
+<p><code>swnprintf.h</code>:</p>
+
+<pre class="lang-c prettyprint-override"><code>#ifndef ALX_STDIO_PRINTF_SWNPRINTF_H
+#define ALX_STDIO_PRINTF_SWNPRINTF_H
+
+
+#include &lt;stddef.h&gt;
+
+
+int     swnprintf(char str[restrict], ptrdiff_t *restrict written, ptrdiff_t nmemb,
+                        const char *restrict format, ...);
+
+
+#endif      /* libalx/base/stdio/printf/swnprintf.h */
+</code></pre>
+
+<p><code>swnprintf.c</code>:</p>
+
+<pre class="lang-c prettyprint-override"><code>#include "libalx/base/stdio/printf/swnprintf.h"
+
+#include &lt;errno.h&gt;
+#include &lt;stdarg.h&gt;
+#include &lt;stddef.h&gt;
+#include &lt;stdio.h&gt;
+
+
+int     swnprintf(char str[restrict], ptrdiff_t *restrict written, ptrdiff_t nmemb,
+                        const char *restrict format, ...)
+{
+        va_list ap;
+        int     len;
+
+        if (nmemb &lt; 0)
+                goto neg;
+
+        va_start(ap, format);
+        len     = vsnprintf(str, nmemb, format, ap);
+        va_end(ap);
+
+        if (written != NULL)
+                *written = len;
+
+        if (len &lt; 0)
+                goto err;
+        if (len &gt;= nmemb)
+                goto trunc;
+
+        return  0;
+trunc:
+        if (written)
+                *written = nmemb - 1;
+        errno   = ENOMEM;
+        return  ENOMEM;
+neg:
+        errno   = EOVERFLOW;
+err:
+        if (written)
+                *written = 0;
+        return  -errno;
+}
+</code></pre>
+
+<p><strong>Edit:</strong></p>
+
+<p>Modified to use <code>ptrdiff_t</code>: it allows to detect invalid (negative) sizes, instead of using their unsigned value.  Also removes a cast.</p>
+
+<p>Modified to set <code>written</code> to 0 on error when the string is unreliable.</p>
+
+<hr>
+
+<p>The return value should <strong>always</strong> be used:</p>
+
+<pre><code>__attribute__((warn_unused_result))
+</code></pre>
+
+<p>Add checks to the format and varargs:</p>
+
+<pre><code>__attribute__((format(printf, 4, 5)))
+</code></pre>
+
+<p><strong>EDIT:</strong></p>
+
+<p>When using <code>__attribute__((warn_unused_result))</code>, the macro <code>sbprintf</code> silences the warning because of the way it works;  to warn the user, the following code can be used:</p>
+
+<pre><code>#define ARRAY_SIZE(a)       (sizeof(a) / sizeof((a)[0]))
+
+#define sbprintf(buff, written, fmt, ...)                               \
+        swnprintf(buff, written, ARRAY_SIZE(buff), fmt, ##__VA_ARGS__)
+</code></pre>
+
+<p>Note:  GCC 8 warns (<code>-Werror=sizeof-pointer-div</code>) if buff is not an array without needing a <code>static_assert</code>, when using <code>ARRAY_SIZE</code> defined this way.  If using an old version of GCC, you will need to use some tricks to block compilation.</p>
+    </div>

@@ -1,0 +1,131 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><code>&lt;cstddef&gt;</code> defines <strong><code>std::ptrdiff_t</code></strong> - the implementation is allowed to also define it in the global namespace, but it's not required to - so always qualify the type.</p>
+
+<p>I was expecting to see <code>sbprintf()</code> defined as a template, rather than as a macro (as an aside, macros work at the preprocessor level, and the <code>namespace</code> definition in that file is empty and useless).  Here's how the template looks:</p>
+
+<pre><code>namespace alx {
+
+    template&lt;std::size_t N, typename... Args&gt;
+    int sbprintf(char(&amp;buff)[N], std::ptrdiff_t *written,
+                 const char *fmt, Args... args)
+    {
+        return swnprintf(buff, written, sizeof buff, fmt, args...);
+    }
+
+}
+</code></pre>
+
+<p>Not only is this much neater than a macro, it's standard C++ (no GNU extensions), and automatically type-safe with no need for static asserts.</p>
+
+<p>We can enable extra type checking on GCC using the <code>format</code> attribute, but we'd need to use <code>&lt;cstdarg&gt;</code> variable argument list rather than a template parameter pack for that.</p>
+
+<p>I don't see the advantage of giving the functions different names; this is a situation where operator overloading allows us to use one name regardless of arguments (and allows natural extension to write wide character strings, for instance).  We might choose to provide overloads for providing the <code>written</code> argument or not (by reference), as I can't see any need for this to be a run-time thing.</p>
+
+<p>When <code>std::vsnprintf()</code> returns a negative result, we shouldn't be storing that in <code>written</code> - it makes more sense to store zero instead, and ensure we write an empty string.</p>
+
+<p>I think the use of <code>goto</code> for error handling is less clear than simply putting the error return inline - each label has only one entry point, and there's no common cleanup to do.</p>
+
+<p>The cast of <code>len</code> to <code>unsigned</code> is pointless and possibly harmful, given that <code>std::ptrdiff_t</code> is a signed type.</p>
+
+<hr>
+
+<h1>Modified code</h1>
+
+<p>With some of the improvements suggested above, I get the following.</p>
+
+<h3>Header</h3>
+
+<pre><code>#include &lt;cstdarg&gt;
+#include &lt;cstddef&gt;
+
+#ifdef __GNUC__
+#define attribute(x) __attribute__(x)
+#else
+#define attribute(x)
+#endif
+
+namespace alx {
+
+    // va_list version
+    int sprintf(char *str, std::ptrdiff_t *written,
+                  std::ptrdiff_t buf_size, const char *format, va_list ap)
+        attribute((format (printf, 4, 0)));
+
+    // general version
+    int sprintf(char *str, std::ptrdiff_t *written,
+                  std::ptrdiff_t buf_size, const char *format, ...)
+        attribute((format (printf, 4, 5)));
+
+    // deduce size from buffer argument
+    template&lt;std::size_t N&gt;
+    int sprintf(char(&amp;buff)[N], std::ptrdiff_t *written,
+                 const char *fmt, ...)
+        attribute((format (printf, 3, 4)));
+}
+
+#undef attribute
+
+// template definition
+template&lt;std::size_t N&gt;
+int alx::sprintf(char(&amp;buff)[N], std::ptrdiff_t *written,
+                  const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    int result = alx::sprintf(buff, written, N, fmt, ap);
+    va_end(ap);
+    return result;
+}
+</code></pre>
+
+<h3>Implementation</h3>
+
+<pre><code>#include &lt;cerrno&gt;
+#include &lt;cstdarg&gt;
+#include &lt;cstddef&gt;
+#include &lt;cstdio&gt;
+
+int alx::sprintf(char *str, std::ptrdiff_t *written,
+                 std::ptrdiff_t buf_size, const char *format, va_list ap)
+{
+    if (buf_size &lt;= 0) {
+        return - (errno = EOVERFLOW);
+    }
+
+    int len = std::vsnprintf(str, buf_size, format, ap);
+
+    if (len &lt; 0) {
+        *str = '\0';
+        if (written) {
+            *written = 0;
+        }
+        return -errno;
+    }
+
+    if (len &gt;= buf_size) {
+        if (written) {
+            *written = buf_size - 1;
+        }
+        return - (errno = EOVERFLOW);
+    }
+
+    if (written) {
+        *written = len;
+    }
+
+    return  0;
+}
+
+int alx::sprintf(char *str, std::ptrdiff_t *written,
+                 std::ptrdiff_t buf_size, const char *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    int result = alx::sprintf(str, written, buf_size, format, ap);
+    va_end(ap);
+    return result;
+}
+</code></pre>
+
+<p>Look Ma, no macros!</p>
+    </div>

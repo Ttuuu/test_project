@@ -1,0 +1,118 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I tried to make a parallelized implementation without full locks (use collections from Concurrency namespace). Also, I've added an optional <code>compareFunc</code> function useful if you want to test object equality without override <code>Equals</code> on <code>TSource</code>.</p>
+
+<p>This is my version:</p>
+
+<pre><code>    /// &lt;summary&gt;
+    /// Gets the changes [Deleted, changed, inserted] comparing this collection to another.
+    /// &lt;/summary&gt;
+    /// &lt;param name="local"&gt;The source collection.&lt;/param&gt;
+    /// &lt;param name="remote"&gt;The remote collection to comare agains.&lt;/param&gt;
+    /// &lt;param name="keySelector"&gt;The primary key selector function&lt;/param&gt;
+    /// &lt;param name="compareFunc"&gt;Optional camparing function between 2 objects of type TSource&lt;/param&gt;
+    /// &lt;returns&gt;List of changes as Added, Removed and Changed items of type TSource&lt;/returns&gt;
+    public static ChangeResult&lt;TSource&gt; CompareTo&lt;TSource, TKey&gt;(
+        this IEnumerable&lt;TSource&gt; local, IEnumerable&lt;TSource&gt; remote, Func&lt;TSource, TKey&gt; keySelector, Func&lt;TSource, TSource, bool&gt; compareFunc = null)
+    {
+        if (local == null)
+            throw new ArgumentNullException("local");
+        if (remote == null)
+            throw new ArgumentNullException("remote");
+        if (keySelector == null)
+            throw new ArgumentNullException("keySelector");
+
+        var remoteKeyValues = new ConcurrentDictionary&lt;TKey, TSource&gt;(remote.ToDictionary(keySelector));
+        var localKeyValues = new ConcurrentDictionary&lt;TKey, TSource&gt;(local.ToDictionary(keySelector));
+        var changed = new ConcurrentBag&lt;Tuple&lt;TSource, TSource&gt;&gt;();
+
+        Parallel.ForEach(
+           local,
+           localItem =&gt;
+           {
+               var localItemKey = keySelector(localItem);
+
+               //1. Check if item is both in local and remote
+               if (remoteKeyValues.TryRemove(localItemKey, out var remoteItemValue))
+               {
+                   //1.a item is in both collections -&gt; check if they are different
+                   var isItemChanged = compareFunc != null ? !compareFunc(localItem, remoteItemValue) :
+                        !localItem.Equals(remoteItemValue);
+
+                   if (isItemChanged)
+                   {
+                       //1.b are different -&gt; mark a change
+                       changed.Add(new Tuple&lt;TSource, TSource&gt;(localItem, remoteItemValue));
+                   }
+
+                   //1.c remove the item from local list as it's prensent in remote list too
+                   //this should never return false
+                   localKeyValues.TryRemove(localItemKey, out var localItemValue);
+               }
+
+               //2. if item is not in remote list means it has been removed
+           });
+
+        var deleted = localKeyValues.Values;
+        var inserted = remoteKeyValues.Values;
+
+        return new ChangeResult&lt;TSource&gt;(deleted, changed, inserted);
+    }
+</code></pre>
+
+<p>and ChangeResult class slightly modified:</p>
+
+<pre><code>    /// &lt;summary&gt;
+/// Immutable class containing changes
+/// &lt;/summary&gt;
+public sealed class ChangeResult&lt;T&gt;
+{
+    public ChangeResult(IEnumerable&lt;T&gt; deleted, IEnumerable&lt;Tuple&lt;T, T&gt;&gt; changed, IEnumerable&lt;T&gt; inserted)
+    {
+        Deleted = deleted;
+        Changed = changed;
+        Inserted = inserted;
+    }
+
+    public IEnumerable&lt;T&gt; Deleted { get; }
+
+    public IEnumerable&lt;Tuple&lt;T, T&gt;&gt; Changed { get; }
+
+    public IEnumerable&lt;T&gt; Inserted { get; }
+}
+</code></pre>
+
+<p>end this is a test</p>
+
+<pre><code>[TestClass]
+public class ListUtilsTests
+{
+    class User
+    {
+        public string Key { get; set; }
+
+        public string Name { get; set; }
+    }
+
+    [TestMethod]
+    public void ListUtilsCompare()
+    {
+        var local = new[] { new User() { Key = "A", Name = "John" }, new User() { Key = "B", Name = "Red" } };
+        var remote = new[] { new User() { Key = "B", Name = "Red (edited)" }, new User() { Key = "C", Name = "Tizio" } };
+
+        var changes = local.CompareTo(remote, _ =&gt; _.Key, (i1, i2) =&gt; i1.Name == i2.Name);
+
+        Assert.IsNotNull(changes);
+        Assert.AreEqual(1, changes.Inserted.Count());
+        Assert.AreEqual("Tizio", changes.Inserted.First().Name);
+        Assert.AreEqual(1, changes.Deleted.Count());
+        Assert.AreEqual("John", changes.Deleted.First().Name);
+        Assert.AreEqual(1, changes.Changed.Count());
+        Assert.AreEqual("Red (edited)", changes.Changed.First().Item2.Name);
+    }
+}
+</code></pre>
+
+<p>Edit: After further investigations, I found that actually going without parallel threads it runs much faster (see <a href="https://gist.github.com/adospace/917429d2163a5435f5d19b9f092affce" rel="nofollow noreferrer">https://gist.github.com/adospace/917429d2163a5435f5d19b9f092affce</a> for a comparison chart).</p>
+
+<p>So just replace the <code>Parallel</code> code above with <code>foreach (var localItem in local)</code></p>
+    </div>

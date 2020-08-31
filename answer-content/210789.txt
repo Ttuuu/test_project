@@ -1,0 +1,72 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>offset = re_supp._offset_byte_char
+
+def compare_escaped_within_range(char):
+    """Test that the character is escaped at the beginning of a range."""
+    end = offset(char, 3)
+    assert re_supp.byte_range(char, end, [end]) == b'[\\' + char + b'-' + offset(end, -1) + b']'
+</code></pre>
+
+<p>Two weird things going on here. First, your unit test depends on an internal implementation detail of <code>re_supp</code> (namely the <code>_offset_byte_char</code> method). Second, you're actually storing that method in a <em>global variable</em>, which makes your test not standalone. You couldn't extract just the <code>compare_escaped_within_range</code> test into a different test file, for example, unless you brought the global <code>offset</code> along with it. It would at least be more maintainable to say</p>
+
+<pre><code>def compare_escaped_within_range(char):
+    """Test that the character is escaped at the beginning of a range."""
+    offset = re_supp._offset_byte_char
+    end = offset(char, 3)
+    assert re_supp.byte_range(char, end, [end]) == b'[\\' + char + b'-' + offset(end, -1) + b']'
+</code></pre>
+
+<p>But it would be even better not to depend on that detail at all! Either make <code>_offset_byte_char</code> a public member of the API (lose the underscore), or just reimplement it yourself where you need it.</p>
+
+<p>When you reimplement it, consider that Python offers the <code>chr</code> builtin to do exactly what you're currently doing with all that <code>byteorder='big'</code> nonsense on ints. Although I guess Python3 does force you to know about <code>latin_1</code> encoding:</p>
+
+<pre><code>offset = lambda x, y: chr(ord(x) + y).encode('latin_1')
+</code></pre>
+
+<hr>
+
+<p>IIUC, your public API really just consists of the function <code>byte_range(b, e, xs)</code>, where <code>b</code> and <code>e</code> are single bytes and <code>xs</code> is an iterable of bytes — which generates a regex character class matching any of the bytes in <code>b</code> to <code>e</code> inclusive, but excluding all of the bytes in <code>xs</code>.</p>
+
+<p>In other words, it produces a regex which is the moral equivalent of <code>(?=[b-e])(?![xs]).</code>, or more succinctly <code>(?![xs])[b-e]</code>.</p>
+
+<p>I guess you knew this, but it does feel like your 60-line thing is a bit overengineered. ;)</p>
+
+<hr>
+
+<p>Personally I would write <code>ch</code> everywhere you wrote <code>char</code>, but that's probably partly due to my being primarily a C and C++ programmer. ;)  <code>ch</code> would still be shorter and arguably harder to confuse with <code>chr</code>, though...</p>
+
+<hr>
+
+<p>Again on the testing side: your <code>compare_escaped_within_range</code> seems overdetermined and overcomplicated. If I were writing tests for your API, I would write one like this:</p>
+
+<pre><code>def test_inputs(b, e, xs):
+    needle = re_supp.byte_range(b, e, xs)
+    for i in range(256):
+        haystack = chr(i).encode('latin_1')
+        expected = (ord(b) &lt;= i &lt;= ord(e)) and (haystack not in xs)
+        actual = bool(re.match(needle, haystack))
+        assert actual == expected
+</code></pre>
+
+<p>And then I'd make sure all of my tests <em>at least</em> verified that <code>test_inputs(b, e, xs)</code> passed for their inputs. Even if they went on to verify other properties.</p>
+
+<pre><code>def test_byte_regex_range_escaped_caret():
+    """Test that '^' is escaped"""
+    test_inputs(b'^', b'a', [b'a'])
+    assert re_supp.byte_range(b'^', b'a', [b'a']) == b'[\\^-`]')  # should we even verify this, or are we micromanaging?
+</code></pre>
+
+<p>Incidentally, you got very lucky that out of <code>]</code>, <code>^</code>, and <code>-</code>, no two of them are exactly 2 positions apart in the ASCII table! Did you know that? Do you expect your maintainer to know that <code>3</code> is a magic number in this respect — or should you maybe document it for posterity?</p>
+
+<hr>
+
+<p>I ran my <code>test_inputs</code> on some random data and discovered some bugs in your code. Most blatantly, you forgot that <code>\</code> needs to be escaped. So <code>test_inputs(b'\\', b'A', [])</code> fails.</p>
+
+<p>Fix the trivial bug by adding two characters in <code>escape_byte_in_character_class</code>. Now add a regression test: <code>compare_escaped_within_range(b'\\')</code>. The test still fails! Why? :)</p>
+
+<p>And you don't handle the completely empty case: <code>test_inputs(b'A', b'A', [b'A'])</code> fails.</p>
+
+<p>And you don't handle <code>test_inputs(b'B', b'A', [])</code> either, but that's more of an input validation issue, which is an issue of taste. Maybe you want to return <code>b'(?!.).'</code> in that case; maybe you want to assert-fail; or maybe you're happy just saying "don't do that."</p>
+
+<p>The moral of the story is that you should always write a test harness that permits fuzzing! It's never wasted effort. ...Well, it's never <em>effort that fails to find bugs,</em> anyway. :)</p>
+    </div>

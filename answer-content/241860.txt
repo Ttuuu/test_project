@@ -1,0 +1,822 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>General design</h1>
+
+<p>Before digging into the nitty-gritty, I like to take a moment to consider the overall design. The main difference between a beginner and a pro (or between a <em>competent</em> pro and an incompetent one), is that a good pro knows that 80–90% of the <em>real</em> work of programming is done before you even tap a single key. Every second you spend <em>thinking</em> about how you’re going to tackle your problem saves you an hour­—if not a day, or even a <em>week</em>—of work later.</p>
+
+<p>And this is <em>especially</em> true if what you’re working on is a library. Application code and business logic code can be clunky (but shouldn’t be, obvs), because you’re only using it once. <em>Library</em> code is meant to be used over and over, so if it’s clunky, it <em>really</em> hurts.</p>
+
+<p>You provided the code for your utility… but you didn’t provide any <em>examples</em> of how that utility is meant to be <em>used</em>. That, to me, is a red flag. It tells me you probably didn’t give all that much thought to the ergonomics of how this utility is going to be used. (It also makes me wonder if you even <em>tried</em> to use it. Does this code even compile? I see some things in there that tell me it might not. But more on that later.)</p>
+
+<p>So let’s look at what your utility might look like when in use:</p>
+
+<pre><code>auto data = std::vector&lt;int&gt;{};
+// fill data with data...
+
+auto func = [](auto val)
+{
+    // do something with val...
+};
+
+auto f1 = utils::async_for_each&lt;decltype(data), decltype(func)&gt;{};
+
+f1(data, func);
+</code></pre>
+
+<p>So I have to give the type of both the data and the function when constructing the object… well that’s clunky.</p>
+
+<p>Worse, because those types are now embedded in the object, I can't do this:</p>
+
+<pre><code>auto other_data = std::array&lt;int&gt;{};
+auto more_other_data = std::vector&lt;long&gt;{};
+
+f1(other_data, func); // nope, won't compile
+f1(more_other_data, func); // nope
+</code></pre>
+
+<p>I need to create whole new objects, with whole new thread pools. Which, really, kinda defeats the whole purpose, if your goal was to eliminate the overhead of thread creation each time the “foreach” is used.</p>
+
+<p>Is that really the interface you want your <code>async_for_each()</code> to have?</p>
+
+<p>In my opinion, the underlying problem here is you’re making the classic mistake of creating a “god object”: a single “thing” that just does too much stuff. Your <code>async_for_each</code> class does <em>at least</em> three different jobs that I might very reasonably want to customize differently:</p>
+
+<ol>
+<li>it’s a thread pool</li>
+<li>it’s a task scheduler</li>
+<li>it’s an algorithm</li>
+</ol>
+
+<p>Any one of those things is useful independently, and I might want to be able to do something differently from what you have done:</p>
+
+<ol>
+<li>I might want to create my own threads with specific affinities, or maybe use special thread types like GPU threads.</li>
+<li>I might want to use priority scheduling or a job queue or some other kind of scheduling rather than round-robin scheduling by chunks, because the jobs might not all take the same amount of time.</li>
+<li>I might want to stop at the first “success” or “fail” result rather than barrelling through the whole data set.</li>
+</ol>
+
+<p>If these things were all separate, rather than all baked together into one object, not only would that allow me more control and flexibility, it would actually make the interface simpler. For example:</p>
+
+<pre><code>auto tp = thread_pool();
+
+auto scheduler = basic_scheduler{tp};
+
+async_for_each(scheduler, data, func);
+
+// but also, these would reuse the thread pool and scheduler:
+async_for_each(scheduler, other_data, func);
+async_for_each(scheduler, more_other_data, func);
+</code></pre>
+
+<p>And as others have pointed out, if you make these things standard-library-compatible, you get all the benefits of the standard library (such as tons of different algorithms, and not just a limited form of <code>for_each</code>) for free.</p>
+
+<p>So let’s dive into the code…</p>
+
+<h1>Code review</h1>
+
+<pre><code>#include &lt;thread&gt;
+#include &lt;condition_variable&gt;
+</code></pre>
+
+<p>These seem like a rather limited set of headers to include. I see in the class itself that it uses <code>unique_ptr</code> and <code>mutex</code>… does the code even compile with just these headers?</p>
+
+<pre><code>template &lt;typename Container, typename Function&gt;
+class async_foreach
+</code></pre>
+
+<p>So you’ve templated the class on <code>Container</code> and <code>Function</code> because you want to store a pointer to the container and a pointer to the function. Okay, but… is that necessary?</p>
+
+<p>Step back and rethink the problem. Does the thread function really, actually need to call <code>function(container[index])</code>?</p>
+
+<p>Let me show you what I mean. Right now, your code is doing something like this:</p>
+
+<pre><code>operator()(container, function)
+{
+    // Set up data for the thread to use:
+    _p_container = &amp;container;
+    _p_function = &amp;function;
+    _p_indices[i] = {from, to}; // for each thread[i]
+
+    // Signal the threads there's data to use,
+    // then wait for them to finish.
+}
+
+thread_method(index)
+{
+    // ... looping, waiting for signal, then gets the signal to start...
+
+    for (i = (*_p_indices)[i].from ... (*_p_indices)[i].to)
+        (*_p_function)((*_p_container)[i]);
+
+    // ... and so on (ie, signal completion, etc.)
+}
+</code></pre>
+
+<p>What if, instead, it did something like this:</p>
+
+<pre><code>operator()(container, function)
+{
+    // Set up data for the thread to use:
+    auto lambda = [&amp;container, &amp;function, from, to]()
+    {
+        for (i = from ... to)
+            function(container[i]);
+    };
+
+    // For each thread:
+    _function[index] = lambda; // _function is a vector&lt;function&lt;void()&gt;&gt;
+
+    // Signal the threads there's data to use,
+    // then wait for them to finish.
+}
+
+thread_method(index)
+{
+    // ... looping, waiting for signal, then gets the signal to start...
+
+    _function[index]();
+
+    // ... and so on (ie, signal completion, etc.)
+}
+</code></pre>
+
+<p>Note that <code>thread_method()</code> now doesn’t need to know the container or function type—it’s just calling a type-erased void function. By extension, the constructor and class also don’t need to know these things, so the class doesn’t need to be a template anymore. The only part of the interface that needs to know the container and function type is <code>operator()()</code>… and that’s cool because it can deduce those types directly from the function arguments. Which means my original example code could become:</p>
+
+<pre><code>auto data = std::vector&lt;int&gt;{};
+// fill data with data...
+
+auto func = [](auto val)
+{
+    // do something with val...
+};
+
+// Note: no template types necessary...
+auto f = utils::async_for_each{};
+
+// ... because they're deduced here
+f(data, func);
+
+// And now these will work, too:
+auto other_data = std::array&lt;int&gt;{};
+f(other_data, func);
+
+auto more_other_data = std::vector&lt;long&gt;{};
+f(more_other_data, func);
+</code></pre>
+
+<p>I think that’s much easier to work with.</p>
+
+<pre><code>//this is the constant size of all the dynamically allocated arrays
+const size_t threads_count;
+//holds all the threads
+std::unique_ptr&lt;std::thread[]&gt; threads;
+//condition variables and mutexes to wait-notify individual threads
+std::unique_ptr&lt;std::condition_variable[]&gt; conditionals;
+std::unique_ptr&lt;std::mutex[]&gt; mutexes;
+</code></pre>
+
+<p>(I assume all these data members are meant to be private, and are only left public because you’re fiddling. I see no reason why they can or should be accessible outside of the class.)</p>
+
+<p>This is the part of your class that irks my C++ bones the most. Why all the <code>unique_ptr</code> arrays? Why not vectors? I see no rational reason why one might prefer manually allocating arrays here… I mean, okay, granted, the size will be duplicated across all the vectors (except maybe not! but I’ll get to that), but compared to all the overhead of the context switches, does that really matter?</p>
+
+<p>Also, when I see a bunch of arrays side-by-side, all of which are the same size because a single iota of data is spread out across <code>array_1[i]</code>, <code>array_2[i]</code>, <code>array_3[i]</code>, … etc, I immediately wonder why you don’t create a struct to package everything together, and avoid the complexity of maintaining the invariant that <code>array_1.size == array_2.size == array_3.size…</code>. (I mean, sure, there <em>are</em> very rare cases where a struct-of-arrays is better than an array-of-structs, but I can’t see that being the case here.)</p>
+
+<p>In other words, why not this:</p>
+
+<pre><code>// private inner class:
+struct pool_thread_t
+{
+    std::thread thread;
+    std::condition_variable cv;
+    std::mutex m;
+    std::size_t from;
+    std::size_t to;
+};
+
+std::vector&lt;pool_thread_t&gt; threads;
+</code></pre>
+
+<p>(I mean, maybe you might have to wrap the condition variable and mutex—or the whole struct—in a <code>unique_ptr</code> to make them easier to work with, because they’re not movable or copyable, but that’s hardly a major problem. Of course, you don’t really need a cv and mutex for each thread anyway, but I’ll get to that.)</p>
+
+<pre><code>bool running = true;
+</code></pre>
+
+<p>This should be an <code>atomic&lt;bool&gt;</code>. Why? Because it is both read and set without any mutexes guarding it. It will probably “work” on most real-world platforms without a problem… but who knows what might happen on some exotic hardware with false sharing or something else weird going on. Plus, if anyone makes any changes (like reusing the flag for other purposes, for example, as I coincidentally suggest next), things could break very easily.</p>
+
+<pre><code>async_foreach(size_t threads_count = std::thread::hardware_concurrency()) :
+// ... [snip] ...
+    {
+    for (size_t i = 0; i &lt; threads_count; i++)
+        {
+        threads.get()[i] = std::thread(&amp;async_foreach::thread_method&lt;Container, Function&gt;, this, i);
+        }
+    }
+</code></pre>
+
+<p>There is a major bug lurking here.</p>
+
+<p>Imagine <code>threads_count</code> is 8. Your loop starts, 6 threads get constructed just fine… but thread 7 fails and throws an exception. Now what happens?</p>
+
+<p>Well, to start with, you’ve got 6 deadlocked threads, waiting on a condition variable that will never be signalled.</p>
+
+<p>But then it gets <em>really</em> bad. Because the stack will unwind, and all those <code>unique_ptr</code> arrays will be freed, and now those 6 threads are locking/unlocking mutexes that don’t even exist anymore, checking zombie condition variables and <code>bool</code>s. Anything could happen now; nasal demons, et al.</p>
+
+<p>You need to re-engineer how this is going to work. In your constructor, you could wrap that <code>for</code> loop in a <code>try</code> block, while keeping track of how far along you got in the construction. If an exception is thrown, then set <code>running</code> to <code>false</code> and for all the threads that have already been successfully constructed, notify them, and wait for them to join. Then and only then let the exception thrown propagate.</p>
+
+<pre><code>void operator()(Container&amp; container, Function function)
+</code></pre>
+
+<p>Is there a reason <code>Function</code> takes the function by value here, rather than by reference? It doesn’t take ownership of the function or anything. You might need to worry about <code>const</code> correctness here, but if you refactor the class so that it’s no longer a template—and only this function is a template—then you can use forwarding references to solve all that.</p>
+
+<pre><code>void operator()(Container&amp; container, Function function)
+    {
+    // ... [snip] ...
+
+    //{ std::unique_lock&lt;std::mutex&gt; lock(out); std::cout &lt;&lt; "waiting threads" &lt;&lt; std::endl; }
+    //wait for each thread to complete
+    if (true)
+        {
+        std::unique_lock&lt;std::mutex&gt; lock(main_mutex);
+        main_conditional.wait(lock, [&amp;]()
+            {
+            //{ std::unique_lock&lt;std::mutex&gt; lock(out); std::cout &lt;&lt; returned_count &lt;&lt; " threads returned" &lt;&lt; std::endl; }
+            return returned_count == threads_count;
+            });
+        }
+    //{ std::unique_lock&lt;std::mutex&gt; lock(out); std::cout &lt;&lt; "all threads returned (possibly, maybe)(?)" &lt;&lt; std::endl; }
+    //reset the counter for next call
+    returned_count = 0;
+    }
+</code></pre>
+
+<p>This seems like a brittle and dangerous way to keep track of which threads are done. Consider what would happen if one thread failed to increment <code>returned_count</code>. For example, what if <code>function</code> threw an exception in one of the threads? Boom. Deadlock. <code>main_conditional</code> never gets its notification, and even if it does spuriously wake up, your wait condition will never succeed.</p>
+
+<p>A first step to improving this could be to use a RAII object in <code>thread_method()</code> to <em>ensure</em> the count gets incremented even in the face of an exception (and then either ignore or propagate the exception somehow).</p>
+
+<p>But if that’s starting to sound a little over-engineered… well, yeah. You have a bunch of worker threads all acquiring a lock on that main mutex and <em>then</em> the main thread being notified, waking up, having to wait for that notifying worker to release the mutex before it can lock the mutex itself to check the variable and make sure it wasn’t spuriously woken. The only reason you need all that mutex locking is to protect <code>returned_count</code>.</p>
+
+<p>Instead, consider making <code>returned_count</code> an <code>atomic&lt;size_t&gt;</code>.</p>
+
+<p>That won’t make much difference in <code>operator()()</code> (or will it! more on that in a moment!), but it will make a <em>huge</em> difference in <code>thread_method()</code>. That entire final <code>if</code> block just… goes away. It gets replaced with <code>++returned_count;</code>. Yes. Just that.</p>
+
+<p>Or even better, it gets replaced with… nothing. Because you would have that RAII object that automatically increments <code>returned_count</code> at the end of the loop.</p>
+
+<p>But this still isn’t great, for the next reason:</p>
+
+<pre><code>void thread_method(size_t index)
+    {
+    // ... [snip] ...
+
+    while (true)
+        {
+        if (true) //just to get the ide to indent the block
+            {
+            std::unique_lock&lt;std::mutex&gt; lock(mutex);
+            //go sleep until there's something to actually do
+            conditional.wait(lock); 
+            }
+</code></pre>
+
+<p>This is the second major bug in this code.</p>
+
+<p>The problem here is that condition variables might spuriously wake up without being notified. Your code currently has no way to protect against this. <code>thread_func()</code> has no way to tell whether that condition variable was legitimately notified because there’s work to do or not. So the cv triggers, sees <code>running</code> is <code>true</code> (because the destructor hasn’t been called yet), and cheerfully charges into that loop to run <code>function</code> over <code>container</code>… except those are both null pointers. Or maybe they’re not; maybe they’re left over from the last call. Either way, boom.</p>
+
+<p>So the first thing you might think to do to fix this is add a ”theres_work_to_do” flag for every thread. Now your <code>thread_method()</code> might look something like this:</p>
+
+<pre><code>void thread_method(size_t index)
+    {
+    // ... [snip] ...
+
+    while (true)
+        {
+        if (true)
+            {
+            std::unique_lock&lt;std::mutex&gt; lock(mutex);
+            conditional.wait(lock, [&amp;] { return !running or theres_work_to_do; });
+            }
+</code></pre>
+
+<p>But now ask yourself… is it really necessary for every thread to have its own “there’s work to do” flag? That requires the main thread locking each worker thread’s mutex to set the flag. (Yes, that’s only if the flag isn’t atomic, but we’ll get to that.) Seems like all the threads are always going to be started in lockstep anyway, so you only need a single flag for them all. And if they’re all sharing a single flag, they don’t need individual mutexes (and indeed, can’t work that way, because you’d have different mutexes guarding the setting and reading of the flag). You’d only need a single mutex—the main mutex, for example—to guard that one flag… and not even that if the flag is atomic.</p>
+
+<p>Except now there’s another bug. What if the worker thread wakes up, sees “there’s work to do”, does the work, then goes back to sleep… then wakes up again and sees “there’s work to do”. Now, here’s the riddle: is this new work to do, or is this flag still set from the last job, and the main thread just hasn’t had a chance to unset it yet?</p>
+
+<p>So you <em>do</em> need per-thread flags. But perhaps there’s a way to eat our cake and have it, too.</p>
+
+<p>What if each worker thread had a single associated atomic <code>bool</code>, set to <code>false</code> by default. When the main thread has set up work for it to do, it sets that <code>bool</code> to <code>true</code>. Then it waits for the flag to change. The worker thread, meanwhile, sees the flag is <code>true</code>, so it does its task, then sets the flag to <code>false</code> again. The next time it sees the flag is <code>true</code> it knows for sure there’s new work to do.</p>
+
+<p>So you can use a single flag to signal when there is work to do, and when that work is done. That solves the problem of how the worker thread knows it hasn’t been spuriously woken, and you no longer need <code>returned_count</code>.</p>
+
+<p>And also, now you no longer need a mutex and cv for each worker thread. Nor do you need the main mutex and cv.</p>
+
+<p>It might look something like this:</p>
+
+<pre><code>// private inner class:
+struct pool_thread_t
+{
+    std::thread thread;
+    std::atomic&lt;bool&gt; flag;
+    // ...
+};
+
+std::vector&lt;pool_thread_t&gt; threads;
+
+void operator()(Container&amp;&amp; container, Function&amp;&amp; function)
+    {
+    // Set up the data for the worker threads, then:
+    for (auto&amp;&amp; thread : threads)
+        thread.flag = true;
+
+    // Now just wait for all the flags to go false again:
+    for (auto&amp;&amp; thread : threads)
+        {
+            if (thread.flag)
+                std::this_thread::yield();
+        }
+
+    // That's it.
+    }
+
+void thread_method(std::size_t index)
+    {
+    // Set up this thread's data.
+
+    while (running)
+        {
+        if (flag)
+            {
+            // Use whatever RAII method you like for this
+            on_scope_exit([&amp;flag] { flag = false; });
+
+            // do the work
+
+            // And that's it.
+            }
+        else
+            std::this_thread::yield();
+        }
+    }
+</code></pre>
+
+<p>And to make this even better, there are a few tools you can use.</p>
+
+<p>First, you can explicitly specify the memory sync ordering. Won’t make much difference on x64… might make a huge difference on ARM.</p>
+
+<p>Second, starting in C++20, you can actually use <code>atomic_flag</code> for this, and you can wait on the flag just like a condition variable:</p>
+
+<pre><code>// private inner class:
+struct pool_thread_t
+{
+    std::thread thread;
+    std::atomic_flag flag;
+    // ...
+};
+
+std::vector&lt;pool_thread_t&gt; threads;
+
+void operator()(Container&amp;&amp; container, Function&amp;&amp; function)
+    {
+    // Set up the data for the worker threads, then:
+    for (auto&amp;&amp; thread : threads)
+        thread.flag.test_and_set(memory_order::release);
+
+    // Now just wait for all the flags to go false again:
+    for (auto&amp;&amp; thread : threads)
+            thread.flag.wait(true, memory_order::acquire);
+
+    // That's it.
+    }
+
+void thread_method(std::size_t index)
+    {
+    // Set up this thread's data.
+
+    while (true)
+        {
+        flag.wait(false, memory_order::acquire);
+        if (!running) // this could also be an atomic flag, with memory ordering
+            break;
+
+        // Use whatever RAII method you like for this
+        on_scope_exit([&amp;flag] { flag.clear(memory_order::release); });
+
+        // do the work
+
+        // And that's it.
+        }
+    }
+</code></pre>
+
+<p>Not a single mutex in sight, let alone condition variables.</p>
+
+<h1>Summary</h1>
+
+<p>You have two-and-a-half major bugs in the current code that I can see:</p>
+
+<ol>
+<li>If an exception is thrown while constructing the worker threads, all hell can break loose.</li>
+<li>You don’t take into account that condition variables can awaken spuriously in your worker thread function, which means it may go ahead and try to do work when there isn’t any. This could either result in dereferencing null pointers, or absolute chaos.</li>
+</ol>
+
+<p>The “half” bug is because you don’t account for an exception being thrown <em>in</em> a worker thread, which would result in your completed count being off, and a deadlock. This is only a half-bug, because it probably doesn’t matter because <code>std::terminate()</code> is going to be called anyway… assuming the program isn’t deadlocked in a way that prevents that, of course.</p>
+
+<p>You also have a lot of performance issues due to the overuse of mutexes and condition variables. Atomics can really save your bacon here. <em>Especially</em> C++20 atomics, which can wait like condition variables for even better performance. (But even a lazy spinlock in userspace would probably be a <em>LOT</em> more efficient than all those mutexes locking and unlocking.)</p>
+
+<p>The biggest problem here is the design, which is clunky and difficult to use because the container and function types are baked into the class itself. By using type-erased function pointers—like <code>std::function&lt;void()&gt;</code>—you can eliminate the need to template on the container/function except in <code>operator()</code>… where they can be deduced from the function arguments.</p>
+
+<p>It would also probably be wise to break up this class into smaller components. It does too much. It manages a thread pool <em>and</em> handles task scheduling. These are things that could probably better be handled by more specialized classes.</p>
+
+<p>Also, I should point out that there’s really no technical reason to limit yourself to only handling containers that have a subscript operator. In the example I gave with the lambda <code>lambda</code>, it uses a <code>for</code> loop of indices from <code>from</code> to <code>to</code>… but it could just as easily use a pair of iterators.</p>
+
+<p>You could even support containers or ranges that don’t know their size by switching to a task queue design. For example, rather than breaking the job up into chunks then sending those chunks out to each worker thread, instead you could do something roughly like:</p>
+
+<pre><code>void operator()(Container&amp;&amp; container, Function&amp;&amp; function)
+    {
+    using std::begin;
+    using std::end;
+
+    auto first = begin(container);
+    auto const last = end(container);
+
+    while (first != last)
+        {
+        auto available_thread = std::find_if(begin(threads), end(threads), [](auto&amp;&amp; thread) { return thread.flag == false; });
+        if (available_thread != end(threads))
+            {
+            auto task = [&amp;function, first] { function(*first); };
+
+            available_thread-&gt;task = task;
+            available_thread-&gt;flag = true;
+
+            ++first;
+            }
+        else
+            {
+            // All worker threads busy, so wait.
+            std::this_thread::yield();
+            }
+        }
+
+    for (auto&amp;&amp; thread : threads)
+        thread.flag.wait(true);
+}
+</code></pre>
+
+<p>Perhaps you could even use <code>if constexpr</code> to get the best of <em>both</em> worlds, by switching on the container’s iterator type. For random-access iterators, chunk up the tasks; otherwise, send them one-by-one.</p>
+
+<p>Hope this helps!</p>
+
+<h1>Extension: Questions and answers</h1>
+
+<blockquote>
+  <p>i didn't want the vector to eventually reserve more space then required, since i already know beforehand that it will never ever grow.</p>
+</blockquote>
+
+<p>Rather than just <em>using</em> your standard library, you’re trying to outsmart it. That’s not a productive way to program. The standard library should be your friend and partner, not an antagonist you have to work around and undermine. Oh, for sure, always <em>verify</em> that your standard library is working the way you want it to… but the rule is trust then verify, which starts with ”trust”.</p>
+
+<p>Consider: Why would the developer of your standard library write their vector class to waste memory? What would be the point? If you specify that the vector holds N elements… why would the vector allocate for N+X elements? Why wouldn’t it just allocate what you told it you wanted?</p>
+
+<p>I am not aware of any standard vector implementation that won’t just allocate what you ask for. (Granted, I haven’t used <em>ALL</em> the stdlib implementations out there, but I’ve used libstdc++, libc++, Rogue Wave’s libs, Dinkumware’s, STLPort, the original HP STL, and a couple others.) But, heck, don’t take my word for it. Verify. Rather than assuming your standard library won’t work for you and trying to hack around it… check it to see if it works:</p>
+
+<pre><code>#include &lt;iostream&gt;
+#include &lt;vector&gt;
+
+auto main() -&gt; int
+{
+    // Let's try just constructing with the size we want.
+    auto v1 = std::vector&lt;int&gt;(17);
+
+    // Now let's try just reserving the size we want.
+    auto v2 = std::vector&lt;int&gt;{};
+    v2.reserve(27);
+
+    // Now let's try reserving the size we want, then filling it.
+    auto v3 = std::vector&lt;int&gt;{};
+    v3.reserve(13);
+    for (auto i = 0; i &lt; 13; ++i)
+        v3.push_back(i);
+
+    // Now let's try neither constructing at size or reserving,
+    // and instead expanding the vector as we fill it.
+    auto v4 = std::vector&lt;int&gt;{};
+    for (auto i = 0; i &lt; 23; ++i)
+        v4.push_back(i);
+
+    std::cout &lt;&lt; "v1.size = " &lt;&lt; v1.size() &lt;&lt; '\n';
+    std::cout &lt;&lt; "v1.capacity = " &lt;&lt; v1.capacity() &lt;&lt; '\n';
+    std::cout &lt;&lt; "v2.size = " &lt;&lt; v2.size() &lt;&lt; '\n';
+    std::cout &lt;&lt; "v2.capacity = " &lt;&lt; v2.capacity() &lt;&lt; '\n';
+    std::cout &lt;&lt; "v3.size = " &lt;&lt; v3.size() &lt;&lt; '\n';
+    std::cout &lt;&lt; "v3.capacity = " &lt;&lt; v3.capacity() &lt;&lt; '\n';
+    std::cout &lt;&lt; "v4.size = " &lt;&lt; v4.size() &lt;&lt; '\n';
+    std::cout &lt;&lt; "v4.capacity = " &lt;&lt; v4.capacity() &lt;&lt; '\n';
+}
+</code></pre>
+
+<p>I just tried that myself, and for bother libstdc++ and libc++, I got the same results:</p>
+
+<pre><code>v1.size = 17
+v1.capacity = 17
+v2.size = 0
+v2.capacity = 27
+v3.size = 13
+v3.capacity = 13
+v4.size = 23
+v4.capacity = 32
+</code></pre>
+
+<p>As you can see, the capacity is always exactly what you ask for… <em>except</em> in the case where the vector has to <em>grow</em>. (Bonus: try adding another element to either <code>v1</code> or <code>v3</code>. Betcha the capacity is now double the original capacity. This is from memory, but I’m pretty sure that for both libstdc++ and libc++, the growth factor is 2—the vector doubles in size when it has to grow. For Dinkumware, I think it’s 1.5.)</p>
+
+<p>And, really, if you think about it, if a stdlib implementation’s vector <em>didn’t</em> just allocate the size you asked for, it probably has a damn good reason for that. Otherwise, why not just use the information you gave it? For example, maybe the allocator simply <em>can’t</em> allocate your exact size, and thus gives you the next size up. (In which case, the exact same thing would be happening for your manually allocated arrays… you just wouldn’t know it.)</p>
+
+<p>The moral of the story here is that you jumped through a lot of hoops and wrote a lot of code to avoid a problem that doesn’t exist. For every one of those <code>unique_ptr</code> arrays, you know the size at construction time… which means a vector could just as easily be used, and it would have exactly the same size. And of course, the more code you write, the more the chance of error, the more the maintenance burden, and the more testing you have to do.</p>
+
+<blockquote>
+  <p>i made multiple arrays of a single data rather than structs because i'm mostly iterating on each array individually, so having all contiguous data should improve caching compared to having to skip over data i don't care in a specific loop for each step.</p>
+  
+  <p>At least it makes sense to me to split threads, from-to, and condition_variable-mutex (i agree these two make sense toghether since they're used in the same loops consecutively). But i don't agree in putting from-to in the same contiguous memory as cv-mutex and threads.</p>
+</blockquote>
+
+<p>“Should improve caching” hm? Have you actually measured? Because this sure sounds like premature optimization to me.</p>
+
+<p>Let’s get some numeric perspective. Let’s start with size. The type I suggested is 112 bytes using libc++ (and probably libstdc++ too, since most of the types are pretty much dictated by the kernel (or userspace analogues like <code>futex</code>)):</p>
+
+<ul>
+<li><code>std::thread</code>: 8 bytes (1 <code>pthread_t</code>, which is a <code>unsigned long</code>)</li>
+<li><code>std::condition_variable</code>: 48 bytes (set by kernel)</li>
+<li><code>std::mutex</code>: 40 bytes (set by kernel)</li>
+<li><code>std::size_t</code>: 8 bytes</li>
+</ul>
+
+<p>Sound pretty big, right? And sure, it’s a hell of a lot bigger than the usual size of a cache line these days, which is 64 bytes. But here’s where perspective comes into play. When people fret over packing data into cache lines, they’re usually talking about arrays of <em>thousands</em> or <em>tens of thousands</em> of values. What exactly are we talking about here?</p>
+
+<p>Well, realistically, it doesn’t really make a lot of sense to have more threads in the pool than there are hardware threads… anymore than that, and you’ve pretty much lost any gains you get from concurrency. Okay, so let’s assume you have an 8 kiB L1 cache (which is tiny these days; I’d expect at least 32 kiB). How many of those structs can fit in L1 cache? <em>Over 72</em>. So even with a tiny 8 kiB cache you can have 72 freakin’ threads in your pool, and still not have to worry about a cache miss. With a more average 32 kiB L1 cache, you can have <em>290</em>.</p>
+
+<p>I don’t think cache misses are going to be a problem.</p>
+
+<p>But let’s approach this from another angle. Let’s pretend cache misses are going to happen every single access. Is this actually a problem?</p>
+
+<p>Well, let’s look at all the places you iterate through the various arrays:</p>
+
+<ol>
+<li>In the constructor:
+
+<ul>
+<li>every one of the init list constructors has to iterate through each of the arrays, so that’s 4 different iterations</li>
+<li>in the body itself, a second iteration over the threads to construct them</li>
+</ul></li>
+<li>In the destructor:
+
+<ul>
+<li>once over <em>both</em> the cv and mutex arrays, locking and notifying</li>
+<li>once over the thread array to join</li>
+</ul></li>
+<li>In <code>operator()</code>:
+
+<ul>
+<li>once over <em>both</em> the indices <em>and</em> the cv array, setting the former and notifying the latter</li>
+</ul></li>
+</ol>
+
+<p>And that’s it.</p>
+
+<p>Now, we can pretty much ignore the constructor and destructor, because you don’t really need to worry about optimizing those. (Though, if you insist on considering them, let me point out that you’re not gaining anything in the constructor by iterating over <em>four</em> arrays sequentially, compared to iterating over a single one one time. But in any case, any cache miss costs are going to be <em>dwarfed</em> by the allocations and the costs of creating all those threads, even on platforms where threads are pretty cheap.) So the key loop you’d care about is the one in <code>operator()</code>.</p>
+
+<p>But look at what that loop is doing! Not only is it doing <em>two</em> indirections into <em>two</em> different arrays (so much for the gains you won by splitting the arrays up—you’re just using them together anyway)… you… you’re also… <em>notify on a condition variable</em>!!! In what is supposedly a hot loop!</p>
+
+<p>And not only that! Even if that loop were godawfully slow (which it isn’t really, for what it does)… <em>it doesn’t matter</em>. Because what’s going to happen next is <em>a series of context switches</em> as the threads that will actually do the work get their turns. So even if you get a cache miss for every access (which is absurd), which is each iteration of that loop, which is once per thread, then each thread still has to context switch (and then go through all the hoopla of locking the mutex, checking the condition variable, reading the task data, etc.). A rough estimate of the cost of an L1 cache miss is ~10 ns. A rough estimate of the cost of a thread context switch: ~10 <em>ms</em>. That’s <em>three orders of magnitude bigger</em>… and that’s a <em>massively</em> conservative estimate!</p>
+
+<p>In other words, all those code acrobatics you went through to in order to avoid cache misses ultimately turn out to give you a performance gain of… not 10%… not 1%… but <em>in the most generous estimate I can muster</em>, only ~0.1%. And the real-life gain is probably going to be much, much less. That’s basically thermal noise at that point; you can’t even tell the difference between cache misses and <em>hardware interrupts</em> at that point.</p>
+
+<p>So, realistically speaking, you are gaining pretty much literally <em>nothing</em> by making your code more convoluted, more difficult to reason about, and more difficult to maintain and debug.</p>
+
+<p>Don’t just read stuff on the internet and blindly apply it. There <em>are</em> situations where a struct-of-arrays design can be <em>much</em> faster than an array-of-structs design—I’ve seen documented cases of 50× improvement. But those are cases where you’re dealing with relatively <em>huge</em> amounts of data… not like a dozen elements, which is roughly the regime you’re dealing with here, but like a hundred thousand or a <em>million</em> elements. You ain’t makin’ a hundred thousand or a million threads, I assure you… and if you are… dude… cache misses are the least of your concerns. Also, those are cases where each operation is very short and quick, like a simple arithmetic calculation. They ain’t doing mutex locks, condition variable notifications, and thread context switches.</p>
+
+<p>Take the time to understand your problem to really grok the context before hacking up your code into spaghetti out of fear of phantom performance traps. And, most importantly, profile, profile, profile. Profile first; <em>then</em> (maybe) optimize.</p>
+
+<blockquote>
+  <p>About the bool not being atomic, you wrote "This should be an atomic. Why? Because it is both read and set without any mutexes guarding it". But how? The boolean is only set when all the threads are sleeping, or am i missing something?</p>
+</blockquote>
+
+<p>I think you have some confusion about how data is shared across threads. Whether a thread is active or not is completely irrelevant. The problem is that when you’re dealing with multiple cores, you’re often dealing with completely different, completely independent “views” of global memory. And those views are not necessarily deterministic with respect to each other.</p>
+
+<p>(Also, I think you’re still labouring under the misconception that if you <code>wait()</code> on a condition variable, that means the thread has obediently stopped and is just sitting, waiting for you to give it the green light to go again. When a thread is <code>wait()</code>ing, it’s still effectively waking up over and over and over—it keeps checking the condition then (hopefully) if the condition hasn’t been set, yielding then going back to step 1 (but not always; there are spurious wake-ups).)</p>
+
+<p>The most important thing to understand with concurrent programming is that not only do different threads see different views of shared memory, they don’t even see consistent “snapshots”. In other words, you have to stop imagining your program’s state as a single, consistent, universal truth, with different threads just seeing it at different points in time. Two threads may see completely inconsistent “truths”, each of which is impossible from the other thread’s point of view.</p>
+
+<p>For example, say the main thread is running on core 1. Let’s ignore the mutexes for a moment; we’ll get back to them. The destructor gets called, and <code>running</code> gets set to <code>false</code>, and then thread 2 gets notified. But thread 2 is on core 2, and it doesn’t “see” the change to <code>running</code>­—it has its own L1 cache, completely distinct from core 1’s L1 cache (L1 cache is usually per-core; L2 can be per-core or shared). So thread 2 gets woken up… but it doesn’t yet see that <code>running</code> is false.</p>
+
+<p>So far this all still makes sense in a deterministic world, but here’s where it starts to get wacky: the compiler and the CPU are <em>both</em> allowed to reorder memory reads/writes. So the main thread may decide to set <code>running</code> to <code>false</code> <em>AFTER</em> it sends the notification. Because why not? It’s a perfectly legal thing for the optimizer or CPU to do, because it makes no difference at all to the semantics of the code in the main thread. The main thread doesn’t care whether <code>running = false</code> “happens-before” <code>conditionals.get()[i].notify_one()</code> or not, right?</p>
+
+<p>Think about it: ignoring the existence of other threads (pretend the mutex lock and cv notify are no-ops), what is the difference between:</p>
+
+<pre><code>running = false;
+for (size_t i = 0; i &lt; threads_count; i++)
+    {
+    // effectively no-op: std::unique_lock&lt;std::mutex&gt; lock(mutexes.get()[i]);
+    // effectively no-op: conditionals.get()[i].notify_one();
+    }
+</code></pre>
+
+<p>and</p>
+
+<pre><code>for (size_t i = 0; i &lt; threads_count; i++)
+    {
+    // effectively no-op: std::unique_lock&lt;std::mutex&gt; lock(mutexes.get()[i]);
+    // effectively no-op: conditionals.get()[i].notify_one();
+    }
+running = false;
+</code></pre>
+
+<p>(Note that by “effective no-op”, I don’t mean that it doesn’t actually <em>do</em> anything. I just mean that it doesn’t do anything <em>that depends on <code>running</code></em>. The compiler can see that neither of those statements reads (or writes) the value of <code>running</code>, so from the point of view of the value of <code>running</code> they don’t matter.)</p>
+
+<p>There’s no difference, right? There is no indication that the stuff in the <code>for</code> loop has any dependency on <code>running</code> being set to false. Unless the compiler/CPU knows that the stuff in the loop has a dependency on <code>running</code> being set to <code>false</code>, it can’t know that it has to make sure the write to <code>running</code> is done before the loop.</p>
+
+<p>At the same time, thread 2 doesn’t care whether <code>if (!running) { break; }</code> “happens-before” <code>conditional.wait(lock)</code>. Without knowing that the value of <code>running</code> may magically change at any time, there’s no reason that:</p>
+
+<pre><code>while (true)
+    {
+    if (true)
+        {
+        // effectively no-op: std::unique_lock&lt;std::mutex&gt; lock(mutex);
+        // effectively no-op: conditional.wait(lock); 
+        }
+    if (!running) { break; }
+</code></pre>
+
+<p>couldn’t be rewritten as:</p>
+
+<pre><code>while (running)
+    {
+    if (true)
+        {
+        // effectively no-op: std::unique_lock&lt;std::mutex&gt; lock(mutex);
+        // effectively no-op: conditional.wait(lock); 
+        }
+</code></pre>
+
+<p><em>You</em> know that the value of <code>running</code> might change at any time… but the compiler and CPU don’t know that. (This is why, before C++11, people used to use <code>volatile</code> for rudimentary synchronization. <code>volatile</code> would prevent the compiler from making this kind of assumption.)</p>
+
+<p>And note: none of this has anything to do with whether the thread was active or not at the time of <code>running</code> being set, or the cv being notified.</p>
+
+<p>Okay, but there are mutexes involved, and that does change things. Why? Because <em>locking</em> a mutex is effectively an “acquire” event, and <em>releasing</em> a mutex is a “release” event.</p>
+
+<p>What this means is that if you wrapped the reading and writing of <code>running</code> in a mutex, there would be no problem:</p>
+
+<pre><code>// Thread 1:
+{
+    auto lock = std::unique_lock(mutex);
+    running = false;
+}
+// The mutex being unlocked triggers a "release", meaning that
+// everything that happened before the unlocking must be visible as
+// happening before the unlocking.
+// So the next thread that locks the mutex will EITHER see running set
+// properly to true OR properly to false... and not some weird hybrid of
+// the two (if such a thing is possible on a platform).
+conditional.notify_one();
+
+// Thread 2:
+{
+    auto lock = std::unique_lock(mutex):
+    conditional.wait(lock);
+    // wait() relocks the mutex after getting its notification. That
+    // locking triggers an “acquire”, which synchronizes with thread 1.
+    // So this thread will either see true or false, not
+    // half-set-to-false (again, if such a thing is possible).
+
+    // Note that this is guarded by the mutex. If it were not (as is the
+    // case in your actual code), then what could happen is thread 1
+    // could PARTIALLY set its value (or, really, ANYTHING could happen;
+    // it would be a data race, which is UB, which means anything
+    // goes).
+    // But, as I said, it will PROBABLY still "work" on all real-life
+    // systems.
+    if (not running) break;
+}
+</code></pre>
+
+<p>Now, in your actual code, you’ve actually got something peculiar going on that I’m not sure about, because you do the notify while still holding the mutex locked. In theory, this would mean that the worker thread would get the notification, and try to lock the mutex, and block… then the main thread releases the mutex—which triggers the “release” operation—then the worker would be able to lock the mutex—triggering an “acquire”—and all is well. <em>BUT</em>! I know that some implementations avoid that extra block, and simply sorta… “transfer” the lock over. But does that mean the “release” and “acquire” happen? I’m not sure.</p>
+
+<p>In any case, the bottom line is that the rule is: if your data is shared across threads, then it must be guarded by acquire-release barriers of some sort: a mutex works, and so do atomics. Fail to do this, and you’ve got a data race… as you do in your code. A data race is always UB, but that doesn’t mean it actually always manifests, or that it matters when it does. As a practical matter, I think that even if it does manifest in your code’s case, it will still “work”. But it’s still technically wrong.</p>
+
+<p><code>running</code> is mutable shared data. Thus it should either always be read-written while locked by (the same) mutex <em>OR</em> it should be atomic (or otherwise synchronized). Personally, I prefer atomics where possible, especially for tiny bits of data like <code>bool</code>s.</p>
+
+<blockquote>
+  <p>But don't i still need multiple mutexes for the conditional variable in any case?</p>
+</blockquote>
+
+<p>I don’t see why, honestly. Conceptually speaking, your worker threads aren’t really independent. They are <em>ALWAYS</em> started all together in lockstep, and <em>ALWAYS</em> finish all together in lockstep (all within a single function: <code>operator()</code>). There’s really only one set of global data you’re sharing—the task data. I don’t see why you need a dozen mutexes for a single block of data. It’s set up once at the start of <code>operator()</code> (and technically it doesn’t need a mutex for that; it just needs a fence… but a mutex is the easiest way to handle that), and then each thread just needs to read it before diving into their task.</p>
+
+<p>Or think of it another way: the point of a mutex is to protect data from being written to by multiple writers, or written to while it’s being read. Okay, so what data is each per-thread mutex guarding? Just the task-specific data (the to/from indices, and the pointers to the function and container). The worker thread doesn’t write to that data, it only reads it. Who else might be writing to that data while the worker thread is reading it? Well, nobody. The data is only changed while all the worker threads are sleeping, and then when they’re running they’re all only reading it. There’s no write contention. You don’t need to guard data that’s only being read (you just need to make sure it’s visible—that is, you need to make sure after you write it, you publish those writes to every thread that will want to read it, but once it’s visible, it doesn’t need to be guarded with a lock).</p>
+
+<p>By the same logic, you don’t really need a dozen condition variables. The only thing you’re using them for is to wake up the threads. Okay, fine, but again, this isn’t <em>really</em> a case of a dozen distinct events. There’s really just <em>one</em> event: a single wake-up of all the worker threads together. What you really want is for a single notification to wake up all the worker threads at once. You could do that with a single condition variable and <code>notify_all()</code>.</p>
+
+<p>Incidentally, I didn’t notice before that both <code>function</code> and <code>container</code> are <em>also</em> global data that isn’t protected. Unlike the case with <code>running</code>… yeah, you’re playing with fire there—this is <em>definitely</em> a bug. You have nothing guaranteeing that <em>either</em> of those writes are ordered before the call to <code>notify_one()</code> for each thread. This is a clear and definite data race. So are the writes to the indices. <em>ALL</em> of these things should be atomics, or guarded by mutexes. Or, at the <em>very</em> least, fences.</p>
+
+<p>You might be able to get away with something like this (very rough and untested code that I honestly really haven't sat down and really reasoned through):</p>
+
+<pre><code>// private inner struct
+struct pool_thread_t
+{
+    std::thread thread;
+    std::size_t from;
+    std::size_t to;
+    std::function&lt;void(std::size_t, std::size_t)&gt; task;
+    std::atomic&lt;bool&gt; busy;
+};
+
+std::vector&lt;pool_thread_t&gt; _threads;
+bool _shutdown = false;
+
+~destructor()
+{
+    _shutdown = true;
+
+    // Fence makes sure the write above is visible when the atomic
+    // writes that follow are visible.
+    std::atomic_thread_fence(std::memory_order::release);
+    for (auto&amp;&amp; thread : _threads)
+    {
+        thread.busy.store(true, std::memory_order::relaxed);
+        thread.busy.notify_one();
+    }
+
+    for (auto&amp;&amp; thread : _threads)
+        thread.thread.join();
+}
+
+template &lt;typename Container, typename Function&gt;
+auto operator()(Container&amp;&amp; container, Function&amp;&amp; function)
+{
+    using std::size;
+
+    auto const total_tasks = size(container);
+    auto const task_quantum = (total_tasks / _threads.size())
+        + bool(total_tasks % _threads.size());
+
+    // Set up task data.
+    auto task = [&amp;container, &amp;function] (std::size_t from, std::size_t to)
+    {
+        for (auto i = from; i &lt; to; ++i)
+            function(container[i]);
+    };
+
+    for (auto i = decltype(_threads.size()){}; i &lt; _threads.size(); ++i)
+    {
+        _threads[i].from = i * task_quantum;
+        _threads[i].to = std::min(_threads[i].from + (task_quantum - 1), total_tasks);
+        _threads[i].task = task;
+    }
+
+    // Fence to ensure everything above is visible when the following
+    // atomic stores are visible.
+    std::atomic_thread_fence(std::memory_order::release);
+    for (auto&amp;&amp; thread : _threads)
+    {
+        thread.busy.store(true, std::memory_order::relaxed);
+        thread.busy.notify_one();
+    }
+
+    // Now just wait for everything to be done.
+    for (auto&amp;&amp; thread : _threads)
+        thread.busy.wait(true, std::memory_order::acquire);
+}
+
+auto thread_method(std::size_t index)
+{
+    // You know, you could just pass a reference to the thread data
+    // directly, rather than an index.
+    auto&amp;&amp; thread_data = _threads[index];
+
+    while (true)
+    {
+        // Fence ensures that once we read the busy flag is true,
+        // we also see every other write done before.
+        thread_data.busy.wait(false, std::memory_order::relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+
+        // Were we woken up because it's shutdown time?
+        if (_shutdown)
+            return;
+
+        // Do the task.
+        try
+        {
+            thread_data.task(thread_data.from, thread_data.to);
+        }
+        catch (...)
+        {
+            // I guess just ignore errors.
+        }
+
+        // Notify that we're not longer busy.
+        thread_data.busy.store(false, std::memory_order::release);
+        thread_data.busy.notify_one();
+    }
+}
+</code></pre>
+
+<p>In C++17 you’re going to need condition variables (and, by extension, mutexes) because atomics can’t wait or notify. But you probably only need a single condition variable to start all the workers running; it’s probably overkill to also use notification for when the workers are done. It’s probably good enough for the main thread to just check “done” flags from all the worker threads and yield its time slice if they’re still busy, because when the workers finish and go to sleep, the schedule will probably switch back to the main thread anyway, so it won’t be wasting that much time.</p>
+
+<p>Or, perhaps a better solution before C++20 is to use promises and futures. You'd just set up the promises for each worker thread, save their futures, then trigger them all to start (using a cv, for example), then just wait on them all. As a bonus, using this technique you could also easily handle errors in the worker threads.</p>
+
+<p>But yeah, the general takeaway is that if your data is shared between threads, it must be synchronized somehow. Either protect it with a mutex, use atomics, or do something else (fences, futures, whatever). Don’t just rely on assumptions about if/when changes to data values become visible across threads. That’s just asking to be burned with data races.</p>
+    </div>

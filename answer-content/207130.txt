@@ -1,0 +1,273 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Include (only) what you use</h1>
+
+<p>This class uses nothing from <code>&lt;iostream&gt;</code>, so it's a waste of the compiler's time to include it.</p>
+
+<h1>Control the public interface</h1>
+
+<p>Is <code>trim()</code> really a facility that should be a part of <code>SectionlessINIReader</code>?  I don't think it belongs in the public interface, and more likely belongs in a <code>private</code> or <code>protected</code> section.</p>
+
+<h1>Make it easier to use</h1>
+
+<p>The <code>getLong()</code> member function has an awkward interface, requiring the user to pass an lvalue (worse, a pointer).  Consider returning a <code>std::optional&lt;long&gt;</code> instead, to convey the result in a single value.</p>
+
+<h1>Pass strings by const reference</h1>
+
+<p>There's no need to make a copy of the <code>key</code> argument to the accessors - that should be declared as <code>const std::string&amp; key</code> instead.</p>
+
+<h1>Accessors should be <code>const</code></h1>
+
+<p><code>get()</code> and <code>getLong()</code> both modify <code>dict</code> (they create a new empty mapping for any requested key that doesn't yet exist).  We don't want to do that, as it's wasteful.  We would have spotted this bug if we'd declared those members <code>const</code> (so that they could be used by code with only a const reference to the reader - that will be important if we later add writing functions).</p>
+
+<p>We could write:</p>
+
+<pre><code>std::optional&lt;std::string&gt; get(std::string key) const
+{
+    auto const it = dict.find(key);
+    if (it == dict.end())
+        return {};
+
+    return it-&gt;second;
+}
+</code></pre>
+
+<p>And <code>getLong()</code> could use it:</p>
+
+<pre><code>std::optional&lt;long&gt; getLong(std::string key) const
+{
+    auto const value = get(key);
+    if (!value.has_value())
+        return {};
+
+    return std::stol(value.value());
+}
+</code></pre>
+
+<h1>Open the code to extension</h1>
+
+<p>At present, the only way to add more types that can be read is to edit this class or to subclass it.  And it's not designed for subclassing (it has a non-virtual destructor), so it's closed to end-users.</p>
+
+<p>One way to make it open for extension is to separate the string-to-value conversion from the string lookup, and allow users to specialize that part; our code could then use the appropriate specialization, or fail to compile if no conversion has been defined.</p>
+
+<p>This would be the starting position:</p>
+
+<pre><code>namespace convert {
+
+    // This function must be specialized for any extension types to
+    // convert from string to value.
+    template&lt;typename T&gt;
+    std::optional&lt;T&gt; fromString(const std::string&amp;);
+}
+</code></pre>
+
+<p>It's used in our <code>get&lt;&gt;()</code> function quite simply:</p>
+
+<pre><code>template&lt;typename T&gt;
+std::optional&lt;T&gt; get(const std::string&amp; key) const
+{
+    auto const value = get(key);
+    if (!value.has_value())
+        return {};
+
+    return convert::fromString&lt;T&gt;(value.value());
+}
+</code></pre>
+
+<p>We could provide some common conversions:</p>
+
+<pre><code>template&lt;&gt;
+std::optional&lt;std::string&gt; convert::fromString(const std::string&amp; s)
+{ return s; }
+
+template&lt;&gt;
+std::optional&lt;long&gt; convert::fromString(const std::string&amp; s)
+{ return std::stol(s); }
+
+template&lt;&gt;
+std::optional&lt;double&gt; convert::fromString(const std::string&amp; s)
+{ return std::stod(s); }
+</code></pre>
+
+<p>Users can add their own conversions in similar manner.</p>
+
+<h3>Variation</h3>
+
+<p>Instead of creating a free function to specialize, we could make <code>fromString()</code> be a private static member function of <code>SectionlessINIReader</code>.  The choice may well depend on whether you might want to use <code>fromString()</code> from anywhere else.</p>
+
+<h1>Think about exceptions</h1>
+
+<p><code>std::stol()</code> will throw an exception if the value can't be parsed as a long.  Do we want to pass this straight to our callers, or do we want to treat malformed values the same as missing values, and simply return an empty <code>std::optional</code>?  (There's no right or wrong answer here; I just want to be sure that we've made a conscious choice.)</p>
+
+<h1>Avoid narrowing conversions</h1>
+
+<blockquote>
+<pre><code>    int idxEq;
+    ...
+        if (((idxEq = line.find("=")) != std::string::npos)) {
+</code></pre>
+</blockquote>
+
+<p>Here, we assign the result of <code>find()</code> (a size type) to <code>idxEq</code> (a signed integer) and then compare <code>idxEq</code> to <code>std::string::npos</code> (a size type again).  That's a potentially narrowing conversion which could change the sign, and a comparison between types of different signedness.  I know we don't expect keys to be long enough to overflow <code>int</code>, but it would be nice to silence the compiler warning here, and it's very easy to make it consistent:</p>
+
+<pre><code>    std::string::size_type idxEq;
+</code></pre>
+
+<h1>Check the result of filesystem operations</h1>
+
+<p>In the constructor, we call <code>file.close()</code>, but never check the result.  If we want to be sure that we read the complete file, we need to ensure that <code>close()</code> has succeeded.</p>
+
+<p>If we really don't care about whether we missed some data, then we could simply omit the <code>close()</code> and let the file's destructor do that for us - but I don't advise ignoring a failed close.</p>
+
+<h1>Inefficient use of search</h1>
+
+<p>There's no need to search all the way through a string just to see what its first character is:</p>
+
+<blockquote>
+<pre><code>if (line.find_first_not_of(";#") == 0)
+</code></pre>
+</blockquote>
+
+<p>It's clearer to examine the first character directly (after checking that the line has at least one character, of course).</p>
+
+<h1>Check for duplicate keys</h1>
+
+<p>When reading, we simply overwrite any key that appears more than once.  Consider emitting a warning, or throwing an exception.</p>
+
+<h1>Remove dead code</h1>
+
+<p>There's a remnant of some old code still hanging around, which should be deleted:</p>
+
+<blockquote>
+<pre><code>// bool getDouble(...)
+</code></pre>
+</blockquote>
+
+<hr>
+
+<h1>Modified code</h1>
+
+<pre><code>#include &lt;fstream&gt;
+#include &lt;map&gt;
+#include &lt;optional&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+
+class SectionlessINIReader
+{
+
+private:
+    std::map&lt;std::string, std::string&gt; dict = {};
+
+public:
+    SectionlessINIReader(const std::string&amp; filename)
+    {
+        auto file = std::ifstream {filename};
+        readStream(file);
+    }
+
+    SectionlessINIReader(std::istream&amp; in)
+    {
+        readStream(in);
+    }
+
+    std::optional&lt;std::string&gt; get(const std::string&amp; key) const
+    {
+        auto const it = dict.find(key);
+        if (it == dict.end())
+            return {};
+
+        return it-&gt;second;
+    }
+
+    template&lt;typename T&gt;
+    std::optional&lt;T&gt; get(const std::string&amp; key) const
+    {
+        auto const value = get(key);
+        if (!value.has_value())
+            return {};
+
+        return fromString&lt;T&gt;(value.value());
+    }
+
+private:
+
+    // https://stackoverflow.com/a/1798170/3516684
+    static std::string trim(const std::string&amp; str,
+                            const std::string&amp; whitespace = " \t")
+    {
+        const auto strBegin = str.find_first_not_of(whitespace);
+        if (strBegin == std::string::npos)
+            return {}; // no content
+
+        const auto strEnd = str.find_last_not_of(whitespace);
+        const auto strRange = strEnd - strBegin + 1;
+
+        return str.substr(strBegin, strRange);
+    }
+
+    template&lt;typename T&gt;
+    static std::optional&lt;T&gt; fromString(const std::string&amp;);
+
+private:
+
+    void readStream(std::istream&amp; in)
+    {
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty() or line[0] == ';' or line[0] == '#') {
+                continue;
+            }
+            auto const idxEq = line.find('=');
+            if (idxEq == line.npos) {
+                // consider reporting an error here
+                continue;
+            }
+
+            auto const key = trim(line.substr(0,idxEq));
+            auto const value = trim(line.substr(idxEq+1));
+            if (!dict.emplace(key, value).second) {
+                throw std::runtime_error("Duplicate key in INI file");
+            }
+        }
+        if (!in.eof()) {
+            throw std::runtime_error("Failed to read INI file");
+        }
+    }
+};
+
+// String converters
+template&lt;&gt;
+std::optional&lt;std::string&gt; SectionlessINIReader::fromString(const std::string&amp; s)
+{ return s; }
+
+template&lt;&gt;
+std::optional&lt;long&gt; SectionlessINIReader::fromString(const std::string&amp; s)
+{ return std::stol(s); }
+
+template&lt;&gt;
+std::optional&lt;double&gt; SectionlessINIReader::fromString(const std::string&amp; s)
+{ return std::stod(s); }
+
+// we can add more specializations here, and user may also add
+// specializations.
+</code></pre>
+
+
+
+<pre><code>#include &lt;iostream&gt;
+#include &lt;sstream&gt;
+int main()
+{
+    std::istringstream contents("age = 30\n"
+                                "favourite_drink = tea\n"
+                                "name = Bob\n");
+
+    const SectionlessINIReader ini(contents);
+    auto age = ini.get&lt;long&gt;("age");
+    if (age.has_value())
+        std::cout &lt;&lt; "Name: " &lt;&lt; ini.get&lt;std::string&gt;("name").value_or("")
+                  &lt;&lt; "; age: " &lt;&lt; age.value()
+                  &lt;&lt; std::endl;
+}
+</code></pre>
+    </div>

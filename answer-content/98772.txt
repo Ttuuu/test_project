@@ -1,0 +1,105 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The program consists of a pipeline of operations:</p>
+
+<ul>
+<li>breaking up the input file into lines</li>
+<li>parsing each line as a complex number</li>
+<li>updating the histogram vector</li>
+<li>writing out the PPM file</li>
+</ul>
+
+<p>The first step to optimizing the program is to measure how long each of these steps is taking.</p>
+
+<p><code>criterion</code> is a great tool, but because it runs the test function multiple times it isn't well suited for operations which take many seconds. Also, <code>criterion</code> is designed to get precise timings, and we just need ballpark figures. For our timings we're just going to use the shell's <code>time</code> command.</p>
+
+<p>I first created a test file containing a million random complex numbers, and ran the entire pipeline to get a base line reading. Creating the the PPM from the million complex numbers took 33 secs. To understand if that was a reasonable number or not I wrote a quick perl script to just read in and add up the real parts of the complex numbers:</p>
+
+<pre><code>my $sum = 0;
+while (&lt;&gt;) {
+  if (m/^(.*?)[+]/) { $sum += $1; }
+}
+print $sum, "\n";
+</code></pre>
+
+<p>and it only took 1.7 seconds. Clearly there is a big problem somewhere with the Haskell program.</p>
+
+<p>The next step it to write alternative main functions which cut off the pipeline at various stages, e.g.:</p>
+
+<p>A main which just prints out the number of lines read:</p>
+
+<pre><code>mainLength path =  do
+    rawData &lt;- liftA LB.words (LB.readFile path)
+    let formatedData = map (extr.LP.parse parseComplex) rawData
+    print $ length formatedData
+</code></pre>
+
+<p>A main which just adds up the real parts of the parsed numbers:</p>
+
+<pre><code>mainSum path = do
+    rawData &lt;- liftA LB.words (LB.readFile path)
+    let formatedData = map (extr.LP.parse parseComplex) rawData
+        rpart (Complex r _) = r
+    print $ sum $ map rpart $ formatedData
+</code></pre>
+
+<p>and the timings I got are as follows:</p>
+
+<pre><code>mainLength   0.18 secs
+mainSum     17.37 secs
+</code></pre>
+
+<p>So what work is being done in <code>mainSum</code> which is not being done in <code>mainLength</code>? Due to laziness it is the conversion of the parsed bytestrings to Double values.</p>
+
+<p>A quick scan of the code reveals that you are using <code>read</code> to perform this conversion. <code>read</code> is notoriously slow, and should be avoided for performance critical code.</p>
+
+<h3>A replacement for <code>read :: ByteString -&gt; Double</code></h3>
+
+<p>If you search Google you can find this Stackoverflow article:</p>
+
+<p><a href="https://stackoverflow.com/questions/4489518/efficient-number-reading-in-haskell">https://stackoverflow.com/questions/4489518/efficient-number-reading-in-haskell</a></p>
+
+<p>Mostly because the answer was submitted by Don Stewart I decided on using the <code>bytestring-lexing</code> module, and came up with this version of <code>parseComplex</code>:</p>
+
+<pre><code>parseComplex' = do
+  r &lt;- P.takeTill (== '+')
+  P.char '+'
+  i &lt;- P.takeTill (== '*')
+  P.string iT  -- or just skip this
+  return $ Complex (toDouble r) (toDouble i)
+  where toDouble s = case (readSigned readDecimal) s of
+                       Nothing -&gt; 0
+                       Just (d, _) -&gt; d
+</code></pre>
+
+<p>The timing for <code>mainSum</code> using <code>parseComplex'</code> is:</p>
+
+<pre><code>mainSum'  0.6 secs
+</code></pre>
+
+<p>So now the first two stages of the pipeline are very performant. The next step is to figure out why updating the histogram vector and writing out the PPM file is taking so long.</p>
+
+<h3>Using Ubboxed Vectors</h3>
+
+<p>I've found another important optimization - you want to use unboxed vectors instead of the regular vectors. Here is an alternate version of <code>genVec</code>:</p>
+
+<pre><code>import qualified Data.Vector.Unboxed as UnboxedV
+import qualified Data.Vector.Unboxed.Mutable as UnboxedM
+
+genVec :: [Complex] -&gt; UnboxedV.Vector Int
+genVec xs = runST $ do
+  mv &lt;- UnboxedM.replicate (imgSize*imgSize) (0::Int)
+  forM_ xs $ \c -&gt; do
+    let x = computeCIndex c
+    count &lt;- UnboxedM.unsafeRead mv x
+    UnboxedM.unsafeWrite mv x (count+1)
+  UnboxedV.freeze mv
+</code></pre>
+
+<p>This will cut down the run time by another couple of seconds (which is now significant since the whole pipeline takes now only takes about 4 secs to run.)</p>
+
+<p>Update:</p>
+
+<p><del>I think you'll find that improving the Double parsing is about the best you can do for a single threaded program.</del> To scale to 600M points you are going to have to use multiple threads / machines. Fortunately this is a classic map-reduce problem, so there's a lot of tools and libraries (not necessarily in Haskell) that you can draw upon.</p>
+
+<p>If you just want to scale on a single machine using multiple threads, you can put together your own solution using a module like <code>Control.Monad.Par</code>. For a clustering solution you'll probably have to use a third-party framework like Hadoop in which case you might be interested in the <a href="https://github.com/Soostone/hadron" rel="nofollow noreferrer">hadron</a> package - there is also a video describing it here: <a href="https://vimeo.com/90189610" rel="nofollow noreferrer">https://vimeo.com/90189610</a></p>
+    </div>

@@ -1,0 +1,197 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p><strong>NOTE 2:</strong></p>
+  
+  <p>If you'd like to run the whole script and don't have a Twilio account, just call <code>get_earthquake_data()</code> instead of <code>send_message()</code> function.</p>
+</blockquote>
+
+<p>You could improve this part by providing a command line option, so that</p>
+
+<pre><code>python eatrhquake.py
+</code></pre>
+
+<p>Would run <code>get_earthquake_data()</code>;</p>
+
+<pre><code>python earthquake.py --twilio
+</code></pre>
+
+<p>Would run <code>send_message()</code> with the default (credentials.json) file; and</p>
+
+<pre><code>python earthquake.py --twilio /path/to/my/credentials.json
+</code></pre>
+
+<p>Would run <code>send_message()</code> with a user provided file path.</p>
+
+<hr>
+
+<p>Python provides the <a href="https://docs.python.org/3/library/argparse.html#module-argparse" rel="nofollow noreferrer"><code>argparse</code></a> module for such case that you can define along the lines of</p>
+
+<pre><code>def command_line_parser():
+    parser = argparse.ArgumentParser(description='Earthquake Listener')
+    parser.add_argument(
+            '-t', '--twilio',
+            nargs='?',
+            type=argparse.FileType('r'),
+            const='credentials.json',
+            help='&lt;describe the file and its content here&gt;')
+    return parser
+</code></pre>
+
+<p>You can then use <code>parser.parse_args().twilio</code> to know which function to call depending on wether it is <code>None</code> or an opened file object.</p>
+
+<hr>
+
+<p>You also call <code>get_credentials()</code> a lot during the script lifetime, when you could call it only once and store the resulting dict in a variable instead. This is especially wasteful as it opens the file each time.</p>
+
+<p>In the same vein, you create a Twilio client at each loop even if you don't send anything. Art the very least you could create it only when you need to send something; at best you could create it once at the beginning of the script and reuse the same for each send, but I'm not familiar with the API and there may be some timeouts limiting this option.</p>
+
+<hr>
+
+<p>Proposed improvements:</p>
+
+<pre><code>"""
+This projects aims to send an SMS to a specific number using Twilio
+if an earthquake with magnitude &gt; 4 is going to occur (depending on
+your location, this can warn you (best case scenario within 25-30
+seconds before you feel the earthquake wave).
+"""
+
+import argparse
+import datetime
+import json
+import re
+import time
+from functools import partial
+
+import requests
+from lxml.html import fromstring
+from twilio.rest import Client
+
+
+BASE_URL = 'http://alerta.infp.ro'
+DATA_URL = f'{BASE_URL}/server.php'
+
+
+def command_line_parser():
+    parser = argparse.ArgumentParser(description='Earthquake Listener')
+    parser.add_argument(
+            '-t', '--twilio',
+            nargs='?',
+            type=credentials,
+            const='credentials.json',
+            help='&lt;???&gt;')
+    parser.add_argument(
+            '-d', '--delay',
+            type=float,
+            default=1.0,
+            help='delay in seconds between two calls to the earthquake API')
+    return parser
+
+
+def credentials(filepath: str) -&gt; dict:
+    """Return secrets from `filepath` file as a dict.
+
+    The file looks like this:
+
+        {
+          "TWILIO_ACCOUNT_SID": "Your twilio account SID",
+          "TWILIO_AUTH_TOKEN": "Your twilio account auth token",
+          "FROM": "The number from which you'll receive the alert",
+          "TO": "The number the message is sent to"
+        }
+
+
+    Args:
+        filepath (str): Path to credentials JSON file.
+
+    Returns:
+        dict: The return value.
+    """
+
+    with open(filepath) as credentials_file:
+        credentials = json.load(credentials_file)
+
+    if not credentials:
+        raise ValueError('Credentials file should not be empty.')
+
+    return credentials
+
+
+def get_earthquake_data() -&gt; dict:
+    """Get earthquake data from `DATA_URL`.
+
+    Returns:
+        dict: A dict containing the following data:
+              {
+                'mag': '0.1',
+                'heart': '2020-01-04 13:30:04 HEARTBEAT',
+                'sec': '30',
+                'key': 'NjY2NDYyMzAzNjMwNjM2MzM1Mz...=='
+              }
+    """
+
+    session = requests.Session()
+    with session as page_session:
+        html_page = page_session.get(BASE_URL).content
+        html_script = fromstring(html_page).xpath('//script[contains(., "source")]/text()')[0]
+        key = {
+            'keyto': re.search(
+                r"var source = new EventSource\('server\.php\?keyto=(.*)'\);", html_script
+            ).group(1)
+        }
+        earthquake_data = page_session.get(f'{DATA_URL}', params=key).content
+        earthquake_data = earthquake_data.decode('utf8').replace("data", '"data"').strip()
+        return json.loads(f'{{{earthquake_data}}}')
+
+
+def send_message(twilio_client, send_to, sent_from) -&gt; None:
+    """Send a message via Twilio if the magnitude of an earthquake
+    is bigger than 4.
+    """
+
+    data = get_earthquake_data().get('data')
+    eq_magnitude = data.get('mag')
+
+    if float(eq_magnitude) &gt;= 4:
+        body = f"""ATTENTION!!!
+
+        Earthquake with magnitude: {eq_magnitude} 
+        at {datetime.datetime.strftime(datetime.datetime.now(), '%Y-%m-%d %H:%M:%S')}!
+        """
+
+        try:
+            twilio_client.messages.create(body=body, from_=sent_from, to=send_to)
+        except Exception as error:
+            print(f'Twilio API error: {error}')
+    else:
+        print('No need to worry. YET!')
+
+
+def main(credentials=None, delay=1.0) -&gt; None:
+    """Main entry to the program."""
+
+    if credentials is None:
+        action = get_earthquake_data
+    else:
+        twilio_client = Client(
+                credentials['TWILIO_ACCOUNT_SID'],
+                credentials['TWILIO_AUTH_TOKEN'])
+        sender = credentials['FROM']
+        receiver = credentials['TO']
+        action = partial(send_message, twilio_client, receiver, sender)
+
+    while True:
+        try:
+            action()
+            time.sleep(delay)
+        except KeyboardInterrupt:
+            print('Closing the program...')
+
+
+if __name__ == '__main__':
+    args = command_line_parser.parse_args()
+    main(args.twilio, args.delay)
+</code></pre>
+
+<p>Note that I changed your custom exception to a <code>ValueError</code> to integrate better with <code>argparse</code>'s exception handling.</p>
+    </div>

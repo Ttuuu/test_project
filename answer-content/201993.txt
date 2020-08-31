@@ -1,0 +1,106 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Your <code>arg_count_v</code> is trying to solve one of the <a href="https://quuxplusone.github.io/blog/2018/06/12/perennial-impossibilities/" rel="nofollow noreferrer">perennial impossibilities of C++</a>. What is the "arg count" (or <em>arity</em>, as Snowhawk rightly says) of the lambda</p>
+
+<pre><code>[](auto&amp;&amp;... xs) -&gt; int { return sizeof...(xs); }
+</code></pre>
+
+<p>? Until you can answer that, you shouldn't write anything that depends on the arity of one of its arguments.</p>
+
+<p>Also notice that <code>&amp;F::operator()</code> doesn't necessarily exist; for example if <code>F</code> is a pointer-to-function type.</p>
+
+<hr>
+
+<pre><code>//Returns a pointer to the remainder values or the end or nullptr
+</code></pre>
+
+<p>But why?! Why would you make a generic algorithm that returns a <em>pointer</em>, when you have <em>iterators</em> conveniently passed in specifically for you to use?</p>
+
+<p>Let's fix that and also fix the "arity" issue at the same time. We'll force the user to pass in their intended arity as a (non-deducible) template parameter. Since this parameter is non-deducible, it must come first.</p>
+
+<p>Also, let's use the traditional names <code>first</code> and <code>last</code>, rather than <code>begin</code> and <code>end</code>. It's not a big deal, but it might help the reader's comprehension, because <code>begin</code> and <code>end</code> are also the names of functions
+in <code>namespace std</code>, whereas <code>first</code> and <code>last</code> are the traditional names for range-based algorithms like this one.</p>
+
+<pre><code>template&lt;size_t Arity, class Iterator, class Function&gt;
+Iterator for_each_adjacent(Iterator first, Iterator last, Function func)
+{
+    static_assert(Arity &gt;= 1);
+    using Indices = std::make_integer_sequence&lt;unsigned, Arity&gt;;
+
+    auto length = std::distance(first, last);
+    auto remainder = length % Arity;
+
+    for (auto d = length; d &gt;= Arity; d -= Arity) {
+        detail::apply(func, (last - d), Indices());
+    }
+    return last - remainder;
+}
+</code></pre>
+
+<hr>
+
+<p>I removed the unused <code>value_type</code> typedef (well, it was used, but only in a place where <code>auto</code> should have been used, and actually using <code>value_type</code> there caused a bug, as Snowhawk pointed out). I also factored out <code>Indices</code> into a local typedef, for readability; but in a setting with longer line-lengths you might just inline it.</p>
+
+<p>As Snowhawk notes, you should be using <code>index_sequence</code> and <code>make_index_sequence</code> instead of your weird <code>integer_sequence&lt;unsigned,...&gt;</code> business.</p>
+
+<hr>
+
+<p>So far so good. But we can do much better, right?  Your current algorithm works only on <em>random-access</em> iterators. Let's make it work on <em>any</em> kind of iterator, by getting rid of the math.</p>
+
+<pre><code>template&lt;size_t Arity, class Iterator, class Function&gt;
+Iterator for_each_adjacent(Iterator first, Iterator last, Function func)
+{
+    static_assert(Arity &gt;= 1);
+    using Indices = std::make_index_sequence&lt;Arity&gt;;
+
+    while (true) {
+        auto cur = first;
+        for (size_t countdown = Arity; countdown != 0; --countdown) {
+            if (cur == last) {
+                return first;
+            }
+            ++cur;
+        }
+        detail::apply(func, first, Indices());
+        std::advance(first, Arity);
+    }
+}
+</code></pre>
+
+<p>And then we need to adjust <code>detail::apply</code> a little bit:</p>
+
+<pre><code>template&lt;class Function, class Iterator, size_t... Is&gt;
+auto apply(Function&amp; f, Iterator first, std::index_sequence&lt;Is...&gt;)
+{
+    return f(*std::next(first, Is)...);
+}
+</code></pre>
+
+<p>Notice that we must take <code>Function</code> by reference in this helper function, to avoid making a <em>copy</em> of it. The lambda passed in by our caller might not be copyable.</p>
+
+<p>Actually, I strongly recommend taking <code>const Function&amp;</code> in both signatures. But I recognize that the STL doesn't do that, for historical reasons.</p>
+
+<hr>
+
+<p>The last change I would make is to eliminate the quadratic behavior in <code>apply</code>. <code>f(*std::next(first, Is)...)</code> computes <code>std::next(first, 1)</code>, <code>std::next(first, 2)</code>, <code>std::next(first, 3)</code>, and so on, doing the same increments over and over. We'd like to compute and save all our function arguments just <em>once</em>. So let's do that.</p>
+
+<pre><code>template&lt;class Function, class Iterator, size_t... Is&gt;
+auto apply(Function&amp; f, Iterator first, std::index_sequence&lt;Is...&gt;)
+{
+    Iterator args[] = {
+        (void(Is), first++) ...
+    };
+    return f(args[Is]...);
+}
+</code></pre>
+
+<p>We could make this a little more efficient by thinking about how to use <code>++first</code> instead of <code>first++</code> here. (Hint: Pass in <code>std::make_index_sequence&lt;Arity-1&gt;()</code>!)</p>
+
+<p>Notice that I'm casting <code>Is</code> to <code>void</code> here. This is a common trick among library implementors to defend against user-defined overloads of <code>operator,</code>:</p>
+
+<pre><code>void operator,(size_t, std::vector&lt;MyWidget&gt;::iterator) {
+    puts("Hijacked!");
+}
+</code></pre>
+
+<p>Overloads of <code>operator,</code> are basically never this malicious in the wild, but I recommend always adding the six extra characters <code>void()</code> because it's such a cheap price to pay for eliminating a whole class of really crazy bugs.</p>
+    </div>

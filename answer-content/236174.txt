@@ -1,0 +1,119 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>That's a <em>lot</em> of code. Consider just using STL? ;)</p>
+
+<p>Seriously, though, you wrote an entire <code>List</code> utility class, almost 500 lines of code, and:</p>
+
+<ul>
+<li><p>It doesn't work anything like <code>std::list</code>, so any coworker of yours (e.g., me) can't use their existing knowledge base to understand it.</p></li>
+<li><p>Your own code doesn't use half of the functionality you implemented (e.g., <code>slice</code> and <code>sort</code>). So those bits were wasted effort.</p></li>
+<li><p>Since you don't use that code, <em>and</em> I'm assuming you wrote no unit tests for it, the code probably doesn't work at all. Code that is unused and untested should be ripped out. Code that is <em>used</em> but untested... should be tested!</p></li>
+</ul>
+
+<p>To expand on that first point, the unfamiliar API: It looks like the way you iterate over a <code>list_h::List&lt;T&gt;</code> is like this—</p>
+
+<pre><code>Iterator i(myList);
+for (i.first(); not i.hasEnded(); ++i) {
+    const T&amp; elt = i.current-&gt;data;
+    do_something_with(elt);
+}
+</code></pre>
+
+<p>Compare this to the way we iterate over a <em>standard</em> container:</p>
+
+<pre><code>for (const T&amp; elt : myList) {
+    do_something_with(elt);
+}
+</code></pre>
+
+<p>The standard containers can all be used with range-<code>for</code>-loops because they implement iterators with the standard interface: initialized with the return values of <code>myList.begin()</code> and <code>myList.end()</code>, compared with <code>==</code>, dereferenced with <code>*</code>, and incremented with <code>++</code>. Of that checklist, the only part you successfully copied was "incremented with <code>++</code>."</p>
+
+<hr>
+
+<p>Serious bug: Your destructors are all wrong. This indicates strongly to me that you have never tested this code.</p>
+
+<pre><code>~Node() {
+    data.~T();
+    next = previous = nullptr;
+}
+</code></pre>
+
+<p>If you construct and then destroy a <code>Node&lt;std::unique_ptr&lt;int&gt;&gt;</code>, you'll find that the allocation is deleted twice (that's a "double-free bug"). Your hand-written destructor does not need to manually destroy the members (or base classes) of <code>Node</code>, any more than you ever need to manually destroy the local variables in the stack frame of a function.</p>
+
+<blockquote>
+  <p>Rule of thumb for 12th-graders: never, ever write <code>foo.~Bar()</code>. (Okay, let me revise that to allow for experimentation. Never write <code>foo.~Bar()</code> and expect the code to actually work correctly!)</p>
+</blockquote>
+
+<p>You don't need to set <code>next = previous = nullptr;</code> either. It doesn't matter what value those members have, given that they're going to be destroyed either way.</p>
+
+<hr>
+
+<p>Your namespaces are weird. Did your teacher tell you that <code>list.h</code> should put everything in <code>namespace list_h</code>, and <code>graph.h</code> should put everything in <code>namespace graph_h</code>? In the real world, we'd do something more like</p>
+
+<pre><code>// varad_list.h
+namespace varad {
+    template&lt;class T&gt; class List { ... };
+}
+
+// varad_graph.h
+namespace varad {
+    template&lt;class T&gt; class Graph { ... };
+}
+</code></pre>
+
+<p><a href="https://quuxplusone.github.io/blog/2020/01/07/namespaces-are-for-preventing-name-collisions/" rel="noreferrer">Namespaces are for preventing name collisions.</a> When I see a repetitive redundant repetitive name like <code>graph_h::Graph</code>, I know something's wrong.  On the other hand, the name <code>varad::Graph</code> actually tells me something in C++ese. "It's a <code>Graph</code> class. Whose <code>Graph</code> class? The <code>Graph</code> class that belongs to <code>varad</code>."</p>
+
+<hr>
+
+<p>Again showing that you never compiled this code:</p>
+
+<pre><code>      bool operator!=(const Node* const node) const {
+        return not current == node;
+      }
+</code></pre>
+
+<p>Suppose <code>current</code> is <code>(Node*)0x12345678</code>. Then what is <code>not current</code>?— Right, it's the boolean <code>false</code>. Can you compare a <code>bool</code> with a pointer? Nope.</p>
+
+<hr>
+
+<p>Finally (although there's much much more to unpack here), I want to talk about <code>BinaryFunctor</code>.</p>
+
+<pre><code>// Make type const if it is a pointer
+template &lt;class T&gt;
+struct AddConstToType {
+  typedef T type;
+};
+template &lt;class T&gt;
+struct AddConstToType&lt;T*&gt; {
+  typedef const T* type;
+};
+
+template &lt;class T&gt;
+class BinaryFunctor {
+  public :
+    virtual bool function(const typename AddConstToType&lt;T&gt;::type&amp; a, const typename AddConstToType&lt;T&gt;::type&amp; b) const = 0;
+    inline bool operator()(const typename AddConstToType&lt;T&gt;::type&amp; a, const typename AddConstToType&lt;T&gt;::type&amp; b) const {
+      return function(a, b);
+    }
+};
+
+void sort(const list_h::BinaryFunctor&lt;T&gt;&amp; func) {
+    [...]
+}
+</code></pre>
+
+<p>Your <code>AddConstToType</code> doesn't do anything except break your code for non-const-qualified pointers. (Again, you never compiled this code to test it.) If I make a <code>List&lt;int*&gt;</code> and then try to <code>.sort</code> it, I'll just get a bunch of errors about how an lvalue of type <code>int*</code> cannot be bound to a reference of type <code>const int*&amp;</code>.</p>
+
+<p>Your <code>BinaryFunctor</code> uses something kind of like the Non-Virtual Interface Idiom, which is cool; but to get all the way there, you should make <code>virtual bool function</code> a <code>private</code> method. Nobody should ever be calling it directly, right? They should be going via the public <code>operator()</code>. And derived classes don't need access to <code>virtual bool function</code> either — they can override a private method just as easily as they can override a public one.</p>
+
+<p>But really you shouldn't have <code>BinaryFunctor</code> at all. C++ already has first-class "function objects" — lambdas, and pointers to functions, and <code>std::function&lt;bool(const T&amp;)&gt;</code> objects, and so on and so forth. You seem to want a <code>List&lt;T&gt;::sort(F)</code> that can accept <em>any kind of</em> predicate type <code>F</code>, just like <code>List&lt;T&gt;</code> can accept <em>any kind of</em> object type <code>T</code>. You already know how to express that in C++. Use a template!</p>
+
+<pre><code>template&lt;class F&gt;
+void sort(const F&amp; func) {
+    [...]
+}
+</code></pre>
+
+<p>And then don't reinvent <code>quickSort</code>. (I guarantee that your implementation is wrong. I don't know how, but I'm confident that if you write a bunch of unit tests, you'll find out pretty quick.) Just use <code>std::sort</code>.</p>
+
+<p>Or, as I implied at the beginning of this review: just delete the entire <code>sort</code> function. You never use it! And code that is unused and untested <em>never works.</em></p>
+    </div>

@@ -1,0 +1,458 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You are generally correct in using <code>Application</code> functions (<code>SumIfs</code> and <code>CountIfs</code>) over rolling your own functions, as the built-in functions in Excel should be optimized in the DLL than anything you could write in VBA. The difference in performance is due to the organization of the data.</p>
+
+<p>The key to my example below is to pre-process the input data into a form that reduces the "lookup" time of all the data. For comparison sake, using <code>SumIfs</code> and <code>CountIfs</code> will always be working with your entire data range. Your data set may be large (40k+ rows), so these Excel functions will always take a fixed amount of time. I timed my example to process 45,500 rows in 44.8 seconds. (I'll share a <code>GenerateData</code> sub that I created to set up the inputs for you or anyone else to double-check my work.)</p>
+
+<p>The simple reccommendation for processing large amounts of data is to use a memory-based array. You're already doing this with your <code>arrTotal</code> array. There are two main issues in performance with this: 1) the Excel functions are still accessing the Worksheet object to process <code>SumIfs</code> and <code>CountIfs</code>, and 2) there is no optimization in the <code>arrTotal</code> data to help speed things up. This is where my own example starts.</p>
+
+<p>First, I want to create an array from the input data that is "ordered". In this case, it means a memory-based array with the data sorted first on <code>Agente</code> and then on <code>Fecha Completa</code>. Please note that my code calculates the used area of the spreadsheet in a manner that should always be accurate (see @MathieuGuindon's comment). This function returns an ordered array:</p>
+
+<pre><code>Private Function OrderedInputs() As Variant
+    '--- first sort the input data by Agente, then by date
+    With Hoja37
+        Dim inputArea As Range
+        Dim lastRow As Long
+        lastRow = .Cells(.Rows.count, 1).End(xlUp).Row
+        Set inputArea = .Range("A2").Resize(lastRow - 1, 6)
+        With .Sort
+            .SortFields.Clear
+            .SortFields.Add Key:=inputArea.Columns(1), SortOn:=xlSortOnValues, _
+                            Order:=xlAscending, DataOption:=xlSortNormal
+            .SortFields.Add Key:=inputArea.Columns(2), SortOn:=xlSortOnValues, _
+                            Order:=xlAscending, DataOption:=xlSortNormal
+            .SetRange inputArea
+            .Header = xlNo
+            .MatchCase = False
+            .Orientation = xlTopToBottom
+            .SortMethod = xlPinYin
+            .Apply
+
+            '--- now grab the data into a memory-based array
+            Dim inputData As Variant
+            inputData = inputArea.Value
+
+            '--- assuming the original data was sorted by date, then by Agente
+            '    we'll put it back
+            .SortFields.Clear
+            .SortFields.Add Key:=inputArea.Columns(2), SortOn:=xlSortOnValues, _
+                            Order:=xlAscending, DataOption:=xlSortNormal
+            .SortFields.Add Key:=inputArea.Columns(1), SortOn:=xlSortOnValues, _
+                            Order:=xlAscending, DataOption:=xlSortNormal
+            .SetRange inputArea
+            .Header = xlNo
+            .MatchCase = False
+            .Orientation = xlTopToBottom
+            .SortMethod = xlPinYin
+            .Apply
+        End With
+    End With
+    OrderedInputs = inputData
+End Function
+</code></pre>
+
+<p>Having a sorted, ordered set of data is nice, but it's not nearly optimized enough yet. When you're processing this much data, you want to be able to immediately access any given agent's data. The way to do this is a <code>Dictionary</code>, using the agent's name as the key. Associated with each agent, is the date plus FCR1, FCR3, and FCR30 data values -- and there are multiple sets of this data for each agent. So for each agent, we can build a <code>Collection</code> of this data. The best way to do this is to create a simple object class called <code>AgentData</code>.</p>
+
+<pre><code>'--- Class: AgentData
+Option Explicit
+
+Public day As Date
+Public fcr1 As Long
+Public fcr3 As Long
+Public fcr30 As Long
+</code></pre>
+
+<p>All the fields are public because you really don't need to manipulate the data going in or coming out. Building up a <code>Collection</code> of <code>AgentData</code> objects starts with looping through all the (ordered) input data by name, and creating a <code>Collection</code> entry for each date:</p>
+
+<pre><code>Private Function BuildAgentData(ByRef inputArray As Variant) As Dictionary
+    '--- we're creating a Dictionary of Agentes for quick lookup
+    '    each Item in the Dictionary is an ordered Collection of AgentData
+    '    objects, i.e. the objects are in date ascending order
+    Dim agentes As Dictionary
+    Set agentes = New Dictionary
+
+    Dim i As Long
+    Dim thisAgente As String
+    Dim aData As AgentData
+    Dim allAgentData As Collection
+    For i = LBound(inputArray, 1) To UBound(inputArray, 1)
+        If thisAgente &lt;&gt; inputArray(i, 1) Then
+            thisAgente = inputArray(i, 1)
+            '--- create the first entry
+            Set aData = New AgentData
+            aData.day = inputArray(i, 2)
+            aData.fcr1 = inputArray(i, 4)
+            aData.fcr3 = inputArray(i, 5)
+            aData.fcr30 = inputArray(i, 6)
+            Set allAgentData = New Collection
+            allAgentData.Add aData
+            agentes.Add thisAgente, allAgentData
+        Else
+            '--- increase the size of the array by one and add the date
+            Set allAgentData = agentes(thisAgente)
+            Set aData = New AgentData
+            aData.day = inputArray(i, 2)
+            aData.fcr1 = inputArray(i, 4)
+            aData.fcr3 = inputArray(i, 5)
+            aData.fcr30 = inputArray(i, 6)
+            allAgentData.Add aData
+        End If
+    Next i
+    Set BuildAgentData = agentes
+End Function
+</code></pre>
+
+<p>This reduces the beginning of your test sub to:</p>
+
+<pre><code>Dim sortedInputData As Variant
+Dim agentes As Dictionary
+sortedInputData = OrderedInputs()
+Set agentes = BuildAgentData(sortedInputData)
+Debug.Print "There are " &amp; UBound(sortedInputData, 1) &amp; " rows of input data."
+</code></pre>
+
+<p>There are changes to your <code>Calcula</code> functions, but the main test sub changes very little:</p>
+
+<pre><code>With Hoja4
+    Dim arrTotal As Variant: arrTotal = .UsedRange.Value
+    Dim fecha As Double
+    Dim i As Long
+    For i = 2 To UBound(arrTotal)
+        fecha = arrTotal(i, 1)
+        arrTotal(i, 13) = CalculaLlamadas2(sortedInputData, agentes, CStr(arrTotal(i, 2)), fecha, 1, 4)
+        arrTotal(i, 14) = CalculaFCR2(sortedInputData, agentes, CStr(arrTotal(i, 2)), fecha, 1, 4)
+        arrTotal(i, 15) = CalculaLlamadas2(sortedInputData, agentes, CStr(arrTotal(i, 2)), fecha, 3, 5)
+        arrTotal(i, 16) = CalculaFCR2(sortedInputData, agentes, CStr(arrTotal(i, 2)), fecha, 3, 5)
+        arrTotal(i, 17) = CalculaLlamadas2(sortedInputData, agentes, CStr(arrTotal(i, 2)), fecha, 30, 6)
+        arrTotal(i, 18) = CalculaFCR2(sortedInputData, agentes, CStr(arrTotal(i, 2)), fecha, 30, 6)
+    Next i
+    .UsedRange.Value = arrTotal
+End With
+</code></pre>
+
+<p>Each of the <code>Calcula</code> functions will now use both the <code>sortedInputData</code> and the <code>agentes</code> dictionary as inputs. Instead of being forced to loop through all 40,000+ rows to count and sum for every single agent, the function immediately accesses the collection of data for each agent (via the <code>Dictionary</code>), and then can loop through the <code>Collection</code> (which may have as many entries as needed, but still is far, far less than the original input set).</p>
+
+<pre><code>Private Function CalculaFCR2(ByRef inputData As Variant, ByRef agentDates As Dictionary, _
+                             ByVal agente As String, ByVal fecha As Date, _
+                             ByVal dias As Long, ByVal columna As Long) As Long
+    Dim fechaFin As Date
+    fechaFin = fecha + dias
+    Dim sum As Long
+    If agentDates.Exists(agente) Then
+        Dim aData As Variant
+        Set aData = agentDates(agente)
+        Dim item As Variant
+        For Each item In aData
+            If (item.day &gt;= fecha) And (item.day &lt;= fechaFin) Then
+                Select Case columna
+                    Case 4
+                        sum = sum + item.fcr1
+                    Case 5
+                        sum = sum + item.fcr3
+                    Case 6
+                        sum = sum + item.fcr30
+                End Select
+            ElseIf (item.day &gt; fechaFin) Then
+                Exit For
+            End If
+        Next item
+        CalculaFCR2 = sum
+    Else
+        '--- error processing if the agente doesn't exist
+    End If
+End Function
+
+Private Function CalculaLlamadas2(ByRef inputData As Variant, ByRef agentDates As Dictionary, _
+                                  ByVal agente As String, ByVal fecha As Date, _
+                                  ByVal dias As Long, ByVal columna As Long) As Long
+    Dim fechaFin As Date
+    fechaFin = fecha + dias
+    Dim count As Long
+    If agentDates.Exists(agente) Then
+        Dim aData As Variant
+        Set aData = agentDates(agente)
+        Dim item As Variant
+        For Each item In aData
+            If (item.day &gt;= fecha) And (item.day &lt;= fechaFin) Then
+                count = count + 1
+            ElseIf (item.day &gt; fechaFin) Then
+                Exit For
+            End If
+        Next item
+        CalculaLlamadas2 = count
+    Else
+        '--- error processing if the agente doesn't exist
+    End If
+End Function
+</code></pre>
+
+<p>I added a software timer class to measure execution time on my laptop (Intel Core i5-6300, 2.40GHz) and received the following results:</p>
+
+<pre><code>There are 4550 rows of input data.
+Time to build ordered inputs: 0.078 seconds
+Total Run Time: 4.407 seconds
+
+There are 45500 rows of input data.
+Time to build ordered inputs: 0.484 seconds
+Total Run Time: 44.797 seconds
+</code></pre>
+
+<p>For reference, here are the three code modules you need to add:</p>
+
+<p>Class: <code>AgentData</code></p>
+
+<pre><code>'--- Class: AgentData
+Option Explicit
+
+Public day As Date
+Public fcr1 As Long
+Public fcr3 As Long
+Public fcr30 As Long
+</code></pre>
+
+<p>Class: <code>StopWatch</code></p>
+
+<pre><code>Option Explicit
+'--- from https://stackoverflow.com/a/939260/4717755
+
+Private mlngStart As Long
+Private Declare Function GetTickCount Lib "kernel32" () As Long
+
+Public Sub StartTimer()
+    mlngStart = GetTickCount
+End Sub
+
+Public Function EndTimer() As Long
+    EndTimer = (GetTickCount - mlngStart)
+End Function
+</code></pre>
+
+<p>Code Module: <code>Module1</code></p>
+
+<pre><code>Option Explicit
+
+Sub Test()
+    Dim sw As StopWatch
+    Set sw = New StopWatch
+    sw.StartTimer
+
+    Dim sortedInputData As Variant
+    Dim agentes As Dictionary
+    sortedInputData = OrderedInputs()
+    Set agentes = BuildAgentData(sortedInputData)
+    Debug.Print "There are " &amp; UBound(sortedInputData, 1) &amp; " rows of input data."
+    Debug.Print "Time to build ordered inputs: " &amp; CDbl((sw.EndTimer / 1000#)) &amp; " seconds"
+
+    With Hoja4
+        Dim arrTotal As Variant: arrTotal = .UsedRange.Value
+        Dim fecha As Double
+        Dim i As Long
+        For i = 2 To UBound(arrTotal)
+            fecha = arrTotal(i, 1)
+            arrTotal(i, 13) = CalculaLlamadas2(sortedInputData, agentes, CStr(arrTotal(i, 2)), fecha, 1, 4)
+            arrTotal(i, 14) = CalculaFCR2(sortedInputData, agentes, CStr(arrTotal(i, 2)), fecha, 1, 4)
+            arrTotal(i, 15) = CalculaLlamadas2(sortedInputData, agentes, CStr(arrTotal(i, 2)), fecha, 3, 5)
+            arrTotal(i, 16) = CalculaFCR2(sortedInputData, agentes, CStr(arrTotal(i, 2)), fecha, 3, 5)
+            arrTotal(i, 17) = CalculaLlamadas2(sortedInputData, agentes, CStr(arrTotal(i, 2)), fecha, 30, 6)
+            arrTotal(i, 18) = CalculaFCR2(sortedInputData, agentes, CStr(arrTotal(i, 2)), fecha, 30, 6)
+        Next i
+        .UsedRange.Value = arrTotal
+    End With
+    Debug.Print "Total Run Time: " &amp; CDbl((sw.EndTimer / 1000#)) &amp; " seconds"
+End Sub
+
+Private Function CalculaFCR2(ByRef inputData As Variant, ByRef agentDates As Dictionary, _
+                             ByVal agente As String, ByVal fecha As Date, _
+                             ByVal dias As Long, ByVal columna As Long) As Long
+    Dim fechaFin As Date
+    fechaFin = fecha + dias
+    Dim sum As Long
+    If agentDates.Exists(agente) Then
+        Dim aData As Variant
+        Set aData = agentDates(agente)
+        Dim item As Variant
+        For Each item In aData
+            If (item.day &gt;= fecha) And (item.day &lt;= fechaFin) Then
+                Select Case columna
+                    Case 4
+                        sum = sum + item.fcr1
+                    Case 5
+                        sum = sum + item.fcr3
+                    Case 6
+                        sum = sum + item.fcr30
+                End Select
+            ElseIf (item.day &gt; fechaFin) Then
+                Exit For
+            End If
+        Next item
+        CalculaFCR2 = sum
+    Else
+        '--- error processing if the agente doesn't exist
+    End If
+End Function
+
+Private Function CalculaLlamadas2(ByRef inputData As Variant, ByRef agentDates As Dictionary, _
+                                  ByVal agente As String, ByVal fecha As Date, _
+                                  ByVal dias As Long, ByVal columna As Long) As Long
+    Dim fechaFin As Date
+    fechaFin = fecha + dias
+    Dim count As Long
+    If agentDates.Exists(agente) Then
+        Dim aData As Variant
+        Set aData = agentDates(agente)
+        Dim item As Variant
+        For Each item In aData
+            If (item.day &gt;= fecha) And (item.day &lt;= fechaFin) Then
+                count = count + 1
+            ElseIf (item.day &gt; fechaFin) Then
+                Exit For
+            End If
+        Next item
+        CalculaLlamadas2 = count
+    Else
+        '--- error processing if the agente doesn't exist
+    End If
+End Function
+
+Private Function OrderedInputs() As Variant
+    '--- first sort the input data by Agente, then by date
+    With Hoja37
+        Dim inputArea As Range
+        Dim lastRow As Long
+        lastRow = .Cells(.Rows.count, 1).End(xlUp).Row
+        Set inputArea = .Range("A2").Resize(lastRow - 1, 6)
+        With .Sort
+            .SortFields.Clear
+            .SortFields.Add Key:=inputArea.Columns(1), SortOn:=xlSortOnValues, _
+                            Order:=xlAscending, DataOption:=xlSortNormal
+            .SortFields.Add Key:=inputArea.Columns(2), SortOn:=xlSortOnValues, _
+                            Order:=xlAscending, DataOption:=xlSortNormal
+            .SetRange inputArea
+            .Header = xlNo
+            .MatchCase = False
+            .Orientation = xlTopToBottom
+            .SortMethod = xlPinYin
+            .Apply
+
+            '--- now grab the data into a memory-based array
+            Dim inputData As Variant
+            inputData = inputArea.Value
+
+            '--- assuming the original data was sorted by date, then by Agente
+            '    we'll put it back
+            .SortFields.Clear
+            .SortFields.Add Key:=inputArea.Columns(2), SortOn:=xlSortOnValues, _
+                            Order:=xlAscending, DataOption:=xlSortNormal
+            .SortFields.Add Key:=inputArea.Columns(1), SortOn:=xlSortOnValues, _
+                            Order:=xlAscending, DataOption:=xlSortNormal
+            .SetRange inputArea
+            .Header = xlNo
+            .MatchCase = False
+            .Orientation = xlTopToBottom
+            .SortMethod = xlPinYin
+            .Apply
+        End With
+    End With
+    OrderedInputs = inputData
+End Function
+
+Private Function BuildAgentData(ByRef inputArray As Variant) As Dictionary
+    '--- we're creating a Dictionary of Agentes for quick lookup
+    '    each Item in the Dictionary is an ordered Collection of AgentData
+    '    objects, i.e. the objects are in date ascending order
+    Dim agentes As Dictionary
+    Set agentes = New Dictionary
+
+    Dim i As Long
+    Dim thisAgente As String
+    Dim aData As AgentData
+    Dim allAgentData As Collection
+    For i = LBound(inputArray, 1) To UBound(inputArray, 1)
+        If thisAgente &lt;&gt; inputArray(i, 1) Then
+            thisAgente = inputArray(i, 1)
+            '--- create the first entry
+            Set aData = New AgentData
+            aData.day = inputArray(i, 2)
+            aData.fcr1 = inputArray(i, 4)
+            aData.fcr3 = inputArray(i, 5)
+            aData.fcr30 = inputArray(i, 6)
+            Set allAgentData = New Collection
+            allAgentData.Add aData
+            agentes.Add thisAgente, allAgentData
+        Else
+            '--- increase the size of the array by one and add the date
+            Set allAgentData = agentes(thisAgente)
+            Set aData = New AgentData
+            aData.day = inputArray(i, 2)
+            aData.fcr1 = inputArray(i, 4)
+            aData.fcr3 = inputArray(i, 5)
+            aData.fcr30 = inputArray(i, 6)
+            allAgentData.Add aData
+        End If
+    Next i
+    Set BuildAgentData = agentes
+End Function
+</code></pre>
+
+<p>And at the bottom of <code>Module1</code> is the bonus sub to create the input data:</p>
+
+<pre><code>Sub GenerateData()
+    Dim names() As String
+    '--- from http://listofrandomnames.com/
+    names = Split("Lori,Norah,Valorie,Evita,Alden,Tressa,Carrol," &amp; _
+                  "Leeanna,Alexia,Marlyn,Wilhemina,Lanell,Kari," &amp; _
+                  "Rose,Arianne,Lesa,Royal,Maura,Sherie,Lahoma", ",")
+    Const START As Date = #1/1/2020#
+    Const FINISH As Date = #3/31/2020#
+    Const LOGINS_PER_DAY As Long = 500
+
+    '--- output setup
+    Dim entry As Range
+    Dim day As Date
+    Dim i As Long
+    Dim index As Long
+    With Hoja4
+        .Cells.Clear
+        .Range("A1").Value = "Fecha"
+        .Range("B1").Value = "Login"
+        .Range("F1").Value = "Centro"
+        .Range("F1").Value = "Centro"
+        .Range("M1").Value = "Encuestas 1"
+        .Range("N1").Value = "FCR 1"
+        .Range("O1").Value = "Encuestas 3"
+        .Range("P1").Value = "FCR 3"
+        .Range("Q1").Value = "Encuestas 30"
+        .Range("R1").Value = "FCR 30"
+        Set entry = .Range("A2")
+        For day = START To FINISH
+            For i = LBound(names) To UBound(names)
+                entry.Cells(1, 1).Value = day
+                entry.Cells(1, 2).Value = names(i)
+                Set entry = entry.Offset(1, 0)
+            Next i
+        Next day
+    End With
+
+    '--- input setup
+    With Hoja37
+        .Cells.Clear
+        .Range("A1").Value = "Agente"
+        .Range("B1").Value = "Fecha Completa"
+        .Range("D1").Value = "FCR 1"
+        .Range("E1").Value = "FCR 3"
+        .Range("F1").Value = "FCR 30"
+        Set entry = .Range("A2")
+        For day = START To FINISH
+            For i = 1 To LOGINS_PER_DAY
+                index = CLng((UBound(names) - LBound(names)) * Rnd() + LBound(names))
+                entry.Cells(1, 1).Value = names(index)
+                entry.Cells(1, 2).Value = day
+                entry.Cells(1, 4).Value = IIf(Rnd() &gt; 0.5, 1, 0)
+                entry.Cells(1, 5).Value = IIf(Rnd() &gt; 0.5, 1, 0)
+                entry.Cells(1, 6).Value = IIf(Rnd() &gt; 0.5, 1, 0)
+                Set entry = entry.Offset(1, 0)
+            Next i
+        Next day
+    End With
+End Sub
+</code></pre>
+    </div>

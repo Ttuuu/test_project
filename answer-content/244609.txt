@@ -1,0 +1,67 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>Disclaimer:</strong> It has been a while since I've written Haskell in production. Also, while I usually like to review <em>all</em> the code, I have to admit that there is too much for me in this case. Instead, I'll try to focus on what I've seen from a short glance, raise concerns and show alternatives where applicable.</p>
+<p>But first, let's give praise.</p>
+<h1>Types are everywhere</h1>
+<p>This is great. You've put a type signature on every top-level value, and never one on an intermediate binding. This enables me to reason about your code even without a compiler that would usually help me with the review.</p>
+<p>You also introduced proper <code>newtype</code>s instead of <code>HashMap Int Int</code> or other non-semantic types. Overall, well-done.</p>
+<h1>Stateless vs stateful functions</h1>
+<p>Next, we come into a territory that's probably subject to personal opinion: should one write functions in terms of the <code>State</code> monad, or without?</p>
+<p>Let's have a look at our first <code>State</code>ful function:</p>
+<pre><code>writeToMemory :: Int -&gt; Int -&gt; State Memory ()
+writeToMemory pointer 0 = modify $ \(Memory m) -&gt; Memory $ Map.delete pointer m
+writeToMemory pointer value = modify $ \(Memory m) -&gt; Memory $ Map.alter (\_ -&gt; Just value) pointer m
+</code></pre>
+<p>While seemingly innocent, those functions provide some problems later on. For example in <code>writeToProcessMemory</code> we have to conjure a new <code>State</code>:</p>
+<pre><code>writeToProcessMemory :: Int -&gt; Int -&gt; State ProcessState ()
+writeToProcessMemory pointer value = 
+    modify $ \s@ProcessState{memory = m} -&gt; 
+        s {memory = execState (writeToMemory pointer value) m} -- &lt;- execState
+</code></pre>
+<p>Our stateful functions force us to create and <code>exec</code> a new <code>State</code> just to apply a function. That's cumbersome.</p>
+<p>What happened if we used another <code>writeToMemory</code>?</p>
+<pre><code>writeToMemory :: Int -&gt; Int -&gt; Memory -&gt; Memory
+writeToMemory pointer 0     (Memory m) = Memory $ Map.delete pointer m
+writeToMemory pointer value (Memory m) = Memory $ Map.insert pointer value m
+
+writeToProcessMemory :: Int -&gt; Int -&gt; State ProcessState ()
+writeToProcessMemory pointer value = 
+    modify $ \s@ProcessState{memory = m} -&gt; 
+        s {memory = writeToMemory pointer value m}
+</code></pre>
+<p>No more <code>execState</code>, and we don't have to wrap around <code>State</code> to understand this function.</p>
+<h2>Some more examples for simpler building blocks</h2>
+<p>Another example where the <code>State</code>ful function is much more verbose than a non-<code>State</code>ful one is <code>hasShutDown</code>:</p>
+<pre><code>hasShutDown :: State ProcessState Bool
+hasShutDown = do
+    currentStatus &lt;- processStatus
+    case currentStatus of
+        Terminated -&gt; return True    -- alignment added by me
+        Error      -&gt; return True
+        _          -&gt; return False
+</code></pre>
+<p>Those seven lines need to get carefully processed by a reviewer. However, we can simply split it into two functions:</p>
+<pre><code>hasShutDown' :: ProcessState -&gt; Bool
+hasShutDown' Terminated = True
+hasShutDown' Error      = True
+hasShutDown' _          = False
+
+hasShutDown :: State ProcessState Bool
+hasShutDown = hasShutDown' &lt;$&gt; processStatus
+</code></pre>
+<p>Even with the additional empty line and types, the overall length stayed at 7 lines. However, it is now a lot easier to examine <code>hasShutDown'</code> in my point of view.</p>
+<h2><em>My</em> general rule of thumb</h2>
+<p>If you have a function with type <code>a -&gt; b</code> for some <code>a</code> and <code>b</code>, keep it out of the <code>State</code> monad as much as possible to make it easier for reuse. If you have a function with type <code>a -&gt; (b, a)</code>, then it's a lot easier to handle with <code>State</code>.</p>
+<p>However, that is <em>my</em> general rule of thumb. Your style might vary.</p>
+<h1>Consider lenses</h1>
+<p>Let's get back to our new <code>writeToProcessMemory</code>:</p>
+<pre><code>writeToProcessMemory :: Int -&gt; Int -&gt; State ProcessState ()
+writeToProcessMemory pointer value = 
+    modify $ \s@ProcessState{memory = m} -&gt; 
+        s {memory = writeToMemory pointer value m}
+</code></pre>
+<p>While I usually dislike lenses when overused, as they introduce a new dependency (use <code>microlens-platform</code> instead of <code>lens</code> if you don't need prisms, isomorphisms or similar), they can make this function even shorter:</p>
+<pre><code>writeToProcessMemory :: Int -&gt; Int -&gt; State ProcessState ()
+writeToProcessMemory pointer value = memory %= writeToMemory pointer value
+</code></pre>
+<p>However, this needs <code>memory</code> to be a lens; it's a design decision whether to use them, but they can simplify code a lot.</p>
+    </div>

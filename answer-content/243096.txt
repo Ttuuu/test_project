@@ -1,0 +1,58 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>Big picture/design</strong></p>
+
+<p>If you have the option to use DMA, then go with that. DMA can be somewhat complex in its own, but it doesn't screw up all the real-time requirements of the whole program, in the way that asynchronous receiver interrupts do.</p>
+
+<p>That being said, storing incoming Rx data from a UART in a (ring) buffer is the old school way of doing things. It should work out fine unless your program has a lot of real-time deadlines.</p>
+
+<p><strong>Interrupts</strong></p>
+
+<p>The all-time most common bug in embedded systems is failing to protect data shared with interrupts from race conditions, so it is not at all surprising if this is the cause of the bug you describe.</p>
+
+<p>It is not entirely clear how the interrupts handle re-entrancy with the main application, as the magic <code>I2C_handle_p</code> struct definition is absent. I don't understand what you mean to do with <code>\r</code>, there is no code posted that disables the interrupts based on that.</p>
+
+<p>You need some manner of semaphores from protecting the caller from reading part of the data, then get interrupted in the middle of it. I like to provide these as a feature in the ring buffer ADT itself, making that one intrinsically interrupt safe.</p>
+
+<p>Alternatively, you could temporary disable interrupts in the caller while you grab the data, but that only works if the caller can do this in less time than it takes for the serial bus to send another byte.</p>
+
+<p>Usually this is done by providing double-buffering (no matter if you have a ring buffer or a linear one). You have one software buffer where the incoming data is getting written, and another buffer which contains the latest completely received data. When the ISR is done receiving, it only swaps the pointers between these two buffers. </p>
+
+<p>So if you have a <code>memcpy</code> somewhere doing a hard copy of the whole buffer, you are doing it wrong. This is yet another very common problem in defective ISR code. Similarly, there should be no need to <code>memset</code> everything to zero repeatedly, that's just wasting time for nothing.</p>
+
+<p>And finally, all variables shared with the ISR must be declared <code>volatile</code>. That's another common bug - read this: <a href="https://electronics.stackexchange.com/questions/409545/using-volatile-in-embedded-c-development/409570#409570">Using volatile in embedded C development</a>.</p>
+
+<p><strong>Other issues/best practices</strong></p>
+
+<ul>
+<li><p>What about framing/overrun errors and similar? What do you do when such errors occur? Your program should handle them and discard the data when they strike. Also, I don't see any checksum or CRC. UART in particular is very unreliable.</p></li>
+<li><p>Never bit shift on signed or negative types. This means, never write <code>1 &lt;&lt; ..</code> because the integer constant <code>1</code> is of type signed int. Use <code>1u</code> suffix and in case of variables, make sure to cast to a large unsigned type before shifting. </p></li>
+<li><p><code>~</code> is notorious for changing signedness of its operand and thereby causing all manner of implicit integer promotion bugs. It's a good habit of casting its operand to a large unsigned type before applying <code>~</code>. Be aware of the <a href="https://stackoverflow.com/questions/46073295/implicit-type-promotion-rules">Implicit type promotion rules</a>, they are especially known to cause havoc on small 8- or 16-bit microcontroller systems.</p></li>
+<li><p>Never use <code>char</code> for storing raw data, even if you expect incoming data from UART to be text. It comes with implementation-defined signedness (<a href="https://stackoverflow.com/questions/2054939/is-char-signed-or-unsigned-by-default">Is char signed or unsigned by default?</a>), and embedded compilers in particular are known to implement <code>char</code> differently from case to case. Read everything as <code>uint8_t</code> and then when everything is verified and you know that the input is valid text, cast to <code>char</code> if you must.</p></li>
+<li><p>Avoid variadic functions. These are known to have non-existent safety and are needlessly slow. They might seem convenient to the programmer, but they are not convenient to the <em>program</em>, as they make things slower and buggier in general. There should be no need to use variadic functions in an embedded system.</p></li>
+<li><p>It's bad practice to write empty while loops like <code>while (something);</code>, because to the reader it is completely unclear if the semi-colon is intentional or just a slip of the finger. Therefore, always use one of these forms instead:</p>
+
+<pre><code>while (something)
+  ;
+</code></pre>
+
+<p>or</p>
+
+<pre><code>while(something)
+{}
+</code></pre></li>
+<li><p><code>uint8_t bytes = end - start;</code> is rather questionable, you need to guarantee that this won't be larger than 255 bytes. </p>
+
+<p>Also note that upon pointer subtraction, you are actually getting back an obscure large integer type called <code>ptrdiff_t</code> which does you no good. I'd recommend to do <code>(uint8_t)end - (uint8_t)start</code> instead.</p></li>
+<li><p>Never use <code>int</code> anywhere in an embedded system. You should be using the types from <code>stdint.h</code>, or <code>size_t</code> in case you are declaring a for loop iterator.</p></li>
+<li><p><code>static uint8_t txSize = sizeof(txBuffer)/sizeof(txBuffer[0]);</code>. This should either have been a macro or a <code>const</code>, instead of a read/write variable. </p></li>
+<li><p>The format of main() in an embedded bare metal system is always <code>void main(void)</code>, unless your compiler requires some other exotic form. Who are you going to return to? With gcc-like compilers, you need to compile embedded systems with the <code>-ffreestanding</code> option.</p></li>
+<li><p>All your files are missing <code>#include</code> so it isn't clear if you are even including the correct libraries or otherwise have strange file dependencies.</p></li>
+<li><p>Where is the watchdog code? Microcontroller firmware which is not utilizing a watchdog is defective, period. You may disable it in debug release, but where to place it and where to feed it needs to be considered early on, and the code must be present. </p>
+
+<p>Ideally you only feed it at one single point of your program, on top of the internal loop in main().</p></li>
+</ul>
+
+<hr>
+
+<p>Overall, a lot of these common issues/dormant bugs could have been avoided if you used MISRA-C. I'd strongly recommend to at least read it as study material, even if you don't want to go all the way and get formal compliance. </p>
+    </div>

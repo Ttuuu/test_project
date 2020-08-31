@@ -1,0 +1,113 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Ok, for starters, it mentions on the first challenge:</p>
+
+<p><strong>Always operate on raw bytes, never on encoded strings. Only use hex and base64 for pretty-printing.</strong></p>
+
+<p>Since <code>String</code> is actually a list of encoded <code>Char</code>s, it would make more sense to migrate to an implementation that uses <a href="http://hackage.haskell.org/package/bytestring-0.10.10.0/docs/Data-ByteString.html" rel="nofollow noreferrer"><code>ByteString</code></a> instead. This data structure is suited for handling raw data, like we will be doing here. There is also a very helpful parser library called <a href="http://hackage.haskell.org/package/attoparsec" rel="nofollow noreferrer"><code>attoparsec</code></a>. It is a parser combinator library, similar to <code>parsec</code>, but specialized for <code>ByteString</code>. Using it to parse the input as a <code>ByteString</code> makes the most sense in this situation.</p>
+
+<hr>
+
+<h3>Parsing ByteStrings</h3>
+
+<p>A <code>ByteString</code> can be formed from <code>[Word8]</code> using <a href="https://hackage.haskell.org/package/bytestring-0.10.10.0/docs/Data-ByteString.html#v:pack" rel="nofollow noreferrer"><code>pack</code></a>, and it can also be broken apart again using <code>unpack</code>. <code>Word8</code> is just an 8-bit unsigned integer, and interestingly, an 8-bit unsigned integer is also what is needed for holding the value a single hex-digit! This means that we can parse two <code>Word8</code>s from <code>'0'</code> to <code>'f'</code> and get a single <code>Word8</code> which holds the encoded number.</p>
+
+<pre><code>import Control.Applicative (liftA2, liftA3, many)
+import Data.Attoparsec.ByteString.Char8
+import qualified Data.ByteString as B
+import           Data.ByteString (ByteString, pack, uncons)
+import Data.Bits (shift)
+import Data.Char (ord)
+-- The strict version is suitable here
+import Data.IntMap.Strict (IntMap, fromAscList, (!))
+import Data.Word8
+
+hexMap :: IntMap Word8
+hexMap = fromAscList $ zip (map ord $ ['0'..'9'] ++ ['a'..'f']) [0..]
+
+
+hex :: Parser Word8
+hex = liftA2 mkWord8 hexChar hexChar
+  where
+    hexChar :: Parser Word8
+    hexChar = choice $ map char8 $ ['0'..'9'] ++ ['a'..'f']
+
+    mkWord8 :: Word8 -&gt; Word8 -&gt; Word8
+    mkWord8 a b =
+          (hexMap ! fromIntegral a) `shift` 4
+        + (hexMap ! fromIntegral b)
+
+hexStr :: Parser ByteString
+hexStr = fmap pack (many hex)  -- Parser is a Functor
+
+parseHex :: ByteString -&gt; Either String ByteString
+parseHex = parseOnly hexStr
+</code></pre>
+
+<p>Let's take a look at how the <code>hex</code> parser is put together. First, look at the inner functions. <code>mkWord8</code> takes two <code>Word8</code> values and looks both of them up in <code>hexMap</code>. Then, it <em>bit shifts</em> the first result by four bits to the left and adds it to the second result. This means that if the first and second arguments to <code>mkWord8</code> are "f2", then we will have <code>11110010</code> stored in the resulting <code>Word8</code>.</p>
+
+<p><code>hexChar</code> is a <code>Parser</code> that matches a single character in the range of <code>['0'..'9']</code> or <code>['a'..'f']</code>. This works by mapping <a href="http://hackage.haskell.org/package/attoparsec-0.13.2.2/docs/Data-Attoparsec-ByteString-Char8.html#v:char8" rel="nofollow noreferrer"><code>char8 :: Char -&gt; Parser Word8</code></a> over the list of acceptable characters and then calling <a href="http://hackage.haskell.org/package/attoparsec-0.13.2.2/docs/Data-Attoparsec-ByteString-Char8.html#v:choice" rel="nofollow noreferrer"><code>choice :: [Parser Word8] -&gt; Parser Word8</code></a> to indicate that any of the generated parsers will work.</p>
+
+<p>Now, it is easy to understand how <code>hex</code> works. It is a parser that takes two characters and calls <code>mkWord8</code> on the results, assuming both characters match. To extend <code>hex</code> in order to allow for arbitrary numbers of hex-digits, we just need to utilize <a href="https://hackage.haskell.org/package/base-4.12.0.0/docs/Control-Applicative.html#v:many" rel="nofollow noreferrer"><code>many :: Parser Word8 -&gt; Parser [Word8]</code></a>, as in <code>many hex</code>. To actually <em>use</em> <code>hex</code>, we can utilize <code>parseOnly</code> which will run a parser and return either the results or a <code>String</code> containing an error message if it fails.</p>
+
+<hr>
+
+<h3>Converting bytes to Base64</h3>
+
+<p>We are halfway to a working solution now that we can parse an incoming hex string into a <code>ByteString</code>. To make it all the way, we need to convert the <code>ByteString</code> into Base64 and print it. This can be done by first converting to something that we are more familiar with, such as decimals, but it may be possible to convert more directly using a little math. Since we know that Base64 uses 6 bits (64 = 2^6) and <code>Word8</code> uses 8 bits, we can conclude that both formats will line up every 24 bits. When this happens, we can convert 3 bytes into 4 Base64 characters. If there aren't 3 bytes left to use, we will have to utilize as much as we can before giving up.</p>
+
+<pre><code>-- These two functions pull 3 items or 2 items from the front of the ByteString,
+-- respectively. (`uncons` pulls one off)
+
+uncons3 :: ByteString -&gt; Maybe ((Word8,Word8,Word8), ByteString)
+uncons3 b = do -- We will use the Monad instance of Maybe by using `do`
+    (w1,b1) &lt;- uncons b
+    (w2,b2) &lt;- uncons b1
+    (w3,b3) &lt;- uncons b2
+    Just ((w1,w2,w3), b3)
+
+uncons2 :: ByteString -&gt; Maybe ((Word8,Word8), ByteString)
+uncons2 b = do
+    (w1,b1) &lt;- uncons b
+    (w2,b2) &lt;- uncons b1
+    Just ((w1,w2), b2)
+
+---
+
+type Base64 = Char -- Might as well use good 'ol Strings again...
+
+toBase64 :: ByteString -&gt; [Base64] -- [Base64] is equivalent to String
+toBase64 b =
+    case uncons3 b of
+        Just ((w1,w2,w3),b') -&gt; from3Bytes w1 w2 w3 ++ toBase64 b' -- loop
+        Nothing -&gt; -- Less than 3 bytes left...
+            case uncons2 b of
+                Just ((w1,w2),b') -&gt; from2Bytes w1 w2
+                Nothing -&gt; -- Less than 2 bytes left...
+                    case uncons b of
+                        Just (w,b') -&gt; from1Byte w
+                        Nothing -&gt; [] -- No more data, so end the string
+
+base64Map :: IntMap Base64
+base64Map = undefined
+
+-- Convert 3 Word8's to 4 Chars
+from3Bytes :: Word8 -&gt; Word8 -&gt; Word8 -&gt; [Base64]
+from3Bytes = undefined
+
+-- Convert 2 Word8's to 2 Chars (drop the remainder)
+from2Bytes :: Word8 -&gt; Word8 -&gt; [Base64]
+from2Bytes = undefined
+
+-- Convert 1 Word8 to 1 Char (drop the remainder)
+from1Byte :: Word8 -&gt; [Base64]
+from1Byte = undefined
+
+
+</code></pre>
+
+<hr>
+
+<p>I'll leave it up to you to finish up by filling in the <code>undefined</code> portions. Keep in mind that you can do bitwise manipulations with <code>Data.Bits</code>. Obviously you will need to break up the 8-bit <code>ByteString</code>s into smaller chunks in order to reassemble them into 6-bit pieces, and have some mapping from these pieces to their Base64 character representation. I left the stub for <code>base64Map</code> as a reminder of <em>one possible</em> solution here.</p>
+
+<p>There's a lot to digest here, but I think this will give you some other strategies to consider. Good luck and happy coding!</p>
+    </div>

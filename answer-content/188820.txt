@@ -1,0 +1,146 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Code doesn't look too bad for a first attempt at using promises. </p>
+
+<p>Here are a few observations.</p>
+
+<p><strong>General</strong></p>
+
+<ol>
+<li>A wholly synchronous step in a promise chain doesn't need its own <code>.then()</code> and can be merged downwards with following synchronous step(s) up to and including the next asynchronous step.</li>
+<li>Completely flat promise chains are not always the best. Nesting is perfectly acceptable and often offers big benefits in terms of closure and flow control. </li>
+<li>You can avoid clumsy outer vars when it's possible to pass them down a promise chain or keep them in a closure.</li>
+<li>Arrow functions would help make the code more concise (and arguably more readable).</li>
+</ol>
+
+<p><strong>Specific</strong></p>
+
+<ol>
+<li>The routes take no account of failure of <code>fs.readFile(path.resolve(__dirname, 'TokenERC20.json'), 'UTF-8')</code>.  </li>
+<li>In fixing (1), you can (probably) execute <code>contract.deployed()</code> once and deliver <code>deployed</code> via a <code>deployedPromise</code> promise in those routes that use it. </li>
+<li>In routes that use <code>deployed</code>, you can start with <code>deployedPromise.then(...)</code> to ensure that nothing is executed if <code>fs.readFile(...)</code> or <code>contract.deployed()</code> failed.</li>
+<li>In <code>router.post('/api/v1/wallet')</code>, <code>sequelize.query(...)</code> doesn't wait for <code>web3.personal.unlockAccount()</code>.</li>
+<li>The test <code>if (typeof web3 !== 'undefined')</code> is a bit odd when <code>web3</code> is guaranteed to be undefined.</li>
+</ol>
+
+<p>With all that in mind, I end up with the following :</p>
+
+<pre><code>const express = require('express');
+const path = require('path');
+const Web3 = require('web3');
+const fs = require('fs');
+const TruffleContract = require('truffle-contract');
+const Sequelize = require('sequelize');
+const Aigle = require('aigle');
+
+const router = express.Router();
+// const Op = Sequelize.Op; // not used
+
+const sequelize = new Sequelize('aircoin', 'giuseppe', '12345', {
+    'dialect': 'postgres',
+    'host': 'localhost',
+    'port': 5432,
+    'operatorsAliases': false
+});
+
+let web3;
+
+if (typeof web3 !== 'undefined') { // ???
+    web3Provider = web3.currentProvider;
+} else {
+    web3Provider = new Web3.providers.HttpProvider('localhost:8545');
+}
+
+web3 = new Web3(web3Provider);
+
+let deployedPromise = Aigle.promisify(fs.readFile)(path.resolve(__dirname, 'TokenERC20.json'), 'UTF-8')
+.then(res =&gt; {
+    let contract = new TruffleContract(JSON.parse(res));
+    contract.setProvider(web3Provider);
+    return contract.deployed();
+});
+
+router.get('/', function(req, res, next) {
+    res.sendFile('index.html');
+});
+
+router.get('/api/v1/wallet/:ens', function(req, res) {
+    return deployedPromise
+    .then(deployed =&gt; {
+        const name = req.params.ens.replace(' ', '_');
+        return sequelize.query('SELECT address FROM ens WHERE UPPER(name) LIKE UPPER($1);', { 'bind': [name], 'raw': true, 'type': Sequelize.QueryTypes.SELECT })
+        .then(row =&gt; {
+            return Aigle.resolve(row).map(value =&gt; {
+                return deployed.balanceOf(value.address)
+                .then(data =&gt; { 'address': value.address, 'name': name, 'balance': data.toNumber() / Math.pow(10, 18) });
+            });
+        });
+    })
+    .then(result =&gt; {
+        res.json(result);
+    })
+    .catch(err =&gt; {
+        console.log(err.message);
+    });
+});
+
+router.get('/api/v1/wallet', function(req, res) {
+    return deployedPromise
+    .then(deployed =&gt; {
+        return sequelize.query('SELECT address, name FROM ens;', { 'raw': true, 'type': Sequelize.QueryTypes.SELECT })
+        .then(row =&gt; {
+            return Aigle.resolve(row).map(value =&gt; {
+                return deployed.balanceOf(value.address)
+                .then(data =&gt; { 'address': value.address, 'name': value.name, 'balance': data.toNumber() / Math.pow(10, 18) })
+            });
+        });
+    })
+    .then(result =&gt; {
+        res.json(result);
+    })
+    .catch(error =&gt; {
+        console.log(err.message);
+    });
+});
+router.post('/api/v1/wallet', function(req, res) {
+    const data = { 'name': req.body.name.replace(' ', '_'), 'passphrase': req.body.passphrase };
+    const address = web3.personal.newAccount(data.passphrase);
+    const bank = "0x49b36fa1772bdb4d9249f43179832ccdb3732ffc";
+    return web3.personal.unlockAccount(bank, '')
+    .then(() =&gt; web3.eth.sendTransaction({ 'from': bank, 'to': address, 'value': web3.toWei(3.20, 'ether') }))
+    .then(() =&gt; sequelize.query('INSERT INTO ens (address, name) VALUES ($1, $2);', { 'bind': [address, data.name], 'raw': true, 'type': Sequelize.QueryTypes.INSERT }))
+    .then(() =&gt; {
+        res.status(200).json({ 'address': address });
+    })
+    .catch(error =&gt; {
+        console.log(error.message);
+    });
+});
+
+router.post('/api/v1/transaction', function(req, res) {
+    return deployedPromise
+    .then(deployed =&gt; {
+        const data = { 'from': req.body.from.replace(' ', '_'), 'passphrase': req.body.passphrase, 'to': req.body.to.replace(' ', '_'), 'amount': req.body.amount*10**18 };
+        return sequelize.query('SELECT address, name FROM ens WHERE UPPER(name) LIKE UPPER($1) OR UPPER(name) LIKE UPPER($2);', { 'bind': [data.from, data.to], 'raw': true, 'type': Sequelize.QueryTypes.SELECT })
+        .then(row =&gt; {
+            let result = {};
+            return Aigle.resolve(row).each(value =&gt; {
+                result[value.name] = value.address;
+            })
+            .then(() =&gt; {
+                return web3.personal.unlockAccount(result[data.from], data.passphrase)
+                .then(deployed =&gt; deployed.transfer(result[data.to], data.amount, { 'from': result[data.from] }));
+            });
+        });
+    })
+    .then(tx =&gt; {
+        res.status(200).json(tx);
+    })
+    .catch(error =&gt; {
+        res.status(500).json(error);
+    });
+});
+module.exports = router;
+</code></pre>
+
+<p><em>Untested and includes a few assumptions, therefore may not be 100% correct. Be prepred to debug, or just raid for ideas.</em></p>
+    </div>

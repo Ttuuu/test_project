@@ -1,0 +1,153 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Ok, old question.  But no accepted answer and I've got some thoughts, so...</p>
+
+<p>My first thought on reading this code was to suggest you re-arrange your compares, so that you can "drop through" rather than doing an additional jump.  If you move this to the end of your compare block:</p>
+
+<pre><code>cmp currentCharacter, DOUBLE_QUOTE             ; compare [currentCharacter] to QUOTE_DOUBLE
+jnz ReadLine@NextChar ; &lt;-- Note: jnz
+</code></pre>
+
+<p>You can get rid of that extra <code>jmp</code>, dropping straight into HitDoubleQuote.</p>
+
+<p>But upon reflection, it might be better to leave it where it is, and add an additional jmp.</p>
+
+<p>Consider the string <code>Goodbye cruel world.\n</code>  How many compares and how many jumps instructions does this take with your current code?  Excluding the bufferTail, there's 3 cmp, 3 jz, and 1 jmp for every character.  That's 63 cmp, 63 jz, and 62 jmp (including the end of line, which doesn't jmp).</p>
+
+<p>Now, what if right after <code>cmp currentCharacter, DOUBLE_QUOTE</code> you add <code>jg ReadLine@NextChar</code>?  Since jg doesn't affect the flags, there would be no need to do an extra cmp, so you're just adding one instruction.  And since the "largest" value you're interested in parsing is the DOUBLE_QUOTE (0x22), any value greater than that and you already know what to do.</p>
+
+<p>And look what happens to the number of cmp/jz/jmp.</p>
+
+<p>cmp:21+3*2 = 27, jz: 21+3*3 = 30, jmp: 2</p>
+
+<p>To clarify: We'd only go past the jg 3 times: twice for the spaces (0x20), and once for eol (0xa).  So, while tabs, spaces, lf, cr, double quotes and exclamation marks (0x21) would all become 1 instruction more expensive due to the extra jg, all the letters and numbers become 5 instructions cheaper.</p>
+
+<p>Worth doing?  Probably not now that you likely haven't looked at the code in the last 5 months.  But something to think about for next time.</p>
+
+<p>Note: You could still take advantage of the drop thru.  Something like this:</p>
+
+<pre><code>    cmp currentCharacter, DOUBLE_QUOTE             ; compare [currentCharacter] to QUOTE_DOUBLE
+    jg ReadLine@NextChar                           ; not DOUBLE_QUOTE or control code
+    jz ReadLine@HitDoubleQuote                     ; if equal, jump to HitDoubleQuote
+
+    cmp currentCharacter, LINE_FEED                ; compare [currentCharacter] to LINE_FEED
+    jz ReadLine@HitLineFeed                        ; if equal, jump to HitLineFeed
+
+    cmp currentCharacter, CARRIAGE_RETURN          ; compare [currentCharacter] to CARRIAGE_RETURN
+    jnz ReadLine@NextChar                          ; if not CR, get next character
+
+ReadLine@HitCarriageReturn:
+    cmp nextCharacter, LINE_FEED                   ; compare [nextCharacter] to LINE_FEED
+    jz ReadLine@NextChar                           ; if equal, jump to NextChar
+
+ReadLine@HitLineFeed:
+    cmp isQuotedSequence, TRUE                     ; compare [isQuotedSequence] to TRUE
+    jz ReadLine@NextChar                           ; if equal, jump to NextChar
+
+ReadLine@Return:
+    ret                                            ; return to caller
+
+ReadLine@HitDoubleQuote:
+    xor isQuotedSequence, TRUE                     ; invert [isQuotedSequence] indicator
+    jmp ReadLine@NextChar                          ; jump to NextChar
+
+ReadLine endp
+</code></pre>
+
+<p>Notice how the <code>jmp</code> is gone after the compares?</p>
+
+<p>What else?  1201ProgramAlarm already mentioned using <code>inc</code> vs <code>add</code>.  That's one byte shorter.  However you could also use <code>lea rax, [rax + 1]</code>.  While it's not shorter than add, it doesn't use the flags register (which both add and inc do).  This might ease the CPU's pipelining.</p>
+
+<p>Similarly, <code>xor edx</code> is only 3 bytes, compared to <code>xor rdx</code> which is 4.  Since you're only using 1 bit, I don't see any need to use rdx.  Similarly, why use r8d/movzx instead of just 'mov r8b, [rax]`?  Again, it's a byte shorter.</p>
+
+<p>I note that there is no facility provided for error returns.  What if you are inside a quoted string when you hit bufferTail?  You want to be able to start "mid string," but you don't return a value indicating that you need to do so?  Maybe return NULL in this case?  And I guess the caller can check if the return value is bufferTail to detect a missing cr/lf.</p>
+
+<p>I get what you are saying about 128 bit returns.  But I don't see a practical way to do that here.  Such being the case, you're incurring a penalty (of swapping registers around) for a benefit you cannot (or at least do not) achieve.</p>
+
+<p>From an ease of use point of view, I might be tempted to change the call to:</p>
+
+<pre><code>extern char* ReadLine(const char* bufferOffset, size_t length, bool sQuotedSequence);
+</code></pre>
+
+<p>Obviously I haven't seen the code for the caller, but keeping track of lengths might be a bit easier for people to grasp than "a pointer to 1 byte after your string."  Even better might be to indicate that NUL (0x0) is a buffer terminator and may not be embedded in the string.  Then you don't need either bufferTail or length, you can just check for currentCharacter being 0.</p>
+
+<p>You apologize for:</p>
+
+<blockquote>
+  <p>the excessive amount of comments</p>
+</blockquote>
+
+<p>I'm not sure there is such a thing in asm.  They add nothing at all to the execution time of the code, and greatly reduce the maintenance time.  In fact, adding comments about how you check for missing cr/lf or how mismatched quoted strings are handled might be a good idea.  On the other hand, if the function ever gets <em>changed</em>, the maintainer has to go thru them all and make sure they reflect the new logic or you end up with comments that are WRONG, which can be worse than no comments.</p>
+
+<p>A few stylistic nits: I might add more blank lines to make things easier to read.  And I'm pretty sure using "proc" means that labels are local to the function.  So the "ReadLine@" (to avoid conflict with names in other functions?) may be redundant.  And as the guy said last time, I'd probably go with <code>je</code> rather than <code>jz</code>.  Functionally they're identical, but conceptually you're (J)umping depending on whether currentCharacter is (E)qual to DOUBLE_QUOTE.  And you have several comments that read "compare [nextCharacter]".  Putting the brackets means you're going to read the value at the <em>address</em> pointed to by nextCharacter.  But nextCharacter isn't a pointer, it's the actual value.  They're comments, but still.</p>
+
+<p>And one last thought: Unless this was a homework project for an asm class, why write this in asm?  Unless you know what "instruction fusing" and "pipelining" mean and what causes "stalling" and a dozen other esoteric concepts, squeezing the max perf out of assembler is <em>really hard</em>.  The people who write c/c++ compilers are all completely bonkers, but they <strong>do</strong> understand this stuff and have decades worth of "tricks" they can apply.  As a result, well-structured c code can actually result in smaller code and faster execution times than asm written by us mere mortals.</p>
+
+<hr>
+
+<p>Edit: Rolling my (non-stylistic) comments in:</p>
+
+<pre><code>;-----------------------------; (CONSTANTS)
+CARRIAGE_RETURN  = 00Dh
+DOUBLE_QUOTE     = 022h
+LINE_FEED        = 00Ah
+
+arg0             textequ &lt;rcx&gt;
+bufferOffset     textequ &lt;rax&gt;
+bufferTail       textequ &lt;rdx&gt;
+currentCharacter textequ &lt;cl&gt;
+isQuotedSequence textequ &lt;r8d&gt;
+nextCharacter    textequ &lt;r9b&gt;
+
+.code
+
+Rfc4180_ReadRow proc
+    mov bufferOffset, arg0                         ; initialize bufferOffset
+
+    cmp bufferOffset, bufferTail                   ; validate that there are more characters to read
+    jae Rfc4180_ReadRow@Return                     ; if end of file reached, jump to Return
+
+    mov nextchar, byte ptr[bufferOffset]           ; extract nextCharacter from [bufferOffset]
+
+; todo try adding: .align xx
+Rfc4180_ReadRow@NextChar:
+    mov currentCharacter, nextchar                 ; shift nextCharacter into currentCharacter
+    inc bufferOffset                               ; increment bufferOffset
+    ; todo maybe replace inc: lea bufferOffset, [bufferOffset + 1]
+
+    cmp bufferOffset, bufferTail                   ; validate that there are more characters to read
+    jae Rfc4180_ReadRow@Return                     ; if end of file reached, jump to Return
+
+    mov nextchar, byte ptr[bufferOffset]           ; extract nextCharacter from [bufferOffset]
+
+    cmp currentCharacter, DOUBLE_QUOTE             ; compare currentCharacter to QUOTE_DOUBLE
+    ; todo maybe add: jg Rfc4180_ReadRow@NextChar
+    jz Rfc4180_ReadRow@HitDoubleQuote              ; if equal, jump to HitDoubleQuote
+
+    cmp currentCharacter, LINE_FEED                ; compare currentCharacter to LINE_FEED
+    jz Rfc4180_ReadRow@HitLineFeed                 ; if equal, jump to HitLineFeed
+
+    cmp currentCharacter, CARRIAGE_RETURN          ; compare currentCharacter to CARRIAGE_RETURN
+    jnz Rfc4180_ReadRow@NextChar                   ; if not CARRIAGE_RETURN, NextChar
+
+Rfc4180_ReadRow@HitCarriageReturn:
+    cmp nextchar, LINE_FEED                        ; compare nextCharacter to LINE_FEED
+    jz Rfc4180_ReadRow@NextChar                    ; if equal, jump to NextChar
+
+Rfc4180_ReadRow@HitLineFeed:
+    test isQuotedSequence, isQuotedSequence        ; see if isQuotedSequence is set
+    jnz Rfc4180_ReadRow@NextChar                   ; if set, jump to NextChar
+
+Rfc4180_ReadRow@Return:
+    ret                                            ; return to caller
+
+Rfc4180_ReadRow@HitDoubleQuote:
+    xor isQuotedSequence, 1                        ; invert isQuotedSequence indicator
+    jmp Rfc4180_ReadRow@NextChar                   ; jump to NextChar
+
+Rfc4180_ReadRow endp
+
+end
+</code></pre>
+
+<p>Note: I haven't even <em>assembled</em> this let alone validated or perf tested it.  Still, shows you what I'm thinking.  While I <em>think</em> it's likely to be better, that can't be known until someone times it against real data.  See the 3 <code>todo</code>s for more things to try.</p>
+    </div>

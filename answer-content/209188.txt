@@ -1,0 +1,92 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Bug</h2>
+
+<p>You have a two bugs in <code>get_digits_minimum_length()</code>:</p>
+
+<blockquote>
+<pre><code>if len(str(start_number)) &gt; digits_length:
+    digits_length = start_number
+</code></pre>
+</blockquote>
+
+<p>First of all, you probably meant <code>digits_length = len(start_number)</code>.  But even that is not enough, because the end number might have more digits than the starting number.  Therefore, it should be:</p>
+
+<pre><code>digits_length = max(digits_length, len(str(start_number + len(filenames) - 1)))
+</code></pre>
+
+<h2>File manipulation</h2>
+
+<p>A better way to make a temporary directory within <code>directory</code> is <a href="https://docs.python.org/3/library/tempfile.html#tempfile.mkdtemp" rel="nofollow noreferrer"><code>tempfile.mkdtemp(dir=directory)</code></a>.  It guarantees that the name of the new directory will not collide with any existing file or directory.  (It automatically generates a different name as necessary to make that happen.)</p>
+
+<p>The temporary directory needs to have permissions <code>stat.S_IRWXU</code>.  On Unix, <code>stat.S_IWRITE</code> (or <code>stat.IWUSR</code>) is insufficient, since you will not be able to call <code>listdir()</code> on the temporary directory.</p>
+
+<p>The program calls <code>get_filenames()</code> three times.  Not only is that slow and wasteful, it also presents a possibility for inconsistencies due to race conditions, if a file gets created or removed while the program is running.</p>
+
+<p><code>shutil.move()</code> is overkill, when <code>os.rename()</code> should work just as well.  Also, it would be better to just do <code>os.rmdir()</code> rather than <code>shutil.rmtree()</code> to clean up the temporary directory, because <code>os.rmdir()</code> asserts that the directory is empty.  (You wouldn't want to accidentally delete any of your files, would you? And if you did want to force a cleanup, <a href="https://docs.python.org/3/library/tempfile.html#tempfile.TemporaryDirectory" rel="nofollow noreferrer"><code>with tempfile.TemporaryDirectory() as temporary_directory: …</code></a> would be a more elegant way to write it.)</p>
+
+<h2>Global state</h2>
+
+<p><code>os.chdir()</code> affects the global state of a process.  I'd try to avoid doing it at all, if possible.  And if you do do it, then I'd call it from a prominent place in your code, so that some innocuous-looking utility function (<code>get_filenames()</code>) does not have unexpected insidious side-effects on the rest of your code.  After calling <code>os.chdir()</code>, you don't have to ever mention <code>directory</code> again in your code anymore, because every operation is relative to the current directory.</p>
+
+<h2>Design and efficiency</h2>
+
+<p>I am slightly annoyed by some of your very short helper functions: <code>make_filename()</code>, <code>make_folder()</code>, and <code>erase_directory()</code>.  In my opinion, they make the code harder to read, because they add very little value over the standard library call, but I have to devote mental effort into keeping track of what they do.  Each of those functions is called from just one place, which makes their existence even less worthwhile.</p>
+
+<p>I imagine that there might be use cases where this program is repeatedly executed for some directory.  In that case, you would be moving files into and out of the temporary directory, most of them for naught.  A better strategy would be to <strong>put more work into mapping the source filenames into their desired destinations</strong> (as in my <code>filename_map()</code> below), so that no more filesystem manipulation is done than necessary.</p>
+
+<h2>Suggested solution</h2>
+
+<pre><code>import os
+import re
+import stat
+import tempfile
+
+def filename_map(prefix, suffix, start_number):
+    """
+    Make a dictionary that maps source filenames to their renumbered
+    destination filename.
+    """
+    pattern = re.compile(re.escape(prefix) + '([0-9]+)' + re.escape(suffix), re.I)
+    num_to_fn = {
+        pattern.fullmatch(fn).group(1): fn
+        for fn in os.listdir()
+        if pattern.fullmatch(fn)
+    }
+    digits_length = max(
+        max((len(num) for num in num_to_fn), default=0),
+        len(str(start_number + len(num_to_fn) - 1))
+    )
+    return {
+        num_to_fn[num]: prefix + str(i).zfill(digits_length) + suffix
+        for i, num in enumerate(sorted(num_to_fn, key=int), start_number)
+    }
+
+def filling_gaps(prefix, suffix, start_number=1):
+    """
+    Rename files in the current directory whose names consist of the given
+    prefix, followed by some digits, and the given suffix, such that they
+    are consecutively numbered from the specified start_number.
+    """
+    if start_number &lt; 0:
+        raise ArgumentError("Start number {0} is less than 0", start_number)
+
+    fn_map = {
+        src_fn: dst_fn
+        for src_fn, dst_fn in filename_map(prefix, suffix, start_number).items()
+        if src_fn != dst_fn
+    }
+    if not fn_map:
+        return  # Nothing to rename
+
+    temp_directory = tempfile.mkdtemp(dir='.', prefix='renumber')
+    os.chmod(temp_directory, stat.S_IRWXU)
+    for src_fn, dst_fn in fn_map.items():
+        os.rename(src_fn, os.path.join(temp_directory, dst_fn))
+    for dst_fn in fn_map.values():
+        os.rename(os.path.join(temp_directory, dst_fn), dst_fn)
+    os.rmdir(temp_directory)
+
+os.chdir(r'E:\spam')
+filling_gaps('spam', '.txt', 1)
+</code></pre>
+    </div>

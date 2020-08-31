@@ -1,0 +1,153 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Let's profile this a little bit (this is on a dual-core i7, so a bit quicker):</p>
+
+<blockquote>
+  <p>Running Time  Self        Symbol Name</p>
+  
+  <p>3984.0ms  100.0%  0.0     Main Thread  0x2856c</p>
+  
+  <p>3982.0ms   99.9%  0.0      start</p>
+  
+  <p>3982.0ms   99.9%  1.0       main</p>
+  
+  <p>3936.0ms   98.7%  3081.0         crypt(char const*)</p>
+  
+  <p>640.0ms   16.0%   640.0           _platform_strchr</p>
+  
+  <p>126.0ms    3.1%   102.0           std::__1::basic_string, std::__1::allocator &gt;::push_back(char)</p>
+  
+  <p>89.0ms    2.2%    89.0            strlen</p>
+  
+  <p>14.0ms    0.3%    14.0           DYLD-STUB$$strchr</p>
+  
+  <p>14.0ms    0.3%    4.0        free</p>
+  
+  <p>8.0ms    0.2% 1.0        szone_free_definite_size</p>
+  
+  <p>7.0ms    0.1% 7.0        DYLD-STUB$$strlen</p>
+  
+  <p>2.0ms    0.0% 2.0        operator delete(void*)</p>
+  
+  <p>2.0ms    0.0% 0.0      _dyld_start</p>
+</blockquote>
+
+<p>Ok, so more than 98% of the time is spent in the <code>crypt</code> function (which isn't surprising really). Almost 16% of the time is spent in <code>strchr</code>, with another 3.1% spent in <code>push_back</code>. There's also a few percent (2.2) spent doing <code>strlen</code>. </p>
+
+<p>Ok, so how do we cut down on these:</p>
+
+<p>Firstly, we'll switch over to using <code>std::array&lt;char&gt;</code> instead of <code>char *</code>. These are both stack-allocated (and so we don't incur the dynamic allocation overhead of <code>std::string</code> or <code>std::vector</code>), but <code>std::array</code> knows its size, and will allow us to remove the <code>strlen</code> in the crypt function:</p>
+
+<pre><code>#include &lt;array&gt;
+
+const std::array&lt;char, 27&gt; alpha = {"ABCDEFGHIJKLMNOPQRSTUVWXYZ"};
+const std::array&lt;std::array&lt;char, 27&gt;, 3&gt; rotors
+{
+    {{"EKMFLGDQVZNTOWYHXUSPAIBRCJ"},
+    {"AJDKSIRUXBLHWTMCQGZNPYFVOE"},
+    {"BDFHJLCPRTXVZNYEIWGAKMUSQO"}}
+};
+
+const std::array&lt;char, 27&gt; reflectors = {"YRUHQSLDPXNGOKMIEBFZCWVJAT"};
+const std::array&lt;char, 4&gt; key = {"ABC"};
+</code></pre>
+
+<p>The <code>indexof</code> function then needs to change as well (and I'm going to rename it to <code>index_of</code>, which is easier to read):</p>
+
+<pre><code>template &lt;size_t N&gt;
+std::size_t index_of (const std::array&lt;char, N&gt;&amp; str, int find)
+{
+    for(std::size_t i = 0; i &lt; N; ++i) {
+        if(str[i] == find) return i;
+    }
+    return -1;
+}
+</code></pre>
+
+<p><code>crypt</code> now looks like:</p>
+
+<pre><code>template &lt;size_t N&gt;
+std::array&lt;char, N&gt; crypt (const std::array&lt;char, N&gt;&amp; ct)
+{
+    // Sets initial permutation
+    int L = li(key[0]);
+    int M = li(key[1]);
+    int R = li(key[2]);
+
+    std::array&lt;char, N&gt; output;
+
+    for ( unsigned x = 0; x &lt; N ; x++ ) {
+        int ct_letter = li(ct[x]);
+
+        // Step right rotor on every iteration
+        R = static_cast&lt;int&gt;(mod26(R + 1));
+
+        // Pass through rotors
+        char a = rotors[2][mod26(R + ct_letter)];
+        char b = rotors[1][mod26(M + li(a) - R)];
+        char c = rotors[0][mod26(L + li(b) - M)];
+
+        // Pass through reflector
+        char ref = reflectors[mod26(li(c) - L)];
+
+        // Inverse rotor pass
+        long d = mod26(index_of(rotors[0], alpha[mod26(li(ref) + L)]) - L);
+        long e = mod26(index_of(rotors[1], alpha[mod26(d + M)]) - M);
+        char f = mod26(index_of(rotors[2], alpha[mod26(e + R)]) - R);
+
+        output[x] = alpha[f];
+    }
+
+    return output;
+}
+</code></pre>
+
+<p>which is close to what it was, but with a few minor changes (no <code>+=</code> on a <code>string</code>, as we know already how large it will be and simple assign directly into that index).</p>
+
+<p>And we now call it like so:</p>
+
+<pre><code>int main ()
+{
+    for ( int i = 0; i &lt; 1000000; i++) {
+        crypt(std::array&lt;char, 37&gt;{"PZUFWDSASJGQGNRMAEODZJXQQKHSYGVUSGSU"});
+    }
+
+    return 0;
+}
+</code></pre>
+
+<p>Let's profile this again:</p>
+
+<blockquote>
+  <p>Running Time  Self        Symbol Name</p>
+  
+  <p>2873.0ms  100.0%  0.0     Main Thread  0x2c7ff</p>
+  
+  <p>2872.0ms   99.9%  0.0      start</p>
+  
+  <p>2872.0ms   99.9%  2.0       main</p>
+  
+  <p>2870.0ms   99.8%  2870.0         std::__1::array crypt&lt;37ul&gt;
+  (std::__1::array const&amp;)</p>
+  
+  <p>1.0ms    0.0% 0.0      _dyld_start</p>
+</blockquote>
+
+<p>Ok, so everything except <code>crypt</code> has now been inlined. If we apply the modification from @MrSmith42, we shave even more time off:</p>
+
+<blockquote>
+  <p>Running Time   Self        Symbol Name</p>
+  
+  <p>1855.0ms  100.0%  0.0     Main Thread  0x2ca5c</p>
+  
+  <p>1854.0ms   99.9%  0.0      start</p>
+  
+  <p>1854.0ms   99.9%  1.0       main</p>
+  
+  <p>1853.0ms   99.8%  1853.0         std::__1::array crypt&lt;37ul&gt;
+  (std::__1::array const&amp;)</p>
+  
+  <p>1.0ms    0.0% 0.0      _dyld_start</p>
+</blockquote>
+
+<p>We have imposed a fairly large constraint however: we need to know the size of the string to be encrypted at compile-time (so no reading it from a file or <code>stdin</code> or the like). If this will always be the case, then this provides a fairly significant speed-up on my hardware.</p>
+    </div>

@@ -1,0 +1,191 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Yes, it is possible to vectorize the code. Does that make it faster? That depends on the spread of values in your data Y. </p>
+
+<p>Computing the <code>scale</code> parameter can be vectorized without issues and should be faster.</p>
+
+<p>For the <code>shape</code> parameter - I haven't read the papers - you seem to use something that looks quite similar to rejection sampling. You compute a probability distribution <code>tbl</code> over NxJ, then draw Y[n, j] many samples from a uniform distribution and check how often you land within <code>tbl[n,j]</code>. <code>shape</code> is then the sum of "hits" along N.</p>
+
+<p>The naive approach to vectorizing this would be to draw the same amount of samples for each Y[n, j]. In this case at least <code>max(Y)</code> many. This can create a lot of overhead if your data has a few really large values but otherwise small ones. If the values are fairly close together, this will make things faster. If you have a way to quickly (pre-)generate large quantities of uniform numbers this limitation doesn't matter.</p>
+
+<p>Here is the code:</p>
+
+<pre class="lang-py prettyprint-override"><code>def sample_r_vec(Y, P, R, e0=1e-2, f0=1e-2, random_numbers=None):
+    """Sample negative binomial dispersion parameter `r` based on
+    (Zhou 2020). See:
+
+    - http://people.ee.duke.edu/~mz1/Papers/Mingyuan_NBP_NIPS2012.pdf
+    - https://mingyuanzhou.github.io/Softwares/LGNB_Regression_v0.zip
+    """
+
+    if random_numbers is None:
+        random_numbers = np.random.uniform(0, 1, size=(*Y.shape, np.max(Y) + 1))
+
+    # compute shape
+    Y_max_vec = np.arange(np.max(Y) + 1).reshape((-1, 1))
+    R_vec = R.reshape((1, -1))
+    tbl = (R_vec / (R_vec + Y_max_vec))
+    tbl = tbl.reshape((*tbl.shape, 1))
+    N_vec = np.arange(Y.shape[0]).reshape(-1, 1)
+    J_vec = np.arange(Y.shape[1]).reshape(1, -1)
+    sum_hits = np.cumsum(random_numbers &lt;= tbl.T, axis=2)[N_vec, J_vec, Y - 1]
+    sum_hits[Y == 0] = 0
+    shape = e0 + np.sum(sum_hits, axis=0)
+
+    # compute scale
+    maxes = np.maximum(1 - P, -np.inf)
+    scale = 1. / (f0 - np.sum(np.log(maxes), axis=0))
+
+    # sample
+    R = np.random.gamma(shape, scale)
+    R[R &lt; 1e-7] = 1e-7
+    return R
+</code></pre>
+
+<p><strong>Edit:</strong> Based on the comment, I did find a different bug that is now fixed.</p>
+
+<hr>
+
+<p><strong>Edit:</strong> Demonstration that both versions perform equally.</p>
+
+<p>Firstly, we need a different test to assert equality of the code; try <code>assert(sample_r(Y, P, R) == sample_r(Y, P, R))</code> and you will quickly see the problem. There are many reasons why a different test is needed: (1) <code>sample_r</code> and <code>sample_r_fast</code> return vectors and not scalars. The truth value of a vector is undefined (numpy also warns for that). (2) your code (<code>sample_r</code>) modifies <code>R</code> in place, which means that the input to <code>sample_r_fast</code> will be different to the input of <code>sample_r</code>. Logically, the outputs will differ due to the unwanted side effect. (3) Both functions are expected to create random samples and compute results based on that. <code>assert</code> tests for <em>exact</em> equality and will hence fail even if both versions are correct. Providing the same random seed won't be enough either, because the order in which the samples are used may differ, which will change the results. (4) This is a numerics problem; even in the deterministic part of the code it is only accurate up to a tolerance. (5) The code estimates parameters for a distribution and then samples once from the estimated distribution; these samples are then compared. If we want to know whether or not the two versions estimate the same distributions it seems much more efficient to directly compare the parameters.</p>
+
+<p>To fix all of this, I modified the code in the following way:</p>
+
+<ol>
+<li>Added an optional parameter to the function that can be used as random numbers; generate them if <code>none</code>.</li>
+<li>Made sure the same random numbers are used for comparisons each time.</li>
+<li>Removed the sampling of R at the end and instead return the estimated shape and scale directly.</li>
+<li>It is also nice to test if the new code is actually faster, so I added a speed test (excluding RNG).</li>
+</ol>
+
+<p>My full script looks like this:</p>
+
+<pre><code>import numpy as np
+
+
+def sample_r(Y, P, R, e0=1e-2, f0=1e-2, random_numbers=None):
+    """Sample negative binomial dispersion parameter `r` based on
+    (Zhou 2020). See:
+
+    - http://people.ee.duke.edu/~mz1/Papers/Mingyuan_NBP_NIPS2012.pdf
+    - https://mingyuanzhou.github.io/Softwares/LGNB_Regression_v0.zip
+    """
+
+    if random_numbers is None:
+        random_numbers = np.random.uniform(0, 1, size=(*Y.shape, np.max(Y) + 1))
+
+    A_vec = np.zeros_like(R)
+    B_vec = np.zeros_like(R)
+    J = Y.shape[1]
+    for j in range(J):
+        L = crt_sum(Y, R, j, random_numbers)
+        A = e0 + L
+        A_vec[j] = A
+
+        # `maximum` is element-wise, while `max` is not.
+        maxes = np.maximum(1 - P[:, j], -np.inf)
+        B = 1. / (f0 - np.sum(np.log(maxes)))
+        B_vec[j] = B
+
+        # R[j] = np.random.gamma(A, B)
+    # `R` cannot be zero.
+    # inds = np.isclose(R, 0)
+    # R[inds] = 0.0000001
+    return A_vec, B_vec
+
+
+def crt_sum(Y, R, j, random_numbers):
+    """Sum independent Chinese restaurant table random variables.
+    """
+
+    Y_j = Y[:, j]
+    r   = R[j]
+    L   = 0
+    tbl = r / (r + np.arange(Y_j.max()))
+    for n_idx, y in enumerate(Y_j):
+        if y &gt; 0:
+            relevant_numbers = random_numbers[n_idx, j, :y]
+            inds = np.arange(y)
+            L += (relevant_numbers &lt;= tbl[inds]).sum()
+    return L
+
+
+def sample_r_vec(Y, P, R, e0=1e-2, f0=1e-2, random_numbers=None):
+    """Sample negative binomial dispersion parameter `r` based on
+    (Zhou 2020). See:
+
+    - http://people.ee.duke.edu/~mz1/Papers/Mingyuan_NBP_NIPS2012.pdf
+    - https://mingyuanzhou.github.io/Softwares/LGNB_Regression_v0.zip
+    """
+
+    if random_numbers is None:
+        random_numbers = np.random.uniform(0, 1, size=(*Y.shape, np.max(Y) + 1))
+
+    # compute shape
+    Y_max_vec = np.arange(np.max(Y) + 1).reshape((-1, 1))
+    R_vec = R.reshape((1, -1))
+    tbl = (R_vec / (R_vec + Y_max_vec))
+    tbl = tbl.reshape((*tbl.shape, 1))
+    N_vec = np.arange(Y.shape[0]).reshape(-1, 1)
+    J_vec = np.arange(Y.shape[1]).reshape(1, -1)
+    sum_hits = np.cumsum(random_numbers &lt;= tbl.T, axis=2)[N_vec, J_vec, Y - 1]
+    sum_hits[Y == 0] = 0
+    shape = e0 + np.sum(sum_hits, axis=0)
+
+    # compute scale
+    maxes = np.maximum(1 - P, -np.inf)
+    scale = 1. / (f0 - np.sum(np.log(maxes), axis=0))
+
+    return shape, scale
+
+if __name__ == "__main__":
+    def sigmoid(x):
+        return 1 / (1 + np.exp(-x))
+
+    np.random.seed(1337)
+
+    N = 100
+    J = 10
+    Y = np.arange(N*J, dtype=np.int32).reshape(N, J)
+    P = sigmoid(np.random.random((N, J)))
+    # use test case from comments
+    R = np.ones(J, dtype=np.float32); R[J-1] = 5000
+    random_numbers = np.random.uniform(0, 1, size=(*Y.shape, np.max(Y) + 1))
+
+    shape_normal, scale_normal = sample_r(Y.copy(), P.copy(), R.copy(), random_numbers=random_numbers)
+    shape_vec, scale_vec = sample_r_vec(Y.copy(), P.copy(), R.copy(), random_numbers=random_numbers)
+
+    assert np.all(np.isclose(scale_normal, scale_vec))
+    assert np.all(np.isclose(shape_normal, shape_vec))
+
+    #speed test
+    import timeit
+    t1 = timeit.timeit(lambda: sample_r(Y.copy(), P.copy(), R.copy(), random_numbers=random_numbers), number=100)
+    t2 = timeit.timeit(lambda: sample_r_vec(Y.copy(), P.copy(), R.copy(), random_numbers=random_numbers), number=100)
+    print(f"Original version total time {t1:.2f}. Vector Version total time {t2:.2f}.")
+
+    N = 1000
+    J = 10
+    Y = 100*np.ones(N*J, dtype=np.int32).reshape(N, J)
+    P = sigmoid(np.random.random((N, J)))
+    R = np.arange(J)+1
+    random_numbers = np.random.uniform(0, 1, size=(*Y.shape, np.max(Y) + 1))
+    t1 = timeit.timeit(lambda: sample_r(Y.copy(), P.copy(), R.copy(), random_numbers=random_numbers), number=100)
+    t2 = timeit.timeit(lambda: sample_r_vec(Y.copy(), P.copy(), R.copy(), random_numbers=random_numbers), number=100)
+    print(f"Original version total time {t1:.2f}. Vector Version total time {t2:.2f}.")
+</code></pre>
+
+<p><em>Note that this now has a python 3.7+ dependency due to format strings in the functional test, the relevant code does not have that dependency.</em></p>
+
+<p>Output:</p>
+
+<pre><code>Original version total time 1.29. Vector Version total time 1.05.
+Original version total time 8.55. Vector Version total time 0.98.
+</code></pre>
+
+<p>I did the following modifications to your code: To return the estimated parameters, I am stacking them up in a vector as they are being computed. To deal with the random sampling, I generate a whole bunch of random numbers (<code>Y.max()</code> many) for each <code>Y[n, j]</code>, and then select the first <code>y=Y[n,j]</code> of them. This is the same idea I used to vectorize the code; it 'wastes' <code>Y.max() - Y[n, j]</code> many random samples at each step, because the code generates them but then doesn't use them; it's a trick to match the shapes for vectorization. This is the main reason why the vectorized version will only be faster if you either (1) pre-generate the random numbers, or (2) have a situation where the different <code>Y[n, j]</code> don't differ too much, so that generating the 'waste' doesn't take more time than is saved by hardware acceleration.</p>
+
+<p>I hope this explains what is going on.</p>
+
+<p>PS: Please, please use informative variable names for code in the future. <code>L,n,j,A,B</code>, ect. are not wise choices if others are to read your code or if you try to understand it 3 years from now.</p>
+    </div>

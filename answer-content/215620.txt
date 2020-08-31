@@ -1,0 +1,204 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I don't know better ways to query for principals, so below is some general comments.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>        if (!(usr is UserPrincipal user) || recipients.Any(m =&gt; m.Name == (user.DisplayName ?? user.Name) &amp;&amp; m.Type == RecipientType.Group)) continue;
+</code></pre>
+</blockquote>
+
+<p>I think <code>m.Type == RecipientType.Group</code> should be <code>m.Type == RecipientType.User</code></p>
+
+<hr>
+
+<p>When I run your function I get an <code>InvalidOpeartionException</code> for this filter:</p>
+
+<blockquote>
+  <p><code>new GroupPrincipal(ctx) {DisplayName = search}</code></p>
+</blockquote>
+
+<hr>
+
+<p>You could consider to extend the function with an argument, that allows the client to specify the context type:</p>
+
+<pre><code>public static IEnumerable&lt;Recipient&gt; Search(string search, ContextType contextType)
+</code></pre>
+
+<hr>
+
+<p>The returned <code>Principals</code> from <code>new PrincipalSearcher(principal).FindAll()</code> is of the same type as the argument <code>Principal</code> so you can omit this check:</p>
+
+<blockquote>
+  <p><code>if (!(grp is GroupPrincipal group)...</code></p>
+</blockquote>
+
+<hr>
+
+<hr>
+
+<p>Both <code>PrincipalSearcher</code> and <code>Principal</code> implements <code>IDisposable</code> so all those objects should call <code>Dispose()</code> or be wrapped in a <code>using()</code> statement. </p>
+
+<hr>
+
+<p>You do essentially the same in the two loops so you should only have one that can handle different types of data. Below I've tried to do that, where all disposable objects are disposed.</p>
+
+<pre><code>public static IEnumerable&lt;Recipient&gt; Search(string search, ContextType contextType)
+{
+  search = $"{search}*";
+
+  using (PrincipalContext context = new PrincipalContext(contextType))
+  {
+    var recipients = new List&lt;Recipient&gt;();
+
+    var filterTypes = new[]
+    {
+      new {
+        Filters = new Func&lt;Principal&gt;[]
+        {
+          () =&gt; new UserPrincipal(context) {DisplayName = search},
+          () =&gt; new UserPrincipal(context) {Name = search},
+          () =&gt; new UserPrincipal(context) {SamAccountName = search}
+        },
+        RepicientType = RecipientType.User },
+      new {
+        Filters = new Func&lt;Principal&gt;[]
+        {
+          //() =&gt; new GroupPrincipal(context) {DisplayName = search},
+          () =&gt; new GroupPrincipal(context) {Name = search},
+          () =&gt; new GroupPrincipal(context) {SamAccountName = search}
+        },
+        RepicientType = RecipientType.Group },
+    };
+
+    foreach (var principalFilter in filterTypes)
+    {
+      foreach (var filterFunc in principalFilter.Filters)
+      {
+        using (var filter = filterFunc())
+        using (var searcher = new PrincipalSearcher(filter))
+        {
+          foreach (var foundPrincipal in searcher.FindAll())
+          {
+            using (foundPrincipal)
+            {
+              if (recipients.Any(m =&gt; m.Name == (foundPrincipal.DisplayName ?? foundPrincipal.Name) &amp;&amp; m.Type == principalFilter.RepicientType))
+                continue;
+
+              recipients.Add(new Recipient()
+              {
+                Name = foundPrincipal.SamAccountName,
+                DisplayName = foundPrincipal.DisplayName ?? foundPrincipal.Name,
+                Type = principalFilter.RepicientType
+              });
+            }
+          }
+        }
+      }
+    }
+
+    return recipients;
+  }
+}
+</code></pre>
+
+<p>Here I use <code>new Func&lt;Principal&gt;[]</code> instead of just <code>new Principal[]</code> in order to signal, that the "client" (the loop) is responsible for cleaning up the created object.</p>
+
+<p>I'm not sure I like this:</p>
+
+<pre><code>      foreach (Principal foundPrincipal in searcher.FindAll())
+      {
+        using (foundPrincipal)
+        {
+           ...
+</code></pre>
+
+<p>but it's doable.</p>
+
+<hr>
+
+<p>Just for the exercise: a version that goes all in on LINQ with the same considerations as above:</p>
+
+<pre><code>  public static class ActiveDirectory
+  {
+    private static IEnumerable&lt;TPrincipal&gt; Search&lt;TPrincipal&gt;(
+      this IEnumerable&lt;Func&lt;TPrincipal&gt;&gt; filters,
+      IEqualityComparer&lt;TPrincipal&gt; equalityComparer,
+      ContextType contextType) where TPrincipal : Principal
+    {
+      return filters
+        .SelectMany(creator =&gt;
+        {
+          using (TPrincipal principal = creator())
+          using (var searcher = new PrincipalSearcher(principal))
+          {
+            return searcher.FindAll();
+          }
+        })
+        .Cast&lt;TPrincipal&gt;()
+        .Distinct(equalityComparer)
+        .ToArray();
+    }
+
+    private static IEnumerable&lt;Recipient&gt; Convert&lt;TPrincipal&gt;(this IEnumerable&lt;TPrincipal&gt; principals, RecipientType recipientType, bool disposePrincipals = true) where TPrincipal : Principal
+    {
+      foreach (TPrincipal principal in principals)
+      {
+        Recipient recipient = new Recipient
+        {
+          Name = principal.SamAccountName,
+          DisplayName = principal.DisplayName ?? principal.Name,
+          Type = recipientType
+        };
+
+        if (disposePrincipals)
+          principal.Dispose();
+
+        yield return recipient;
+      }
+    }
+
+    public static IEnumerable&lt;Recipient&gt; Search(string search, ContextType contextType)
+    {
+      search = $"{search}*";
+
+      using (var context = new PrincipalContext(contextType))
+      {
+        var userFilters = new Func&lt;UserPrincipal&gt;[]
+        {
+          () =&gt; new UserPrincipal(context) {DisplayName = search},
+          () =&gt; new UserPrincipal(context) {Name = search},
+          () =&gt; new UserPrincipal(context) {SamAccountName = search}
+        };
+
+        var groupFilters = new Func&lt;GroupPrincipal&gt;[]
+        {
+          //() =&gt; new GroupPrincipal(context) {DisplayName = search},
+          () =&gt; new GroupPrincipal(context) {Name = search},
+          () =&gt; new GroupPrincipal(context) {SamAccountName = search}
+        };
+
+        var users = userFilters.Search(new PrincipalEqualityComparer&lt;UserPrincipal&gt;(), contextType);
+        var groups = groupFilters.Search(new PrincipalEqualityComparer&lt;GroupPrincipal&gt;(), contextType);
+
+        return users.Convert(RecipientType.User).Concat(groups.Convert(RecipientType.Group)).ToArray();
+      }
+    }
+  }
+
+
+  class PrincipalEqualityComparer&lt;TPrincipal&gt; : IEqualityComparer&lt;TPrincipal&gt; where TPrincipal : Principal
+  {
+    public bool Equals(TPrincipal x, TPrincipal y)
+    {
+      if (x != null &amp;&amp; y == null || x == null &amp;&amp; y != null) return false;
+      return ReferenceEquals(x, y) || string.Equals(x.Name, y.Name) || string.Equals(x.DisplayName, y.DisplayName);
+    }
+
+    public int GetHashCode(TPrincipal obj)
+    {
+      return 0; // obj.GetHashCode();
+    }
+  }
+</code></pre>
+    </div>

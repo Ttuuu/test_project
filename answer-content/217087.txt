@@ -1,0 +1,119 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Welcome to Code Review! Hopefully this experience will be useful and positive for you.</p>
+
+<h2>Your statement about polling</h2>
+
+<blockquote>
+  <p>and then the function below basically polls my database every 1 minute looking for new rows that have a <code>null</code> value &amp; performs actions on them until the <code>lastUpdated</code> can then be updated (once an action is performed elsewhere)</p>
+</blockquote>
+
+<p>I haven't used AWS and DynamoDB but perhaps you could use a trigger or some other hook to receive a notification instead of polling each minute. With this approach, the server doesn’t waste resources checking for an update but rather processes incoming data when necessary. Perhaps <a href="https://aws.amazon.com/blogs/aws/dynamodb-update-triggers-streams-lambda-cross-region-replication-app/" rel="nofollow noreferrer">this page</a> would be useful.</p>
+
+<h2>General feedback</h2>
+
+<p>Overall the handler function looks a bit too long. The suggestions below should help you reduce the length of it, though if it is still too long then it may be advisable to break it up into smaller atomic functions that handle a single part of getting data. </p>
+
+<p>The variable <code>update_params</code> could be moved outside the handler function without the <code>id</code> property of the <code>Key</code> property and <code>:modified</code> property of <code>ExpressionAttributeValues</code> set - those can be set when needed.</p>
+
+<pre><code>const update_params = {
+    TableName:"matches",
+    Key: {},
+    UpdateExpression: "SET #status = :status, updated_at = :modified",
+    ExpressionAttributeNames:{
+        "#status":"status"
+    },
+    ExpressionAttributeValues:{
+        ":status": 1
+    }
+};
+</code></pre>
+
+<p>Then when before passing it to the call to <code>documentClient.update(update_params).promise();</code>:</p>
+
+<pre><code>update_params.Key.id = match.id;
+update_params.ExpressionAttributeValues[":modified"] = modified;
+</code></pre>
+
+<hr>
+
+<p>Your code could make more use of <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/const" rel="nofollow noreferrer"><code>const</code></a> - especially for values that are never reassigned - e.g. <code>documentClient</code>, <code>params</code>, <code>rows</code>, <code>gameAPI</code>, <code>player_params</code>, etc. Some developers believe it is wise to default to using <code>const</code> and then if the need to re-assign presents itself, switch to using <code>let</code>.'</p>
+
+<p>I would also question whether you intentionally used <code>var</code> instead of <code>let</code> within the <code>for</code> loop... </p>
+
+<hr>
+
+<p>Let's look at that function <code>compareModiified()</code>:</p>
+
+<blockquote>
+<pre><code>function compareModiified(match_type, db_modifiied, stats) {
+    var stats_modified;
+    switch(match_type) {
+        case 'myself':
+            stats_modified = stats.group.solo.lastModified;
+            break;
+        case 'solo':
+            stats_modified = stats.group.duo.lastModified;
+            break;
+        case 'duo':
+            stats_modified = stats.group.squad.lastModified;
+            break;
+    }
+    return (stats_modified &gt; db_modifiied);
+}
+</code></pre>
+</blockquote>
+
+<p>Did you intentionally spell the function name as <code>compareModiified</code> and the second parameter as <code>db_modifiied</code>, or are those double <code>i</code>'s typos?</p>
+
+<p>This could be simplified using a mapping of match_type to the property of <code>stats.group</code> to access:</p>
+
+<pre><code>const matchTypeGroupMapping = {
+    'myself' =&gt; 'solo',
+    'solo' =&gt; 'duo', 
+    'duo' =&gt; 'squad'
+};
+</code></pre>
+
+<p>A <a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Map" rel="nofollow noreferrer"><code>Map</code></a> could also be used instead of a plain old JavaScript Object - useful if the keys were not serializable.</p>
+
+<p>That mapping could be used to simplify the function:</p>
+
+<pre><code>function compareModiified(match_type, db_modifiied, stats) {
+    if (match_type in matchTypeGroupMapping) {
+         const mappedKey = matchTypeGroupMapping[match_type];
+         return stats.group[mappedKey].lastModified &gt; db_modifiied;
+    }
+    //do we need to handle other values of match_type?
+}
+</code></pre>
+
+<p>As the comment at the end alludes to: what should happen for other values of <code>match_type</code>?</p>
+
+<hr>
+
+<p>That mapping  define above could also be used to simplify the cases within the <code>switch</code> statement of the <code>for</code> loop inside the handler function. And <a href="https://codereview.stackexchange.com/questions/216782/aws-lambda-function-to-update-newly-added-dynamodb-records#comment419349_216782">Shelby115's comment</a> is correct - the assignment statements in all three cases of the <code>switch</code> statement are identical and could be moved out of the <code>switch</code> statement. But the code below can be used to replace the <code>switch</code> statement entirely.</p>
+
+<pre><code>if (new_data === true &amp;&amp; match.match_type in matchTypeGroupMapping) {
+    const mappedKey = matchTypeGroupMapping[match.match_type];
+    const kills = stats.group[mappedKey].kills;
+    const matches = stats.group[mappedKey].matches;
+
+    update_params.ExpressionAttributeValues[":modified"] == stats.group[mappedKey].lastModified;
+
+    await documentClient.update(update_params).promise();
+
+    const report_params = {
+        Item: {
+            'match_id': match.id,
+            'kills': (kills - player_row.Item.player_1_kills),
+            'matches': (matches - player_row.Item.player_1_matches),
+            'completed_at': new Date().getTime()
+        },
+        TableName : 'reports'
+    };
+    await documentClient.put(report_params).promise();
+}
+</code></pre>
+
+<p>Notice how above the variables <code>kills_completed</code> and <code>matches_completed</code> have been eliminated, but if you want to keep them for clarity you could.</p>
+    </div>

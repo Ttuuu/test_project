@@ -1,0 +1,144 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'm no Apex expert, nor coding expert in general. I do deal with Apex triggers quite a bit, both my own and those written by others.</p>
+
+<p>Ultimately, I don't see any practices which break any of the <a href="https://developer.salesforce.com/blogs/developer-relations/2015/01/apex-best-practices-15-apex-commandments.html" rel="nofollow noreferrer">first 8 commandments</a> except maybe <code>Thou shalt keep logic outside of triggers</code>. It's pretty easy to toss all this into an Apex class and call that class from the trigger itself.</p>
+
+<p>You didn't post your test class, which is fine so long as you actually have meaningful tests running for this code.</p>
+
+<p>Where I am concerned is <code>#15 Thou shalt not introduce extra logic for tests</code>. You've got a lot of <code>if there is a test running, change these values</code> going on, which may provide you a false sense of confidence. Maybe this is part of a more grand testing scheme that I don't see, but from what's in front of me you should reconsider this practice.</p>
+
+<h2>Low Hanging Fruit</h2>
+
+<ul>
+<li>Your code is formatted pretty inconsistently which makes it hard to read. Stick to opening your curly braces either on the same line or on the next line, don't go back and forth.</li>
+<li>Keep an eye on your indenting, that's worse than the curly brace thing.</li>
+<li>Are you really saving much time by typing <code>MarkeRecoTyId</code> instead of <code>MarketingRecordTypeId</code>? If I went down a hundred lines of code, would I, <em>the new guy</em> know that <code>Marke</code> refers to <code>Marketing</code> and not <code>Market</code>?</li>
+<li>Be thoughtful about naming your variables. I, <em>the new guy</em>, have no idea what <code>gc</code> refers to here:</li>
+</ul>
+
+<p><code>gc = [select id, Name from Group where id =:Trigger.new[0].ownerid and Type = 'Queue'];</code></p>
+
+<p>This takes me an extra minute or two when I get to a line like this: <code>for( Group qu :gc){ ... }</code> where I say, "bwuhh?" because those hieroglyphics mean nothing to anyone but the person who wrote the code.</p>
+
+<ul>
+<li><p>Apex is not case-sensitive but many code editors themes rely on it for syntax highlighting. I plugged your trigger into VSCode using the popular Apex extension and things like <code>list</code> and <code>Select</code> did not get picked up by the highlighter. Again, this comes back to readability.</p></li>
+<li><p>You can use the SOQL result to instantiate the lists which I dare not infer the meaning of, i.e.:
+<code>List&lt;RecordType&gt; rc = [SELECT Id, Name From RecordType Where sObjectType = 'case' and Id = :oldCase.RecordTypeId LIMIT 1];</code></p></li>
+<li><p>Line length. You've got a 201 character wide line:</p>
+
+<pre><code> System.debug('RecordTypeIds ==&gt;'+ 'Marketing==&gt;' + MarkeRecoTyId + '  ' +  'G&amp;T Group Leads==&gt;'+  GTGrLRecoTyId + '  ' +  'CCSC==&gt;' + CCSCRecoTyId + '  ' + 'E-Commerce ==&gt;' + EcomRecoTyId  );
+</code></pre></li>
+</ul>
+
+<p>I know it's just a debug statement, but imagine if you had to keep scrolling left to right to figure out where some of those variables with arcane names came from or what they are doing. Isn't this much easier to read?</p>
+
+<pre><code>            System.debug( 'RecordTypeIds ==&gt;'
+                         + 'Marketing==&gt;' + MarketingRecordTypeId
+                         + '  ' 
+                         + 'G&amp;T Group Leads==&gt;' + GTGroupLeadsRecordTypeId
+                         + '  '
+                         + 'CCSC==&gt;' + CCSCRecordTypeId 
+                         + '  ' 
+                         + 'E-Commerce ==&gt;' + EcommerceRecordTypeId);
+</code></pre>
+
+<p>Putting all of these points into practice (except renaming your 1-2 character variables, I still have no clue what those are supposed to be except maybe <code>Group</code> for <code>g</code>), here is a much happier looking trigger.</p>
+
+<pre><code>trigger updateCase on Case (before update) {
+
+    Set &lt;Id&gt; QIds = new Set&lt;Id&gt;();
+    List&lt;Id&gt; caseid = new List &lt;Id&gt;();
+
+    List&lt;RecordType&gt; rc = [SELECT Id, Name FROM RecordType WHERE sObjectType = 'case' and Id = :oldCase.RecordTypeId LIMIT 1];
+    List&lt;Group&gt; gc = [SELECT Id, Name FROM Group WHERE Id =:Trigger.new[0].ownerid and Type = 'Queue'];
+    List&lt;Group&gt; g = [SELECT Id, Name FROM Group WHERE Type = 'Queue'];
+
+    //Get the Ids of the different Queues
+    Id MarketingRecordTypeId = Schema.SObjectType.case.getRecordTypeInfosByName().get('Marketing').getRecordTypeId();
+    Id GTGroupLeadsRecordTypeId = Schema.SObjectType.case.getRecordTypeInfosByName().get('G&amp;T Group Leads').getRecordTypeId();
+    Id CCSCRecordTypeId = Schema.SObjectType.case.getRecordTypeInfosByName().get('CCSC').getRecordTypeId();
+    Id EcommerceRecordTypeId = Schema.SObjectType.case.getRecordTypeInfosByName().get('E-Commerce').getRecordTypeId();
+    Case oldCase = new Case();
+
+    for (Case c:trigger.new){
+        oldCase = trigger.oldMap.get(c.Id);
+    }
+
+    for( Group qu :g){
+        if(qu.Name == 'DS Service Queue' || qu.Name == 'Data Services RFP' || qu.Name == 'Data Services') 
+            QIds.add(qu.Id);
+    }
+    //Loop through all Cases and check owner change
+
+    system.debug('oldrecord type==&gt;+' + oldCase.RecordTypeId ); 
+
+    for (Case c:trigger.new){
+        oldCase = trigger.oldMap.get(c.Id);
+        system.debug('oldCase'+ oldCase);
+        system.debug('RecordTypename' + oldCase.RecordType.name); 
+        // Guest Assistance Project Requirments - Auto stamp Department and Sub-Department when a GA case is re-assigned to other Queues      
+        if (oldCase.OwnerId != c.OwnerId &amp;&amp; QIds.contains(oldCase.OwnerId)){
+            c.Status = 'Open';
+            if (c.Category__c == null || c.Sub_Department__c == null){
+                c.addError('You must provide a value for Category and Sub Department before changing the Case Owner');
+            }
+        }
+
+        for(RecordType rt : rc) {
+            system.debug('Record Type name ==&gt;' + rt.Name);
+            if(rt.Name == 'Guest Assistance') {
+                System.debug( 'RecordTypeIds ==&gt;'
+                            + 'Marketing==&gt;' + MarketingRecordTypeId
+                            + '  ' 
+                            + 'G&amp;T Group Leads==&gt;' + GTGroupLeadsRecordTypeId
+                            + '  '
+                            + 'CCSC==&gt;' + CCSCRecordTypeId 
+                            + '  ' 
+                            + 'E-Commerce ==&gt;' + EcommerceRecordTypeId);
+
+                for( Group qu :gc){
+                    if (qu.name == 'Marketing Queue') { 
+                        c.RecordTypeId = MarketingRecordTypeId;
+                        c.Department__c = 'Marketing';
+                        c.Sub_Department__c = 'Marketing';
+                        c.Category__c = 'Website Feature'; 
+                    } 
+                    if (qu.name == 'G&amp;T Service Queue' || Test.isRunningTest() ) {
+                        c.RecordTypeId = GTGroupLeadsRecordTypeId; 
+                        c.Department__c = 'Group &amp; Tour';
+                        c.Sub_Department__c = 'Group &amp; Tour';
+                        c.Category__c = 'Group Event';                                 
+                    } 
+                    if (qu.name == 'CCSC Queue'||Test.isRunningTest()) {
+                        c.RecordTypeId = CCSCRecordTypeId;
+                        c.Department__c = 'Guest Assistance';
+                        c.Sub_Department__c = 'Guest Assistance';
+                        c.Category__c = null ;                                 
+                    } 
+                    if (qu.name == 'E-Commerce'||Test.isRunningTest()) {
+                        c.RecordTypeId = EcommerceRecordTypeId; 
+                        c.Department__c = 'E-Commerce';
+                        c.Sub_Department__c = 'E-Commerce';
+                        c.Category__c = 'Other';    
+                    }
+                }
+            } else if ((rt.Name == 'Marketing') 
+                        || (rt.Name == 'G&amp;T Group Leads')
+                        || (rt.Name == 'CCSC')
+                        || (rt.Name == 'E-Commerce'|| Test.isRunningTest())){
+
+                Id GuestAsstRecordTypeId = Schema.SObjectType.case.getRecordTypeInfosByName().get('Guest Assistance').getRecordTypeId();
+                for( Group qu :gc){
+                    if (qu.name == 'Guest Assistance Queue') { 
+                        c.RecordTypeId = GuestAsstRecordTypeId; 
+                        c.Department__c = 'Guest Assistance';
+                        c.Sub_Department__c = 'Guest Assistance';
+                        c.Category__c = null;     
+                    }
+                }
+            }                 
+        }
+    }
+}
+</code></pre>
+    </div>

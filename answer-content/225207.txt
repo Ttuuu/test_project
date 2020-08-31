@@ -1,0 +1,121 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You actually already fixed up the main thing that I was going to comment on: your previous use of <code>def</code> over <code>let</code>. Just to emphasize on why it's important to choose one over the other though:</p>
+
+<pre><code>(defn f []
+  (def my-var 5))
+
+(f)
+
+(println my-var)
+5  ; It leaked the state of the function and polluted the namespace
+</code></pre>
+
+<hr>
+
+<p>Beyond that, this isn't bad code. As I mentioned on SO, I'm a little rusty, so hopefully someone else will go a little more in-depth. I'll mention what I see here though:</p>
+
+<p>This might be a little over-engineering, but I don't like how the <code>asym-hobbit-body-parts</code> definition is repeating the keys <code>:name</code> and <code>:size</code> over and over. This allows typos to slip in, and makes more work for you if you want to add more parts. I'd make a "constructor" that automatically creates the maps from the data:</p>
+
+<pre><code>(defn new-part [part-name part-size]
+  {:name part-name, :size part-size})
+
+(def asym-hobbit-body-parts [(new-part "head" 3)
+                             (new-part "left-eye" 1)
+                             (new-part "left-ear" 1)])
+</code></pre>
+
+<p>I like this because now there's a function that definitively says what a "part" is defined as, and if you ever want to change what keywords you use, you only need to change <code>new-part</code> now.</p>
+
+<p>This still has duplication though, and could be reduced down with a helper that auto-wraps vector "tuples":</p>
+
+<pre><code>(defn new-parts [&amp; name-size-pairs]
+  (mapv #(apply new-part %) name-size-pairs))
+  ; or (mapv (partial apply new-part) name-size-pairs))  ; Partially apply "apply"
+
+(def asym-hobbit-body-parts3 (new-parts
+                               ["head" 3]
+                               ["left-eye" 1]
+                               ["left-ear" 1]))
+</code></pre>
+
+<p>Or, if you want to get rid of the need for the wrapping vectors, you can use <code>partition</code> to cut a list of attributes into 2s:</p>
+
+<pre><code>(defn new-parts [&amp; name-size-pairs]
+  (-&gt;&gt; name-size-pairs
+       (partition 2)  ; Cut the list into pairs of 2
+       (mapv #(apply new-part %))))
+
+(def asym-hobbit-body-parts3 (new-parts
+                               "head" 3,
+                               "left-eye" 1,
+                               "left-ear" 1))
+</code></pre>
+
+<p>It really depends on how you want it to read.</p>
+
+<p>In case you aren't familiar with them, I highly recommend practicing use of <a href="https://clojuredocs.org/clojure.core/-%3E" rel="nofollow noreferrer"><code>-&gt;</code></a> and <a href="https://clojuredocs.org/clojure.core/-%3E%3E" rel="nofollow noreferrer"><code>-&gt;&gt;</code></a>. They seem a little complicated at first, but once you understand them, they have the potential to make your code much neater. They allow your code to read more easily as a series of transformations.</p>
+
+<hr>
+
+<p>I think the reduction in <code>make-sym-parts</code> is too big. When I have a call to <code>reduce</code> with a large reducing function like that, I try to move it out into its own standalone function. That gives that code a name to make it clearer what it's doing, and makes the call to <code>reduce</code> easier to understand. I decided just to make it a local function using <a href="https://clojuredocs.org/clojure.core/letfn" rel="nofollow noreferrer"><code>letfn</code></a>. You could also make it a global function using <code>defn</code>; but I don't think that's necessary.</p>
+
+<pre><code>(defn make-sym-parts [asym-set num]
+  (letfn [(transform-lefts [sink {:keys [name] :as body-part}]
+            (if (str/starts-with? name "left-")
+              (into sink (apply vector body-part
+                                (for [i (range num)]
+                                  (update body-part :name
+                                          #(str/replace % #"^left" (str i))))))
+
+              (conj sink body-part)))]
+
+    (reduce transform-lefts [] asym-set)))
+</code></pre>
+
+<p>I also altered what you're doing in the <code>for</code> comprehension. You had a literal <code>{:name ..., :size size}</code> in there. This isn't good practice though. Pretend in the future you decide to add a new attribute to body parts. Maybe <code>:quality</code> or something. What happens if you forget to update <code>make-sym-parts</code>? Because you're reconstructing the map from scratch, the new body part will be discarded! <a href="https://clojuredocs.org/clojure.core/update" rel="nofollow noreferrer"><code>update</code></a> is like <code>assoc</code>, but it "updates" a previous value using a function instead of overwriting it like <code>assoc</code> does. The previous value is passed into the function, and the new value becomes whatever the function returns.</p>
+
+<p>This could still be improved a bit by making use of <code>mapcat</code>. Right now, you're using <code>reduce</code> instead of <code>map</code> because in some cases, you need to add multiple entries per existing element. <code>mapcat</code> (basically short for "map then concatenate") can help here. It will automatically flatten the resulting list. This means you can get rid of the <code>sink</code> accumulator:</p>
+
+<pre><code>(defn make-sym-parts [asym-set num]
+  (letfn [(transform-lefts [{:keys [name] :as body-part}]
+            (if (str/starts-with? name "left-")
+              [body-part
+               (for [i (range num)]
+                 (update body-part :name
+                         #(str/replace % #"^left" (str i))))]
+
+              [body-part]))]  ; Note how this requires a wrapping so it can be flattened
+
+    (mapcat transform-lefts asym-set)))  ; Lazy!
+</code></pre>
+
+<p>The major drawback here is I wouldn't be surprised if this is slower. That likely isn't an issue though.</p>
+
+<hr>
+
+<p>I was going to suggest you change <code>rand-part</code> to use <code>reduce</code> (I had a whole thing written up and everything!), then I realized that it requires knowledge of the next part in the list. It is still possible to use <code>reduce</code>, but it would require doing something messy like partitioning the list of parts into pairs, then reducing over the pairs. I think what you have here is likely neater.</p>
+
+<p>I will mention though, just in case you didn't know, <code>reduce</code> allows for an early exit using <a href="https://clojuredocs.org/clojure.core/reduced" rel="nofollow noreferrer"><code>reduced</code></a>. If you didn't need to use <code>remaining</code> in the loop, that would allow your <code>loop</code> here to be written using <code>reduce</code>.</p>
+
+<p>The only real two noteworthy things in <code>rand-part</code> are</p>
+
+<ul>
+<li><p>I would use <code>:keys</code> here to deconstruct <code>current</code>. You're using explicit key-access a lot which adds some bulk.</p></li>
+<li><p><code>(reduce +</code> can also be written as <code>(apply +</code>. If you look at the <a href="https://github.com/clojure/clojure/blob/841fa60b41bc74367fb16ec65d025ea5bde7a617/src/clj/clojure/core.clj#L985" rel="nofollow noreferrer">definition of <code>+</code></a>, it and most other binary operators have a var-arg overload to delegates to a reduction. It's not a big deal either way. From what I've seen, <code>(apply +</code> is generally regarded as more idiomatic, but not by much.</p></li>
+</ul>
+
+<p>Something like:</p>
+
+<pre><code>(defn rand-part [parts]
+  (let [size-sum (apply + (map :size parts))
+        thresh (rand size-sum)]
+    (loop [[{:keys [name size]} &amp; remaining] parts
+           sum size]
+      (if (&gt; sum thresh)
+        name
+        (recur remaining
+               (+ sum (:size (first remaining))))))))
+</code></pre>
+
+<p>Good luck and welcome to Clojure!</p>
+    </div>

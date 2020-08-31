@@ -1,0 +1,75 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>It would be more useful (and typical) for CodeReview if you'd post the entire code for the class, starting with the class definition and then the method definitions, rather than starting with one of the methods and then two more and then the class definition.</p>
+
+<p>For example, your declaration for</p>
+
+<pre><code>void publish(std::string &amp;message);
+</code></pre>
+
+<p>looks wrong. If you mean to take <code>message</code> by reference for efficiency, it should be <code>const std::string&amp; message</code>. On the other hand, if it is semantically important that <code>publish</code> is going to <em>modify</em> its argument (an "out-parameter"), it would be traditional to pass the argument by pointer, or (better) return it by value.</p>
+
+<pre><code>std::string s;
+kp.publish(s);  // confusing — is `s` modified?
+kp.publish(&amp;s);  // OK, informs the caller that something wacky is going on
+s = kp.publish();  // best way to return a value
+</code></pre>
+
+<p>However, I strongly suspect from context that what's going on here is actually that <code>publish</code> wants to <em>take ownership of</em> <code>s</code>'s heap-allocated buffer of chars. Ownership transfer is represented in C++ by plain old pass-by-value:</p>
+
+<pre><code>void publish(std::string s);
+
+std::string s;
+kp.publish(s);  // publish a copy of `s`, don't modify the original
+kp.publish(std::move(s));  // publish `s` and let the original be trashed
+</code></pre>
+
+<hr>
+
+<p>The parts of the code you posted don't use <code>m_run</code> at all, so theoretically you could eliminate it.</p>
+
+<p>At least, you should explain why it's an <code>int</code>. We only ever see it assigned the values <code>0</code> and <code>1</code>, which strongly implies to me that <code>m_run</code> ought to be a <code>bool</code>.</p>
+
+<hr>
+
+<p>Without seeing the code of your destructor, we can't tell whether your copy-constructor and move-constructor are doing the right thing or not.</p>
+
+<p>But from what I know about librdkafka, I am reasonably confident that your copy-constructor is incorrect. Your destructor should be calling <code>rd_kafka_topic_destroy</code> to balance out the call to <code>rd_kafka_topic_new</code> in your constructor; so, if I write</p>
+
+<pre><code>kafka_publisher kp1(brokers, topicname);
+kafka_publisher kp2 = kp1;
+// destroy kp2
+// destroy kp1
+</code></pre>
+
+<p>the two destructors will each call <code>rd_kafka_topic_destroy</code>, meaning you'll destroy the topic twice; but you only created it once! So you've got a double-free bug here.</p>
+
+<p>My understanding is that librdkafka objects should be handled by <code>unique_ptr</code> in C++. "Copying" a pointer to a librdkafka object (such as a topic) is not generally possible. (Alternatively, you could use <code>shared_ptr</code>; but that seems like overkill.)</p>
+
+<hr>
+
+<pre><code>kafka_publisher(const std::string &amp;brokers,
+                const std::string &amp;topic);
+</code></pre>
+
+<p>should be marked <code>explicit</code>.</p>
+
+<hr>
+
+<pre><code>std::string msg = "Failed to initialize Kafka configuration. Caused by ";
+throw std::invalid_argument(msg.append(m_errstr));
+</code></pre>
+
+<p>strikes me as unnecessarily confusing. Try to avoid having multiple side-effects on the same line of C++ code. Either add lines until you have one side-effect per line:</p>
+
+<pre><code>std::string msg = "Failed to initialize Kafka configuration. Caused by ";
+msg += m_errstr;
+throw std::invalid_argument(msg);
+</code></pre>
+
+<p>or eliminate side-effects until you have one side-effect per line:</p>
+
+<pre><code>throw std::invalid_argument("Failed to initialize Kafka configuration. Caused by " + m_errstr);
+</code></pre>
+
+<p>I would also caution that <code>rd_kafka_conf_set</code> can probably fail for plenty of reasons that would not be best described as "invalid argument." In production code you'd probably just wrap up the return value in a custom exception type (<code>throw KafkaException(return_code)</code>) and let the higher-level code deal with it if it wanted to.</p>
+    </div>

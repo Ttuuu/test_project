@@ -1,0 +1,63 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You have the exact same comment (<code>Construct a Maybe from a std::function returning an optional</code>) on two different constructors. I don't think the comment was necessary anyway. Both constructors should be <code>explicit</code>, to prevent implicit conversions.</p>
+<p>Using <code>return {}</code> instead of <code>return std::nullopt</code> strikes me as needless obfuscation. (In the same way, I wouldn't use <code>return {}</code> when I meant <code>return nullptr</code>.)</p>
+<hr>
+<p>Your use of const-qualified function <em>parameter</em> variables is an antipattern (see my blog post <a href="https://quuxplusone.github.io/blog/2019/01/03/const-is-a-contract/" rel="nofollow noreferrer">"<code>const</code> is a contract"</a>). In this particular case, it prevents you from moving-out-of the parameters, which is exactly what you should want to do here:</p>
+<pre><code>static auto lift(std::function&lt;TReturn(TArgs...)&gt; f) {
+    return [f = std::move(f)](std::optional&lt;TArgs&gt;... args) -&gt; std::optional&lt;TReturn&gt; {
+        if ((args.has_value() &amp;&amp; ...)) {
+            return f(std::move(*args)...);
+        } else {
+            return std::nullopt;
+        }
+    };
+}
+</code></pre>
+<p>You're actually very lucky that <code>std::function&lt;TReturn(const TArgs...)&gt;</code> and <code>std::function&lt;TReturn(TArgs...)&gt;</code> happen to be the same type! You use the two spellings inconsistently throughout this code. Stick to the simpler shorter one.</p>
+<hr>
+<p>It would probably make sense to try to provide an overload of <code>operator&lt;&lt;</code> taking rvalues on left and/or right, to avoid some copying.</p>
+<p>It's surprising that <code>operator&lt;&lt;</code> returns a <code>std::function&lt;...&gt;</code> instead of a <code>Maybe&lt;...&gt;</code>. I don't actually see what that buys you.</p>
+<hr>
+<p>As ALX23z said, it's unfortunate that you build everything around <code>std::function</code> instead of around arbitrary callables. For example, I couldn't write</p>
+<pre><code>auto f = [](int x) -&gt; std::optional&lt;int&gt; { return (x &lt; 10) ? x + 1 : std::nullopt; };
+auto g = [](int y) { return y * 2; };
+auto G = Maybe(f) &lt;&lt; Maybe(g);
+assert(G(5) == 12);
+assert(G(12) == std::nullopt);
+</code></pre>
+<p>As I write that, I realize that it's also pretty confusing to me that you picked <code>&lt;&lt;</code> to mean "compose with." <a href="https://en.wikipedia.org/wiki/Function_composition" rel="nofollow noreferrer">Wikipedia tells me</a> that the notation I'm familiar with, <code>f ∘ g</code>, is also ambiguous — does it mean "f(g(x))" or "g(f(x))"? Well, I might pick something like</p>
+<pre><code>auto g_of_f_of_x = Maybe(f).then(g);
+auto f_of_g_of_x = Maybe(f).of(g);
+</code></pre>
+<p>so as to be completely unambiguous.</p>
+<hr>
+<p>Using <code>std::function</code> allowed you to cheat around one of the <a href="https://quuxplusone.github.io/blog/2018/06/12/perennial-impossibilities/#detect-the-first-argument-type-of-a-function" rel="nofollow noreferrer">perennial impossibilities of C++</a>: detecting a callable's "argument types." This means you can't use your <code>Maybe</code> with generic lambdas or templates like <code>std::plus&lt;&gt;</code>. If I were writing it, I'd ditch that cheat and try to make it work for generic lambdas from the very beginning.</p>
+<p>You can see my worked solution <a href="https://godbolt.org/z/fnWP4d" rel="nofollow noreferrer">here on Godbolt</a> — notice the left-hand pane using <code>std::function</code> for your <code>f,g,h</code> variables, and the right-hand pane using <code>auto</code> to make them actually lambda types, thus eliminating all the <code>std::function</code> overhead. The meat of my solution is</p>
+<pre><code>template&lt;class Callable&gt;
+struct Maybe {
+    Callable f_;
+    explicit Maybe(Callable f) : f_(std::move(f)) {}
+
+    template&lt;class... Args&gt;
+    auto operator()(Args&amp;&amp;... args) const
+        -&gt; decltype(optional_of(f_(value_of(static_cast&lt;Args&amp;&amp;&gt;(args))...)))
+    {
+        if ((has_value(args) &amp;&amp; ...)) {
+            return f_(value_of(static_cast&lt;Args&amp;&amp;&gt;(args))...);
+        } else {
+            return std::nullopt;
+        }
+    }
+};
+
+template&lt;class T, class U&gt;
+auto operator&lt;&lt;(const Maybe&lt;T&gt;&amp; a, const Maybe&lt;U&gt;&amp; b) {
+    // "a &lt;&lt; b" means "a(b(x))"
+    return Maybe([a, b](auto&amp;&amp;... args) {
+        return a(b(static_cast&lt;decltype(args)&gt;(args)...));
+    });
+}
+</code></pre>
+<p><code>value_of</code>, <code>optional_of</code>, <code>has_value</code> are just overload sets with special overloads for <code>std::optional</code>.</p>
+<p>Making this code safe against ADL is left as an exercise for the reader — but I think basically you can just slap a <code>namespace detail</code> around the helper bits and you'll be good to go.</p>
+    </div>

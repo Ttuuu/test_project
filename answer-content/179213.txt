@@ -1,0 +1,140 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You have a lot going on in one middleware. Keep in mind a middleware runs for each request so it needs to be reasonably well optimised.</p>
+
+<p>I have split the logging bit out into PlatformLogger class, that seemed like a logical separation.</p>
+
+<p>I have also removed a lot of the } else {, to me they just add noise and in most cases you return anyway, so the else will never get triggered.</p>
+
+<p>PLEASE NOTE: The conditions below where I removed the else's may not all be the equivalent to the sample provided, it is just to show you what it would look like, you would need to check and make those changes yourself if you choose to do it that way.</p>
+
+<p>Also check your if conditions, and do the cheapest test first as they might short circuit the if statement and you won't have to perform the other slower test that involve database access for example.</p>
+
+<pre><code>if (PlatformSetting::find('platform.website.frontend_maintenance_enabled')-&gt;value == 1 &amp;&amp; $currentRoute != "platform.maintenance" &amp;&amp; !Auth::user()-&gt;canBypassMaintenance()) {
+</code></pre>
+
+<p>vs</p>
+
+<pre><code>if ($currentRoute != "platform.maintenance" &amp;&amp; PlatformSetting::find('platform.website.frontend_maintenance_enabled')-&gt;value == 1 &amp;&amp; !Auth::user()-&gt;canBypassMaintenance()) {
+</code></pre>
+
+<p>Example changes</p>
+
+<pre><code>&lt;?php
+
+
+class PlatformLogger
+{
+    public function handle($request, Closure $next) {
+        $agent = new Agent();
+
+        $entry                   = new EntryLog;
+        $entry-&gt;address_accessed = "$_SERVER[HTTP_HOST]$_SERVER[REQUEST_URI]";
+        $entry-&gt;request_ip       = $request-&gt;ip();
+        $entry-&gt;request_device   = $agent-&gt;isDesktop() ? 'Desktop' : ($agent-&gt;isMobile() ? 'Mobile' : 'Tablet');
+        $entry-&gt;request_system   = $agent-&gt;platform() . ' ' . $agent-&gt;version($agent-&gt;platform());
+        $entry-&gt;request_browser  = $agent-&gt;browser();
+        $entry-&gt;request_method   = $request-&gt;method();
+        $entry-&gt;save();
+
+        return $next($request);
+    }
+}
+
+
+class Platform
+{
+    public function handle($request, Closure $next)
+    {
+        $agent = new Agent();
+
+        $currentRoute = Route::current()-&gt;getName();
+
+        $dontCheck = array(
+            "platform.contact",
+            "frontend.user.account.logout"
+        );
+
+        if (in_array($currentRoute, $dontCheck)) {
+            return $next($request);
+        }
+
+        if (!Auth::check()) {
+            if (UserBan::where('ban_type', 'ip_ban')-&gt;where('ban_value', $request-&gt;ip())-&gt;whereRaw('expires_at &gt; now()')-&gt;first() != null &amp;&amp; $currentRoute != "platform.banned") {
+                return redirect()-&gt;route('platform.banned');
+            } 
+
+            return $next($request);
+        }
+
+
+        $routeLock = RouteLock::where('route_name', $currentRoute)-&gt;first();
+
+        if ($routeLock != null &amp;&amp; $routeLock-&gt;expires_at &gt; time()) {
+            if (strlen($routeLock-&gt;required_permissions) &gt; 0 &amp;&amp; !Auth::user()-&gt;hasAnyPermissions($routeLock-&gt;required_permissions)) {
+                return redirect()-&gt;route('platform.restricted');
+            }
+        }
+
+        if (Auth::user()-&gt;isBanned($request) &amp;&amp; $currentRoute != "platform.banned") {
+            return redirect()-&gt;route('platform.banned');
+        }
+
+        if (!Auth::user()-&gt;roleplayExists() &amp;&amp; $currentRoute != "frontend.user.error") {
+            return redirect()-&gt;route('frontend.user.error');
+        }
+
+        if (PlatformSetting::find('platform.website.frontend_maintenance_enabled')-&gt;value == 1 &amp;&amp; $currentRoute != "platform.maintenance" &amp;&amp; !Auth::user()-&gt;canBypassMaintenance()) {
+            return redirect()-&gt;route('platform.maintenance');
+        }
+
+        if ($currentRoute == 'frontend.guest.register.begin' &amp;&amp; PlatformSetting::findSetting('website.registration.enabled') == '1') {
+            return 'registration is currently closed.';
+        }
+
+        if ($currentRoute == 'frontend.user.play') {
+            $permissions = PlatformSetting::findSetting('website.client.required_permissions');
+
+            if (strlen($permissions) &gt; 0) {
+                if (!Auth::user()-&gt;hasAnyPermissions($permissions)) {
+                    return new Response(view('platform.restricted'));
+                }
+            }
+        }
+
+        if (Auth::user()-&gt;website_setup_finished == '0' &amp;&amp; $currentRoute !='frontend.user.setup.step_' . Auth::user()-&gt;website_last_step) {
+            return redirect()-&gt;route('frontend.user.setup.step_' . Auth::user()-&gt;website_last_step);
+        }
+
+        if (Auth::user()-&gt;is_locked == '1' &amp;&amp; $currentRoute != 'frontend.user.locked' &amp;&amp; $currentRoute != 'frontend.user.account.unlock') {
+            return redirect()-&gt;route('frontend.user.locked');
+        }
+
+        if (Auth::user()-&gt;pin_lock == '1' &amp;&amp; $currentRoute != 'frontend.user.pin') {
+            return redirect()-&gt;route('frontend.user.pin');
+        }
+
+        if (PlatformSetting::find('platform.website.frontend_maintenance_enabled')-&gt;value == 1 &amp;&amp; $currentRoute != "platform.maintenance" &amp;&amp; !Auth::user()-&gt;canBypassMaintenance()) {
+            return redirect()-&gt;route('platform.maintenance');
+        }
+
+
+        $platformState = PlatformSetting::find('platform.state')-&gt;value;
+
+        if (($platformState == 1 || $platformState == 2 || $platformState == 3) &amp;&amp; !Auth::user()-&gt;hasBeta()) {
+            return redirect()-&gt;route('frontend.user.beta');
+        }
+        else {
+            $allowedPages = PlatformSetting::findSetting('website.allowed_pages');
+
+            if (strlen($allowedPages) &gt; 0) {
+                if (!in_array($currentRoute, explode(',', $allowedPages))) {
+                    return new Response(view('platform.restricted'));
+                }
+            }
+        }
+
+        return $next($request);
+    }
+}
+</code></pre>
+    </div>

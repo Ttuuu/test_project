@@ -1,0 +1,186 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Serialisation</h2>
+
+<p>What you have is OK. It works, but your serialisation code is verbose, brittle, manual, and hard to maintain. </p>
+
+<p>This is a very common problem. Plenty of libraries out there, including this very good and <a href="https://github.com/google/libnop" rel="nofollow noreferrer">popular one from Google: libnop</a>. </p>
+
+<p>I refactored your code using that. The number of lines of code dropped significantly and became more robust and maintainable. See below:</p>
+
+<h2>Other notable changes</h2>
+
+<ul>
+<li><code>Insert(Element&amp;)</code> was broken, because it was not accepting rvalues. Added an overload</li>
+<li>The <code>friend operator&lt;&lt;()</code> for <code>Element</code> was in the wrong class. It was in <code>Records</code>. </li>
+<li>Added a default constuctor for <code>Element</code> because <code>libnop</code> needs it. This means you can potentially have an uninitialised object. Also the existing constructor left <code>id</code> uninitiliased. Give this some thought. </li>
+<li>I know this is subjective, but: code formatting. Yours was very "verbose". Consider the style you are using. </li>
+</ul>
+
+<pre><code>
+// Element.h
+
+#pragma once
+
+#include &lt;cstdint&gt;
+#include &lt;ctime&gt;
+#include &lt;nop/serializer.h&gt;
+
+class Element {
+public:
+  Element() = default;
+
+  Element(uint32_t requi, time_t originDate, time_t requestDate,
+          time_t authorizedDate, uint64_t amount, bool hasTax,
+          bool authorized = false);
+
+  void SetId(uint32_t id) { this-&gt;id = id; }
+
+  [[nodiscard]] uint32_t GetId() const { return id; }
+  [[nodiscard]] uint32_t GetRequi() const { return requi; }
+  [[nodiscard]] time_t   GetOriginDate() const { return originDate; }
+  [[nodiscard]] time_t   GetRequestDate() const { return requestDate; }
+  [[nodiscard]] time_t   GetAuthorizedDate() const { return authorizedDate; }
+  [[nodiscard]] uint64_t GetAmount() const { return amount; }
+  [[nodiscard]] bool     IsTaxed() const { return hasTax; }
+  [[nodiscard]] bool     IsAuthorized() const { return authorized; }
+
+  bool operator&lt;(const Element&amp; rhs) const { return requi &lt; rhs.requi; }
+  bool operator&gt;(const Element&amp; rhs) const { return requi &gt; rhs.requi; }
+  bool operator==(const Element&amp; rhs) const { return requi == rhs.requi; }
+  bool operator!=(const Element&amp; rhs) const { return requi != rhs.requi; }
+
+  void Authorize();
+
+  friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; out, const Element&amp; el) {
+    out &lt;&lt; "Id: " &lt;&lt; el.GetId() &lt;&lt; ", Requi: " &lt;&lt; el.GetRequi() &lt;&lt; ", Monto: $ "
+        &lt;&lt; int(el.GetAmount() / 100) &lt;&lt; "." &lt;&lt; int(el.GetAmount() % 100)
+        &lt;&lt; (el.IsTaxed() ? " mas IVA" : " neto (no aplica IVA)");
+    return out;
+  }
+
+private:
+  uint32_t id;
+  uint32_t requi;
+  time_t   originDate;
+  time_t   requestDate;
+  time_t   authorizedDate;
+  uint64_t amount;
+  bool     hasTax;
+  bool     reviewed   = true;
+  bool     authorized = false;
+  NOP_STRUCTURE(Element, id, requi, originDate, requestDate, authorizedDate,
+                amount, hasTax, reviewed, authorized);
+};
+
+// Element.cpp
+
+#include "Element.h"
+
+Element::Element(uint32_t requi, time_t originDate, time_t requestDate,
+                 time_t authorizedDate, uint64_t amount, bool hasTax,
+                 bool authorized)
+    : requi(requi), originDate(originDate), requestDate(requestDate),
+      authorizedDate(authorizedDate), amount(amount), hasTax(hasTax),
+      authorized(authorized) {}
+
+void Element::Authorize() {
+  std::time(&amp;authorizedDate);
+  authorized = true;
+}
+
+// Records.h
+
+#pragma once
+
+#include "Element.h"
+#include &lt;nop/serializer.h&gt;
+#include &lt;nop/utility/die.h&gt;
+#include &lt;nop/utility/stream_reader.h&gt;
+#include &lt;nop/utility/stream_writer.h&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+class Records {
+public:
+  void Insert(Element&amp; element);
+  void Insert(Element&amp;&amp; element) { Insert(element); } // support rvalues
+
+  void SaveToFile(const std::string&amp; filename);
+  void LoadFromFile(const std::string&amp; filename);
+  void ListRequi();
+
+private:
+  std::vector&lt;Element&gt; elements;
+};
+
+// Records.cpp
+
+#include "Records.h"
+#include &lt;algorithm&gt;
+#include &lt;fstream&gt;
+#include &lt;iostream&gt;
+#include &lt;iterator&gt;
+
+void Records::Insert(Element&amp; element) {
+  element.SetId(elements.size() +
+                1); // autoincrement record count and use it as indes (id)
+  elements.emplace_back(element);
+}
+
+void Records::SaveToFile(const std::string&amp; filename) {
+  using Writer = nop::StreamWriter&lt;std::ofstream&gt;;
+  nop::Serializer&lt;Writer&gt; serializer{filename};
+  serializer.Write(elements) || nop::Die(std::cerr);
+}
+
+void Records::LoadFromFile(const std::string&amp; filename) {
+  using Reader = nop::StreamReader&lt;std::ifstream&gt;;
+  nop::Deserializer&lt;Reader&gt; deserializer{filename};
+  deserializer.Read(&amp;elements) || nop::Die(std::cerr);
+}
+
+void Records::ListRequi() {
+  if (elements.size() &gt; 0) {
+    std::sort(elements.begin(), elements.end());
+    std::copy(elements.begin(), elements.end(),
+              std::ostream_iterator&lt;Element&gt;(std::cout, "\n"));
+  }
+}
+
+// main.cpp
+
+#include "Records.h"
+#include &lt;algorithm&gt;
+#include &lt;ctime&gt;
+#include &lt;iostream&gt;
+
+int main() {
+  const auto filename = std::string{"datos.txt"};
+
+  {
+    time_t tRequest     = 0;
+    time_t tElaboration = 0;
+    // get today's date and time
+    std::time(&amp;tRequest);
+    std::time(&amp;tElaboration);
+
+    Records reg;
+    reg.Insert(Element(22132, tElaboration, tRequest, 0, 1586450, true));
+    reg.Insert(Element(22340, tElaboration, tRequest, 0, 123490, false));
+    reg.Insert(Element(45398, tElaboration, tRequest, 0, 58674, true));
+    reg.Insert(Element(21518, tElaboration, tRequest, 0, 879965, true));
+    reg.SaveToFile(filename);
+    std::cout &lt;&lt; "The following records have been saved:\n";
+    reg.ListRequi();
+  }
+
+  {
+    Records reg;
+    reg.LoadFromFile(filename);
+    std::cout &lt;&lt; "\nThe following records have been loaded:\n";
+    reg.ListRequi();
+  }
+  return 0;
+}
+</code></pre>
+    </div>

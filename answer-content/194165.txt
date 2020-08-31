@@ -1,0 +1,107 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'm not familiar with Amazon's API at all. I consulted <a href="https://docs.aws.amazon.com/general/latest/gr/sigv4-create-canonical-request.html" rel="nofollow noreferrer">https://docs.aws.amazon.com/general/latest/gr/sigv4-create-canonical-request.html</a> about the request format, I hope this is the applicable reference. This is not a thorough review, I was mostly looking for security risks.</p>
+
+<p>You should add <code>set -e</code> at the beginning of the script so that it will exit if a command fails.</p>
+
+<blockquote>
+<pre><code> key=${ARGS[1]}
+ secret=${ARGS[2]}
+</code></pre>
+</blockquote>
+
+<p>My understanding is that <code>key</code> is a key identifier (not secret) and <code>secret</code> is the actual key. You should use a different name for <code>key</code> to make this less confusing, e.g. <code>key_name</code>.</p>
+
+<p>You should not include secrets in a command line. Command lines are visible with <code>ps</code> and tend to be logged in command line histories, audit logs, etc. Environment variables are safer: at least they aren't visible to other users, but they can show up in logs and you need to take care not to pass them to subprocesses that might accidentally leak them. Files are best because you can write the file once and for all and then access it securely.</p>
+
+<p>Therefore I propose to replace the <code>secret</code> argument by a <code>secret_file</code>.</p>
+
+<pre><code>key_name=${ARGS[1]}
+secret_file=${ARGS[2]}
+secret=$(cat -- "$secret_file")
+</code></pre>
+
+<blockquote>
+<pre><code>if [[ "${signHeaders}" == "1" ]]; then
+</code></pre>
+</blockquote>
+
+<p>This is cosmetic, but since <code>signHeaders</code> is an integer representing a boolean, I prefer to test it through an arithmetic expression.</p>
+
+<pre><code>if ((signHeaders)); then
+</code></pre>
+
+<blockquote>
+<pre><code>for loop in "${headers[@]}"; do
+</code></pre>
+</blockquote>
+
+<p>Using <code>loop</code> as a variable name is bizarre. <code>loop</code> is not a loop, it's a header. You aren't looping over loops! Use a variable name that reflects what's stored in the variable. Here it's a header.</p>
+
+<blockquote>
+<pre><code>     name=$(tr '[A-Z]' '[a-z]' &lt;&lt;&lt; "${loop%:*}")
+</code></pre>
+</blockquote>
+
+<p>This should actually be <code>tr A-Z a-z</code>: with the brackets, you're saying that <code>[</code> must be transformed to <code>[</code> and <code>]</code> must be transformed to <code>]</code>. Fortunately this doesn't change the output.</p>
+
+<p>But anyway there's a built-in bash construct to change the case of a string: <code>${VAR,,}</code>. Put <code>export LC_CTYPE=C</code> or <code>export LC_ALL=C</code> near the top of the script to avoid running into any locale issue, although I think you're only doing case transcriptions with ASCII strings anyway so that wouldn't be a problem.</p>
+
+<p>There's an actual bug here, which is that <code>${loop%:*}</code> removes the suffix starting from the <em>last</em> colon. This doesn't do what you need if the text of a header contains a colon. You need <code>${loop%%:*}</code>.</p>
+
+<p>Here's how I'd write this loop.</p>
+
+<pre><code>for header in "${headers[@]}"; do
+    name="${header%%:*}"
+    crheaders+=("${name,,}:${header#*:}")
+done
+</code></pre>
+
+<blockquote>
+<pre><code>IFS=$'\n' sortedHeaders=($(sort &lt;&lt;&lt;"${crheaders[*]}"))
+</code></pre>
+</blockquote>
+
+<p>The output of an unquoted variable of command substitution undergoes both field splitting and filename generation (globbing). See <a href="https://unix.stackexchange.com/questions/131766/why-does-my-shell-script-choke-on-whitespace-or-other-special-characters">Why does my shell script choke on whitespace or other special characters?</a> for some general advice on the topic. You're correctly double-quoting almost everything in the script. Here, you want splitting so you can't double-quote, but you're still getting globbing. This is a problem if a header ever contains some shell wildcards and happens to match a file name on your system (e.g. <code>Mime-Type: text/*</code> if there happens to be a subdirectory called <code>text</code> in the current directory). You don't use file globbing anywhere in your script, so a simple solution is to turn it off: put <code>set -f</code> near the top of the script.</p>
+
+<p>Note that <code>IFS=$'\n' sortedHeaders=…</code> sets <code>IFS</code> for the rest of the script. It's two assignments, not the <code>VAR=VALUE EXTERNAL-COMMAND</code> syntax to set an environment variable (which <code>IFS</code> isn't) for the duration of an external command. It's equivalent to <code>IFS=$'\n'; sortedHeaders=…</code>. Put the assignments on separate lines to make it clearer. Since you never rely on the default value of <code>IFS</code>, you could put <code>IFS=$'\n'</code> near the top of the script.</p>
+
+<p>Since you're calling <code>sort</code>, you need to set <code>LC_LOCATE</code> to <code>C</code>, otherwise the order depends on your locale. Put <code>export LC_CTYPE=C</code> or <code>export LC_ALL=C</code> near the top of the script.</p>
+
+<blockquote>
+<pre><code>queryParam=""
+querySep='?'
+for loop in "${sortedQuerys[@]}"; do
+    queryParam+="${querySep}${loop}"
+    querySep='&amp;'
+done
+</code></pre>
+</blockquote>
+
+<p>I found this code less clear than it could be. Below you reuse <code>querySep</code> in the following way: <code>${url}${queryParam}${querySep}</code>. There's always a <code>?</code> except when you're building the canonical request string and there you strip off a leading <code>?</code> anyway. So I'd change this to make <code>queryParam</code> always start with a <code>?</code>, and keep <code>querySep</code> as the separator to put after <code>$queryParam</code>, which is <code>&amp;</code> unless there are no parameters. Here, you don't need a loop.</p>
+
+<pre><code>IFS='&amp;'
+queryParam="?${sortedQuerys[*]}"
+IFS=$'\n'
+if ((${#querys[@]} == 0)); then
+  querySep=
+else
+  querySep='&amp;'
+fi
+</code></pre>
+
+<blockquote>
+<pre><code>cr=$(uniq &lt;&lt;CanonicalRequest
+</code></pre>
+</blockquote>
+
+<p>I'm not sure what you're trying to do here, but it's not working. <code>uniq</code> requires sorted input. If you need to remove duplicate headers (but I don't see this in the AWS specification), apply <code>uniq</code> to `"${sortedHeaders[*]}" only.</p>
+
+<blockquote>
+<pre><code>kDate=$(echo -n ${date}        | openssl dgst -sha256 -binary -hmac "AWS4${secret}")
+</code></pre>
+</blockquote>
+
+<p>Per my remark above about not passing secrets on the command line, you shouldn't pass the HMAC key here. Unfortunately that doesn't seem to be possible with the <code>openssl</code> utility. Generally speaking, the <code>openssl</code> utility is designed for use in OpenSSL's test suite, not for production. Some of its commands can read a key from the environment or from a file, it's a pity that <code>dgst -hmac</code> can't. I would recommend calling some other utility here.</p>
+
+<p>There's a further problem here, and I don't see how your script could possibly work. You're generating the binary representation of the HMAC value, which is correct according to the <a href="https://docs.aws.amazon.com/general/latest/gr/sigv4-calculate-signature.html" rel="nofollow noreferrer">specification</a>. Each byte of the HMAC has a 1/256 change of being 0. You can't put a null byte in a bash string: bash will skip them. You either need to encode and decode each step into printable characters (e.g. with a hexadecimal or Base64 representation, or avoid these problems by writing at least this section in some other language that's suitable for manipulating binary data, such as Python.</p>
+    </div>

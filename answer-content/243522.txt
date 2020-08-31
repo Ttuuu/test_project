@@ -1,0 +1,82 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Naming nitpicks: The relationship between <code>count</code> and <code>maxThreads</code> is not obvious. I would probably name them something like <code>threads_arrived_</code> and <code>total_threads_</code> (using the common convention of postfix-underscore for data members).</p>
+
+<p>You might like to know that there's a <a href="https://en.cppreference.com/w/cpp/thread/barrier" rel="noreferrer"><code>std::barrier</code></a> in C++20. Your <code>wait</code> is what C++20 calls <code>arrive_and_wait</code>.  Your <code>generation</code> is what C++20 calls the "phase."</p>
+
+<hr>
+
+<p>Why is your <code>notifyAll</code> a separate function, given that it's private and called only in a single place? You should just inline it. As a bonus, you could then <em>drop the mutex lock</em> before calling <code>cv.notify_all()</code> — this is widely quoted as a performance optimization.</p>
+
+<hr>
+
+<p>You wrote:</p>
+
+<pre><code>void wait(std::chrono::milliseconds = std::chrono::milliseconds(0));
+</code></pre>
+
+<p>Being as <a href="https://quuxplusone.github.io/blog/2020/04/18/default-function-arguments-are-the-devil/" rel="noreferrer">default arguments are the devil</a>, this is a red flag. Personally I would write this as</p>
+
+<pre><code>void arrive_and_wait();
+void arrive_and_wait_for(std::chrono::milliseconds timeout);
+</code></pre>
+
+<p>and continue adding an <code>arrive_and_wait_until</code> as well. I would <em>not</em> use overloading or default arguments to accomplish this, because "wait for 0 milliseconds" and "wait forever" are <em>completely different things</em>. You really really don't want someone doing, like,</p>
+
+<pre><code>barrier.wait(user_configured_timeout);      // wait for 1ms
+barrier.wait(user_configured_timeout / 2);  // wait for half that
+</code></pre>
+
+<p>and getting an infinite wait instead. Follow the STL's lead here: <code>wait</code>, <code>wait_for</code>, and <code>wait_until</code> are all different operations.</p>
+
+<hr>
+
+<pre><code>if (0 == --count) notifyAll();
+else {
+    if (timeWait == std::chrono::milliseconds(0)) cv.wait(ulock, waitCondition);
+    else {
+        const auto timedOut = !cv.wait_for(ulock, timeWait, waitCondition);
+        if (timedOut) ++count;
+    }
+}
+</code></pre>
+
+<p>This is a ridiculously misindented piece of code. Try this:</p>
+
+<pre><code>if (0 == --count) {
+    notifyAll();
+} else if (timeWait == std::chrono::milliseconds(0)) {
+    // note that our refactored `wait_for` will not contain this branch
+    cv.wait(ulock, waitCondition);
+} else {
+    // note that our refactored `wait` will not contain this branch
+    bool timedOut = !cv.wait_for(ulock, timeWait, waitCondition);
+    if (timedOut) ++count;
+}
+</code></pre>
+
+<p>That <code>++count</code> smells like a race condition to me. Sure, we're operating under the mutex lock <em>here</em>; but I suspect it's possible that some other thread might have observed the decremented value of <code>count</code> and acted on it, which might mean that here we're bumping <code>count</code> from 0 to 1, or from <code>maxThreads</code> to <code>maxThreads+1</code>. I'm not sure that this can happen, but I would look at this codepath <em>very</em> closely if I were you.</p>
+
+<hr>
+
+<p>Consider what happens in code like</p>
+
+<pre><code>Thread A         Thread B         Thread C
+
+Barrier b(2);
+b.wait();        b.wait();
+                 &lt;notifyAll&gt;
+                 b.wait();        b.wait();
+                                  &lt;notifyAll&gt;
+                 &lt;awaken&gt;
+&lt;awaken&gt;
+&lt;resume waiting&gt;
+</code></pre>
+
+<p>If I understand correctly, when thread A finally gets scheduled and belatedly awakens from its <code>cv.wait</code>, it will observe <code>gen == generation</code> because <code>generation</code> has been toggled <em>twice</em> since it went to sleep. So it will remain blocked, even though it should have become unblocked as a result of thread B's first <code>b.wait()</code>.</p>
+
+<p>I'm not sure how to fix this, but it might involve thread B being forced to block, <em>itself</em>, until all the other threads in the current phase have indicated that they're unblocked. In fact I'm not sure that <em>that</em> would even fix the issue.</p>
+
+<hr>
+
+<p>It's worth mentioning that it is physically possible for the programmer to destroy a <code>Barrier</code> while some other thread is still blocked waiting on it. Presumably you're okay with having this be undefined behavior.</p>
+    </div>

@@ -1,0 +1,125 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>string value = text[assignIndex + 1 .. $].idup.strip();
+</code></pre>
+
+<p>Since you're using <code>stripRight</code> on the line above, why not <code>stripLeft</code> here? Also, instead of doing <code>idup.strip</code>, use <code>strip.idup</code> - that way you aren't allocating spaces that you then strip off and ignore, wasting memory.</p>
+
+<pre><code>configFile.close();
+</code></pre>
+
+<p>Unnecessary - <code>File</code> will auto-close when leaving scope.</p>
+
+<pre><code>void writeConfig(File configFile, const string[string] configData) {
+    configFile.rewind();
+
+    string[] configKeys = configData.keys();
+    string textBuffer;
+</code></pre>
+
+<p>Consider using <a href="https://dlang.org/phobos/std_array#Appender" rel="nofollow noreferrer"><code>Appender!string</code></a> instead of <code>string</code> here. As the name indicates, it's optimized for appending, while <code>string</code> is more a jack-of-all-trades.</p>
+
+<p>Next up:</p>
+
+<pre><code>(configData[configKeys[varIndex]] || "null")
+</code></pre>
+
+<p><code>||</code> always returns a boolean result, so this will always evaluate to <code>true</code>, or <code>0x01</code>, so every single line you write will be corrupted. You can use this utility function:</p>
+
+<pre><code>auto or(T...)(T args) {
+    foreach (e; args)
+        if (e)
+            return e;
+    assert(0);
+}
+</code></pre>
+
+<p>Usage:</p>
+
+<pre><code>configData[configKeys[varIndex]].or("null")
+</code></pre>
+
+<p>All-in-all, <code>writeConfig</code> looks a bit curious. I assume it's written the way it is in order to keep comments, and perhaps as an attempt at optimization. However, it's using <code>startsWithAny</code> on every line, giving it a <code>N^2</code> complexity. This can be improved by looking up the prefix in the AA:</p>
+
+<pre><code>const assignIndex = stripped.indexOf("=");
+const prefix = stripped[0..assignIndex == -1 : 0 : assignIndex];
+auto var = prefix in configData;
+
+if (var) {
+    textBuffer ~= prefix ~ " = " ~ ((*var).or("null")) ~ '\n';
+    configKeys = configKeys.remove(varIndex);
+} else
+    textBuffer ~= text ~ '\n';
+</code></pre>
+
+<p>Another problem with using <code>startsWithAny</code> is that a variable called <code>foo</code> will overwrite one called <code>foobar</code>, if they happen to be arranged that way in the AA keys. Your solution also discards comments on the form <code>var=value #comment</code>.</p>
+
+<p>Next:</p>
+
+<pre><code>File configFile = File(configPath, "w+");
+</code></pre>
+
+<p>You're trying to read lines from this file. Use "r+", not "w+".</p>
+
+<p>The problems with <code>writeConfig</code> are generally also present in <code>setVariable</code>. <code>setVariable</code> is also somewhat confusing - when would you set the value of a setting, but not update the <code>string[string]</code>?</p>
+
+<p>Lastly, have you even tested this code? As pointed out, it will write corrupted data to file, it will discard comments, it will overwrite variables with similar names, and it will ignore file contents.</p>
+
+<p>I would suggest in the future you write at least some kind of unit tests to check that the code does what you want it to. Something along the lines of:</p>
+
+<pre><code>unittest {
+    import std.array : array;
+    import std.algorithm.iteration : map;
+    enum filename = "config.conf";
+    // Create initial config file
+    {
+        auto f = File(filename, "w");
+        f.writeln("#comment");
+        f.writeln("var2 = foo");
+        f.writeln("var1 = bar");
+    }
+
+    // Read contents and check that correct data is read
+    auto cfg = readConfig(filename);
+    assert(cfg.length == 2);
+    assert("var2" in cfg);
+    assert(cfg["var2"] == "foo");
+    assert("var1" in cfg);
+    assert(cfg["var1"] == "bar");
+
+    // Write back and check that correct data is written
+    writeConfig(filename, cfg);
+    auto contents = File(filename).byLine.map!idup.array;
+    // Trailing \r included in byLine is bug #11465, and a windows-only problem.
+    assert(contents[0] == "#comment\r");
+    assert(contents[1] == "var2 = foo\r");
+    assert(contents[2] == "var1 = bar\r");
+}
+</code></pre>
+
+<p>Now, I can't in good conscience write only negative stuff, and there are certainly good things in your implementation. Your naming is great - names are explanatory, not too short and not too long. Comments are used when they are useful, not too many, and not too few. Functions are of good length, and the control flow is easy to follow, and utility functions are introduced where sensible. Imports are tidy, and selective imports are used to give quick information about which function comes from where. All in all, it's a pleasant read, marred by implementation problems.</p>
+
+<p>If I were to write an implementation of the functionality you have, I would also encapsulate it in a struct or class:</p>
+
+<pre><code>struct Config {
+    string[string] _variables;
+    this(string filename)
+    {
+        // read into _variables
+    }
+
+    string opIndex(string name) {
+        return _variables[name];
+    }
+
+    void opIndexAssign(string value, string name) {
+        _variables[name] = value;
+    }
+
+    void save() {
+        // save to file
+    }
+}
+</code></pre>
+
+<p>This way, I have all the functionality inside a nice little box that I can pass around, and I'm free to keep other information like comments in the data structure, without exposing that complexity to the user of the code.</p>
+    </div>

@@ -1,0 +1,68 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Great idea.  I was having the same problem and this helped me solve it.  Your method for doing cleanup though is wrong (as you mentioned it might be).  Basically, you need to close the write end of the pipes after passing them to the subprocess.  That way when the child process exits and closes it's end of the pipes, the logging thread will get a <code>SIGPIPE</code> and return a zero length message as you expected.  </p>
+
+<p>Otherwise, the main process will keep the write end of the pipe open forever, causing <code>readline</code> to block indefinitely, which will cause your thread to live forever as well as the pipe.  This becomes a major problem after a while because you'll reach the limit on the number of open file descriptors.</p>
+
+<p>Also, the thread shouldn't be a daemon thread because that creates the risk of losing log data during process shutdown.  If you properly cleanup as a described, all the threads will exit properly removing the need to mark them as daemons.</p>
+
+<p>Lastly, the <code>while</code> loop can be simplified using a <code>for</code> loop.</p>
+
+<p>Implementing all of these changes gives:</p>
+
+<pre><code>import logging
+import threading
+import os
+import subprocess
+
+logging.basicConfig(format='%(levelname)s:%(message)s', level=logging.INFO)
+
+class LogPipe(threading.Thread):
+
+    def __init__(self, level):
+        """Setup the object with a logger and a loglevel
+        and start the thread
+        """
+        threading.Thread.__init__(self)
+        self.daemon = False
+        self.level = level
+        self.fdRead, self.fdWrite = os.pipe()
+        self.pipeReader = os.fdopen(self.fdRead)
+        self.start()
+
+    def fileno(self):
+        """Return the write file descriptor of the pipe
+        """
+        return self.fdWrite
+
+    def run(self):
+        """Run the thread, logging everything.
+        """
+        for line in iter(self.pipeReader.readline, ''):
+            logging.log(self.level, line.strip('\n'))
+
+        self.pipeReader.close()
+
+    def close(self):
+        """Close the write end of the pipe.
+        """
+        os.close(self.fdWrite)
+
+# For testing
+if __name__ == "__main__":
+    import sys
+
+    logpipe = LogPipe(logging.INFO)
+    with subprocess.Popen(['/bin/ls'], stdout=logpipe, stderr=logpipe) as s:
+        logpipe.close()
+
+    sys.exit()
+</code></pre>
+
+<p>I used different names in a couple of spots, but otherwise it's the same idea, except a little cleaner and more robust.</p>
+
+<p>Setting <code>close_fds=True</code> for the subprocess call (which is actually the default) won't help because that causes the file descriptor to be closed in the forked (child) process before calling exec.  We need the file descriptor to be closed in the parent process (i.e. before the fork) though.</p>
+
+<p>The two streams still end up not being synchronized correctly.  I'm pretty sure the reason is that we're using two separate threads.  I think if we only used one thread underneath for the logging, the problem would be solved.</p>
+
+<p>The problem is that we're dealing with two different buffers (pipes).  Having two threads (now I remember) gives an approximate synchronization by writing the data as it becomes available.  It's still a race condition, but there are two "servers", so it's normally not a big deal.  With only one thread, there's only one "server" so the race condition shows up pretty bad in the form of unsynchronized output.  The only way I can think to solve the problem is to extend <code>os.pipe()</code> instead, but I have no idea how feasible that is.</p>
+    </div>

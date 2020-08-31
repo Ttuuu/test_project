@@ -1,0 +1,221 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Neat idea.</p>
+<pre><code>template&lt;typename T1, template &lt;typename&gt; typename Container, typename T2&gt;
+bool contains (Container&lt;T1&gt; const &amp;source, T2 const &amp;val)
+</code></pre>
+<p>I’m not sure a template template parameter is necessary here, or even a good idea. It prevents the function from being used with containers that <em>aren’t</em> templates… or that aren’t the kind of templates you expect.</p>
+<p>There is a standard definition for “<a href="https://en.cppreference.com/w/cpp/named_req/Container" rel="nofollow noreferrer">container</a>”. (There’s also a more-or-less matching proposed concept in the range-v3 library.) Under that definition you could get <code>T1</code> as <code>typename Container::value_type</code>.</p>
+<pre><code>if constexpr (std::is_same&lt;T1, T2&gt;::value)
+</code></pre>
+<p>I don’t think <code>is_same</code> is the test you really want to be applying here, because it precludes all kinds of useful cases. For example, let’s say you have a vector of strings, and the key you want to search for is a <code>string_view</code>:</p>
+<pre><code>auto strings = std::vector&lt;std::string&gt;{/*...*/};
+
+auto const search_key = "to be found"sv;
+
+// This won't work
+if (contains(strings, search_key))
+    // ...
+</code></pre>
+<p>What you want is really the C++20 concept <code>std::equality_comparable_with</code>. Lacking concepts in C++17, you could roll a type trait that does the same test.</p>
+<pre><code>return std::find(std::cbegin(source), std::cend(source), val) != std::cend(source);
+</code></pre>
+<p>Using the fully-qualified forms of <code>std::cbegin</code> and <code>std::cend</code> prevents ADL, which could break basically any container not defined in the <code>std</code> namespace.</p>
+<p>You should use the standard pattern:</p>
+<pre><code>using std::cbegin;
+using std::cend;
+
+return std::find(cbegin(source), cend(source), val) != cend(source);
+</code></pre>
+<p>Also, I’d suggest using <code>begin</code> and <code>end</code> rather than <code>cbegin</code> and <code>cend</code>. Why? Because it doesn’t matter, since <code>source</code> is <code>const</code>, but third-party containers may not have bothered to add support for <code>cbegin</code> and <code>cend</code> (<code>begin</code> and <code>end</code> should be universal).</p>
+<p>I think you really need some additional type traits (or concepts, if you’re targeting C++20) to make this work. First, a type trait <code>is_container</code> would be very handy for making the function produce better errors, and for helping with the internals:</p>
+<pre><code>template &lt;typename Container, typename T&gt;
+auto contains(Container const&amp; source, T const&amp; val) -&gt;
+    std::enable_if_t&lt;is_container_v&lt;Container&gt;, bool&gt;
+</code></pre>
+<p>Or perhaps, rather than using SFINAE, you could use a <code>static_assert</code>:</p>
+<pre><code>template &lt;typename Container, typename T&gt;
+auto contains(Container const&amp; source, T const&amp; val) -&gt; bool
+{
+    static_assert(is_container_v&lt;Container&gt;);
+</code></pre>
+<p>You could also use an <code>equality_comparable_with</code> trait, to allow for more flexibility:</p>
+<pre><code>template &lt;typename Container, typename T&gt;
+auto contains(Container const&amp; source, T const&amp; val) -&gt; bool
+{
+    if constexpr (is_equality_comparable_with_v&lt;typename Container::value_type, T&gt;)
+        // ...
+</code></pre>
+<p>Those two type traits will also help when testing for whether recursion is possible.</p>
+<pre><code>template &lt;typename Container, typename T&gt;
+auto contains(Container const&amp; source, T const&amp; val) -&gt; bool
+{
+    if constexpr (is_equality_comparable_with_v&lt;typename Container::value_type, T&gt;)
+        // just use std::find
+    else if constexpr (is_container_v&lt;typename Container::value_type&gt;)
+        // recurse
+    else
+        // error
+</code></pre>
+<p>Those type traits will help a <em>lot</em> when there are problems; they can make a huge difference in the size and readability of the error messages you get if you’re dealing with deeply nested containers.</p>
+<p>Other than that, the only other thing I can think to suggest is to make the function <code>constexpr</code>. Because why not?</p>
+<h1>Questions</h1>
+<h2>You say "containers that aren’t templates" and " templates you expect", can you add 1 or 2 examples of this?</h2>
+<p>In order for a container-like type to work with your template template parameter, 3 things must be true:</p>
+<ol>
+<li>It must be a template.</li>
+<li>It must have 1 template type parameter (with any subsequent template parameters aliased or defaulted away).</li>
+<li>That parameter must be the same as the container’s value type.</li>
+</ol>
+<p>For an example that fails the first case: <code>std::filesystem::directory_iterator</code>. It is not a template. So this works:</p>
+<pre><code>auto dir = std::filesystem::directory_iterator(".");
+if (std::find(begin(dir), end(dir), "foo") != end(dir))
+    std::cout &lt;&lt; "foo is in current working directory";
+</code></pre>
+<p>but this won’t work:</p>
+<pre><code>auto dir = std::filesystem::directory_iterator(".");
+if (gco::contains(dir, "foo"))
+    std::cout &lt;&lt; "foo is in current working directory";
+</code></pre>
+<p>For an example that fails the second case: <code>std::array</code>. Your function expects a template with a single type parameter (and anything else defaulted away). <code>std::array</code> has a type parameter… and a non-type parameter (which is not defaulted). It’s certainly a container, and a template, but not the kind of template you expect.</p>
+<p>So this works:</p>
+<pre><code>auto numbers = std::array&lt;int, 5&gt;{1, 2, 3, 4, 5};
+if (std::find(begin(numbers), end(numbers), 3) != end(numbers))
+    std::cout &lt;&lt; "found 3";
+</code></pre>
+<p>but this won’t work:</p>
+<pre><code>auto numbers = std::array&lt;int, 5&gt;{1, 2, 3, 4, 5};
+if (gco::contains(numbers, 3))
+    std::cout &lt;&lt; "found 3";
+</code></pre>
+<p>For an example that fails the third case… I can’t think of anything off the top of my head. This would require a container template whose first template parameter is not the container’s value type. That would be an odd thing to do (there’s certainly nothing like that in the standard library)… but it could happen!</p>
+<h2>You suggest to use the standard definition for container. Can you show me how this is done?</h2>
+<p>In a perfect world, the standard library would have done this for you. (And it <em>will</em> do it for you, but not until C++20.)</p>
+<p>But if we’re going to get into this, we really need to tighten up some terminology. I don’t think you want <code>contains()</code> to be a <em>container</em> operation. I think you want it to be a <em>range</em> operation.</p>
+<p>In C++ lingo, a <em>container</em> is a type that <em>holds</em> a bunch of stuff. <code>std::vector</code>, <code>std::list</code>, <code>std::map</code>, and so on, they’re all containers. They <em>own</em> their contents; when the container is destroyed, so are all the contents.</p>
+<p>But there are other things that are container-like but not containers. As of C++17, there are also <em>views</em>.</p>
+<p>A <em>view</em> is a type that provides a container-like view of stuff, but <em>does not hold that stuff</em>. As of C++17, the only view in the standard library (unless I’m forgetting something) is <code>std::string_view</code>, though there are lot more in the pipes, like C++20’s <code>std::span</code>. <code>std::string_view</code> does not <em>own</em> its contents. By contrast, <code>std::string</code>, which <em>is</em> a container, does.</p>
+<p>I’m pretty sure you’d want <code>gco::contains()</code> to work with <code>std::string_view</code>. So obviously you want to support more than just containers.</p>
+<p>And there are still other things that are neither containers nor views, but still seem like they should be able to work with <code>gco::contains()</code>. There’s nothing really in the standard library yet, but there’s a <em>lot</em> coming in future. For example, coroutines would bring generators. I can imagine a function that checks whether a number is part of the Fibonacci sequence that works something like this:</p>
+<pre><code>// fibonacci_sequence() is a generator that returns successive
+// elements in the Fibonacci sequence: 1, 2, 3, 5, 8, 13, ...
+if (gco::contains(fibonacci_sequence(), number))
+    std::cout &lt;&lt; number &lt;&lt; " is in the Fibonacci sequence";
+</code></pre>
+<p>The generic C++ concept that covers both containers and views and more (including types that provides a container-like view of stuff, but not only don’t own the stuff, <em>the stuff might not actually exist</em>) is <em>range</em>. C++20 will be bringing a long-awaited range library, but C++ has been taking baby steps to support ranges since all the way back in C++11, with the range-<code>for</code>-loop.</p>
+<p>I think what you’re making is not a library of generalized <em>container</em> operations, but rather a <em>range</em> library.</p>
+<p>Now, if this were C++20, everything would be trivial. You could just do:</p>
+<pre><code>template &lt;typename&gt; struct dependent_false : std::false_type {};
+
+template &lt;typename T&gt;
+constexpr auto dependent_false_v = dependent_false&lt;T&gt;::value;
+
+template &lt;std::input_range Container, typename T&gt;
+constexpr auto contains(Container const&amp; source, T const&amp; val) -&gt; bool
+{
+    using value_type = std::ranges::range_value_t&lt;Container&gt;;
+
+    using std::begin;
+    using std::end;
+
+    if constexpr (std::equality_comparable_with&lt;value_type, T&gt;)
+        return std::find(begin(source), end(source), val) != end(source);
+    else if constexpr (std::input_range&lt;T&gt;)
+        return std::any_of(begin(source), end(source), [&amp;val](auto&amp;&amp; el) { return contains(el, val); });
+    else
+        static_assert(dependent_false_v&lt;Container&gt;);
+}
+</code></pre>
+<p>Unfortunately, in C++17, you don’t have concepts, so you have to roll your own type traits to do the tests.</p>
+<p>Okay, so… how? Well, the first thing you need to do is figure out what the requirements are. A minimal range is anything that works with range-<code>for</code>. That requires at least:</p>
+<ul>
+<li><code>begin()</code></li>
+<li><code>end()</code></li>
+<li>that the return types of <code>begin()</code> and <code>end()</code> can be equality-compared</li>
+<li>that the return type of <code>begin()</code> supports <code>operator++</code>; and</li>
+<li>probably a few other things I’m forgetting.</li>
+</ul>
+<p>You can test the first two requirements with something like:</p>
+<pre><code>template &lt;typename Range&gt;
+constexpr auto adl_begin(Range&amp;&amp; r)
+{
+    using std::begin;
+    return begin(r);
+}
+
+template &lt;typename Range&gt;
+constexpr auto adl_end(Range&amp;&amp; r)
+{
+    using std::end;
+    return end(r);
+}
+
+template &lt;typename T, typename = void&gt;
+struct has_begin_support : std::false_type {};
+
+template &lt;typename T&gt;
+struct has_begin_support&lt;T, std::void_t&lt;decltype(adl_begin(std::declval&lt;T&gt;()))&gt; : std::true_type {};
+
+template &lt;typename T, typename = void&gt;
+struct has_end_support : std::false_type {};
+
+template &lt;typename T&gt;
+struct has_end_support&lt;T, std::void_t&lt;decltype(adl_end(std::declval&lt;T&gt;()))&gt; : std::true_type {};
+</code></pre>
+<p>Then make similar type traits to check that the return type of <code>begin()</code> is equality comparable with the return type of <code>end()</code>, and that the return type of <code>begin()</code> is an input iterator, and so on… and eventually put it all together as a single type trait.</p>
+<p>Yes, that’s a shitload of work (unless you use a library like <a href="https://ericniebler.github.io/range-v3/" rel="nofollow noreferrer">range-v3</a> which I <em>HIGHLY</em> recommend), but that’s why C++ programmers get the big bucks.</p>
+<p>Now, this next bit is an opinionated rant:</p>
+<blockquote class="spoiler">
+<p> </p><p>Honestly, I’ve started suggesting to programmers to consider targeting C++20, rather than C++17, even though C++20 isn’t fully officially out yet, and compiler support is as yet anemic. C++20 is the biggest update to C++ since C++11… and it might be even <em>bigger</em>. <em>EVERYTHING</em> will change once C++20 is the norm, probably even far more so than it did when C++11 came around. The amount of code you’d have to write to do <code>contains()</code> <em>well</em> in C++17 is dozens and dozens, if not <em>hundreds</em> of lines of arcane SFINAE crap that only experts understand with bullshit like <code>enable_if</code> and <code>void_t</code>. In C++20? It’s like, 10-12 lines, all obvious, simple, and brief (well, except maybe for the <code>dependent_false</code> trick, but that might not even be necessary, depending on how clear compiler errors are in C++20 mode).</p>
+
+ <p>So it might be worth your while to hold off on writing a container ops library, and for now spend the time reading up on what’s coming in C++: like concepts, modules, and particularly the ranges library. Then when you’re ready, hopefully compiler support will have caught up, and you can roll out this library easily.</p>
+
+ <p>If you <em>really</em> want to target C++17 with your library, that’s fine—there’s very little you <em>can’t</em> do in C++17 (it’s just <em>MUCH</em> easier in C++20). Just understand that you will be diving into a deep, deep well of very, very complicated stuff, and—and this is the worst part—even if you just want to do it for the learning experience, it will be mostly a waste of time, because the skills you’ll learn will be obsolete in a few months.</p>
+</blockquote>
+<h2>you suggest either using 'std::enable_if_t' or a static_assert. Is one of the two preferred or more common?</h2>
+<p>That’s an engineering question, meaning the answer is: there is no right answer; it depends on what you want.</p>
+<p>Both methods will trigger a compile error if the constraints are not met. The difference is how.</p>
+<p><code>static_assert</code> is easier to understand. If the constraint fails, the compile just dies. That’s it. Nothing fancy. It’s so brutally simple, that it actually requires tricks to make it <em>not</em> fail when you don’t want it to. If you look at the C++20 version of <code>contains()</code> I wrote above, the static assert uses <code>dependent_false</code>:</p>
+<pre><code>static_assert(dependent_false_v&lt;Container&gt;);
+</code></pre>
+<p>If I’d just done:</p>
+<pre><code>static_assert(false);
+</code></pre>
+<p>it would just fail, always. Literally always—no code that uses <code>contains()</code> would compile. “But,” you say, “that <code>static_assert</code> is in the <code>else</code> part of an <code>if constexpr</code>!” Doesn’t matter. <code>static_assert</code> doesn’t care. When that function is compiled, if the compiler sees <code>static_assert(false)</code>, it just dies immediately, before even bothering to check the rest of the function, before even realizing which branch of the <code>if constexpr</code> it’s in. The <code>dependent_false</code> trick is a way to confuse the compiler temporarily: it doesn’t see the false until <em>after</em> it parses everything in the function… at which point it then sees it’s in an <code>else</code> that doesn’t apply, so it ignores the assertion.</p>
+<p><code>enable_if</code> is more complicated. What it does (assuming you use it right) is <em>remove the function from the overload set temporarily</em>.</p>
+<p>To understand what that means, imagine you have two overloads of <code>template &lt;typename T&gt; foo(T)</code> with different return types, then you call <code>foo(0)</code> (with <code>T</code> as an <code>int</code>):</p>
+<pre><code>template &lt;typename T&gt;
+auto foo(T) -&gt; T { std::cout &lt;&lt; "int"; return {}; }
+
+template &lt;typename T&gt;
+auto foo(T) -&gt; typename T::value_type { std::cout &lt;&lt; "T::value_type"; return {}; }
+
+foo(0); // what happens?
+</code></pre>
+<p>Well, first the compiler collects all the possibilities. So the overload set consists of both <code>foo()</code> functions.</p>
+<p>Then the compiler eliminates obvious failures. In this case, <code>foo(0)</code> can’t <em>possibly</em> be calling the overload that returns <code>T::value_type</code>… because <code>int</code> does not have a <code>value_type</code> subtype: <code>int::value_type</code> is nonsense. So that overload is eliminated, leaving only the overload that returns <code>T</code>.</p>
+<p>With only one possibility left, the compiler accepts that <code>foo(0)</code> means the first overload. The program compiles, and prints “int”.</p>
+<p>If you try to use a <code>std::string</code> (which has a <code>value_type</code>) instead of an <code>int</code>, <em>both</em> overloads are valid, and you’ll get an error because the call is ambiguous.</p>
+<p>What <code>enable_if</code> does is gives you control over the elimination step. It basically says “only include this function in the set of potential overloads if the condition is true”. If the condition is false, then it’s as if the function doesn’t exist.</p>
+<p>Why is that cool? Well consider if you did this:</p>
+<pre><code>template &lt;typename Container, typename T&gt;
+auto contains(Container const&amp; source, T const&amp; val) -&gt; bool
+{
+    static_assert(is_container_v&lt;Container&gt;);
+</code></pre>
+<p>Then when you call <code>contains(something, other)</code> and <code>something</code> is not a container, the <code>static_assert</code> fires, and the whole compile dies. That may be exactly what you want.</p>
+<p><em>But</em>!… Maybe if <code>something</code> is not a container, there is some other overload of <code>contains()</code> that might be suitable (“contains” is a common name, after all!).</p>
+<p>So if you did this:</p>
+<pre><code>template &lt;typename Container, typename T&gt;
+auto contains(Container const&amp; source, T const&amp; val) -&gt;
+    std::enable_if_t&lt;is_container_v&lt;Container&gt;, bool&gt;
+</code></pre>
+<p>(or used a concept; a concept basically does the same thing as <code>enable_if</code>), then called <code>contains(something, other)</code> where <code>something</code> is not a container, you don’t <em>immediately</em> get a compile failure. Instead, this function just… disappears. Like it was never written. The compiler goes on searching for all the other overloads of <code>contains()</code> (for everything that is <em>not</em> a container), and if it finds a match, then good! If not, well, then that’s an error as always.</p>
+<p>So that’s the difference:</p>
+<ul>
+<li>With <code>static_assert</code>, if someone calls <code>contains()</code> with inappropriate arguments, the compile just dies immediately, even if there are other (and better) possibilities that might work.</li>
+<li>With <code>enable_if</code>, if someone calls <code>contains()</code> with inappropriate arguments… the compiler just pretends the function doesn’t exist, and keeps looking for other possibilities. If it finds one, it uses it. If not, then that’s an error as always.</li>
+</ul>
+<p>Which one is preferred? 🤷🏼 It depends on what you want.</p>
+<p>If you can be reasonably sure that no one will ever name another function <code>contains()</code> that might be confused with your function (which is a perfectly reasonable assumption!), then <code>static_assert</code> is just fine. But if you think you might be sharing the name <code>contains()</code> with other stuff… maybe you might not want to trigger a hard error right away; maybe you might want your function to “step aside” to give other functions with the same name a chance.</p>
+<p>Hope all this helps!</p>
+    </div>

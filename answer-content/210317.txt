@@ -1,0 +1,99 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The other answer gave some really good advice; this is intended as a complementary answer with still more things to think about.</p>
+
+<h2>Put default arguments at the top of the script</h2>
+
+<p>If someone wanted to change the default arguments, they'd have to hunt through the code to find them.  I typically prefer to put them at the top of the script and then only overwrite them if command line arguments are passed.  For example:</p>
+
+<pre><code>#!/bin/bash
+
+# default arguments
+TARGET=./target 
+JSON=steps.json
+
+# Command line args are both optional: TARGET JSON
+if [[ -z "$1" ]] ; then
+    TARGET="$1"
+fi
+if [[ -z "$2" ]] ; then
+    JSON="$2"
+fi
+</code></pre>
+
+<h2>Use <code>install</code> to copy files</h2>
+
+<p>DOS archives may or may not have proper permissions bits set and may need to have a complex path created before copying the file.  We can manage all of this easily with <code>install</code> which is also a basic part of every Linux installation:</p>
+
+<pre><code>echo "installing $src on $disk to $dst"
+install -p --mode=664 -D "$TMPDIR"/$src -t "$TARGET"/$dst/
+</code></pre>
+
+<p>With the <code>-p</code> argument we preserve the original timestamp.  The <code>mode</code> argument explictly sets the mode for each file (you could, of course change this to something else if you cared to).  The combination of <code>-D</code> and <code>-t</code> tells install to create the destination directory if it doesn't already exist.</p>
+
+<h2>Do more with <code>jq</code></h2>
+
+<p>Since you're already requiring a dependency on <code>jq</code>, it makes sense to use its capabilities more thoroughly.  As you know, it has the ability to apply one or more filters sequentially to the result of the previous step.  We can use this to great advantage and only call <code>jq</code> once like this:</p>
+
+<pre><code># use jq to create disk, src, dst triplets to feed to inst
+jq -r -c '.[] | {disk, file: .files[]} | {disk, src: .file.src, dst: .file.dest} | [.disk,.src,.dst] |@sh ' "$JSON" | while read line 
+    do inst ${line}
+done
+</code></pre>
+
+<p>As you can see from the comment, this extracts disk, src, dst triplets.</p>
+
+<h2>Create a function to do the work</h2>
+
+<p>Given the above advice, what we need is the <code>inst</code> routine to actually do the work.  Here's one way to write that:</p>
+
+<pre><code># working variables
+TMPDIR=
+LASTDISK=
+
+# given disk, src, dst triplet
+# mount the disk in a temporary dir
+# (if not already mounted)
+# and install from src to dst
+# src may contain wildcards
+function inst () {
+    disk=$(eval echo $1)
+    src=$(eval echo $2)
+    dst=$(eval echo $3)
+    if [[ "$disk" != "$LASTDISK" ]] ; then 
+        cleanup
+        TMPDIR="$(mktemp -d)"
+        echo "mounting $disk on $TMPDIR"
+        if sudo mount -r "$disk" "$TMPDIR" ; then 
+            LASTDISK="$disk"
+        else 
+            echo "Failed to mount $disk"
+            sudo rmdir "$TMPDIR"
+        fi
+    fi
+    echo "installing $src on $disk to $dst"
+    install -p --mode=664 -D "$TMPDIR"/$src -t "$TARGET"/$dst/
+}
+</code></pre>
+
+<p>Notice that I've used a number of <code>bash</code>-isms here that make this non-portable, but since you've explicitly called out <code>bash</code>, I'm assuming this is OK.  I've also chosen to use <code>sudo mount</code> and <code>sudo umount</code> instead of <code>udiskctl</code>.  Either could work, of course; it's a matter of preference as to which is used.  On one hand, <code>mount</code> is always available but on the other, it requires <code>sudo</code> privileges.  Most of this will be self-explanatory, except for <code>cleanup</code> which is described in the next suggestion.</p>
+
+<h2>Use a cleanup function</h2>
+
+<p>It's annoying when a script fails for some reason and then leaves temporary files or other junk lying around as a result.  One technique that's handy for this is to use <code>bash</code>'s <code>TRAP</code> feature.</p>
+
+<pre><code># un mount and remove bind dir TMPDIR if
+# TMPDIR is not empty
+function cleanup {
+    if [[ ! -z "$TMPDIR" ]] ; then
+        sudo umount "$TMPDIR"
+        sudo rm -rf "$TMPDIR"
+    fi
+}
+
+# rest of script ...
+
+trap cleanup EXIT
+</code></pre>
+
+<p>This tells <code>bash</code> that no matter how we get to the exit (either normally or via some fatal error) it needs to invoke the specified function, which I typically name <code>cleanup</code> for obvious reasons.</p>
+    </div>

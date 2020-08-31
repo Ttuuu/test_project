@@ -1,0 +1,122 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I was somewhat curious if Woodstox has improved, so I wrote a complete parser for your example data. It's in a different style than your code, complete repo: <a href="https://github.com/chhh/testing-woodstox-xml-parsing" rel="nofollow noreferrer">https://github.com/chhh/testing-woodstox-xml-parsing</a></p>
+
+<p><strong>My results with fake data records that I created:</strong><br>
+Parsed 4,000,000 persons (1.36 GB) in 16.75 seconds (Ryzen5 3600), memory usage wasn't really significant.</p>
+
+<p>First of all there's a newer version of Woodstox on Maven Central.<br>
+Gradle dependency: <code>implementation 'com.fasterxml.woodstox:woodstox-core:6.0.3'</code><br>
+They now have XMLStreamReader2 with <code>.configureForSpeed()</code> option. I didn't really check what it does, but for my test it didn't do much.</p>
+
+<p>Had to create fake data. You can make files of any size with <a href="https://github.com/chhh/testing-woodstox-xml-parsing/blob/master/src/main/java/com/dmtavt/tests/FakeData.java" rel="nofollow noreferrer">FakeData.createHugeXml(Path path, int numEntries)</a>.</p>
+
+<p>Just in case, here's main parsing code, excluding the Person class (which is not very interesing and can be found <a href="https://github.com/chhh/testing-woodstox-xml-parsing/blob/db189b4e9b5efb87f3b5c4f7cf6905e075b8d3c9/src/main/java/com/dmtavt/tests/woodstox/WoodstoxParser.java#L121" rel="nofollow noreferrer">here</a>)</p>
+
+<pre class="lang-java prettyprint-override"><code>public class WoodstoxParser {
+    @FunctionalInterface
+    interface ConditionCallback {
+        boolean processXml(XMLStreamReader2 sr) throws XMLStreamException;
+    }
+
+    interface TagPairCallback {
+        void tagStart(String tagName, XMLStreamReader2 sr) throws XMLStreamException;
+
+        void tagContents(String tagName, StringBuilder sb);
+    }
+
+    public static void processUntilTrue(XMLStreamReader2 sr, ConditionCallback callback) throws XMLStreamException {
+        do {
+            if (callback.processXml(sr))
+                return;
+        } while (sr.hasNext() &amp;&amp; sr.next() &gt;= 0);
+        throw new IllegalStateException("xml document ended without callback returning true");
+    }
+
+    /** Main parsing function. **/
+    public static List&lt;Person&gt; parse(Path path) throws IOException, XMLStreamException {
+        XMLInputFactory2 f = (XMLInputFactory2) XMLInputFactory2.newFactory();
+        f.configureForSpeed();
+//        f.configureForLowMemUsage();
+        XMLStreamReader2 sr = null;
+        try (BufferedReader br = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+            sr = (XMLStreamReader2) f.createXMLStreamReader(br);
+
+            // fast forward to beginning 'persons' tag (will throw if we don't find the tag at all)
+            processUntilTrue(sr, sr1 -&gt; isTagStart(sr1, "persons"));
+
+            final List&lt;Person&gt; persons = new ArrayList&lt;&gt;(); // we've found the tag, so we can allocate storage for data
+            final StringBuilder sb = new StringBuilder(); // reuse a single string builder for all character aggregation
+
+            // now keep processing unless we reach closing 'persons' tag
+            processUntilTrue(sr, sr1 -&gt; {
+                if (isTagEnd(sr1, "persons"))
+                    return true;
+
+                if (isTagStart(sr1, "person")) {
+                    // now we're finally reached a 'person', can start processing it
+                    int idIndex = sr1.getAttributeInfo().findAttributeIndex("", "id");
+                    Person p = new Person(Integer.parseInt(sr1.getAttributeValue(idIndex)));
+
+                    sr1.next();
+                    processUntilTrue(sr1, sr2 -&gt; {
+                        // processing the meat of a 'person' tag
+                        // split it into a function of its own to not clutter the main loop
+                        //return processPerson(sr2, p, sb);
+                        if (isTagEnd(sr2, "person"))
+                            return true; // we're done processing a 'person' only when we reach the ending 'person' tag
+
+                        if (isTagStart(sr2))
+                            processTagPair(sr2, sb, p);
+
+                        return false;
+                    });
+                    // we've reached the end of a 'person'
+                    if (p.isComplete()) {
+                        persons.add(p);
+                    } else {
+                        throw new IllegalStateException("Whoa, a person had incomplete data");
+                    }
+                }
+
+                return false;
+            });
+            return persons;
+
+        } finally {
+            if (sr != null)
+                sr.close();
+        }
+
+    }
+
+    public static void processTagPair(XMLStreamReader2 sr, StringBuilder sb, TagPairCallback callback) throws XMLStreamException {
+        final String tagName = sr.getLocalName();
+        callback.tagStart(tagName, sr); // let the caller do whatever they need with the tag name and attributes
+        sb.setLength(0); // clear our buffer, preparing to read the characters inside
+        processUntilTrue(sr, sr1 -&gt; {
+            switch (sr1.getEventType()) {
+                case XMLStreamReader2.END_ELEMENT: // ending condition
+                    callback.tagContents(tagName, sb); // let the caller do whatever they need with text contents of the tag
+                    return true;
+                case XMLStreamReader2.CHARACTERS:
+                    sb.append(sr1.getText());
+                    break;
+            }
+            return false;
+        });
+    }
+
+    public static boolean isTagStart(XMLStreamReader2 sr, String tagName) {
+        return XMLStreamReader2.START_ELEMENT == sr.getEventType() &amp;&amp; tagName.equalsIgnoreCase(sr.getLocalName());
+    }
+
+    public static boolean isTagStart(XMLStreamReader2 sr) {
+        return XMLStreamReader2.START_ELEMENT == sr.getEventType();
+    }
+
+    public static boolean isTagEnd(XMLStreamReader2 sr, String tagName) {
+        return XMLStreamReader2.END_ELEMENT == sr.getEventType() &amp;&amp; tagName.equalsIgnoreCase(sr.getLocalName());
+    }
+}
+</code></pre>
+    </div>

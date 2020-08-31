@@ -1,0 +1,183 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>General</h2>
+
+<p>I think the correct translation is <a href="https://dict.leo.org/englisch-deutsch/r%C3%B6mische%20ziffern" rel="nofollow noreferrer">Roman numeral</a>.</p>
+
+<p>As far as I understood, it is not a good functional style to throw exceptions in case of unexpected input because it breaks the purity. An alternative approach is <a href="https://fsharpforfunandprofit.com/posts/recipe-part2/" rel="nofollow noreferrer">Railway oriented programming</a> which makes the code much cleaner and separates the business logic from the exception handling.</p>
+
+<p>Internal stuff (like <code>getValue</code>) could be private.</p>
+
+<h2>Function validate</h2>
+
+<p>The whole validation logic is placed in one function. Splitting the single rules in its own function allows to give each rule a name and it puts things together that belongs together (e.g. <code>exceptions</code> and <code>duplicates</code> are used by one rule only).</p>
+
+<h2>Function fromRoman</h2>
+
+<p>It is not required to handle the case <code>length = 1</code> specially. The recursive <code>converter</code> function can be simplified by using fold (as you did in <code>fromDecimal</code> in the updated version)</p>
+
+<h2>Function fromDecimal</h2>
+
+<p>The function <code>postfixBy</code> is actually not required because string can be concatinated with <code>result + "M"</code>.</p>
+
+<hr>
+
+<p>Below is an alternative implementaion (based on your initial question) where I tried to consider the points above. The API has chnaged to <code>RomanNumeral.fromNumber (int -&gt; Result&lt;RomanNumeral, string&gt;)</code> and <code>RomanNumeral.fromStr (string -&gt; Result&lt;RomanNumeral, string&gt;)</code>. The <code>Result&lt;a', b'&gt;</code> type requires handle the error case (similar to an Option type). If desired, it can be unwrapped with an exception in case of an error using the (external) <code>unwrap</code> function. However, the actual error handling has been moved to the caller who has to handle possible errors befor getting the result.</p>
+
+<pre><code>open System
+
+module RomanNumeral =    
+
+    (* TYPES *)
+
+    type RomanNumeral =
+        { Text:string;
+          Value:int}
+
+    type private ParsingState = 
+        { Sum:int;
+          Prev:int } 
+
+    (* GENERIC HELPER *)
+
+    let private getDuplicates items = 
+        items |&gt; List.groupBy id
+        |&gt; List.filter( fun (_,set) -&gt; set.Length &gt; 1)
+        |&gt; List.map( fun (key,_) -&gt; key )
+
+    let private getNones selector items =
+        items 
+        |&gt; List.map (fun x -&gt; (selector x, x))
+        |&gt; List.filter (fst &gt;&gt; Option.isNone)
+        |&gt; List.map snd
+
+    let private toError msg invalidItems =
+        Error(sprintf "%s: %s" msg (invalidItems |&gt; String.concat "; "))
+
+    (* DOMAIN HELPER *)
+
+    let private getOptionValue = function 
+        | 'I' -&gt; Some(1)
+        | 'V' -&gt; Some(5)
+        | 'X' -&gt; Some(10)
+        | 'L' -&gt; Some(50)
+        | 'C' -&gt; Some(100)
+        | 'D' -&gt; Some(500)
+        | 'M' -&gt; Some(1000)
+        | _ -&gt; None
+
+    let private getValue x =
+        match x |&gt; getOptionValue with
+        | Some(v) -&gt; v
+        | None -&gt; failwith "Invalid character"
+
+    let private parseStr str =        
+        let folder state current =
+            if current &gt; state.Prev
+            then { Sum = state.Sum + current - state.Prev * 2; Prev = current}
+            else { Sum = state.Sum + current; Prev = current}        
+        str 
+            |&gt; Seq.map getValue 
+            |&gt; Seq.fold folder { Sum = 0; Prev = 0; } 
+            |&gt; (fun x -&gt; x.Sum)
+
+    let private parseNumber num =
+        let map = [ (1000, "M"); (900, "CM"); (500, "D"); (400, "CD"); (100, "C"); (90, "XC");
+                    (50, "L");   (40, "XL");  (10, "X");  (9, "IX");   (5, "V");   (4, "IV");  (1, "I") ]
+        let rec converter (result:string) num =             
+            let element = map |&gt; List.tryFind (fun (v, _) -&gt; num &gt;= v)                        
+            match element with
+            | Some (value, romanStr) -&gt; (num - value) |&gt; converter (result + romanStr)
+            | None -&gt; result             
+        num |&gt; converter ""
+
+    (* VALIDATION *)
+
+    let private validateSingeCharacters (roman:string) =
+        let invaliChars = roman |&gt; Seq.toList |&gt; getNones getOptionValue |&gt; List.map string
+        match invaliChars with
+        | _::_ -&gt; invaliChars |&gt; toError "Invalid Characters"
+        | [] -&gt; Ok(roman)
+
+    let private validateNotNullOrEmpty roman =    
+        match (roman |&gt; String.IsNullOrWhiteSpace) with
+            | true -&gt; Error("Input null or empty")
+            | false -&gt; Ok(roman)
+
+    let private validateExceptionalRules (roman:string) =
+        // Ascending order rule: "IVV" means 4 + 5 but should be VIV 5 + 4 (but that will also be caught by noDuplicates (se below))
+        let exceptions = 
+            [ "IIV"; "IIX"; "IL"; "IC"; "ID"; "IM"; "XXL"; "XXC"; "XD"; "XM";
+              "CCD"; "CCM"; "IVV"; "IXX"; "XLL"; "XCC"; "CDD"; "CMM" ]
+
+        let invalidParts = exceptions |&gt; List.filter (fun part -&gt; roman.Contains(part))
+        match invalidParts with
+        | _::_ -&gt; invalidParts |&gt; toError "Invalid Sequences"
+        | [] -&gt; Ok(roman)
+
+    let private validateNoDuplicates roman =
+        let charsThatMustBeUnique = [ "V"; "L"; "D" ]
+        let duplicates = charsThatMustBeUnique |&gt; getDuplicates
+        match duplicates with
+        | _::_ -&gt; duplicates |&gt; toError "Following characters must be unique"
+        | [] -&gt; Ok(roman)
+
+    let private validateStr x =
+            x 
+            |&gt; validateSingeCharacters 
+            |&gt; Result.bind validateNotNullOrEmpty
+            |&gt; Result.bind validateExceptionalRules
+            |&gt; Result.bind validateExceptionalRules
+            |&gt; Result.bind validateNoDuplicates
+
+    let private validateNumberGreaterThanZero number =
+        match number &gt; 0 with
+        | true -&gt; Ok(number)
+        | false -&gt; Error("Number must be greater than 0.")
+
+    let private validateNumber x =
+            x |&gt; validateNumberGreaterThanZero
+
+    (* PUBLIC API *)
+
+    let fromStr str =
+        str 
+        |&gt; validateStr
+        |&gt; Result.map (fun s -&gt; { Text = s; Value = s |&gt; parseStr})
+
+    let fromNumber number =
+        number
+        |&gt; validateNumber
+        |&gt; Result.map  (fun number -&gt; { Text = number |&gt; parseNumber; Value = number})
+
+    let inline private romanOper oper (r1) (r2) = (oper r1.Value r2.Value)
+
+    // Extending with operators
+    type RomanNumeral with 
+        static member inline (+) (r1, r2) = romanOper (+) r1 r2 
+        static member inline (-) (r1, r2) = romanOper (-) r1 r2
+        static member inline (*) (r1, r2) = romanOper (*) r1 r2
+        static member inline (/) (r1, r2) = romanOper (/) r1 r2
+        static member inline (%) (r1, r2) = romanOper (%) r1 r2    
+
+module Test =
+
+    let unwrap x = match x with | Ok(v) -&gt; v | Error(msg) -&gt; failwith(msg)
+
+    // fromNumber / fromStr
+    printfn "Numbers from 1 to 100"
+    for i in 1..100 do
+        let dec = i
+        let roman = i |&gt; RomanNumeral.fromNumber |&gt; unwrap
+        let romanRev = RomanNumeral.fromStr roman.Text |&gt; unwrap
+        printfn "%i: %s -&gt; %i; %s -&gt; %i" dec roman.Text roman.Value romanRev.Text romanRev.Value
+
+    // operator
+    let a = RomanNumeral.fromStr("X") |&gt; unwrap
+    let b = RomanNumeral.fromStr("XI") |&gt; unwrap
+    let c = b - a
+
+    // error input
+    let d = RomanNumeral.fromStr("fdsgfdgas")
+    let e = RomanNumeral.fromNumber(-22)
+</code></pre>
+    </div>

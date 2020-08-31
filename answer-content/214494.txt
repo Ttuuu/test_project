@@ -1,0 +1,159 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Notes:</p>
+
+<ul>
+<li>Quote your variables. Ref <a href="https://unix.stackexchange.com/questions/171346/security-implications-of-forgetting-to-quote-a-variable-in-bash-posix-shells">Security implications of forgetting to quote a variable in bash/POSIX shells</a></li>
+<li>Don't use ALLCAPS varnames. It's too easy to overwrite important shell variables like PATH.</li>
+<li><code>A2ENSITE=$A2A2ENSITE$HOST".conf"</code> -- I don't see the <code>A2A2ENSITE</code> variable anywhere
+
+<ul>
+<li>this is a perhaps a corollary of the ALLCAPS vars problem: they can be hard to read.</li>
+</ul></li>
+<li>For <a href="https://www.gnu.org/software/bash/manual/bash.html#Command-Substitution" rel="nofollow noreferrer">Command Substitution</a>, don't use backticks, use <code>$( ... )</code>. That syntax is (IMO) easier to read, and there are other advantages, such as nestability.</li>
+<li><p><code>if ((`which zenity|wc -w` == 0))</code> -- use the bash builtin <code>type</code> command to see if there is a zenity command available: <code>type -p zenity</code> will return an unsuccessful exit status if there's no zenity in your path:</p>
+
+<pre><code>if ! type -p zenity &gt;/dev/null
+</code></pre>
+
+<p>Although I don't really see the need for zenity. It would be super frustrating for the user who doesn't have it, being prevented from using your script. And the technical user who would be comfortable installing it is the type of user who doesn't need the bells and whistles, IMO.</p></li>
+<li><p>To check if a string is empty, you don't need to call out to wc.</p>
+
+<p>Not this:</p>
+
+<pre><code>TEXT=`zenity --text-info --filename=$TMPHOST$HOST --editable`
+words=$( wc -w &lt;&lt;&lt;"$TEXT" )
+if (($words == 0))
+</code></pre>
+
+<p>but this:</p>
+
+<pre><code>text=$(zenity --text-info --filename="$filename" --editable)
+if [ -z "$text" ]       # cancel if empty
+</code></pre></li>
+<li><p>use <code>mktemp</code> for temp files</p>
+
+<pre><code>tmphost=$(mktemp)
+</code></pre>
+
+<p>And just use <code>"$tmphost"</code> instead of <code>$TMPHOST$HOST</code></p></li>
+<li><p>you can tell bash to automatically delete the temp file when it exits:</p>
+
+<pre><code>trap "rm $tmphost" EXIT
+</code></pre></li>
+<li><p>validate user input for host: a <code>case</code> statement might make sense here:</p>
+
+<pre><code>host=$(zenity --forms --add-entry=Name --text='Create virtualhost (= Folder name,case sensitive)')
+case "$host" in
+    "")            zenity --error --text="Bad input: empty";      exit 1 ;;
+    *"*"*)         zenity --error --text="Bad input: wildcard";   exit 1 ;;
+    *[[:space:]]*) zenity --error --text="Bad input: whitespace"; exit 1 ;;
+esac
+</code></pre></li>
+<li><p>I applaud your use of here-documents</p></li>
+<li>use <code>if [ "$(id -un)" = "root" ]</code> instead of the <code>USER</code> variable.</li>
+<li><code>mkdir -p</code> silently does nothing if the directory already exists, so you don't need to test <code>-d</code></li>
+</ul>
+
+<p>Perhaps you want this:</p>
+
+<pre><code>#!/bin/bash
+
+webroot="/home/leonid/Web/" # root folder where subfolders for virtualhosts created
+apachehost="/etc/apache2/sites-available/050-" # prefix for virtualhost config file
+a2ensite="050-"             # short prefix for virtualhost config file
+tmphost=$(mktemp)
+trap "rm $tmphost" EXIT
+
+if [ "$USER" == "root" ]
+then
+    echo "You should not run this script as root but as user going to edit web files." &gt;&amp;2
+    exit 1
+fi
+
+read -p"Create virtualhost (= Folder name,case sensitive)" -r host
+case "$host" in
+    "")            echo "Bad input: empty" &gt;&amp;2;      exit 1 ;;
+    *"*"*)         echo "Bad input: wildcard" &gt;&amp;2;   exit 1 ;;
+    *[[:space:]]*) echo "Bad input: whitespace" &gt;&amp;2; exit 1 ;;
+esac
+
+# braces only for readability
+hostfile="${apachehost}${host}.conf"    # apache virtualhost config file
+dir="${webroot}${host}"                 # folder used as document root for virtualhost
+
+# virtualhost template 
+cat &gt;"$tmphost" &lt;&lt;EOF
+&lt;VirtualHost *:80&gt;
+    ServerAdmin webmaster@localhost
+    DocumentRoot $dir
+    ServerName  $host.localhost
+    ServerAlias $host.localhost
+    &lt;Directory "$dir"&gt;
+        AllowOverride All
+        Require local
+    &lt;/Directory&gt;
+    # Available loglevels: trace8, ..., trace1, debug, info, notice, warn,
+    # error, crit, alert, emerg.
+    LogLevel warn
+&lt;/VirtualHost&gt;
+# vim: syntax=apache ts=4 sw=4 sts=4 sr noet
+EOF
+
+# edit virtualhost config
+editor=${VISUAL:-$EDITOR}
+if [ -z "$editor" ]
+then
+    echo "edit '$tmphost' to your liking, then hit Enter"
+    read -p "I'll wait ... "
+else
+    "$editor" "$tmphost"
+fi
+# probably want some validating here that the user has not broken the config
+
+echo "execute root tools with pkexec to create virtualhost"
+mkdir -p "$dir"
+
+pkexec /bin/bash &lt;&lt;EOF
+chgrp www-data "$dir"
+chmod u=rwX,g=rX,o= "$dir"
+mv "$tmphost" "$hostfile"
+chown root:root "$hostfile"
+chmod u=rw,g=r,o=r "$hostfile"
+a2ensite "${a2ensite}${host}.conf"
+EOF
+</code></pre>
+
+<hr>
+
+<p>Responding to your questions:</p>
+
+<ol>
+<li><p>"determine if running in a terminal?" Yes with this obscure test:</p>
+
+<pre><code>if [ -t 0 ]; then echo "in a terminal"; fi
+</code></pre>
+
+<p>That tests file descriptor 0, which is stdin. If you're launching your script as a GUI, that test <em>should</em> be false.</p></li>
+<li><p><code>editor=${VISUAL:-$EDITOR}</code> sets the <code>editor</code> variable to the user's <code>$VISUAL</code> variable, or if that's not set, to the <code>$EDITOR</code> variable. Many programs use this to determine the user's preferred "terminal" editor. vim and emacs are two common values there. If neither of those are set, then the user gets to go edit that however he chooses.</p></li>
+<li><p>"is <code>read</code> terminal only?" Yes</p></li>
+</ol>
+
+<p>If you're going to aim for GUI and text versions, I'd use one script, but make sure all the common code is put into functions so you don't have to duplicate your code. For example:</p>
+
+<pre><code>get_virtual_host() {
+    if [ -t 0 ]; then
+        read -p "Create virtualhost (= Folder name,case sensitive)" -r host
+    else
+        host=$(zenity --forms --add-entry=Name --text='Create virtualhost (= Folder name,case sensitive)')
+    fi
+    case "$host" in
+        "")            echo "Bad input: empty" &gt;&amp;2;      exit 1 ;;
+        *"*"*)         echo "Bad input: wildcard" &gt;&amp;2;   exit 1 ;;
+        *[[:space:]]*) echo "Bad input: whitespace" &gt;&amp;2; exit 1 ;;
+    esac
+    echo "$host"
+}
+
+host=$(get_virtual_host)
+</code></pre>
+    </div>

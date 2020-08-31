@@ -1,0 +1,725 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First of all, thanks for sharing the code. </p>
+
+<p>This is the most comprehensible example of an Aho Corasick matcher I have found and I've seen a few. I also find your code pretty elegant and concise. Congratulations on that. Good work!</p>
+
+<p>As always, I think there is room for improvement. Naming variables with i,j in a nested loop is a bit tough for example, as i and j almost look the same. I like to give it longer, comprehensible names like "textIndex" or "patternIndex" or "node). This also makes wrong things look wrong. As an example "patterns[textIndex]" would stand out as wrong while "patterns[x]" would not look suspicious, if it should have been "patterns[j]".</p>
+
+<p>I found something that I thought looked like a bug in the Utils.randomCharacter method, where randomCharacter('a','b',random) would just emit 'a' - this is consistent with String#substring(..) methods and array indexes in general, but in this case I had expected that randomCharacter('a','b', random) would emit any character from 'a' to 'b' inclusive, like you would have it in a regular expression like "[a-b]+". This is clearly a matter of taste. </p>
+
+<p>I was looking for a Aho-Corasick implementation for a private project and since I found yours to be best comprehensible, I've adapted your code for my needs: For example I needed to match byte arrays instead of Strings, so I changed it to byte[] matching (still allows matching Strings by using String#getBytes(charset))", I've added searching in a specified sub-range of the input text, I've removed some autoboxing of Integers and since there are only 256 bytes, I've made the tree node children an array of 256 nodes which removes hashing at the cost of some memory - both did not have any noticeable effect on the speed (processors are just so good), so I might reverse the latter. I changed the code from returning a List of Matches to calling a consumer with a match, this way the user can chose whether to put the matches into a Set, a List, a Map or process them in a streaming fashion (like just counting them, not keeping all results in memory). I've replaced the Pattern index with a reference to the pattern itself and I've changed the Match a bit, so one can easily see the start and end index in the text. I also added a "RunStopExeption" that is silently caught. 
+The Performance demo I've removed and added some tests to the test suite that give hints about the performance characteristics. I'm running the code on a machine with 64GB RAM, you might want to turn down the sizes of the test sets a bit (actually I have not checked how much memory they need, but just in case you wonder).</p>
+
+<p>Here's the result:</p>
+
+<pre><code>package net.coderodde.patternmatching;
+
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.function.Consumer;
+
+/**
+ * This interface defines the API for multiple exact string matching algorithms.
+ *
+ * @author Rodion "rodde" Efremov
+ * @version 1.6 (Jan 2, 2016)
+ * @author Wanja Gayk (byte[] instead of String)
+ * @version 2.0 (Oct 10, 2016)
+ */
+public abstract class AbstractMultipleExactStringMatcher {
+
+    public static class RunStopException extends RuntimeException {
+        // blank
+    }
+
+    public final void match(final byte[] text, final Consumer&lt;MatchingResult&gt; target, final byte[]... patterns) {
+        match(text, 0, text.length, target, patterns);
+    }
+
+    public abstract void match(byte[] text, int start, int end, final Consumer&lt;MatchingResult&gt; target, byte[]... patterns);
+
+    protected byte[][] uniquePatterns(final byte[][] patterns) {
+        final Set&lt;byte[]&gt; filter = new HashSet&lt;&gt;(Arrays.asList(patterns));
+        return filter.toArray(new byte[filter.size()][0]);
+    }
+
+    /**
+     * This class represents a match.
+     */
+    public static final class MatchingResult {
+
+        public final int startIndex;
+
+        public final int endIndex;
+
+        public final int matchLength;
+
+        public final byte[] pattern;
+
+        public MatchingResult(final int endIndex, final byte[] pattern) {
+            startIndex = endIndex - pattern.length;
+            this.endIndex = endIndex;
+            matchLength = pattern.length;
+            this.pattern = pattern;
+        }
+
+        @Override
+        public int hashCode() {
+            final int prime = 31;
+            int result = 1;
+            result = prime * result + Arrays.hashCode(pattern);
+            result = prime * result + startIndex;
+            return result;
+        }
+
+        @Override
+        public boolean equals(final Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (obj == null) {
+                return false;
+            }
+            if (getClass() != obj.getClass()) {
+                return false;
+            }
+            final MatchingResult other = (MatchingResult) obj;
+            if (!Arrays.equals(pattern, other.pattern)) {
+                return false;
+            }
+            if (startIndex != other.startIndex) {
+                return false;
+            }
+            return true;
+        }
+
+        @Override
+        public String toString() {
+            return "MatchingResult [startIndex=" + startIndex + ", endIndex=" + endIndex + ", pattern=" + new String(pattern) + "]";
+        }
+
+    }
+}
+</code></pre>
+
+<p>.</p>
+
+<pre><code>package net.coderodde.patternmatching;
+
+import java.util.ArrayDeque;
+import java.util.Arrays;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.function.Consumer;
+
+/**
+ * This class implements Aho-Corasick algorithm for multiple exact string matching problem.
+ *
+ * @author Rodion "rodde" Efremov
+ * @version 1.6 (Jan 2, 2016)
+ * @author Wanja Gayk (byte[] instead of String + micro-optimizations)
+ * @version 2.0 (Oct 10, 2016)
+ */
+public class AhoCorasickMatcher extends AbstractMultipleExactStringMatcher {
+
+    @Override
+    public void match(final byte[] text, final int start, final int end, final Consumer&lt;MatchingResult&gt; target, byte[]... patterns) {
+        try {
+            if (patterns.length &gt; 0) {
+                patterns = uniquePatterns(patterns);
+                final Automaton automaton = constructACAutomaton(patterns);
+                TrieNode state = automaton.root;
+                for (int textIndex = start; textIndex &lt; end; ++textIndex) {
+                    // traverse back towards root node, break if we pick up a possible match begin:
+                    while (state.getChild(text[textIndex]) == null) {
+                        state = automaton.fail.get(state);
+                    }
+
+                    state = state.getChild(text[textIndex]);
+                    for (final int patternIndex : automaton.patterns.get(state)) {
+                        target.accept(new MatchingResult(textIndex + 1, patterns[patternIndex]));
+                    }
+                }
+            }
+        } catch (final RunStopException e) {
+            // deliberately left blank
+        }
+    }
+
+    private static final class TrieNode {
+
+        private final TrieNode[] children = new TrieNode[0x100];
+
+        void setChild(final byte character, final TrieNode child) {
+            children[Byte.toUnsignedInt(character)] = child;
+        }
+
+        TrieNode getChild(final byte character) {
+            return children[Byte.toUnsignedInt(character)];
+        }
+    }
+
+    private Automaton constructACAutomaton(final byte[]... patterns) {
+        final Automaton ret = new Automaton();
+        constructTrie(ret, patterns);
+        computeFailureFunction(ret);
+        return ret;
+    }
+
+    private void constructTrie(final Automaton automaton, final byte[]... patterns) {
+        final TrieNode root = new TrieNode();
+        final int k = patterns.length;
+
+        for (int patternIndex = 0; patternIndex &lt; k; ++patternIndex) {
+            TrieNode node = root;
+            int charIndex = 0;
+            final int patternLength = patterns[patternIndex].length;
+
+            while (charIndex &lt; patternLength &amp;&amp; node.getChild(patterns[patternIndex][charIndex]) != null) {
+                node = node.getChild(patterns[patternIndex][charIndex]);
+                ++charIndex;
+            }
+
+            while (charIndex &lt; patternLength) {
+                final TrieNode u = new TrieNode();
+                node.setChild(patterns[patternIndex][charIndex], u);
+                node = u;
+                ++charIndex;
+            }
+
+            automaton.patterns.put(node, new int[] { patternIndex });
+        }
+
+        automaton.patterns.put(root, new int[0]);
+        automaton.root = root;
+    }
+
+    private void computeFailureFunction(final Automaton automaton) {
+        final TrieNode fallbackNode = new TrieNode();
+
+        for (int c = 0; c &lt; 0x100; ++c) {
+            final byte b = toUnsignedByte(c);
+            fallbackNode.setChild(b, automaton.root);
+        }
+
+        automaton.fail.put(automaton.root, fallbackNode);
+        final Deque&lt;TrieNode&gt; queue = new ArrayDeque&lt;&gt;();
+        queue.addLast(automaton.root);
+
+        while (!queue.isEmpty()) {
+            final TrieNode head = queue.removeFirst();
+
+            for (int c = 0; c &lt; 0x100; ++c) {
+                final byte character = toUnsignedByte(c);
+
+                if (head.getChild(character) != null) {
+
+                    final TrieNode child = head.getChild(character);
+                    TrieNode w = automaton.fail.get(head);
+
+                    while (w.getChild(character) == null) {
+                        w = automaton.fail.get(w);
+                    }
+
+                    automaton.fail.put(child, w.getChild(character));
+
+                    final int[] failTargets = automaton.patterns.get(automaton.fail.get(child));
+
+                    final int[] existingList = automaton.patterns.get(child);
+                    if (existingList == null) {
+                        automaton.patterns.put(child, failTargets);
+                    } else {
+                        final int[] extendedList = Arrays.copyOf(existingList, existingList.length + failTargets.length);
+                        System.arraycopy(failTargets, 0, extendedList, existingList.length, failTargets.length);
+                        automaton.patterns.put(child, extendedList);
+                    }
+                    queue.addLast(child);
+                }
+            }
+        }
+
+        automaton.patterns.put(automaton.root, new int[0]);
+    }
+
+    private static byte toUnsignedByte(final int value) {
+        return (byte) (0xFF &amp; value);
+    }
+
+    private static final class Automaton {
+        TrieNode root;
+        Map&lt;TrieNode, TrieNode&gt; fail = new HashMap&lt;&gt;();
+        Map&lt;TrieNode, int[]&gt; patterns = new HashMap&lt;&gt;();
+    }
+}
+</code></pre>
+
+<p>.</p>
+
+<pre><code>package net.coderodde.patternmatching;
+
+import java.util.function.Consumer;
+
+/**
+ * This class implements a brute force algorithm for solving multiple exact string matching problem.
+ *
+ * @author Rodion "rodde" Efremov
+ * @version 1.6 (Jan 2, 2016)
+ * @author Wanja Gayk (byte[] instead of String)
+ * @version 2.0 (Oct 10, 2016)
+ */
+public class BruteForceMatcher extends AbstractMultipleExactStringMatcher {
+
+    @Override
+    public void match(final byte[] text, final int start, final int end, final Consumer&lt;MatchingResult&gt; target, byte[]... patterns) {
+        patterns = uniquePatterns(patterns);
+        try {
+            for (int textIndex = start; textIndex &lt; end; ++textIndex) {
+                for (int patternIndex = 0; patternIndex &lt; patterns.length; ++patternIndex) {
+                    tryMatch(text, patterns[patternIndex], textIndex, patternIndex, target);
+                }
+            }
+        } catch (final RunStopException e) {
+            // deliberately left blank
+        }
+    }
+
+    private void tryMatch(final byte[] text, final byte[] pattern, final int endIndex, final int patternIndex, final Consumer&lt;MatchingResult&gt; target) {
+        final int patternLength = pattern.length;
+
+        if (patternLength &lt;= endIndex + 1) {
+
+            int textCursor = endIndex;
+            int patternCursor = patternLength - 1;
+
+            while (patternCursor &gt;= 0) {
+                if (text[textCursor] != pattern[patternCursor]) {
+                    return;
+                }
+
+                --textCursor;
+                --patternCursor;
+            }
+
+            target.accept(new MatchingResult(endIndex + 1, pattern));
+        }
+    }
+}
+</code></pre>
+
+<p>.</p>
+
+<pre><code>package net.coderodde.patternmatching;
+
+import static java.util.Arrays.copyOfRange;
+
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.Random;
+import java.util.Set;
+import java.util.TreeSet;
+
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.Test;
+
+import net.coderodde.patternmatching.AbstractMultipleExactStringMatcher.MatchingResult;
+
+public class MultipleExactStringMatcherTest {
+
+    private AbstractMultipleExactStringMatcher bruteForceMatcher;
+    private AbstractMultipleExactStringMatcher ahoCorasickMatcher;
+    private Set&lt;MatchingResult&gt; bruteForceSet;
+    private Set&lt;MatchingResult&gt; ahoCorasickSet;
+
+    @Before
+    public void setup() {
+        bruteForceMatcher = new BruteForceMatcher();
+        ahoCorasickMatcher = new AhoCorasickMatcher();
+        bruteForceSet = new HashSet&lt;&gt;();
+        ahoCorasickSet = new HashSet&lt;&gt;();
+    }
+
+    @Test
+    public void testText() {
+        printTestName();
+
+        final byte[] text = "der whiskymixer mixt whisky im whiskymixer".getBytes();
+        final byte[][] patterns = { "der".getBytes(), "whisky".getBytes(), "mixer".getBytes(), "whiskymixer".getBytes() };
+
+        matchAndPrintResult(text, patterns);
+    }
+
+    @Test
+    public void testOverlapping() {
+
+        final byte[] text = "aaaaa".getBytes();
+        final byte[][] patterns = { "a".getBytes(), "aa".getBytes(), "aaaa".getBytes() };
+
+        matchAndPrintResult(text, patterns);
+    }
+
+    @Test
+    public void testRepetitivePattern() {
+        printTestName();
+
+        final byte[] text = "abc abc abc abcd abc abcd".getBytes();
+        final byte[][] patterns = { "abc".getBytes(), "abc ".getBytes(), "abcd".getBytes(), " abc abc".getBytes() };
+
+        matchAndPrintResult(text, patterns);
+
+        Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(0 + patterns[0].length, patterns[0])));
+        Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(4 + patterns[0].length, patterns[0])));
+        Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(8 + patterns[0].length, patterns[0])));
+        Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(12 + patterns[0].length, patterns[0])));
+        Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(17 + patterns[0].length, patterns[0])));
+        Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(21 + patterns[0].length, patterns[0])));
+
+        Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(0 + patterns[1].length, patterns[1])));
+        Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(4 + patterns[1].length, patterns[1])));
+        Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(8 + patterns[1].length, patterns[1])));
+        Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(17 + patterns[1].length, patterns[1])));
+
+        Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(12 + patterns[2].length, patterns[2])));
+        Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(21 + patterns[2].length, patterns[2])));
+
+        Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(3 + patterns[3].length, patterns[3])));
+        Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(7 + patterns[3].length, patterns[3])));
+        Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(16 + patterns[3].length, patterns[3])));
+    }
+
+    @Test
+    public void testRepetitivePattern2() {
+        printTestName();
+
+        final byte[] text = " so long, so long\n [female chorus] # So long, so long\n so long and thanks for all the fish".getBytes();
+        final byte[][] patterns = { //
+                " so ".getBytes(), //
+                " so l".getBytes(), //
+                " so lo".getBytes(), //
+                " so long".getBytes(), //
+                " so long,".getBytes(), //
+                " so long, ".getBytes(), //
+                " so long, s".getBytes(), //
+                " so long, so".getBytes(), //
+                " so long, so ".getBytes(), //
+                " so long, so l".getBytes(), //
+                " so long, so lo".getBytes(), //
+                " so long, so lon".getBytes(), //
+                " so long, so long".getBytes(), //
+        };
+
+        matchAndPrintResult(text, patterns);
+
+        for (int i = 0; i &lt; 4; ++i) {
+            Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(0 + patterns[i].length, patterns[i])));
+            Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(9 + patterns[i].length, patterns[i])));
+            Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(45 + patterns[i].length, patterns[i])));
+            Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(54 + patterns[i].length, patterns[i])));
+        }
+        for (int i = 5; i &lt; patterns.length; ++i) {
+            Assert.assertTrue(ahoCorasickSet.contains(new MatchingResult(0 + patterns[i].length, patterns[i])));
+        }
+    }
+
+    @Test
+    public void testRandom() {
+        printTestName();
+
+        final Random random = new Random(123);
+        for (int t = 0; t &lt; 200; ++t) {
+
+            final byte[] text = Utils.getText(200, 'a', 'c', random).getBytes();
+            final byte[][] patterns = new byte[10][];
+            for (int p = 0; p &lt; patterns.length; ++p) {
+                final byte[] pattern = Utils.getText(5, 'a', 'c', random).getBytes();
+                patterns[p] = pattern;
+            }
+
+            bruteForceSet.clear();
+            ahoCorasickSet.clear();
+
+            bruteForceMatcher.match(text, bruteForceSet::add, patterns);
+            ahoCorasickMatcher.match(text, ahoCorasickSet::add, patterns);
+
+            if (!bruteForceSet.equals(ahoCorasickSet)) {
+                System.out.println(new String(text));
+                System.out.println(bruteForceSet);
+                System.out.println(ahoCorasickSet);
+            }
+            Assert.assertEquals(bruteForceSet, ahoCorasickSet);
+            if (bruteForceSet.isEmpty()) {
+                --t;
+            }
+        }
+    }
+
+    @Test
+    public void testWholeByteRange() {
+        printTestName();
+
+        final byte[] text = new byte[0x100];
+        for (int b = 0; b &lt; text.length; ++b) {
+            text[b] = toUnsignedByte(b);
+        }
+        final byte[][] patterns = new byte[0x100 / 4][];
+        for (int p = 0; p &lt; patterns.length; ++p) {
+            final int start = p * 4;
+            final int end = start + 4;
+            final byte[] pattern = Arrays.copyOfRange(text, start, end);
+            patterns[p] = pattern;
+        }
+
+        matchAndPrintResult(text, patterns);
+    }
+
+    @Test
+    public void testBigPatternSize() {
+        printTestName();
+
+        final Random random = new Random(123);
+        final int textSize = 1 &lt;&lt; 21;
+        System.out.println("preparing text, size " + textSize);
+        final byte[] text = Utils.getText(textSize, 'a', 'c', random).getBytes();
+
+        final byte[][] patterns = new byte[][] { //
+                text, //
+                Arrays.copyOfRange(text, 0, text.length / 2), //
+                Arrays.copyOfRange(text, text.length / 2, text.length), //
+                Arrays.copyOfRange(text, 0, text.length / 8), //
+        };
+        for (final byte[] pattern : patterns) {
+            System.out.println("pattern size: " + pattern.length);
+        }
+
+        matchAndPrintResult(text, patterns);
+    }
+
+    @Test
+    public void testSmallPatternInBigText() {
+        printTestName();
+
+        final Random random = new Random(123);
+        final int textSize = 1 &lt;&lt; 30;
+        System.out.println("preparing text, size " + textSize);
+        final byte[] text = Utils.getText(textSize, 'a', 'c', random).getBytes();
+
+        final byte[][] patterns = new byte[][] { //
+                Arrays.copyOfRange(text, 0, 4), //
+                Arrays.copyOfRange(text, 100, 116), //
+                Arrays.copyOfRange(text, 1000, 1008), //
+        };
+        for (final byte[] pattern : patterns) {
+            System.out.println("pattern size: " + pattern.length);
+        }
+
+        matchAndPrintResult(text, patterns);
+    }
+
+    @Test
+    public void testHugeNumberOfSmallPatterns() {
+        printTestName();
+
+        final Random random = new Random(123);
+        final int textSize = 1 &lt;&lt; 19;
+        System.out.println("preparing text, size " + textSize);
+        final byte[] text = Utils.getText(textSize, 'a', 'c', random).getBytes();
+
+        final int chunkSize = 16;
+        final byte[][] patterns = new byte[text.length / chunkSize / 10][];
+        System.out.println("preparing patterns, amount:" + patterns.length);
+        for (int p = 0; p &lt; patterns.length; ++p) {
+            final int start = p * chunkSize;
+            final int end = start + chunkSize;
+            final byte[] pattern = Arrays.copyOfRange(text, start, end);
+            patterns[p] = pattern;
+        }
+
+        matchAndPrintResult(text, patterns);
+    }
+
+    @Test
+    public void testWorstCaseTextAndSmallSinglePattern() {
+        printTestName();
+
+        final Random random = new Random(123);
+        final int textSize = 1 &lt;&lt; 22;
+        System.out.println("preparing text, size " + textSize);
+        final byte[] text = Utils.getText(textSize, 'a', 'a', random).getBytes();
+
+        final byte[][] patterns = new byte[][] { Arrays.copyOfRange(text, 0, 10), };
+        matchAndPrintResult(text, patterns);
+    }
+
+    @Test
+    public void testWorstCaseTextAndBigSinglePattern() {
+        printTestName();
+
+        final Random random = new Random(123);
+        final int textSize = 1 &lt;&lt; 20;
+        System.out.println("preparing text, size " + textSize);
+        final byte[] text = Utils.getText(textSize, 'a', 'a', random).getBytes();
+
+        final byte[][] patterns = new byte[][] { Arrays.copyOfRange(text, 0, 1000), };
+        matchAndPrintResult(text, patterns);
+    }
+
+    @Test
+    public void testWorstCaseTextAndSomeSmallPatterns() {
+        printTestName();
+
+        final Random random = new Random(123);
+        final int textSize = 1 &lt;&lt; 18;
+        System.out.println("preparing text, size " + textSize);
+        final byte[] text = Utils.getText(textSize, 'a', 'a', random).getBytes();
+
+        final byte[][] patterns = new byte[100][];
+        System.out.println("preparing patterns, amount:" + patterns.length);
+        for (int p = 0; p &lt; patterns.length; ++p) {
+            final byte[] pattern = Arrays.copyOfRange(text, 0, p + 1);
+            patterns[p] = pattern;
+        }
+        matchAndPrintResult(text, patterns);
+    }
+
+    @Test
+    public void testWorstCaseTextAndSomeBigPatterns() {
+        printTestName();
+
+        final Random random = new Random(123);
+        final int textSize = 1 &lt;&lt; 14;
+        System.out.println("preparing text, size " + textSize);
+        final byte[] text = Utils.getText(textSize, 'a', 'a', random).getBytes();
+
+        final byte[][] patterns = new byte[100][];
+        System.out.println("preparing patterns, amount:" + patterns.length);
+        for (int p = 0; p &lt; patterns.length; ++p) {
+            final byte[] pattern = Arrays.copyOfRange(text, 0, (p + 1) * 100);
+            patterns[p] = pattern;
+        }
+        matchAndPrintResult(text, patterns);
+    }
+
+    @Test
+    public void testPerfDemoOrginal() {
+        printTestName();
+
+        final long seed = System.nanoTime();
+        final Random random = new Random(seed);
+        final byte[] text = Utils.getText(500_000, 'a', 'a', random).getBytes();
+
+        System.out.println("Seed = " + seed);
+
+        final byte[][] patterns = new byte[][] { copyOfRange(text, 1000, 1220), copyOfRange(text, 2000, 2225), copyOfRange(text, 2005, 2225),
+                copyOfRange(text, 20000, 22025), copyOfRange(text, 22000, 22025), copyOfRange(text, 22060, 22100), };
+
+        matchAndPrintResult(text, patterns);
+    }
+
+    @Test
+    public void testPerfDemoOrginalAsIntended() {
+        printTestName();
+
+        final long seed = System.nanoTime();
+        final Random random = new Random(seed);
+        final byte[] text = Utils.getText(500_000, 'a', 'b', random).getBytes();
+
+        System.out.println("Seed = " + seed);
+
+        final byte[][] patterns = new byte[][] { copyOfRange(text, 1000, 1220), copyOfRange(text, 2000, 2225), copyOfRange(text, 2005, 2225),
+                copyOfRange(text, 20000, 22025), copyOfRange(text, 22000, 22025), copyOfRange(text, 22060, 22100), };
+
+        matchAndPrintResult(text, patterns);
+    }
+
+    @Test
+    public void testPerfDemoOrginalWiderNumberOfcharacters() {
+        printTestName();
+
+        final long seed = System.nanoTime();
+        final Random random = new Random(seed);
+        final byte[] text = Utils.getText(500_000, 'a', 'z', random).getBytes();
+
+        System.out.println("Seed = " + seed);
+
+        final byte[][] patterns = new byte[][] { copyOfRange(text, 1000, 1220), copyOfRange(text, 2000, 2225), copyOfRange(text, 2005, 2225),
+                copyOfRange(text, 20000, 22025), copyOfRange(text, 22000, 22025), copyOfRange(text, 22060, 22100), };
+
+        matchAndPrintResult(text, patterns);
+    }
+
+    private void matchAndPrintResult(final byte[] text, final byte[][] patterns) {
+        System.out.println("brute force matching");
+        final long startB = System.currentTimeMillis();
+        bruteForceMatcher.match(text, bruteForceSet::add, patterns);
+        final long endB = System.currentTimeMillis();
+        System.out.println(endB - startB + "ms");
+
+        System.out.println("aho corasick matching");
+        final long startC = System.currentTimeMillis();
+        ahoCorasickMatcher.match(text, ahoCorasickSet::add, patterns);
+        final long endC = System.currentTimeMillis();
+        System.out.println(endC - startC + "ms");
+
+        if (!bruteForceSet.equals(ahoCorasickSet)) {
+            System.out.println(new String(text));
+
+            final Comparator&lt;MatchingResult&gt; matchingResultComparator = Comparator.&lt;MatchingResult&gt; comparingInt(m -&gt; m.startIndex)
+                    .thenComparingInt(m -&gt; m.endIndex);
+            final Set&lt;MatchingResult&gt; bruteForceSetSorted = new TreeSet&lt;&gt;(matchingResultComparator);
+            final Set&lt;MatchingResult&gt; ahoCorasickSetSorted = new TreeSet&lt;&gt;(matchingResultComparator);
+            bruteForceSetSorted.addAll(bruteForceSet);
+            ahoCorasickSetSorted.addAll(ahoCorasickSet);
+
+            System.out.println(bruteForceSetSorted);
+            System.out.println(ahoCorasickSetSorted);
+        }
+        Assert.assertEquals(bruteForceSet, ahoCorasickSet);
+    }
+
+    void printTestName() {
+        System.out.println("----");
+        System.out.println(Thread.currentThread().getStackTrace()[2].getMethodName());
+    }
+
+    private static byte toUnsignedByte(final int value) {
+        return (byte) (0xFF &amp; value);
+    }
+
+}
+</code></pre>
+
+<p>.</p>
+
+<pre><code>package net.coderodde.patternmatching;
+
+import java.util.Random;
+
+/**
+ * This class provides some miscellaneous utilities.
+ *
+ * @author Rodion "rodde" Efremov
+ * @version 1.6 (Jan 2, 2016)
+ * @author Wanja Gayk (bugfix)
+ * @version 2.0 (Oct 10, 2016)
+ */
+public class Utils {
+
+    public static String getText(final int size, final char a, final char b, final Random random) {
+        final StringBuilder sb = new StringBuilder(size);
+
+        for (int i = 0; i &lt; size; ++i) {
+            sb.append(randomCharacter(a, b, random));
+        }
+
+        return sb.toString();
+    }
+
+    private static char randomCharacter(final char a, final char b, final Random random) {
+        return (char) (a + (random.nextInt((b + 1) - a)));
+    }
+}
+</code></pre>
+    </div>

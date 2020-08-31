@@ -1,0 +1,125 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>There are two main problems with your code.</p>
+
+<ol>
+<li>Repeated Lookups</li>
+<li>Unnecessary Calculations</li>
+</ol>
+
+<h2>Repeated Lookups</h2>
+
+<p>With a 100,000 x 100,000 chess board, when you begin moving in a particular direction, you lookup <code>direction_vectors[i][0]</code> and <code>direction_vectors[i][1]</code> and add those values to <code>r_q_temp</code> and <code>c_q_temp</code>.  And on the next move you look up those values again.  And on the move after that, you look up those values again.</p>
+
+<p>To be clear, each time you look up those values, the Python interpreter must:</p>
+
+<ul>
+<li>Look up <code>direction_vectors</code> in the local symbol table for <code>queensAttack</code>,</li>
+<li>Look up <code>i</code> in the local symbol table for <code>queensAttack</code>,</li>
+<li>Index to the <code>[i]</code> entry,</li>
+<li>Index to the <code>[0]</code> entry of that,</li>
+<li>Look up <code>direction_vectors</code> in the local symbol table for <code>queensAttack</code>, again,</li>
+<li>Look up <code>i</code> in the local symbol table for <code>queensAttack</code>, again,</li>
+<li>Index to the <code>[i]</code> entry, again,</li>
+<li>Index to the <code>[1]</code> entry of that.</li>
+</ul>
+
+<p>So all that happens on up to 100,000 iterations in each given direction!  That is a lot of indexing &amp; lookups.  They are each very fast, but a hundred thousand iterations of very fast starts becoming slow.</p>
+
+<p>First, let's speed that up.</p>
+
+<p>Instead of indexing over the (hard coded) 8 direction indices, let's loop directly over the <code>direction_vectors</code>:</p>
+
+<pre><code>for direction in direction_vectors:
+    r_q_temp, c_q_temp = r_q, c_q
+    while True:
+        r_q_temp += direction[0]
+        c_q_temp += direction[1]
+        ...
+</code></pre>
+
+<p>Two wins!  First, we've eliminated that ugly hard-coded <code>8</code>.  If you repeat the same challenge with bishops or rooks, you don't have to remember that the number of direction vectors has changed.  Second, we're no longer doing the <code>[i]</code> indexing operation twice per loop.  Should be faster, since on each iteration we now only:</p>
+
+<ul>
+<li>Look up <code>direction</code> in the local symbol table for <code>queensAttack</code>,</li>
+<li>Index to the <code>[0]</code> entry of that,</li>
+<li>Look up <code>direction</code> in the local symbol table for <code>queensAttack</code>, again,</li>
+<li>Index to the <code>[1]</code> entry of that.</li>
+</ul>
+
+<p>But why stop there?  Let's get rid of the <code>[0]</code> and <code>[1]</code> indexing operations as well:</p>
+
+<pre><code>for dr, dc in direction_vectors:
+    r_q_temp, c_q_temp = r_q, c_q
+    while True:
+        r_q_temp += dr
+        c_q_temp += dc
+        ...
+</code></pre>
+
+<p>Now, when we loop over the <code>direction_vectors</code> elements, we unpack the tuples directly into two local variables.  Again, should be faster, since on each iteration we now only:</p>
+
+<ul>
+<li>Look up <code>dr</code> in the local symbol table for <code>queensAttack</code>,</li>
+<li>Look up <code>dc</code> in the local symbol table for <code>queensAttack</code></li>
+</ul>
+
+<p>So, how did u/Alviy's code avoid this?</p>
+
+<pre><code>    ..., (lambda r: r + dr[i]), (lambda c: c + dc[i]), ...
+</code></pre>
+
+<p>They are indexing <code>dr[i]</code> and <code>dc[i]</code> once per direction index, and constructing lambda functions from the values.  Tricky, but it works.  We're now doing effectively the same thing, just without the lambdas.</p>
+
+<h2>Unnecessary Calculations</h2>
+
+<p>Consider the statement:</p>
+
+<pre><code>if key in obstacle_dir or not(0&lt;r_q_temp&lt;n+1) or not(0&lt;c_q_temp&lt;n+1):
+</code></pre>
+
+<p>Let's assume for the moment that <code>key in obstacle_dir</code> is frequently <code>False</code>, so we need to evaluate <code>not(0&lt;r_q_temp&lt;n+1) or not(0&lt;c_q_temp&lt;n+1)</code>.  Since we spend a lot of the time examining moves which are on the board, we frequently have to fully evaluate <code>0&lt;r_q_temp&lt;n+1</code> and <code>0&lt;c_q_temp&lt;n+1</code>.</p>
+
+<p>So we need to evaluate <code>n+1</code> ... twice ... per direction iteration.  Hundreds of thousands of adding <code>1</code> to <code>n</code>, to get exactly the same value.  Ouch.</p>
+
+<p>Compiled languages can do data flow analysis, and move constant expressions outside of loops.  As Python is interpreted, (insert technobabble here), it cannot.  So you end up doing an expensive <code>n+1</code> addition each iteration.  Why expensive?  Because, integers are objects, and adding one to a large integer requires allocating a new integer object for the result.  Since it is not saved in a variable, this newly created integer becomes unreferenced and then discarded from the heap, only to be computed again (including allocation &amp; freeing) a microsecond later.  Hundreds of thousands of times!</p>
+
+<p>Should we store <code>n + 1</code> in a local variable?  Sure, that would work.  But so would changing the sub-expression to:</p>
+
+<pre><code>    not (0 &lt; r_q_temp &lt;= n) or not (0 &lt; c_q_temp &lt;= n)
+</code></pre>
+
+<p>Using "less than or equal to" instead of "less than" means the expensive <code>n + 1</code> addition goes away.</p>
+
+<hr>
+
+<p>Micro optimization: By <a href="https://en.wikipedia.org/wiki/De_Morgan%27s_laws" rel="nofollow noreferrer">De Morgan's Laws</a> we know that <code>not x or not y</code> is equivalent to <code>not (x and y)</code>, so we can write:</p>
+
+<pre><code>    not ((0 &lt; r_q_temp &lt;= n) and (0 &lt; c_q_temp &lt;= n))
+</code></pre>
+
+<p>which saves one <code>not</code> operation.  Further, we can reverse the second sub-expression:</p>
+
+<pre><code>    not ((0 &lt; r_q_temp &lt;= n) and (n &gt;= c_q_temp &gt; 0))
+</code></pre>
+
+<p>which then allows us to chain the two subexpression, eliminating the second lookup of the <code>n</code> variable in the local symbol table:</p>
+
+<pre><code>    not (0 &lt; r_q_temp &lt;= n &gt;= c_q_temp &gt; 0)
+</code></pre>
+
+<hr>
+
+<p>There is another unnecessary calculation that is repeated over and over again, hundreds of thousands of times:</p>
+
+<pre><code>        key = (r_q_temp - 1) * n + c_q_temp
+</code></pre>
+
+<p>Specifically, <code>r_q_temp - 1</code>.  Why are you subtracting <code>1</code> from <code>r_q_temp</code>?  On a 10x10 grid, does it make any difference if <code>(1,1)</code> maps to <code>11</code> or <code>1</code>, as long as it is the only coordinate that does so?  Subtracting <code>1</code> just reduces the value of <code>key</code> by <code>n</code> for all <code>key</code> values.  But you chose to create those key values here:</p>
+
+<pre><code>    obstacle_dir[(obstacle[0] - 1) * n + obstacle[1]] = None
+</code></pre>
+
+<p>All you need to do is use the same calculation ... removing the subtract 1 from that key calculation, and the obstacles will be stored under the new, more efficient-to-calculate key values.  Since you are using a dictionary, the exact key values don't matter; only that they are unique.</p>
+
+<p>But while we are looking at this <code>obstacle_dir</code> ... why is it a dictionary?  The only value ever stored in it is <code>None</code>.  You only ever test the existence of the key in the dictionary ... so you could use a <code>set()</code>, which is more memory efficient, and as such, could be faster.</p>
+    </div>

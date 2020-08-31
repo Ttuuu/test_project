@@ -1,0 +1,364 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I can offer some tips for making your code more pythonic.</p>
+
+<h3>General</h3>
+
+<ul>
+<li>It's good practice to add a docstring for each module, class, and documented function.</li>
+<li>Imports <code>io</code> and <code>json</code> are unused.</li>
+<li>In the <code>Tar.__extract</code> method, the variable <code>total</code> is unused.</li>
+</ul>
+
+<h3><code>class Tar</code></h3>
+
+<ul>
+<li><p><code>not file_path or len(file_path) == 0</code>: If the user inputs an empty string, <code>not file_path</code> is sufficient (and <code>None</code> is not a possible value unless input manually). More to the point, you are not exactly detecting a "bad file path". You could use <a href="https://docs.python.org/3.8/library/os.path.html#os.path.exists" rel="nofollow noreferrer"><code>os.path.exists</code></a> for a more robust check. Alternatively, don't validate the path at all, and consider a <code>try... except OSError</code> block in your <code>__enter__</code> method; this will <a href="https://stackoverflow.com/a/14575508/10601881">avoid race conditions</a>. (You perform similar checks in <code>extract_file</code> and <code>extract_all</code> that can also be changed.)</p></li>
+<li><p>You have an <code>__enter__</code> method and an <code>__exit__</code> method, which allows your class to be used with a context-manager, excellent! However, you also provide a <code>close</code> function, without providing a corresponding <code>open</code> function, which means that <code>close</code> could never be reasonably called by the user. Eliminate <code>close</code> or add <code>open</code>.</p></li>
+<li><p>You invoke name-mangling by using double-underscores on methods like <code>__extract</code>; this is fine to prevent truly "private" data members from clashing with those from a superclass or subclass, but on methods it makes inheriting from your class (say, to extend it with logging features) unnecessarily difficult. To mark a member as "private", <a href="https://stackoverflow.com/a/7456865/10601881">a single leading underscore is enough</a>.</p></li>
+<li><p>Similarly, in the interest of being able to subclass your class, you should consider <code>self.BLOCK_SIZE</code> instead of <code>Tar.BLOCK_SIZE</code> (though maybe this is a constant of the tar format?).</p></li>
+<li><p><code>list(map(...))</code>: It's generally more clear to replace this with a list comprehension (and as opposed to <code>lambda</code>, sometimes <a href="https://stackoverflow.com/a/40948713/10601881">more performant</a>):</p>
+
+<pre class="lang-py prettyprint-override"><code>def get_all_files(self):
+    self._scan()
+    return [FileSnapshot(f.file_name, f.file_size, f.file_mode, f.flag) for f in self.headers]
+</code></pre></li>
+<li><p><code>list(filter(...))</code>: To get the first match, it's generally better to use a generator comprehension:</p>
+
+<pre><code>def extract_file(...):
+    ...
+    try:
+        result = next(fh for fh in self.headers if fh.flag == 0 and fh.file_name == file_name)
+    except StopIteration:
+        raise RuntimeError("File '{}' not found".format(file_name))
+    ...
+</code></pre></li>
+</ul>
+
+<h3><code>class FileSnapshot</code>, <code>class FileHeader</code></h3>
+
+<ul>
+<li><p>There is a lot of boilerplate code here, that could be eliminated with <em>e.g.</em> the <a href="https://docs.python.org/3/library/dataclasses.html" rel="nofollow noreferrer"><code>@dataclass</code> decorator</a>.</p>
+
+<pre class="lang-py prettyprint-override"><code>from dataclasses import dataclass
+...
+@dataclass
+class FileSnapshot:
+    file_name : str
+    file_size : int
+    ...
+</code></pre></li>
+<li><p><code>__repr__</code> methods are generally supposed to <a href="https://stackoverflow.com/a/2626364/10601881">return code that will reproduce the object</a>; consider renaming this method to <code>__str__</code> instead.</p></li>
+</ul>
+
+<h3><code>__main__</code></h3>
+
+<ul>
+<li><p>Take advantage of the standard library <a href="https://docs.python.org/3/library/argparse.html" rel="nofollow noreferrer"><code>argparse</code></a> module. For example, it makes extending your <code>--extract</code> switch to extract multiple files easier, provides error checking and usage strings, and can be used to initialize <code>archive</code> as a <code>Tar</code> automatically.</p>
+
+<pre class="lang-py prettyprint-override"><code>from argparse import ArgumentParser
+...
+if __name__ == '__main__':
+    parser = ArgumentParser(description='.tar archive extractor')
+    parser.add_argument('archive', type=Tar, help='...')
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument('--list', action='store_true', help='List files')
+    group.add_argument('--extract-all', action='store_true', help='Extract all')
+    group.add_argument('--extract', nargs='+', help='Extract some')
+    args = parser.parse_args()
+    with args.archive as t:
+        ...
+</code></pre></li>
+</ul>
+
+<h3>Code</h3>
+
+<p>Here's my take on your code</p>
+
+<pre class="lang-py prettyprint-override"><code>#!/usr/bin/env python3
+'''TODO: docstring'''
+
+import os
+import math
+from dataclasses import dataclass
+
+class Tar:
+    '''TODO docstring'''
+    BLOCK_SIZE = 512
+
+    def __init__(self, file_path):
+        self.file_path = file_path
+        self.input_stream = None
+        self.headers = []
+
+    def __enter__(self):
+        self.input_stream = open(self.file_path, "rb")
+        self.headers = []
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        if self.input_stream is not None:
+            self.input_stream.close()
+
+    def get_all_files(self):
+        '''TODO docstring'''
+        self._scan()
+        return [FileSnapshot(f.file_name, f.file_size, f.file_mode, f.flag) 
+                for f in self.headers]
+
+    def extract_file(self, file_name, target_folder=os.getcwd()):
+        '''TODO docstring'''
+        self._scan()
+        try:
+            fh = next(fh for fh in self.headers if fh.flag == 0 and fh.file_name == file_name)
+        except StopIteration:
+            raise RuntimeError("File '{}' not found".format(file_name))
+        leaf = os.path.basename(fh.file_name)
+        f_path = os.path.join(target_folder, leaf)
+        self._extract(fh, f_path)
+
+    def extract_all(self, target_folder=os.getcwd()):
+        '''TODO docstring'''
+        self._scan()
+        for fh in self.headers:
+            f_path = os.path.join(target_folder, fh.file_name)
+            if fh.flag == 5: # if directory
+                os.makedirs(f_path, exist_ok=True)
+            elif fh.flag == 0: # if regular file
+                parent = os.path.dirname(os.path.abspath(f_path))
+                os.makedirs(parent, exist_ok=True)
+                self._extract(fh, f_path)
+
+
+    def _extract(self, fh, file_name):
+        with open(file_name, "wb") as f:
+            if fh.file_size &gt; 0:
+                bytes_left = fh.file_size
+                self.input_stream.seek(fh.offset, 0)
+                while bytes_left &gt; 0:
+                    data = self.input_stream.read(Tar.BLOCK_SIZE)
+                    data = data[:bytes_left]
+                    f.write(data)
+                    bytes_left -= len(data)
+
+    def _scan(self): # iterate over headers
+        if len(self.headers) == 0:
+            while True:
+                block = self.input_stream.read(Tar.BLOCK_SIZE)
+                if len(block) &lt; Tar.BLOCK_SIZE:
+                    break
+                h = self._get_file_header(block)
+                if not len(h.magic) &gt; 0:
+                    break
+                # omit regular file bytes
+                if h.flag == 0:
+                    h.offset = self.input_stream.tell()
+                    if h.file_size &gt; 0:
+                        if h.file_size % Tar.BLOCK_SIZE != 0:
+                            bytes_to_skeep = math.ceil(h.file_size / Tar.BLOCK_SIZE) * Tar.BLOCK_SIZE
+                        else:
+                            bytes_to_skeep = h.file_size
+                        self.input_stream.seek(bytes_to_skeep, 1)
+                self.headers.append(h)
+
+
+    def _get_file_header(self, block):
+        try:
+            return FileHeader(
+                self._get_file_name(block),
+                self._get_file_size(block),
+                self._get_file_mode(block),
+                self._get_uid(block),
+                self._get_gid(block),
+                self._get_mtime(block),
+                self._get_chksum(block),
+                self._get_type_flag(block),
+                self._get_linkname(block),
+                self._get_magic(block),
+                self._get_version(block),
+                self._get_uname(block),
+                self._get_gname(block),
+                self._get_devmajor(block),
+                self._get_devminor(block),
+                self._get_prefix(block)
+            )
+        except Exception as e:
+            raise RuntimeError("Broken file") from e
+
+
+    def _get_file_name(self, block): # string
+        offset, size = 0, 100
+        fname = self._get_block_data(block, offset, size)
+        fname = fname[0:fname.find(b'\x00')].decode().strip()
+        return fname
+
+    def _get_file_mode(self, block): # string
+        offset, size = 100, 8
+        mode = self._get_block_data(block, offset, size)
+        mode = mode[:mode.find(b'\x00')].decode().strip()
+        return mode
+
+    def _get_uid(self, block): # string
+        offset, size = 108, 8
+        uid = self._get_block_data(block, offset, size)
+        uid = uid[:uid.find(b'\x00')].decode().strip()
+        return uid
+
+    def _get_gid(self, block): # string
+        offset, size = 116, 8
+        gid = self._get_block_data(block, offset, size)
+        gid = gid[:gid.find(b'\x00')].decode().strip()
+        return gid
+
+    def _get_file_size(self, block): # int
+        offset, size = 124, 12
+        size = self._get_block_data(block, offset, size)
+        size = size[:size.find(b'\x00')].decode().strip()
+        if len(size) &gt; 0:
+            size = int(size, 8)
+        else:
+            size = 0
+        return size
+
+    def _get_mtime(self, block): # int
+        offset, size = 136, 12
+        mtime = self._get_block_data(block, offset, size)
+        mtime = mtime[:len(mtime)-1]
+        mtime = mtime[:mtime.find(b'\x00')].decode().strip()
+        if len(mtime) &gt; 0:
+            mtime = int(mtime, 8)
+        else:
+            mtime = 0
+        return mtime
+
+    def _get_chksum(self, block): # int
+        offset, size = 148, 8
+        chksum = self._get_block_data(block, offset, size)
+        chksum = chksum[:chksum.find(b'\x00')].decode().strip()
+        if len(chksum) &gt; 0:
+            chksum = int(chksum)
+        else:
+            chksum = 0
+        return chksum
+
+    def _get_type_flag(self, block): # int
+        offset, size = 156, 1
+        flag = self._get_block_data(block, offset, size)
+        if flag == b'\x00':
+            flag = 0
+        elif flag == b'x':
+            flag = 11
+        else:
+            flag = int(flag)
+        return flag
+
+    def _get_linkname(self, block): # string (applicable if type_flag = 1 or 2)
+        offset, size = 157, 100
+        linkname = self._get_block_data(block, offset, size)
+        return linkname[:linkname.find(b'\x00')].decode().strip()
+
+    def _get_magic(self, block): # string
+        offset, size = 257, 6
+        magic = self._get_block_data(block, offset, size)
+        magic = magic[:magic.find(b'\x00')].decode().strip()
+        return magic
+
+    def _get_version(self, block): # string
+        offset, size = 263, 2
+        version = self._get_block_data(block, offset, size)
+        version = version[:len(version)-1].decode().strip()
+        return version
+
+    def _get_uname(self, block): # string
+        offset, size = 265, 32
+        uname = self._get_block_data(block, offset, size)
+        uname = uname[:uname.find(b'\x00')].decode().strip()
+        return uname
+
+    def _get_gname(self, block): # string
+        offset, size = 297, 32
+        gname = self._get_block_data(block, offset, size)
+        gname = gname[:gname.find(b'\x00')].decode().strip()
+        return gname
+
+    def _get_devmajor(self, block): # string
+        offset, size = 329, 8
+        devmajor = self._get_block_data(block, offset, size)
+        devmajor = devmajor[:devmajor.find(b'\x00')].decode().strip()
+        return devmajor
+
+    def _get_devminor(self, block): # string
+        offset, size = 337, 8
+        devminor = self._get_block_data(block, offset, size)
+        devminor = devminor[:devminor.find(b'\x00')].decode().strip()
+        return devminor
+
+    def _get_prefix(self, block): # string
+        offset, size = 345, 155
+        prefix = self._get_block_data(block, offset, size)
+        prefix = prefix[:prefix.find(b'\x00')].decode().strip()
+        return prefix
+
+    def _get_block_data(self, block, offset, size):
+        return block[offset:offset+size]
+
+@dataclass
+class FileSnapshot:
+    '''TODO: docstring'''
+    file_name: str
+    file_size: int
+    file_mode: str
+    flag: int
+
+    def __str__(self):
+        return self.file_name
+
+@dataclass
+class FileHeader:
+    '''TODO: docstring'''
+    file_name: str
+    file_size: int
+    file_mode: str
+    uid: str
+    gid: str
+    mtime: int
+    chksum: int
+    flag: int
+    linkname: str 
+    magic: str
+    version: str
+    uname: str
+    gname: str
+    devmajor: str
+    devminor: str
+    prefix: str
+    offset: int = 0
+
+if __name__ == "__main__":
+    def main():
+        from argparse import ArgumentParser
+        parser = ArgumentParser(description='.tar archive extractor')
+        parser.add_argument('archive', type=Tar,
+                            help='The tar archive file')
+        group = parser.add_mutually_exclusive_group(required=True)
+        group.add_argument('--list', action='store_true', 
+                           help='List all files in the archive')
+        group.add_argument('--extract-all', action='store_true', 
+                           help='Extract all files from the archive')
+        group.add_argument('--extract', nargs='+', dest='files',
+                           help='Extract specified files from the archive')
+        args = parser.parse_args()
+        with args.archive as t:
+            if args.list:
+                files = t.get_all_files()
+                for file in files:
+                    print(file)
+            elif args.extract_all:
+                t.extract_all()
+            else:
+                for file in args.files:
+                    t.extract_file(file)
+
+    main()
+
+</code></pre>
+    </div>

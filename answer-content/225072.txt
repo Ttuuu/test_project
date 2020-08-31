@@ -1,0 +1,184 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'm not very experienced with EF, to me your code looks fine but there are some details you can improve as stated in the other answer, and of course other ways of writing the same which I will show you, just to illustrate, not to say it's the way to go:</p>
+
+<pre><code>module Rm.Iban.Domain.IbanValidation
+
+open System
+open System.Text.RegularExpressions
+open FSharpPlus
+
+type ValidationError =
+    | IllegalCharacters
+    | IncorrectLength
+    | UnknownCountry
+    | TypingError
+
+[&lt;AutoOpen&gt;]
+module private Impl =
+
+    let illegalCharacters = Regex (@"[^0-9A-Za-z ]", RegexOptions.Compiled) // consider one liners
+
+    let checkCharacters iban =
+        if illegalCharacters.IsMatch iban // parens not needed
+        then Error IllegalCharacters
+        else Ok iban
+
+    let cleanup =
+        String.toUpper
+        &gt;&gt; String.replace " " ""
+        &gt;&gt; Ok
+
+    let lengthPerCountry = dict [
+        ("AL", 28); ("AD", 24); ("AT", 20); ("AZ", 28); ("BE", 16); ("BH", 22); ("BA", 20); ("BR", 29);
+        ("BG", 22); ("CR", 21); ("HR", 21); ("CY", 28); ("CZ", 24); ("DK", 18); ("DO", 28); ("EE", 20);
+        ("FO", 18); ("FI", 18); ("FR", 27); ("GE", 22); ("DE", 22); ("GI", 23); ("GR", 27); ("GL", 18);
+        ("GT", 28); ("HU", 28); ("IS", 26); ("IE", 22); ("IL", 23); ("IT", 27); ("KZ", 20); ("KW", 30);
+        ("LV", 21); ("LB", 28); ("LI", 21); ("LT", 20); ("LU", 20); ("MK", 19); ("MT", 31); ("MR", 27);
+        ("MU", 30); ("MC", 27); ("MD", 24); ("ME", 22); ("NL", 18); ("NO", 15); ("PK", 24); ("PS", 29);
+        ("PL", 28); ("PT", 25); ("RO", 24); ("SM", 27); ("SA", 24); ("RS", 22); ("SK", 24); ("SI", 19);
+        ("ES", 24); ("SE", 24); ("CH", 21); ("TN", 24); ("TR", 26); ("AE", 23); ("GB", 22); ("VG", 24); ]
+
+    let checkLength (iban: string) =
+        let country = limit 2 iban // since you're using F#+ you can use this generic function, next version will ship with String.truncate
+        match Dict.tryGetValue country lengthPerCountry with // also this function is available in F#+
+        | Some length when length = iban.Length -&gt; Ok iban
+        | None -&gt; Error UnknownCountry
+        | _    -&gt; Error IncorrectLength
+        // Reorganizing the cases like this makes it easier to visualize the rules.
+        // My advice is try not to mix match with if, as far as practical.
+
+
+    let checkRemainder (iban: string) =
+
+        let digitalIban =
+            let rearrangedIban = iban.[4..] + iban.[..3] // You can use F# slicing syntax
+            let replaceBase36LetterWithBase10String (s: string) (c: char) =
+                String.replace (string c) (string (int c - int 'A' + 10)) s // (int)c looks like a C# cast, but this is not a cast, int is a function.
+            List.fold replaceBase36LetterWithBase10String rearrangedIban [ 'A' .. 'Z' ]
+            // You can also use String.replace from F#+
+            // Note that using string function is shorter and looks more functional than ToString, and most importantly it's culture neutral.
+            // ToString without additional parameters depends on current thread culture.
+
+        let remainder =
+            let inline reduceOnce r n = Int32.Parse (string r + string n) % 97
+            Regex.Matches (digitalIban.[2..], @"\d{1,7}")
+            |&gt; fold reduceOnce (reduceOnce 0 (digitalIban.[..1]))
+        // This is a bit F#+ advanced stuff: Matches are part of the Foldable abstraction, so you can fold them directly with the generic fold operation.
+        // then by using string and making the function online, your reduceOnce becomes polymorphic on 'r'.
+
+        if remainder = 1 then Ok iban
+        else Error TypingError
+
+    let format iban = Regex.Replace (iban, ".{4}", "$0 ") |&gt; Ok
+
+let validate =
+    checkCharacters
+    &gt;=&gt; cleanup
+    &gt;=&gt; checkLength
+    &gt;=&gt; checkRemainder
+    &gt;=&gt; format
+// Is not that I am a big fun of point free functions, but I've seen many F# validation examples written in this style, by using composition with the monadic &gt;=&gt; fish operator.
+</code></pre>
+
+<p>The code that create</p>
+
+<pre><code>module Rm.Iban.App.IbanRetrieval
+
+open System
+open System.Linq
+open Microsoft.FSharp.Data
+open Domain
+open Microsoft.EntityFrameworkCore
+
+type RequestError =
+    | AlreadyRequested
+
+type MeetRequestError =
+    | RequestNotFound
+    | IbanInvalid of IbanValidation.ValidationError
+
+[&lt;AutoOpen&gt;]
+module private Impl =
+
+    let memberIbansWith (context: DbContext.IbanDbContext) memberId ibanState = query {
+        for iban in context.Ibans do
+        where (
+            iban.MemberId = memberId &amp;&amp;
+            iban.State = ibanState) }
+
+    let requested (context: DbContext.IbanDbContext) memberId =
+        let requested = memberIbansWith context memberId IbanState.Requested
+        requested.Select(fun iban -&gt; Some iban)
+                             .SingleOrDefaultAsync()
+                    |&gt; Async.AwaitTask
+    // The async workflow is not really needed here.
+
+    let avoidDuplicateRequest (context: DbContext.IbanDbContext) memberId =
+        async {
+            let! exists = context.Ibans.AnyAsync(fun iban -&gt;
+                                            iban.MemberId = memberId &amp;&amp;
+                                            iban.State = IbanState.Requested)
+                                        |&gt; Async.AwaitTask
+            if exists
+            then return Error AlreadyRequested
+            else return Ok (context, memberId)    
+        }
+
+    let newRequest ((context: DbContext.IbanDbContext), memberId) =
+        async {
+            let iban: Iban = {
+                Id = Guid.Empty
+                MemberId = memberId
+                Iban = None
+                State = IbanState.Requested
+                CreatedOn = DateTimeOffset.UtcNow
+                UpdatedOn = None }
+            let iban = context.Ibans.Add iban
+            do! context.SaveChangesAsync true
+                |&gt; Async.AwaitTask
+                |&gt; Async.Ignore
+            return Ok iban.Entity
+        }
+
+    let updateRequestWith (context: DbContext.IbanDbContext) memberId ibanValue =
+        async {
+            match! requested context memberId with
+            | Some iban -&gt;
+                context.UpdateWith iban
+                    { iban with
+                        Iban = Some ibanValue
+                        State = IbanState.Ok
+                        UpdatedOn = Some DateTimeOffset.UtcNow }
+                do! context.SaveChangesAsync true
+                    |&gt; Async.AwaitIAsyncResult
+                    |&gt; Async.Ignore
+                return Ok iban
+            | _ -&gt;
+                return Error RequestNotFound 
+        }
+
+let request (context: DbContext.IbanDbContext) memberId =
+    async {
+        match! avoidDuplicateRequest context memberId with
+        | Ok value -&gt; return! newRequest value
+        | Error error -&gt; return Error error
+    }
+
+let requested (context: DbContext.IbanDbContext) memberId =
+    requested context memberId
+
+let meetRequest (context: DbContext.IbanDbContext) memberId ibanValue =
+    match IbanValidation.validate ibanValue with
+    | Ok ibanValue -&gt; updateRequestWith context memberId ibanValue
+    | Error error -&gt; async.Return (Error (IbanInvalid error)) // here you can use directly async.Return instead of the whole workflow.
+
+let memberIbans (context: DbContext.IbanDbContext) memberId =
+    memberIbansWith context memberId IbanState.Ok
+</code></pre>
+
+<p>As I said, no big changes just some suggestions and other ways of writing the same, which doesn't mean it's better than what you had already.</p>
+
+<p>The other answer suggests some changes on the design that are interesting, regarding the IbanString suggestion, you can also use <a href="https://www.google.com/search?q=f%23+extending+uoms+to+arbitrary+types&amp;oq=f%23+extending+uoms+to+arbitrary+types" rel="nofollow noreferrer">a technique with UoMs</a> to distinguish between the raw strings and validated ibans, that might be slightly more efficient since UoMs are erased at runtime.</p>
+
+<p>One final note, your Validate function does a bit more than validate, you can leave it like that, it looks ok, but maybe you can change the name to reflect this, something like format and validate.</p>
+    </div>

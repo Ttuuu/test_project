@@ -1,0 +1,133 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I think it's very strange that you provide iterators and an <code>operator[]</code> for an <strong><em>IP address.</em></strong> Generally speaking, IP addresses are not considered to be "iterable"; an IP address is just a <em>single</em> address. If you were modeling a subnet mask, like <code>127.0.0.0/8</code>, then it might make sense to model it as a <em>range</em> of addresses; but if you're modeling just a single address, I don't think it is appropriate at all to model it as a <em>range</em> of <em>octets</em>. What benefit do you gain from that? IMHO: none. <a href="https://www.youtube.com/watch?v=46kXH6GGtT0" rel="noreferrer">None benefit.</a></p>
+
+<hr>
+
+<p>As 1201ProgramAlarm already said, your increment and decrement operators' signatures are a bit screwed up (essentially, backwards). Plus:</p>
+
+<pre><code>::ip::address&amp; ip::address::operator++(int)
+{
+    auto result(*this);
+    ++(*this);
+    return result;
+}
+</code></pre>
+
+<p>This one should also have given you a compiler warning (assuming you use any mainstream compiler, such as GCC, Clang, or MSVC). Step number one when writing C++ is always to <strong>compile with <code>-W -Wall -Wextra</code></strong> and <strong>fix all the warnings</strong> prior to publishing your code. The compiler warnings are usually telling you about bugs in your code; and even when they're not technically bugs, you should still fix the warnings, so that none of your coworkers have to read the warnings ever again. Clean code is friendly code!</p>
+
+<hr>
+
+<pre><code>ip::address::iterator ip::address::begin()
+{
+    return data_.begin();
+}
+
+ip::address::const_iterator ip::address::end() const
+{
+    return data_.end();
+}
+</code></pre>
+
+<p>It is super weird to me that you define these member functions in the order "nonconst <code>begin</code>, const <code>end</code>, const <code>begin</code>, nonconst <code>end</code>." That's harmless, but it's just <em>weird</em>. Also, I recommend defining these functions directly in-line in the body of the class. They're one-liners. You waste space (and thus, waste the reader's time) by defining them out-of-line. That is, I'd write:</p>
+
+<pre><code>    iterator begin() { return data_.begin(); }
+    iterator end() { return data_.end(); }
+    const_iterator begin() const { return data_.begin(); }
+    const_iterator end() const { return data_.end(); }
+private:
+    std::array&lt;value_type, 4&gt; data_;
+</code></pre>
+
+<p>Also, all four of these methods should probably be declared <code>noexcept</code>.</p>
+
+<hr>
+
+<p>Overloaded comparison operators should <em>always</em> be defined in-line in the body of the class, using the "hidden friend" (a.k.a. "ADL friend," a.k.a. "Barton-Nackman") trick. That is, instead of</p>
+
+<pre><code>class address { ... };
+
+bool operator&lt;(const ip::address &amp;first, const ip::address &amp;second);
+
+bool ip::operator&lt;(const ip::address&amp; first, const ip::address&amp; second)
+{
+    return (uint32_t)first() &lt; (uint32_t)second();
+}
+</code></pre>
+
+<p>you should write simply</p>
+
+<pre><code>class address {
+    // ...
+
+    friend bool operator&lt;(const address&amp; a, const address&amp; b) {
+        return uint32_t(a()) &lt; uint32_t(b());
+    }
+};
+</code></pre>
+
+<p>Notice that I switched your type-casts from C style to constructor-style, a.k.a. "Python style," just for the heck of it. I find the fewer parentheses the easier it is to read. Also, I switched the verbose <code>first</code> and <code>second</code> to simply <code>a</code> and <code>b</code>: we don't need long names for these extremely locally scoped variables.</p>
+
+<p>But wait, there's more! I initially assumed that <code>first()</code> was a typo — but it's not! You actually declared an overloaded <code>operator()</code>:</p>
+
+<pre><code>    /**
+     * @brief Implicit conversion to an unsigned 32 bit integer.
+     */
+    uint32_t operator()() const;
+</code></pre>
+
+<p>Why on earth is this an <em>overloaded function-call operator</em> instead of a <em>conversion operator</em>? Worse, why is this any kind of operator at all, when you already went out of your way to declare a free function <code>ip::to_string(const address&amp;)</code>? <strong>Why is the conversion to <code>uint32_t</code> not implemented as <code>ip::to_uint32(const address&amp;)</code>?</strong></p>
+
+<p>Consistency is important. Also, compatibility with the rest of the language is important. When you overload <code>operator()</code>, you're making <code>ip::address</code> "callable," which means you're enabling your clients to write things like</p>
+
+<pre><code>ip::address myAddress(127, 0, 0, 1);
+std::function&lt;int()&gt; f = myAddress;  // !!
+assert(f() == 0x7F000001);
+</code></pre>
+
+<p>Just as with the iterator/range-of-octets business, this functionality strikes me as <em>fundamentally not what an IP address ought to be about.</em> IP addresses aren't ranges, and IP addresses aren't callables. They should be <em>just addresses.</em> To the extent that your <code>ip::address</code> is anything other than <em>just an address</em>, you have actually <em>failed</em> in your stated goal of "modeling an IP address"!</p>
+
+<hr>
+
+<p>Your <code>operator&lt;&lt;</code> should also be defined in-line.</p>
+
+<p>Anytime you provide <code>operator==</code>, you should also provide <code>operator!=</code> — the language doesn't (yet) provide it for you automatically.</p>
+
+<p>Anytime you provide <code>operator&lt;</code>, you should also provide <code>operator&lt;=</code>, <code>&gt;</code>, and <code>&gt;=</code> — the language doesn't (yet) provide these for you automatically. (But in C++2a you'll have <code>operator&lt;=&gt;</code> to play with!)</p>
+
+<hr>
+
+<pre><code>void ip::address::operator++()
+{
+    auto location = std::find_if(data_.rbegin(), data_.rend(), [](const unsigned char&amp; data)
+    {
+        return data &lt; 255;
+    });
+
+    if(location != std::rend(data_))
+    {
+        const auto r_index = std::distance(data_.rbegin(), location);
+        auto index = 4 - r_index - 1;
+        data_[index]++;
+    }
+}
+</code></pre>
+
+<p>It's odd that you write <code>data_.rend()</code> in one place and <code>std::rend(data_)</code> in the other. I recommend the former in both cases, simply because it's shorter.</p>
+
+<p>However, doesn't this code "increment" <code>address(0, 0, 0, 255)</code> to <code>address(0, 0, 1, 255)</code> instead of to <code>address(0, 0, 1, 0)</code>?  If so, oops! IMO the clearest and simplest way to write this "odometer algorithm" is simply</p>
+
+<pre><code>address&amp; operator++() noexcept
+{
+    if (++data_[3] == 0) {
+        if (++data_[2] == 0) {
+            if (++data_[1] == 0) {
+                ++data_[0];
+            }
+        }
+    }
+    return *this;
+}
+</code></pre>
+
+<p>Short and sweet. Arguably it's overly complicated and "clever" — but look what it's replacing! What it's replacing uses multiple STL algorithms, is three lines <em>longer</em>, and (AFAICT) <em>doesn't even work</em>. So feel free to reduce the "cleverness" of my proposed code even further, if you can; regardless, I claim it's an improvement over the original.</p>
+    </div>

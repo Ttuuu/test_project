@@ -1,0 +1,100 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Syntax Issue</h2>
+
+<p>The derived table in the <em>FROM</em> clause needs to be surrounded by parentheses:</p>
+
+<blockquote>
+<pre><code>DECLARE @waypointId INT = 100;   
+DECLARE @Sunday INT = 1;
+SELECT MIN(nextScheduleDateTime) 
+FROM
+    SELECT MIN(CAST(CAST(DATEADD(dd, (6 - DATEPART(dw, GETDATE()) + @Sunday) % 7 + 1, GETDATE()) AS DATE) AS DATETIME) + CAST(ScheduleDetail.startTime AS TIME)) AS nextScheduleDateTime
+</code></pre>
+</blockquote>
+
+<p>Should be updated like this:</p>
+
+<pre><code>SELECT MIN(nextScheduleDateTime) 
+FROM
+    (SELECT MIN(CAST(CAST(DATEADD(dd, (6 - DATEPART(dw, GETDATE()) + @Sunday) % 7 + 1, GETDATE()) AS DATE) AS DATETIME) + CAST(ScheduleDetail.startTime AS TIME)) AS nextScheduleDateTime
+</code></pre>
+
+<p>And then after the sub-queries:</p>
+
+<pre><code>    ) AS Subqueries
+</code></pre>
+
+<h2>Simplifying sub-queries</h2>
+
+<p>I believe (but haven't tested, since I don't have your data and expected output) that the <code>WHERE</code> conditions can be updated like below, which would allow combining the sub-queries into one, eliminating the usage of <code>UNION</code>:</p>
+
+<pre><code>DECLARE @waypointId INT = 100;   
+DECLARE @Sunday INT = 1;
+
+SELECT MIN(CAST(CAST(DATEADD(dd, (6 - DATEPART(dw, GETDATE()) + @Sunday) % 7 + 1, GETDATE()) AS DATE) AS DATETIME) + CAST(ScheduleDetail.startTime AS TIME)) AS nextScheduleDateTime
+FROM WaypointEventLog INNER JOIN
+     Schedule ON Schedule.scheduleRef = WaypointEventLog.ScheduleID INNER JOIN
+     ScheduleDetail ON Schedule.scheduleRef = ScheduleDetail.scheduleRef
+WHERE WaypointID = @waypointId 
+AND Completed = 0
+AND Schedule.scheduleType = 6
+AND 
+(( validSunday = 1 AND DATEPART(dw, GETDATE()) &lt;&gt; @Sunday ) OR 
+        ( validMonday  = 1 AND  DATEPART(dw, GETDATE()) &lt;&gt; @Sunday + 1) OR 
+        ( validTuesday = 1 AND  DATEPART(dw, GETDATE()) &lt;&gt; @Sunday + 2 ) OR 
+        ( validWednesday = 1 AND  DATEPART(dw, GETDATE()) &lt;&gt; @Sunday + 3 ) OR 
+        ( validThursday = 1 AND  DATEPART(dw, GETDATE()) &lt;&gt; @Sunday + 4 ) OR 
+        ( validFriday = 1 AND  DATEPART(dw, GETDATE()) &lt;&gt; @Sunday + 5) OR 
+        ( validSaturday = 1 AND  DATEPART(dw, GETDATE()) &lt;&gt; @Sunday + 6 ))
+</code></pre>
+
+<p>While it only contains the one table <code>scheduleDetail</code>, you can see this illustrated in <a href="http://sqlfiddle.com/#!18/29eb5/19" rel="nofollow noreferrer">this SQL fiddle</a>. Feel free to update that fiddle and provide more details about the other tables, plus the data in those tables.</p>
+
+<h3>Programmatic way of generating the query above</h3>
+
+<p>One approach you could take is to define a <a href="https://docs.microsoft.com/en-us/sql/t-sql/language-elements/declare-cursor-transact-sql" rel="nofollow noreferrer">CURSOR</a>, and use that to loop through each field, adding the sub-queries to be joined via <code>UNION</code> to a long string. Originally I was thinking a <code>varchar(5000)</code> would be necessary but that was before I discovered the <code>UNION</code>s could be eliminated.</p>
+
+<pre><code>DECLARE @name VARCHAR(50) -- field name 
+DECLARE @rowNum varchar(10) -- row number 
+DECLARE @sql VARCHAR(5000) = 'SELECT MIN(CAST(CAST(DATEADD(dd, (6 - DATEPART(dw, GETDATE()) + @Sunday) % 7 + 1, GETDATE()) AS DATE) AS DATETIME) + CAST(ScheduleDetail.startTime AS TIME)) AS nextScheduleDateTime
+FROM WaypointEventLog INNER JOIN
+     Schedule ON Schedule.scheduleRef = WaypointEventLog.ScheduleID INNER JOIN
+     ScheduleDetail ON Schedule.scheduleRef = ScheduleDetail.scheduleRef
+WHERE WaypointID = @waypointId 
+AND Completed = 0
+AND Schedule.scheduleType = 6
+AND ('
+
+DECLARE db_cursor CURSOR FOR  -- fetch columns to loop over
+SELECT COLUMN_NAME, ROW_NUMBER() OVER(ORDER BY ORDINAL_POSITION ASC) - 1 AS RowNum 
+FROM INFORMATION_SCHEMA.columns 
+WHERE table_NAME = 'ScheduleDetail' and COLUMN_NAME like 'valid%' and COLUMN_NAME not like '%holiday' 
+ORDER BY ORDINAL_POSITION
+
+OPEN db_cursor   
+FETCH NEXT FROM db_cursor INTO @name, @rowNum  
+
+WHILE @@FETCH_STATUS = 0   
+BEGIN   
+    --append WHERE condition
+   SET @sql  = @sql + ' ('+ @name + ' = 1 AND DATEPART(dw, GETDATE()) &lt;&gt; @Sunday + ' + @rowNum + ' )'+char(10)+char(13)   -- + CR + LF
+
+   FETCH NEXT FROM db_cursor INTO @name, @rowNum  
+   if @@FETCH_STATUS=0 -- all except last condition
+    BEGIN
+        SET @sql  = @sql + 'OR'+char(10)+char(13)   -- + CR + LF
+    END
+    ELSE 
+    BEGIN -- last condition
+        SET @sql  = @sql + ')'+char(10)+char(13)   -- + CR + LF
+    END
+END   
+
+CLOSE db_cursor   
+DEALLOCATE db_cursor
+
+print @sql
+</code></pre>
+
+<p>That could be used to generate a Table-valued function or View.</p>
+    </div>

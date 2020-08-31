@@ -1,0 +1,108 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Of #1 and #2, I prefer #2.  But I actually dislike them both.</p>
+
+<p>For every customer, you are not only testing for the desired criteria, you are also testing the <code>searchStringNotEmpty</code>, <code>locationsNotEmpty</code> and <code>selectedTagsNotEmpty</code> flags.  If you have 1,000,000 customers, that may be up to 3,000,000 tests of unchanging boolean variables.</p>
+
+<p>What you want is more like:</p>
+
+<pre><code>List&lt;Customer&gt; filteredCustomers = new ArrayList&lt;Customer&gt;(customers);
+
+if (searchStringNotEmpty)
+    filterCustomers.retainIf(c -&gt; c.name.contains(searchString));
+
+if (locationsNotEmpty)
+    filterCustomers.retainIf(c -&gt; locations.contains(c.locationId));
+
+if (selectedTagsNotEmpty)
+    filterCustomers.retainIf(c -&gt; /* c contains any of the selectedTags */);
+</code></pre>
+
+<p>Instead of <code>searchStringNotEmpty</code> being tested once for each customer, it is tested once, and only if true is the filtering performed for the search string.</p>
+
+<p>Except ... if you have 1,000,000 customers, you may only want to pass through the list once, (to avoid cache thrashing) and the above will pass through the list up to 3 times.  So let's fix that so we pass through the list once.</p>
+
+<h2>Dynamic Programming</h2>
+
+<p>What we want to do is write a program to <em>write a program</em> to filter the customers.</p>
+
+<p>Technically, we'll just be writing a program to assemble a program to filter the customers.  Enter stream programming.</p>
+
+<pre><code>Stream&lt;Customer&gt; stream = customers.stream();
+
+if (searchStringNotEmpty)
+    stream = stream.filter(c -&gt; c.name.contains(searchString));
+
+if (locationsNotEmpty)
+    stream = stream.filter(c -&gt; locations.contains(c.locationId));
+
+if (selectedTagsNotEmpty)
+    stream = stream.filter(c -&gt; /* c contains any of the selectedTags */);
+
+List&lt;Customer&gt; filteredCustomers = stream.collect(Collectors.toList());
+</code></pre>
+
+<p>We start with the stream of customers.  If a search string is present, we add the appropriate filter to the stream, and store the resulting stream back in our <code>stream</code> variable.  In the same way, we can add the other two filters.  Once the stream pipeline has been configured, we perform the <code>collect()</code> terminal operation, which actually begins the stream processing, collecting all <code>Customer</code> objects which pass through the filters (if any) into a list.</p>
+
+<p><strong>Note</strong>: Perhaps you just want to return the resulting <code>stream</code> to the caller, instead of a <code>filteredCustomers</code> list, to allow the caller to do additional stream processing on the result.  For instance, the caller might want to take the results and partition them into a map based on location, in which case first collecting the customers into a list is unnecessary step.</p>
+
+<h2>Predicates</h2>
+
+<p>As an alternative to building up a stream pipeline, with filters, you could build a complex <a href="https://docs.oracle.com/en/java/javase/12/docs/api/java.base/java/util/function/Predicate.html" rel="nofollow noreferrer"><code>Predicate</code></a> from individual predicates for the 3 filter conditions.  The predicates would simply combine with <code>.and()</code> to form a larger predicate.</p>
+
+<pre><code>Predicate&lt;Customer&gt; filter = c -&gt; true;
+
+if (searchStringNotEmpty)
+    filter = filter.and(c -&gt; c.name.contains(searchString));
+
+if (locationsNotEmpty)
+    filter = filter.and(c -&gt; locations.contains(c.locationId));
+
+if (selectedTagsNotEmpty)
+    filter = filter.and(c -&gt; /* c contains any of the selectedTags */);
+
+List&lt;Customer&gt; filteredCustomers = new ArrayList&lt;Customer&gt;(customers);
+filteredCustomers.retainIf(filter);
+</code></pre>
+
+<p>You could avoid the extra <code>c -&gt; true</code> filter stage, by initializing <code>filter</code> to <code>null</code>, and then either assign to <code>filter</code>, or execute <code>filter = filter.and(...)</code> depending on whether <code>filter</code> is <code>null</code> or not at each step.  At the end, simply don't call <code>.retainIf(filter)</code> if <code>filter</code> is still <code>null</code> at the end.  That would be more efficient, but the above is easier to understand.</p>
+
+<h2>Optimizations</h2>
+
+<p>Both <code>selectedLocations</code> and <code>selectedTags</code> are lists.  We can improve things by turning these each into a <code>Set</code> for faster <code>.contains()</code> testing.</p>
+
+<p>(Of course, this requires both <code>LocationId</code> and <code>Tag</code> to properly implement <a href="https://docs.oracle.com/en/java/javase/12/docs/api/java.base/java/lang/Object.html#hashCode()" rel="nofollow noreferrer"><code>Object.hashCode()</code></a> in order to function properly.)</p>
+
+<p>(Unlike @EricStein's answer, these sets would be constructed once, not once per customer.)</p>
+
+<p>We can even do some other optimizations based on the sizes of these lists.  A list of 1 can be handled much simpler, with <code>equals()</code> in the location case and a simple <code>.contains()</code> for the tag case.</p>
+
+<p>In the multiple tags case, <a href="https://docs.oracle.com/javase/6/docs/api/java/util/Collections.html#disjoint%28java.util.Collection,%20java.util.Collection%29" rel="nofollow noreferrer"><code>Collections.disjoint()</code></a> can be used to to test for common tags.</p>
+
+<pre><code>Stream&lt;Customer&gt; stream = customers.stream();
+
+if (searchString != null &amp;&amp; !searchString.trim().isEmpty())
+    stream = stream.filter(c -&gt; c.name.contains(searchString));
+
+if (selectedLocations != null &amp;&amp; selectedLocations.size() &gt; 0) {
+    if (selectedLocations.size() == 1) {
+        var location = locations.get(0);
+        stream = stream.filter(c -&gt; location.equals(c.locationId));
+    } else {
+        var location_set = new HashSet&lt;&gt;(locations);
+        stream = stream.filter(c -&gt; location_set.contains(c.locationId));
+    }
+}
+
+if (selectedTags != null &amp;&amp; selectedTags.size() &gt; 0) {
+    if (selectedTags.size() == 1) {
+        var tag = selectedTags.get(0);
+        stream = stream.filter(c -&gt; c.getTags().contains(tag));
+    } else {
+        var tag_set = new HashSet&lt;&gt;(selectedTags);
+        stream = stream.filter(c -&gt; !Collections.disjoint(tag_set, c.getTags()));
+    }
+}
+
+List&lt;Customer&gt; filteredCustomers = stream.collect(Collectors.toList());
+</code></pre>
+    </div>

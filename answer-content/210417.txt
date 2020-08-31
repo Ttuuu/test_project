@@ -1,0 +1,133 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>As evidenced by your timings a major bottleneck of your code is having to read the file multiple times. At least it is now only opened once, but the actual content is still read eight times (once for each unique ID, so four times in your example, and then once again each for the exceptions).</p>
+
+<p>First, let's reduce this to two passes, once for the IDs and once for the exceptions/added events:</p>
+
+<pre><code>from collections import defaultdict
+
+@timer
+def find_device_IDs(file_obj, search_list):
+    """ Find the element (type: str) within the file (file path is 
+        provide as arg). Then find the SQL guid from the line at hand.
+        (Each line has a SQL guid)
+        Return a dict of {element: [&lt;list of SQL guids&gt;]}
+    """
+    sql_guids = defaultdict(set)
+    for line in file_obj:
+        for element in search_list:
+            if element in line:
+                #find the sql-guid from the line-str &amp; append
+                sql_guids[element].add(find_sql_guid(line))
+    return sql_guids
+</code></pre>
+
+<p>The exception/added finding function is a bit more complicated. Here we first need to invert the dictionary:</p>
+
+<pre><code>device_ids = {sql_guid: device_id for device_id, values in unique_ids_dict.items() for sql_guid in values}
+# {'0af229d1-283e-4575-a818-901617a762a7': '3BAA5C57',
+#  '2f4a7f93-d7ed-4514-bef0-9bb0f025ecd3': '3BAA5C42',
+#  '4e720c6e-1866-4c9b-b967-dfab049266fb': '3BAA5B67',
+#  '85708e5d-768d-4a90-ab71-60a737de96e3': '3BAA5B67',
+#  'e268b224-bfb7-40c7-8ae5-500eaecb292b': '3BAA5B84',
+#  'e4ced298-530c-41cc-98a7-42a2e4fe5987': '3BAA5B67'}
+</code></pre>
+
+<p>Then we can use that:</p>
+
+<pre><code>@timer
+def find_num_occurences(file_obj, sql_guids, search_vals):
+    device_ids = {sql_guid: device_id for device_id, values in sql_guids.items() for sql_guid in values}
+    data = defaultdict(lambda: defaultdict(set))
+
+    for line in file_obj:
+        for sql_guid, device_id in device_ids.items():
+            if sql_guid in line:
+                for key, search_val in search_vals.items():
+                    if search_val in line:
+                        data[device_id][key].add(sql_guid)
+    return data
+</code></pre>
+
+<p>The usage is almost the same as your code:</p>
+
+<pre><code>with open(path) as file_obj:
+    device_ids = ('3BAA5C42', '3BAA5B84', '3BAA5C57', '3BAA5B67')
+    sql_guids = find_device_IDs(file_obj, device_ids)
+    file_obj.seek(0)
+
+    search_with_in_deviceID = {"exception": "Exception occurred", 
+                               "added": "Packet record has been added"}
+    print(find_num_occurences(file_obj, sql_guids, search_with_in_deviceID))
+
+# defaultdict(&lt;function __main__.find_num_occurences.&lt;locals&gt;.&lt;lambda&gt;&gt;,
+#             {'3BAA5B67': defaultdict(set,
+#                          {'added': {'4e720c6e-1866-4c9b-b967-dfab049266fb'},
+#                           'exception': {'85708e5d-768d-4a90-ab71-60a737de96e3',
+#                            'e4ced298-530c-41cc-98a7-42a2e4fe5987'}}),
+#              '3BAA5B84': defaultdict(set,
+#                          {'added': {'e268b224-bfb7-40c7-8ae5-500eaecb292b'}}),
+#              '3BAA5C42': defaultdict(set,
+#                          {'added': {'2f4a7f93-d7ed-4514-bef0-9bb0f025ecd3'}}),
+#              '3BAA5C57': defaultdict(set,
+#                          {'added': {'0af229d1-283e-4575-a818-901617a762a7'}})})
+</code></pre>
+
+<hr>
+
+<p>You can actually get this down to a single pass, by collecting all IDs where an exception occurred and only at the end joining that with the elements you are actually searching for:</p>
+
+<pre><code>def get_data(file_obj, device_ids, search_vals):
+    sql_guid_to_device_id = {}
+    data = defaultdict(set)
+
+    for line in file_obj:
+        # search for an sql_guid
+        m = rg.search(line)
+        if m:
+            sql_guid = m.group(1)
+
+            # Add to mapping
+            for device_id in device_ids:
+                if device_id in line:
+                    sql_guid_to_device_id[sql_guid] = device_id
+
+            # Add to exceptions/added
+            for key, search_val in search_vals.items():
+                if search_val in line:
+                    data[sql_guid].add(key)
+    return sql_guid_to_device_id, data
+
+def merge(sql_guid_to_device_id, data):
+    data2 = defaultdict(lambda: defaultdict(set))
+
+    for sql_guid, values in data.items():
+        if sql_guid in sql_guid_to_device_id:
+            for key in values:
+                data2[sql_guid_to_device_id[sql_guid]][key].add(sql_guid)
+    return data2
+</code></pre>
+
+<p>With the following usage:</p>
+
+<pre><code>with open(path) as file_obj:
+    device_ids = ('3BAA5C42', '3BAA5B84', '3BAA5C57', '3BAA5B67')
+    search_with_in_deviceID = {"exception": "Exception occurred", 
+                               "added": "Packet record has been added"}
+    sql_guid_to_device_id, data = get_data(file_obj, device_ids, search_with_in_deviceID)
+    data2 = merge(sql_guid_to_device_id, data)
+
+    for device_id, values in data2.items():
+        for key, sql_guids in values.items():
+            print(f"{device_id} {key} {len(sql_guids)}")
+
+# 3BAA5B67 exception 2
+# 3BAA5B67 added 1
+# 3BAA5C42 added 1
+# 3BAA5B84 added 1
+# 3BAA5C57 added 1
+</code></pre>
+
+<p><code>get_data</code>, <code>data</code> and <code>data2</code> still need better names...</p>
+
+<p>Other than that this should be faster because it reads the file only once. It does consume more memory, though, because it also saves exceptions or added events for SQL guids which you later don't need. If this trade-off is not worth it, go back to the first half of this answer.</p>
+    </div>

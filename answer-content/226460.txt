@@ -1,0 +1,409 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p>This answer assumes that all Names in the data are unique. There is no
+  provision in this example to handle duplicate Names except to issue a
+  note in the debug output.</p>
+</blockquote>
+
+<p>This answer will involve <code>Dictionaries</code>. Please review <a href="https://excelmacromastery.com/vba-dictionary/" rel="nofollow noreferrer">this website</a> for complete information on how and why they are an efficient way to store unique data. The short answer is that you can create a large dictionary by looking at a unique "key", which is a string that uniquely represents some data that you want to track. In your case, you've asserted that all of the Names are unique. Dictionaries exist for speedy access to any single entry -- no looping through 200k entries to find the one you want. Use your unique key string and you have near-instant access to the data associated with that key.</p>
+
+<p>For your situation, my example builds two <code>Dictionaries</code>, one for each set of data. The keys are the Names. The values associated with each key (Name) is the row number on which each Name is used. The row numbers will play a major role later on.</p>
+
+<p>As with the other Code Review for your previous version of code, I'll reiterate:</p>
+
+<ol>
+<li>Identify your function parameters <code>ByRef</code> or <code>ByVal</code></li>
+<li>Declare your variables as close to their first use as possible.</li>
+</ol>
+
+<p>As an example:</p>
+
+<pre><code>Dim arr1 As Variant
+Dim arr2 As Variant
+arr1 = BuildDataArrays(ws1, startRow:=2)
+arr2 = BuildDataArrays(ws2, startRow:=2)
+</code></pre>
+
+<p>You'll see that there is a call to a <code>BuildDataArrays</code> function. That brings me to </p>
+
+<ol start="3">
+<li>Functional Isolation. When your routine starts getting very long, that is the perfect time to begin breaking parts of the logic out into separate functions/subs. This is especially useful if you have repetitive logic where only the variable is different. This is the case for <code>BuildDataArrays</code>.</li>
+</ol>
+
+<p>Give this function a worksheet and optionally the starting row or column and it determines the range of available data, returning a memory-based array. Breaking out code into separate routines is very helpful because it makes your main logic easier to follow.</p>
+
+<pre><code>Private Function BuildDataArrays(ByRef ws As Worksheet, _
+                                 Optional ByVal startRow As Long = 1, _
+                                 Optional ByVal startCol As Long = 1) As Variant
+    '--- assumes all rows and columns are valid data
+    Dim lastRow As Long
+    Dim lastCol As Long
+    Dim dataArea As Range
+    Dim data As Variant
+    With ws
+        lastRow = .Cells(.Rows.Count, startRow).End(xlUp).row
+        lastCol = .Cells(startCol, .Columns.Count).End(xlToLeft).Column
+        Set dataArea = .Cells(startRow, startCol).Resize(lastRow - startRow + 1, _
+                                                         lastCol - startCol + 1)
+        data = dataArea
+    End With
+    BuildDataArrays = data
+End Function
+</code></pre>
+
+<ol start="4">
+<li>Use <code>Dictionaries</code> to collect your data. As with the previous point, this is a perfect opportunity to isolate the logic in a separate function.</li>
+</ol>
+
+<p>The <code>BuildDataDictionary</code> function will accept your memory-based array and use the selected column of data as a unique key (currently defaulted to column "I").</p>
+
+<pre><code>Private Function BuildDataDictionary(ByRef data As Variant, _
+                                     Optional ByVal keyColumn As Long = 8) As Dictionary
+    Dim row As Long
+    Dim name As String
+    Dim names As Dictionary
+    Set names = New Dictionary
+    For row = LBound(data, 1) To UBound(data, 1)
+        name = Trim$(data(row, keyColumn))
+        If Len(name) &gt; 0 Then
+            If Not names.Exists(name) Then
+                '--- add the new name to the dictionary and save the row number
+                names.Add name, row
+            Else
+                '--- if you get here, it means that the Name is NOT unique
+                '    and you'll have to change your logic, or change the name
+                Debug.Print "ERROR: Duplicate name detected on " &amp; _
+                            " on row " &amp; row &amp; ": '" &amp; name &amp; "'"
+            End If
+        End If
+    Next row
+    Set BuildDataDictionary = names
+End Function
+</code></pre>
+
+<p>Next we'll build the resulting report data. According to your description, the report will consist of all data rows (each with a unique Name), with any differences noted in the data itself. In your original post, you are assuming that the larger of the two row counts for the sheets will be your output array. This isn't true.</p>
+
+<p>Consider that, by definition, all of the data from Sheet1 is unique (because each row's Name is unique). That means if you have 10 rows of data on Sheet1, your output data will have at least ten rows. It's possible that your data on Sheet2 also has ten rows of data, and only one of those rows repeats a Name on Sheet1. So your resulting report of data will have 19 rows.</p>
+
+<pre><code>Dim totalRows As Long
+totalRows = ws1Names.Count
+
+'--- now add on the number of unique rows from the other sheet
+Dim name As Variant
+For Each name In ws2Names
+    If Not ws1Names.Exists(name) Then
+        '--- name is unique
+        totalRows = totalRows + 1
+    Else
+        '--- name is not unique
+    End If
+Next name
+Debug.Print "There are " &amp; totalRows &amp; " unique Names between the sheets"
+
+'--- now build a correctly sized output array
+'    ASSUMES both arrays have the same number of columns!!
+Dim reportData As Variant
+ReDim reportData(1 To totalRows, 1 To UBound(arr1, 2))
+</code></pre>
+
+<p>Now that we're about to generate the report data, we have to consider how to make note of any errors encountered. For this I'm using a <code>Collection</code>, which is a simple way to generate a running list of items. In this case, for each difference I'm adding a string that notes the row and column of each difference in the data arrays. I can use this later on to highlight the difference cells.</p>
+
+<pre><code>'--- and create an object to list which cells are different
+Dim diffCells As Collection
+Set diffCells = New Collection
+</code></pre>
+
+<p>After that, we simply move the data over to the report array, making note of any differences.</p>
+
+<pre><code>'--- we know that all Names are unique in sheet1, so move the all that
+'    data from sheet1 into the report array
+Dim row As Long
+Dim col As Long
+Dim ws1row As Long
+Dim ws2row As Long
+row = 1
+For Each name In ws1Names
+    If ws2Names.Exists(name) Then
+        '--- this row will have a difference because the Names match!
+        '    so get the rows for each sheet that match the name
+        ws1row = ws1Names(name)
+        ws2row = ws2Names(name)
+        For col = 1 To UBound(reportData, 2)
+            If arr1(ws1row, col) = arr2(ws2row, col) Then
+                reportData(row, col) = arr1(ws1row, col)
+            Else
+                '--- note the different values in the cell and add the
+                '    row and column to the difference list
+                reportData(row, col) = arr1(ws1row, col) &amp; " &lt;&gt; " &amp; _
+                                       arr2(ws2row, col)
+                diffCells.Add CLng(row) &amp; "," &amp; CLng(col)
+            End If
+        Next col
+    Else
+        '--- this is a unique row, so a straight copy of all columns
+        For col = 1 To UBound(reportData, 2)
+            reportData(row, col) = arr1(row, col)
+        Next col
+    End If
+    row = row + 1
+Next name
+
+'--- the remaining data are the unique rows that exist in sheet2
+'    the "row" variable count is continued in this loop
+For Each name In ws2Names
+    If Not ws1Names.Exists(name) Then
+        '--- this is a unique row, so a straight copy of all columns
+        ws2row = ws2Names(name)
+        For col = 1 To UBound(reportData, 2)
+            reportData(row, col) = arr2(ws2row, col)
+        Next col
+        row = row + 1
+    End If
+Next name
+</code></pre>
+
+<p>The final step is to output the report data. In my example, I am not creating a new workbook, but only creating a new worksheet. You can un-comment some code lines there to change it back for your purposes.</p>
+
+<pre><code>If diffCells.Count &gt; 0 Then
+    Dim report As Workbook
+    Dim reportWS As Worksheet
+    'Set report = Workbooks.Add           'un-comment to report to a new workbook
+    'Set reportWS = report.ActiveSheet    'un-comment to report to a new workbook
+    Set reportWS = ThisWorkbook.Sheets.Add   'comment to report to a new workbook
+
+    '--- copy the resulting report to the worksheet
+    Dim reportArea As Range
+    Set reportArea = reportWS.Range("A1").Resize(UBound(reportData, 1), UBound(reportData, 2))
+    With reportArea
+        .Value = reportData
+        .Columns("A:B").ColumnWidth = 25
+
+        '--- now highlight the cells that are different
+        Dim rowcol As Variant
+        Dim parts() As String
+        For Each rowcol In diffCells
+            parts = Split(rowcol, ",")
+            With .Cells(CLng(parts(0)), CLng(parts(1)))
+                .Font.Bold = True
+                .Font.ColorIndex = 3
+            End With
+        Next rowcol
+    End With
+    Debug.Print "Report Generated secs " &amp; Timer - tm
+End If
+</code></pre>
+
+<p>Here is the whole code module in one block:</p>
+
+<pre><code>Option Explicit
+
+Sub test1()
+    Compare2WorkSheets Sheet1, Sheet2
+End Sub
+
+Sub Compare2WorkSheets(ByRef ws1 As Worksheet, ByRef ws2 As Worksheet)
+    Dim tm As Double
+    tm = Timer
+
+    'Application.ScreenUpdating = False
+    'Application.Calculation = xlCalculationManual
+    'Application.EnableEvents = False
+
+    '--- establish the data in the arrays, skip the header row
+    Dim arr1 As Variant
+    Dim arr2 As Variant
+    arr1 = BuildDataArrays(ws1, startRow:=2)
+    arr2 = BuildDataArrays(ws2, startRow:=2)
+
+    '--- buidl a dictionary of Names for each worksheet
+    Dim ws1Names As Dictionary
+    Dim ws2Names As Dictionary
+    Set ws1Names = BuildDataDictionary(arr1)
+    Set ws2Names = BuildDataDictionary(arr2)
+
+    '--- we don't know how many rows the report will be, so compare
+    '    names between the two sheets to find out. it's basically
+    '    the sum of the number of unique names between the sheets
+    Dim totalRows As Long
+    totalRows = ws1Names.Count
+
+    '--- now add on the number of unique rows from the other sheet
+    Dim name As Variant
+    For Each name In ws2Names
+        If Not ws1Names.Exists(name) Then
+            '--- name is unique
+            totalRows = totalRows + 1
+        Else
+            '--- name is not unique
+        End If
+    Next name
+    Debug.Print "There are " &amp; totalRows &amp; " unique Names between the sheets"
+
+    '--- now build a correctly sized output array
+    '    ASSUMES both arrays have the same number of columns!!
+    Dim reportData As Variant
+    ReDim reportData(1 To totalRows, 1 To UBound(arr1, 2))
+
+    '--- and create an object to list which cells are different
+    Dim diffCells As Collection
+    Set diffCells = New Collection
+
+    '--- we know that all Names are unique in sheet1, so move the all that
+    '    data from sheet1 into the report array
+    Dim row As Long
+    Dim col As Long
+    Dim ws1row As Long
+    Dim ws2row As Long
+    row = 1
+    For Each name In ws1Names
+        If ws2Names.Exists(name) Then
+            '--- this row will have a difference because the Names match!
+            '    so get the rows for each sheet that match the name
+            ws1row = ws1Names(name)
+            ws2row = ws2Names(name)
+            For col = 1 To UBound(reportData, 2)
+                If arr1(ws1row, col) = arr2(ws2row, col) Then
+                    reportData(row, col) = arr1(ws1row, col)
+                Else
+                    '--- note the different values in the cell and add the
+                    '    row and column to the difference list
+                    reportData(row, col) = arr1(ws1row, col) &amp; " &lt;&gt; " &amp; _
+                                           arr2(ws2row, col)
+                    diffCells.Add CLng(row) &amp; "," &amp; CLng(col)
+                End If
+            Next col
+        Else
+            '--- this is a unique row, so a straight copy of all columns
+            For col = 1 To UBound(reportData, 2)
+                reportData(row, col) = arr1(row, col)
+            Next col
+        End If
+        row = row + 1
+    Next name
+
+    '--- the remaining data are the unique rows that exist in sheet2
+    '    the "row" variable count is continued in this loop
+    For Each name In ws2Names
+        If Not ws1Names.Exists(name) Then
+            '--- this is a unique row, so a straight copy of all columns
+            ws2row = ws2Names(name)
+            For col = 1 To UBound(reportData, 2)
+                reportData(row, col) = arr2(ws2row, col)
+            Next col
+            row = row + 1
+        End If
+    Next name
+
+    Debug.Print " Calc secs " &amp; Timer - tm
+    If diffCells.Count &gt; 0 Then
+        Dim report As Workbook
+        Dim reportWS As Worksheet
+        'Set report = Workbooks.Add           'un-comment to report to a new workbook
+        'Set reportWS = report.ActiveSheet    'un-comment to report to a new workbook
+        Set reportWS = ThisWorkbook.Sheets.Add   'comment to report to a new workbook
+
+        '--- copy the resulting report to the worksheet
+        Dim reportArea As Range
+        Set reportArea = reportWS.Range("A1").Resize(UBound(reportData, 1), UBound(reportData, 2))
+        With reportArea
+            .Value = reportData
+            .Columns("A:B").ColumnWidth = 25
+
+            '--- now highlight the cells that are different
+            Dim rowcol As Variant
+            Dim parts() As String
+            For Each rowcol In diffCells
+                parts = Split(rowcol, ",")
+                With .Cells(CLng(parts(0)), CLng(parts(1)))
+                    .Font.Bold = True
+                    .Font.ColorIndex = 3
+                End With
+            Next rowcol
+        End With
+        Debug.Print "Report Generated secs " &amp; Timer - tm
+    End If
+    'Application.ScreenUpdating = True
+    'Application.Calculation = xlCalculationAutomatic
+    'Application.EnableEvents = True
+
+    If diffCells.Count &gt; 0 Then
+        Debug.Print diffCells.Count &amp; " cells contain different data!"
+    Else
+        Debug.Print "No differences found between the sheets."
+    End If
+End Sub
+
+Private Function BuildDataArrays(ByRef ws As Worksheet, _
+                                 Optional ByVal startRow As Long = 1, _
+                                 Optional ByVal startCol As Long = 1) As Variant
+    '--- assumes all rows and columns are valid data
+    Dim lastRow As Long
+    Dim lastCol As Long
+    Dim dataArea As Range
+    Dim data As Variant
+    With ws
+        lastRow = .Cells(.Rows.Count, startRow).End(xlUp).row
+        lastCol = .Cells(startCol, .Columns.Count).End(xlToLeft).Column
+        Set dataArea = .Cells(startRow, startCol).Resize(lastRow - startRow + 1, _
+                                                         lastCol - startCol + 1)
+        data = dataArea
+    End With
+    BuildDataArrays = data
+End Function
+
+Private Function BuildDataDictionary(ByRef data As Variant, _
+                                     Optional ByVal keyColumn As Long = 8) As Dictionary
+    Dim row As Long
+    Dim name As String
+    Dim names As Dictionary
+    Set names = New Dictionary
+    For row = LBound(data, 1) To UBound(data, 1)
+        name = Trim$(data(row, keyColumn))
+        If Len(name) &gt; 0 Then
+            If Not names.Exists(name) Then
+                '--- add the new name to the dictionary and save the row number
+                names.Add name, row
+            Else
+                '--- if you get here, it means that the Name is NOT unique
+                '    and you'll have to change your logic, or change the name
+                Debug.Print "ERROR: Duplicate name detected on " &amp; _
+                            " on row " &amp; row &amp; ": '" &amp; name &amp; "'"
+            End If
+        End If
+    Next row
+    Set BuildDataDictionary = names
+End Function
+</code></pre>
+
+<blockquote>
+  <p><strong>EDIT:</strong> added an example on how to call the routine from a button click</p>
+</blockquote>
+
+<p>It seems that you're adding an ActiveX command button to your worksheet. In this case, the <code>CommandButton1_Click()</code> method will be executed in the Sheet1 module. Take the code above with the <code>Compare2WorkSheets</code> routine and paste it into a regular code module. Then, in your sheet1 module, fix up your button-click code like this:</p>
+
+<pre><code>Option Explicit
+
+Private Sub CommandButton1_Click()
+    Dim myWorkbook1 As Workbook
+    Dim myWorkbook2 As Workbook
+
+    '--- if Sheet1 is contained in the workbook where the code is running, use this
+    Set myWorkbook1 = ThisWorkbook
+
+    '--- if Sheet1 is in a different -- but already open -- workbook, use this
+    Set myWorkbook1 = Workbooks("the-already-open-workbook-filename.xlsx")
+
+    '--- if Sheet1 is in a different -- but unopened -- workbook, use this
+    Set myWorkbook1 = Workbooks.Open("the-workbook-filename-to-open.xlsx")
+
+    '--- you can make the same decisions for setting myWorkbook2
+    Set myWorkbook2 = Workbooks.Open("C:\Temp\testreport1.xlsx")
+
+
+    Compare2WorkSheets myWorkbook1.Worksheets("Sheet1"), myWorkbook2.Worksheets("Sheet1")
+
+    myWorkbook1.Close
+    myWorkbook2.Close
+End Sub
+</code></pre>
+    </div>

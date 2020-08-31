@@ -1,0 +1,142 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>#pragma once
+</code></pre>
+
+<p>Be aware that you are giving up portability here as this is, while common, a non-standard compiler extension. For nearly all applications, as long as you use implementations that support it, neither physically nor logically copy files around, and the filesystem doesn't trigger a false-positive, then #pragma once is fine. Otherwise, stick with standard include guards and give some effort to differentiate the guard name.</p>
+
+<hr>
+
+<pre><code>#include &lt;iostream&gt;
+#include &lt;SDL.h&gt;
+#include &lt;string&gt;
+#include "Window.h"
+</code></pre>
+
+<p>Headers should not be dependent upon other headers being included first.  One way to ensure this is to include your headers before any other headers.</p>
+
+<blockquote>
+  <p>Latent usage errors can be avoided by ensuring that the .h file of a component parses by itself – without externally-provided declarations or definitions... Including the .h file as the very first line of the .c file ensures that no critical piece of information intrinsic to the physical interface of the component is missing from the .h file (or, if there is, that you will find out about it as soon as you try to compile the .c file).</p>
+</blockquote>
+
+<p>That is to say, your includes should be in the following order:</p>
+
+<ol>
+<li>Prototype/Interface. (surface.h)</li>
+<li>Project/Private headers (window.h)</li>
+<li>Headers from non-standard, non-system libraries (QT, Eigen, etc...)</li>
+<li>Standard C++ headers (vector, string, cstdint, etc...)</li>
+<li>System headers (windows.h, dirent.h, etc...)</li>
+</ol>
+
+<p>As you move down the list, libraries are more stable and more widely used (and therefore tested).  Further ordering each subgroup, say lexicographically by path/name, makes it easier for maintainers to quickly find an include when the include list becomes long.</p>
+
+<p>Do not <code>#include &lt;iostream&gt;</code> in header files.  Many C++ implementations transparently inject a static constructor into every translation unit that includes <code>&lt;iostream&gt;</code>, even if the client never uses the <code>&lt;iostream&gt;</code> facilities.</p>
+
+<hr>
+
+<pre><code>        bool IsWindowSurface = false;
+        std::string ImagePath = "";
+</code></pre>
+
+<p>Whenever you have a boolean tied to the existence of some other value, use an <code>optional</code> type (<a href="https://www.boost.org/doc/libs/1_68_0/libs/optional/doc/html/index.html" rel="nofollow noreferrer">Boost</a>, <a href="https://github.com/mnmlstc/core" rel="nofollow noreferrer">Mnmlstc</a>, <a href="https://github.com/facebook/folly" rel="nofollow noreferrer">Folly</a>, <a href="https://en.cppreference.com/w/cpp/utility/optional" rel="nofollow noreferrer">C++17</a>).</p>
+
+<p>Does your surface really need to know where it was created from?</p>
+
+<hr>
+
+<pre><code>        Surface(std::string path);
+</code></pre>
+
+<p>Copying a <code>std::string</code> may be expensive.  Pass this input parameter by reference to <code>const</code>.</p>
+
+<pre><code>SDL2::Surface::Surface(std::string path) :
+    ImagePath{ path },
+    IsWindowSurface{ false } {}
+</code></pre>
+
+<p>If you want to treat the parameter as a sink argument, then <code>std::move(path)</code> into <code>ImagePath</code>.</p>
+
+<hr>
+
+<pre><code>bool SDL2::Surface::LoadBMP() {
+    // Load image from path
+    ScreenSurface = SDL_LoadBMP(ImagePath.c_str());
+</code></pre>
+
+<p>What happens here if the surface already exists? If the surface was a window surface copy, then you leak the old surface and the <code>ScreenSurface</code> will point to null because <code>ImagePath</code> is empty.  If the source was a previous BMP, then the old surface still leaks and <code>ScreenSurface</code> points to clean version of the BMP.</p>
+
+<hr>
+
+<p>Rather than wrapping every function into RAII objects, use <code>std::unique_ptr</code> to manage the lifetimes object types. As long as you don't construct your <code>std::unique_ptr</code> with an instance of a destructor that can't be optimized away, then <code>std::unique_ptr</code> is practically free.</p>
+
+<p>With all of your resources, you've likely noticed a pattern where you create the resource and check the handle to ensure it was created.  We can create a generic helper for creating these resource types.</p>
+
+<pre><code>template&lt;typename Result, typename Creator, typename... Arguments&gt;
+auto make_resource(Creator c, Arguments&amp;&amp;... args)
+{
+    auto r = c(std::forward&lt;Arguments&gt;(args)...);
+    if (!r) { throw std::system_error(errno, std::generic_category()); }
+    return Result(r);
+}
+</code></pre>
+
+<p>Now we need a way to hand <code>std::unique_ptr</code> a deleter without incurring a cost.  We can wrap it in a constant value and return a deleter function whenever <code>std::unique_ptr</code> requests it.</p>
+
+<pre><code>template &lt;typename T, std::decay_t&lt;T&gt; t&gt;
+struct constant_t {
+    constexpr operator T() noexcept const { return t; }
+}
+</code></pre>
+
+<p>Using the two above helpers, we can churn out resources.  First we define the pointer type.</p>
+
+<pre><code>using surface_ptr = std::unique_ptr&lt;
+    SDL_Surface, constant_t&lt;decltype(SDL_FreeSurface), SDL_FreeSurface&gt;&gt;;
+</code></pre>
+
+<p>Then the factory functions.</p>
+
+<pre><code>inline auto make_surface(const char* filename) {
+  return make_resource&lt;surface_ptr&gt;(SDL_LoadBMP, filename);
+}
+
+inline auto make_surface(SDL_Window* ptr) {
+  return make_resource&lt;surface_ptr&gt;(SDL_GetWindowSurface, ptr);
+}
+
+inline auto make_surface(
+    std::uint32_t flags, int width, int height, int depth, 
+    std::uint32 Rmask, std::uint32 Gmask, std::uint32_t Bmask, std::uint32_t Amask) {
+  return make_resource&lt;surface_ptr&gt;(
+      SDL_CreateRGBSurface, flags, width, height, depth, 
+      Rmask, Gmask, Bmask, Amask);
+}
+</code></pre>
+
+<p>Then you can use this <code>surface_ptr</code> with the existing SDL library.</p>
+
+<pre><code>void meow() {
+    auto w = make_window("Purr", SDL_WINDOW_POS_UNDEFINED, SDL_WINDOW_POS_UNDEFINED, 
+                              640, 480, 0));
+    auto s = make_surface(w.get());
+    SDL_FillRect(s.get(), NULL, SDL_MapRGB(s-&gt;format, 255, 0, 0));
+    SDL_UpdateWindowSurface(w.get());
+}
+</code></pre>
+
+<p><em>Note -</em> The <code>constant_t</code> helper above was needed for C++11 as there was a defect with <code>std::integral_constant</code> not being evaluated as a <code>constexpr</code> expression.  With C++14, you can do the following</p>
+
+<pre><code>template &lt;typename T, std::decay_t&lt;T&gt; t&gt;
+using constant_t = std::integral_t&lt;T, t&gt;;
+
+using surface_ptr = std::unique_ptr&lt;SDL_Surface, constant_t&lt;decltype(SDL_FreeSurface)*, SDL_FreeSurface&gt;&gt;;
+</code></pre>
+
+<p>With C++17 allowing non-type template arguments with <code>auto</code>, the verbosity can be eliminated.</p>
+
+<pre><code>template &lt;auto t&gt;
+using constant_t = std::integral_constant&lt;std::decay_t&lt;decltype(t)&gt;, t&gt;;
+
+using surface_ptr = std::unique_ptr&lt;SDL_Surface, constant_t&lt;SDL_FreeSurface&gt;&gt;;
+</code></pre>
+    </div>

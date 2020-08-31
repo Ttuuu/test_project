@@ -1,0 +1,156 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>std::vector&lt;multidimensional_array&lt;T, N - 1&gt;&gt; _data{0};
+</code></pre>
+
+<p>What does this line do? (Possible hint: <code>{0}</code> is a braced initializer sequence consisting of a single <code>int</code>, and <code>int</code> is implicitly convertible to <code>multidimensional_array&lt;T, N-1&gt;</code>. Or is this an anti-hint? Can you tell, without asking a compiler?)</p>
+
+<p>If you want to create an empty vector, just use <code>vector</code>'s default constructor:</p>
+
+<pre><code>std::vector&lt;multidimensional_array&lt;T, N - 1&gt;&gt; _data;
+</code></pre>
+
+<p>or convert from an empty initializer-list:</p>
+
+<pre><code>std::vector&lt;multidimensional_array&lt;T, N - 1&gt;&gt; _data = {};
+</code></pre>
+
+<p>See <a href="https://quuxplusone.github.io/blog/2019/02/18/knightmare-of-initialization/" rel="noreferrer">"The Knightmare of Initialization in C++."</a></p>
+
+<hr>
+
+<pre><code>virtual ~multidimensional_array() = default;
+</code></pre>
+
+<p>Yikes! Why does this class need a vtable? Are you intending to inherit from it? Please don't!</p>
+
+<hr>
+
+<pre><code>  template &lt;typename Size1, typename... Sizes&gt;
+  void _resize(const Size1 &amp;size1, const Sizes &amp;... sizes) {
+    _data.resize(size1);
+    for (auto &amp;item : _data) {
+      item.resize(sizes...);
+    }
+  }
+  template &lt;typename Size1&gt;
+  void _resize(const Size1 &amp;size1) {
+    _data.resize(size1);
+  }
+</code></pre>
+
+<p>If you're allowed to use C++17 <code>if constexpr</code>, then you can write this without the "recursion", as:</p>
+
+<pre><code>template&lt;class... Sizes&gt;
+void _resize(size_t head, Sizes... tail) {
+    _data.resize(head);
+    if constexpr (sizeof...(tail) != 0) {
+        for (auto&amp;&amp; elt : _data) {
+            elt.resize(tail...);
+        }
+    }
+}
+</code></pre>
+
+<hr>
+
+<pre><code>template &lt;typename... Sizes&gt;
+multidimensional_array(const Sizes &amp;... sizes) {
+  resize(sizes...);
+}
+</code></pre>
+
+<p>This constructor should be marked <code>explicit</code>. Otherwise, declarations like these will compile without complaint:</p>
+
+<pre><code>multidimensional_array&lt;int, 1&gt; a = 3;
+multidimensional_array&lt;int, 1&gt; b {3};
+</code></pre>
+
+<p>In fact, you should probably forbid constructing a <code>multidimensional_array&lt;T, N&gt;</code> with any number of size parameters other than <code>N</code>. And in fact, to avoid the ambiguity of</p>
+
+<pre><code>multidimensional_array&lt;int, 1&gt; b {3};
+</code></pre>
+
+<p>entirely, let's just use a <a href="https://quuxplusone.github.io/blog/2018/06/21/factory-vs-conversion/" rel="noreferrer">factory method</a> instead of a constructor. Result:</p>
+
+<pre><code>template&lt;class T, size_t N&gt;
+class multidimensional_array {
+public:
+    template&lt;class... Sizes,
+             std::enable_if_t&lt;sizeof...(Sizes) == N, int&gt; = 0,
+             std::enable_if_t&lt;(std::is_same_v&lt;Sizes, size_t&gt; &amp;&amp; ...), int&gt; = 0,
+    &gt;
+    static multidimensional_array with_dimensions(Sizes... sizes) {
+        multidimensional_array a;
+        a.resize(sizes...);
+        return a;
+    }
+    [...]
+};
+
+auto a1 = multidimensional_array&lt;int, 1&gt;::with_dimensions(2);
+auto a2 = multidimensional_array&lt;int, 1&gt;{0, 0};
+auto a3 = multidimensional_array&lt;int, 2&gt;::with_dimensions(3, 3);
+</code></pre>
+
+<p>Consider what should happen if the caller passes dimensions (0,0) or (-1,-1) or so on.</p>
+
+<hr>
+
+<pre><code>std::vector&lt;T&gt; data() { return _data; }
+</code></pre>
+
+<p>It is surprising that <code>data()</code> returns a <em>copy</em> of the data; that's not how <code>std::vector::data()</code> or <code>std::array::data()</code> work. I would expect to see also an overload of <code>data()</code> for const arrays:</p>
+
+<pre><code>std::vector&lt;T&gt;&amp; data() { return _data; }
+const std::vector&lt;T&gt;&amp; data() const { return _data; }
+</code></pre>
+
+<p>...oh wait, except that <em>doesn't work at all</em>, because <code>_data</code> is not a <code>vector&lt;T&gt;</code>; it's a <code>vector&lt;multidimensional_array&lt;T,N-1&gt;&gt;</code>.</p>
+
+<p>The moral of this story is that you should always test your code! C++ templates especially, because if you don't instantiate them, you'll never know if they even type-check at all.</p>
+
+<pre><code>T *raw_data() { return _data.begin()-&gt;raw_data(); }
+</code></pre>
+
+<p>This compiles, but is extremely scary, because it sounds (to me) like it ought to give a view onto a contiguous array of <code>(Sizes * ...)</code> objects of type <code>T</code>, but really it only gives a view onto the first linear "row" of the data; the rest of the data is stored somewhere else, non-contiguous with that row.</p>
+
+<p>In fact, I would recommend that you not provide the <code>data()</code> accessor either, because the C++20 STL adds a notion of "contiguous container" which is triggered by seeing if the container has a plausible-looking <code>.data()</code> method (e.g. <code>vector</code>, <code>array</code>, <code>string</code>). Since your container is non-contiguous, you should probably avoid the word <code>.data()</code> — the same way you'd avoid the word <code>.begin()</code> for something that didn't return an iterator.</p>
+
+<hr>
+
+<pre><code>T &amp;operator[](std::uint64_t index) { return _data.at(index); }
+</code></pre>
+
+<p>should have a <code>const</code> overload too. And you should almost certainly use <code>size_t</code>, not <code>uint64_t</code>, just to be idiomatic and to match the <code>size_type</code> of <code>std::vector</code>.</p>
+
+<hr>
+
+<pre><code>void for_each(F &amp;&amp;function)
+</code></pre>
+
+<p>Consider providing a <code>const</code> overload of <code>for_each</code>.</p>
+
+<p>The STL-ese way of passing a callback is just <code>F function</code> — pass by value — because usually the function is just a stateless lambda or something equally cheap to copy. If the caller really wants pass-by-reference, all they have to do is wrap their function in <code>std::ref</code>.</p>
+
+<hr>
+
+<p>Consider adding a <code>static_assert(N &gt;= 2)</code> to the primary template. <code>N==0</code> should be a hard error.</p>
+
+<p>Your repetition of <code>public:</code> is harmless but unidiomatic. We generally just have one big <code>public:</code> section and one big <code>private:</code> section (and personally I put them in that order, but reasonable people may vary on that).</p>
+
+<hr>
+
+<p>Quick, off the top of your head, which parts of your design break when you instantiate <code>multidimensional_array&lt;bool, 2&gt;</code>? Which parts break <em>unsalvageably?</em></p>
+
+<p>Write unit tests! Pay particular attention to <code>const</code> — like, write a test that verifies that <code>a[3] = b[3]</code> compiles when <code>b</code> is const (but not when <code>a</code> is const).</p>
+
+<p>Hmm, that reminds me: did you <em>want</em> <code>a[3] = b[3]</code> to compile? I should be able to assign the entire array at once <code>a = b</code>, and I should be able to assign one <code>T</code> object at a time <code>a[i][j] = t</code>, but should I also be able to assign one <em>row</em> at a time <code>a[i] = r</code>?</p>
+
+<p>What about this?</p>
+
+<pre><code>auto mat = multidimensional_array&lt;int, 2&gt;::with_dimensions(3, 3);
+mat[0].resize(2);
+
+// Is `mat` now a 3x3 array with one corner cut out?
+</code></pre>
+    </div>

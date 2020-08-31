@@ -1,0 +1,147 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Headers</h1>
+
+<p>You forgot to include <code>&lt;vector&gt;</code>.</p>
+
+<p>Only the test program requires <code>&lt;iostream&gt;</code>, so consider moving it to immediately before <code>main()</code>, to make it easier to separate the implementation and its tests when the time comes.</p>
+
+<h1>Interface</h1>
+
+<p>You might be constrained by what the calling environment expects (I don't know much about R), but there are a couple of surprises in the function signature:</p>
+
+<ul>
+<li>Passing the match strings and their replacements as a pair of parallel containers can be hard to get right (and there doesn't seem to be even the minimum of checking that their lengths match).  It's better to accept a list of pairs than a pair of lists; that way, each match appears alongside its replacement.</li>
+<li>The boolean flag is a danger sign - it's not obvious at the call site what the flag means.  It might be better to accept a <code>std::regex_constants::syntax_option_type</code> to be used; this would also allow the caller to choose different regex grammars.</li>
+</ul>
+
+<p>I think I would write the interface something like this:</p>
+
+<pre><code>std::string rcpp_mgsub(std::string string,
+                       std::vector&lt;std::pair&lt;std::regex,std::string&gt;&gt; const&amp; replacements);
+</code></pre>
+
+
+
+<pre><code>// Compatibility layer, if required
+std::string rcpp_mgsub(const std::string&amp; string,
+                       std::vector&lt;std::string&gt; const&amp; match,
+                       std::vector&lt;std::string&gt; const&amp; replace,
+                       bool const&amp; ic)
+{
+    if (match.size() != replace.size())
+        throw std::invalid_argument("match/replace lengths differ");
+
+    auto flags = std::regex_constants::optimize;
+    if (ic)
+        flags |= std::regex_constants::icase;
+    std::vector&lt;std::pair&lt;std::regex,std::string&gt;&gt; replacements;
+    replacements.reserve(match.size());
+    std::transform(match.begin(), match.end(), replace.begin(), std::back_inserter(replacements),
+                   [&amp;flags](const std::string&amp; m, const std::string&amp; r) {return std::make_pair(std::regex(m, flags), r);});
+
+    return rcpp_mgsub(string, replacements);
+}
+</code></pre>
+
+<h1>Algorithm</h1>
+
+<p>After each replacement, every regex is re-searched from the last match.  If we remembered where each one matched, we'd only need to update the matches for any that matched before the text just substituted.  This may save a great deal of processing, particularly for regexes that are unmatched and for long input strings.</p>
+
+<p>Here's an implementation that does this:</p>
+
+<pre><code>#include &lt;regex&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;utility&gt;
+#include &lt;vector&gt;
+
+std::string rcpp_mgsub(const std::string&amp; s, std::vector&lt;std::pair&lt;std::regex,std::string&gt;&gt; const&amp; replacements)
+{
+    static const std::sregex_iterator no_match = {};
+
+    using IterAndReplacement = std::pair&lt;std::sregex_iterator,const std::string&amp;&gt;;
+
+    std::vector&lt;IterAndReplacement&gt; iterators;
+    iterators.reserve(replacements.size());
+    for (auto const&amp; r: replacements)
+        iterators.emplace_back(std::sregex_iterator{s.begin(), s.end(), r.first}, r.second);
+
+    std::string result = {};
+    auto position = s.begin();
+
+    while (true) {
+        // find the next match, ignoring any shorter overlapping matches
+        IterAndReplacement const *best_match = nullptr;
+        for (auto&amp; i: iterators) {
+            auto&amp; it = i.first;
+            // advance iterators to after last match
+            while (it != no_match &amp;&amp; (*it)[0].first &lt; position) {
+                ++it;
+            }
+            if (it == no_match) continue;
+            if (!best_match) {
+                best_match = &amp;i;
+                continue;
+            }
+            auto const&amp; match = (*i.first)[0];
+            auto const&amp; best = (*best_match-&gt;first)[0];
+            if (match.first &gt;= best.second)
+                continue;
+            if (match.second &lt; best.first
+                || match.first &lt; best.first &amp;&amp; match.length() &gt;= best.length()
+                || match.first &lt; best.second &amp;&amp; match.length() &gt; best.length())
+            {
+                best_match = &amp;i;
+            }
+        }
+
+        // if no regex matches, just copy the rest of string and finish
+        if (!best_match) {
+            result.append(position, s.end());
+            return result;
+        }
+
+        // otherwise, replace the match and continue to the next one
+        auto const&amp; best = (*best_match-&gt;first);
+        auto const m = best.format(best_match-&gt;second, std::regex_constants::format_sed);
+        result.append(position, best[0].first).append(m);
+        position = best[0].second;
+    }
+}
+</code></pre>
+
+<h1>Compilation</h1>
+
+<p>The question is tagged <a href="/questions/tagged/performance" class="post-tag" title="show questions tagged 'performance'" rel="tag">performance</a>, but there's no indication of how you're conducting performance tests.  I adapted <code>main()</code> to transform a string (using a replacement and its inverse) twenty thousand times, and to use the result (to avoid over-optimizing):</p>
+
+<pre><code>#include &lt;iostream&gt;
+
+int main()
+{
+   std::cout &lt;&lt; rcpp_mgsub("Hey hey hey ho ho Ho",
+                           {"hey","ho" },
+                           {"ho", "hey"}, true) &lt;&lt; "\n";
+   std::cout &lt;&lt; rcpp_mgsub("Hey, how are you?",
+                           {"hey","how","are","you"},
+                           {"how","are","you","hey"}, true) &lt;&lt; "\n";
+   std::cout &lt;&lt; rcpp_mgsub("Dopazamine is not the same as Dopachloride and is still fake.",
+                           {"[Dd]opa(.*?mine)", "fake"},
+                           {"Meta\\1",          "real"}, false) &lt;&lt; "\n";
+
+   std::string s = "Dopazamine is not the same as Dopachloride and is still fake.";
+   for (auto i = 0u;  i &lt; 10000;  ++i) {
+       s = rcpp_mgsub(s,
+       {"[Dd]opa(.*?mine)", "fake"},
+       {"Meta\\1",          "real"}, false);
+       s = rcpp_mgsub(s,
+       {"Meta(.*?mine)", "fake"},
+       {"Dopa\\1",       "real"}, false);
+   }
+   std::cout &lt;&lt; s &lt;&lt; std::endl ;
+}
+</code></pre>
+
+<p>I found a large difference between <code>g++ -O0</code> and <code>g++ -O3</code> on this code (roughly a factor of 10×).  Quite a large part of this program comes from expanding templates from the <code>&lt;regex&gt;</code> header (therefore compiled as part of this translation unit, with our compiler).  And there's quite a lot that can be inlined or removed by a link-time optimizer.</p>
+
+<p>Remember: when making performance-related changes to code, always <strong>measure</strong> before and after - and make sure that what you're measuring is representative!  If you carefully measure and profile the unoptimized builds, you may find that you're sacrificing readability for no improvement on what the optimizing compiler produces.</p>
+    </div>

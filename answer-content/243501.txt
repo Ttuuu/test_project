@@ -1,0 +1,634 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I’m going to review your code in the order you’ve presented it in the opening post, simply because that’s the most orderly way to go about it from my perspective. I’ll mention overarching design issues along the way, and then include a section at the end collecting them all together. And I’ll be answering most, if not all, of the questions along the way. I hope that won’t be too confusing for you!</p>
+<p>Also, do note that I can’t really give a full and comprehensive review of the entire design, because, well, that’s just too big a job for a Saturday morning. I’ll try and give some big-picture suggestions, of course. But this review won’t be anything close to “complete”.</p>
+<p>So let’s start at the top!</p>
+<h2><code>main.cc</code></h2>
+<p>I’m so glad you included a usage example; I’ve seen far too many people post entire libraries here without a single usage example. In my opinion, the usage example is the most important part of a library’s documentation. If a library doesn’t incude good, clear, practical usage examples, I won’t even look at it.</p>
+<p>The big question that jumps out at me from your usage example is: why have you chosen not to use the standard input pattern? For virtually every type <code>T</code>, if I want to read it from a stream, I do:</p>
+<pre><code>auto t = T{};
+if (input &gt;&gt; t)
+    // use t
+else
+    // handle error
+</code></pre>
+<p>So why have you chosen to do:</p>
+<pre><code>auto parser = JsonReader{};
+auto parsed_json = parser.ParseJsonString(std::cin);
+
+if (parsed_json.has_value())
+    // retrieve value as `auto value = std::move(parsed_json).value();` then use it
+else
+    // handle error
+</code></pre>
+<p>instead of:</p>
+<pre><code>auto value = JValue{JValueType::Null}; // Could this not just be JValue{}?
+if (std::cin &gt;&gt; value)
+    // use value
+else
+    // handle error
+</code></pre>
+<p>That would allow me to write more generic code (as shown in the first code block above, with <code>T</code>).</p>
+<p>I guess what I’m asking is:</p>
+<ul>
+<li>Is there any purpose to the <code>JsonReader</code> object outside of the actual parsing? Is there any purpose to it once parsing is done? (I know you use it for debug output… but that’s kind of a library development thing, not something that <em>users</em> of the library should use, right?)</li>
+<li>Is there any reason not to use the error detection/reporting built into standard streams? You use <code>parsed_json.has_value()</code> to check whether parsing succeded or not… doesn’t that just give the same information as <code>bool{std::cin}</code>? (Except the stream can give much more information, like whether parsing failed because the content was bad (badly formatted JSON) or the stream was bad (like a network disconnection). Not to metion that exceptions could (and should) be used.)</li>
+</ul>
+<p>It’s not that your design using a state machine to parse JSON is wrong—quite the opposite. It just seems to me that the entire <code>JsonReader</code> class should be an implementation detail hidden within a standard extractor like <code>auto operator&gt;&gt;(std::istream&amp;, JValue&amp;)</code>.</p>
+<h2><code>JsonReader.h</code> &amp;&amp; <code>JsonReader.cc</code></h2>
+<p>These are both cool. I could nitpick some criticisms, but they’re really more matters of taste than things that are really <em>wrong</em> with your code.</p>
+<ul>
+<li>Not a fan of using <code>.h</code> for C++ headers. <code>.h</code> to me (and to most IDE’s, file managers, etc.) means a C header. In this case, I’d recommend <code>.hh</code> to go with <code>.cc</code>.</li>
+<li>Not a fan of default arguments, generally. They hide the complexity of a call, so that you may be invisibly constructing a half-dozen expensive objects and have no clue, and they can cause a lot of problems with overloading. In this case, I’d probably design the class with two or three constructors: one with no arguments, one that takes the two streams by ref, and maybe a third that only takes the error stream by ref. Within the class, I’d only keep <em>pointers</em> to the streams that default to <code>nullptr</code> (or maybe the error stream would default to <code>std::cerr</code>), and only do debug/error output if the respective pointer is non-null. There’d be no need for the <code>debug_output_</code> flag then.</li>
+<li>Also not a fan of the using declarations at namespace scope. I mean, they’re within the implementation file, which is certainly better than being in the header. But I don’t see any benefit to using something like <code>std::string</code> unqualified. (Plus, you don’t actually <em>use</em> any of those types unqualified at namespace scope; you could just as well include those <code>using</code> statements within the functions, if you really, really wanted them.)</li>
+<li>And, not a fan of declaring/defining multiple variables on a single line (like: <code>int line_num = 1, char_num = 0, line_char_start = 0;</code>). Every style guide I’ve ever used forbids this.</li>
+</ul>
+<p>There is a <em>dire</em> lack of commenting throughout your code. You don’t need to say what every single line is doing, but you should at least explain the gross outline of what’s going on. For example, <code>JsonReader::ParseJsonString()</code> is essentially a <code>while</code> loop that does all the work, followed by a short block to actually extract the result. I have puzzled that out by meticulously reading the code… but I shouldn’t have had to. There should be a comment explaining that the <code>while</code> loop will only exit when the input is exhausted, or there’s an error, and that <code>value_stack</code> must have only a single item in it at that point, and so on. And that’s just the beginning: what, for example, is <code>ProcessState()</code> doing to <code>input</code>? Is it reading a single character? Possibly several? It doesn’t even help to read <code>ProcessState()</code>’s code, because that just leads to <em>another</em> question—what is <code>GetNextTransition()</code> doing to <code>input</code>, etc..</p>
+<p>Comments should be telling me what all the relevant state at each point is expected to be. I shouldn’t have to guess (or utter a curse, sigh, set a bookmark, then go digging through an entire library of code to find where a specific function/type is defined, only to have to read <em>that</em> function/type’s code, then come back to the bookmark… <em>HOPEFULLY</em>… though it’s just as likely I’ll be forced down a further rabbit hole, requiring <em>another</em> curse, sigh, bookmark, etc.). Basically, the moment I have to stop reading a function’s code and go digging elsewhere for answers, that’s when I’d put the “FAILED” stamp on a code review.</p>
+<p>Digging a little deeper… do you really need <code>has_error</code>? I mean, the moment you detect an error, you log it then break out of the loop, and then ultimately just return the empty <code>optional</code>. Why not just return the empty <code>optional</code> right away and simplify the rest of the function? You also won’t need the <code>else</code> in the loop anymore.</p>
+<p>Similarly, if <code>value_stack.GetSize() &gt; 1</code>, you can just return right away. I know there’s a case to be made for having a single exit point for functions at the end, but when that’s being done at the expense of creating a complex spaghetti mess of flags and conditionals to worm around error states, you’d be doing yourself (and your code’s readers) a favour to relax that rule a bit, at least for errors that require bailing immediately.</p>
+<pre><code>result = std::move(value_stack.RemoveRootValue());
+</code></pre>
+<p>You don't need the <code>move()</code> here. <code>RemoveRootValue()</code> already returns an rvalue. Moves are automatic in C++ wherever possible. Generally, you only need to explicitly ask for a move when an object will continue to exist afterwards. So:</p>
+<pre><code>x = get_thing();
+</code></pre>
+<p>won’t need a <code>move()</code> (assuming <code>get_thing()</code> doesn’t return a reference), because the “thing” returned from <code>get_thing()</code> is a temporary that ceases to exist by the time the statement ends. Meanwhile:</p>
+<pre><code>// y = get_thing();
+x = y;
+</code></pre>
+<p>would need a <code>move()</code>, because <code>y</code> will continue to exist after the assignment statement.</p>
+<p>Put altogether, <code>JsonReader::ParseJsonString</code> could be simplified to something like this:</p>
+<pre><code>optional&lt;JValue&gt; JsonReader::ParseJsonString(std::istream&amp; input) 
+{
+    // Set up the variables you need for the loop.
+    auto current_state_type = ParserStateType::Start;
+    // ...
+    
+    // Input loop.
+    do
+    {
+        // Trace statement.
+        if (debug_output_)
+            // ...
+        
+        // Error check.
+        if (current_state_type == ParserStateType::Error)
+        {
+            error_output_stream_ &lt;&lt; // ...
+            
+            return {}; // or return std::nullopt;
+        }
+        
+        // Actual work of loop.
+        auto next_transition_container = ProcessState(input, current_state_type, value_stack, machine_stack);
+        // ...
+    } while (!finished_input);
+    
+    // Parsing done, but was it done completely?
+    if (value_stack.GetSize() &gt; 1)
+    {
+        error_output_stream_ &lt;&lt; // ...
+        
+        return {};
+    }
+    
+    // Now we're really done.
+    return value_stack.RemoveRootValue();
+}
+</code></pre>
+<p>This isn’t necessarily “correct” (meaning the original code isn’t necessarily “wrong”), but there’s a lot less cognitive burden keeping track of error states. Errors break the flow the moment they’re found, they’re not trucked around for dozens of lines through branches, loops, and other control flow.</p>
+<h2><code>JValue.h</code> &amp; <code>JValue.cpp</code></h2>
+<p>This is the part of the library that I think is, by <em>far</em>, the most important. It’s also the part I think is the most problematic.</p>
+<p>For any of this input stuff to be really useful, it has to read the JSON data into a C++ object that is really useful. I always tell my students that in C++, it’s all about the types: if you get the types right, everything else just falls into place. If you get them wrong….</p>
+<p>Fundamentally, a JSON value is nothing more than a sum of:</p>
+<ul>
+<li>null</li>
+<li>boolean</li>
+<li>number</li>
+<li>string</li>
+<li>array (just a vector of JSON values)</li>
+<li>object (a map of string-&gt;JSON values)</li>
+</ul>
+<p>This is a somewhat recursive type because arrays and objects can hold JSON values. But otherwise… that’s just:</p>
+<pre><code>using json_value = std::variant&lt;
+    std::monostate,
+    bool,
+    double,
+    std::string,
+    json_array,
+    json_object
+&gt;
+</code></pre>
+<p>The only “tricky” part here is defining <code>json_array</code> and <code>json_object</code> before <code>json_value</code>.</p>
+<p>Now, to be clear, I do <em>NOT</em> recommend doing that. A JSON value is a distinct type, and should not be handwaved away with a slapdash alias of a vocabulary type. You should definitely have a JSON value class. But <em>internally</em>, the class needs to be little more than just that variant. Really, this is all you need:</p>
+<pre><code>class json_value
+{
+    using value_type = std::variant&lt;
+        std::monostate,
+        bool,
+        long double,
+        std::string,
+        // As of C++17, vectors can use incomplete types,
+        // so this is cool:
+        std::vector&lt;json_value&gt;,
+        // Maps (and hash maps) cannot use incomplete types, so we
+        // can't use std::map or std::unordered_map. However, Boost's
+        // containers allow incomplete types, so:
+        boost::container::map&lt;std::string, json_value&gt;
+        // You could also use boost::container::flat_map, which would
+        // probably be more efficient. Or it might even be worthwhile
+        // to roll your own (flat) map that accepts incomplete types
+        // for the values. Or maybe you just need an "incomplete pair"
+        // type. (The trick you used, with a vector for the values and
+        // a map with string key-&gt;index into the vector is clever, but
+        // probably overkill, and not very efficient. You could
+        // probably get away with just a vector of JValue and a vector
+        // of std::string, and make sure the indexes match.)
+    &gt;;
+
+    value_type _value;
+    
+public:
+    // You need an interface, of course, but it doesn't need to be OTT.
+    // Just take a look at std::variant - it has, like, 3 or 4 member
+    // functions, and maybe a half-dozen non-member functions.
+};
+</code></pre>
+<p><code>JValue</code> as you’ve written it already more-or-less apes <code>std::variant</code>… except much less efficiently. For example, if the JValue only holds a <code>bool</code>, you still have to pay for constructing and trucking around:</p>
+<ul>
+<li>a string (for the non-existent name; actually, I’m baffled about the existence of this member at all—you seem to duplicate the name in both <code>_name</code> and <code>children_name_indexes_[name]</code>)</li>
+<li>a vector (for the non-existent children)</li>
+<li>a hash map (for the non-existent member names)</li>
+<li>a <code>JValueType</code> discriminator, even though the variant already knows that it holds a <code>bool</code></li>
+</ul>
+<p>And of course, you have to be careful to keep all these various moving compments in sync.</p>
+<p>But the biggest problem is how clunky the user interface is. <code>JValue</code> seems so unnecessarily hard to use.</p>
+<p>Let’s start right at the beginning. A JSON value is one of:</p>
+<ul>
+<li>null</li>
+<li>boolean</li>
+<li>number</li>
+<li>string</li>
+<li>array</li>
+<li>object</li>
+</ul>
+<p>So what’s it like creating a <code>JValue</code> in each of these cases?</p>
+<pre><code>// null
+auto v = JValue{JValueType::Null};
+</code></pre>
+<p>Ehhh. I mean… could be worse? But it also could just be: <code>auto v = JValue{};</code>. I mean, why not default to null anyway?</p>
+<pre><code>// boolean
+auto v = JValue{true};
+auto v = JValue{false};
+</code></pre>
+<p>Cool.</p>
+<pre><code>// number
+auto v = JValue{6.28};
+</code></pre>
+<p>Cool… <em>but</em>… did you try this: <code>v = JValue{0};</code>?</p>
+<pre><code>// string
+auto v = JValue{"char array"};
+auto v = JValue{"std::string"s};
+</code></pre>
+<p>Cool… <em>but</em>… did you try this: <code>v = JValue{"std::string_view"sv};</code>?</p>
+<p>All that’s left are arrays and objects… and here’s where things get tragic. If I have a vector of strings, I would like to simply be able to do:</p>
+<pre><code>auto v = JValue{strings};
+</code></pre>
+<p>and get a <code>JValue</code> that has type <code>JValueType::Array</code>, with all the elements being the strings from the vector. But I can’t do that. I have to do this:</p>
+<pre><code>auto v = JValue{JValueType::Array};
+
+// Nope:
+// std::copy(begin(strings), end(strings), std::back_inserter(v));
+
+// Nope (AddArrayChild() wants an rvalue for some reason):
+// std::for_each(begin(strings), end(strings), [&amp;v](auto&amp;&amp; string) { v.AddArrayChild(string); });
+
+// Works, but it shouldn't (I'll explain later):
+// std::for_each(begin(strings), end(strings), [&amp;v](auto&amp;&amp; string) { v.AddArrayChild(std::string{string}); });
+
+std::for_each(begin(strings), end(strings), [&amp;v](auto&amp;&amp; string) { v.AddArrayChild(JValue{string}); });
+</code></pre>
+<p>Given a vector of things that can be converted to <code>JValue</code> (<code>std::string</code> or <code>double</code> or <code>int</code> or <code>bool</code> or even <code>JValue</code>), why can’t I do this?:</p>
+<pre><code>auto v = JValue{items};
+
+// or:
+auto v = JValue(begin(items), end(items))?
+</code></pre>
+<p>Even cooler would be if the constructor were smart enough to detect if the value type of <code>items</code> can work with a structured binding like <code>auto [k, v] = value_type{};</code>, and that the type of <code>k</code> is convertible to <code>std::string</code>, and if so, create an object value:</p>
+<pre><code>auto items_1 = std::vector{"a"s, "b"s, "c"s};
+auto items_2 = std::vector{
+    std::tuple{"n0"s, 0},
+    std::tuple{"n1"s, 1},
+    std::tuple{"n2"s, 2}
+};
+
+auto v_1 = JValue{items_1}; // = [ "a", "b", "c" ]
+auto v_2 = JValue{items_2}; // = { "n0" : 0, "n1" : 1, "n2" : 2 }
+</code></pre>
+<p>I’m not advocating for any particular interface; I’m just pointing out options. The key point I want to make is that <code>JValue</code> is <em>both</em> too difficult <em>and</em> too easy to construct. It’s too difficult for the reasons I mentioned above. And it’s too <em>easy</em> because the constructors are not marked <code>explicit</code>, as they almost certainly should be. There doesn’t seem to be any good reason to allow implicit conversions to JSON values.</p>
+<p>Speaking of too difficult:</p>
+<pre><code>JValue Clone() const { return JValue(*this); }
+</code></pre>
+<p>When I saw this function, I was absolutely baffled at first. Normally you don’t see “clone” functions in non-polymorphic types. And the type is totally copyable—it has copy ops, and they’re even used in <code>Clone()</code>. Until I saw the comments further below in the code I was scratching my head about the point of this function.</p>
+<p>Nor does the logic in the comment make much sense either. You seem to have a strange fear of copying in C++. You mention concerns about “excessive copying” in your questions, and your code has a bunch of peculiar (mis)uses of rvalue references that often don’t even do anything, and ironically, will probably make code <em>less</em> efficient.</p>
+<p>Don’t treat the language like an enemy you have to fight or outsmart. And, most importantly, don’t write code that assumes users are incompetent. Yes, definitely defend against reasonable mistakes. But… when I want a copy of a value, that’s not a mistake. And if I <em>do</em> make a copy I didn’t need or want… well, frankly, that’s <em>my</em> problem, not a problem with the type being “too easy to copy”. “Accidental” copying isn’t something you should be assuming people are doing that often—the standard library doesn’t make that assumption, for example: classes like <code>std::vector</code> and <code>std::list</code> can be <em>very</em> expensive to copy… but you don’t see them making life more difficult for users by deleting or hiding their copy constructors.</p>
+<p>Don’t punish competent users of your library at the expense of coders who don’t really know what they’re doing. <em>Let</em> the latters’ code be slow and inefficient… that way they’ll be motivated to learn from their mistakes.</p>
+<p>I note that you discovered yourself how clunky and hard to use your type is: you’re forced to have its functions take <code>JValue&amp;&amp;</code> parameters because copying doesn’t work (not mention the need for <code>CopyChildren()</code> and the fact that you’re forced to manually write the copy ops). That should be a sign: if your class is even frustrating to use <em>in its own interface</em>… maybe it’s time to reassess.</p>
+<pre><code>std::optional&lt;std::string&gt; GetStringValue() const;
+std::optional&lt;double&gt;      GetNumberValue() const;
+std::optional&lt;bool&gt;        GetBooleanValue() const;
+</code></pre>
+<p>This may be more opinionated than “standard thinking”, but I think this is an abuse of <code>std::optional</code>.</p>
+<p>While it may “work” for this context, this doesn’t really seem to fit the <em>semantics</em> of <code>std::optional</code>. When I see <code>std::optional</code> used as a return type, that says to me “this function is getting a value that might be there, but might not, and (this is the important part) <em>that is not an error</em>”. For example, a class that holds a person’s name might have a <code>middle_name()</code> function that gets the person’s middle name. But it’s perfectly acceptable for a person to have no middle name, so that function could possibly return <code>std::optional&lt;std::string&gt;</code>.</p>
+<p>But in the case of a JSON value, it’s not perfectly cool if you ask for the string value and there’s none there. If that happens… you’ve screwed up. You failed to check for whether the value type is string or not. Optional is the wrong semantic for that. The string value is not “optional”; if the value type is string, then it <em>MUST</em> be there, and if the value type is not string, then it <em>MUST NOT</em> be there.</p>
+<p>And in fact, <code>std::optional</code> is not just wrong semantically here… it actually makes code less efficient. Because if the string value <em>is</em> there, then it has to be copied into the <code>optional</code> object. That copy is completely unnecessary.</p>
+<p>I always tell my students to look to the standard library. See what it does in cases similar to what you’re doing, and figure out why. Chances are, there are damn good reasons.</p>
+<p>In this case, the closest analogue to <code>JValue</code> is a <code>std::variant</code> like the one I described above. So, okay, what does <code>std::variant</code> do? Does it return a <code>std::optional</code> for the alternative you ask for? No, it does not. If you ask for a type or index, and the variant doesn’t hold that alternative, it simply throws a <code>std::bad_variant_access</code>. If it does hold the alternative you want, you get a reference… no copying necessary. (There’s also <code>std::get_if</code>, that returns a pointer or <code>nullptr</code>, but again, no copying.)</p>
+<p>This is what code with your current interface looks like:</p>
+<pre><code>if (auto&amp;&amp; str = val.GetStringValue(); str)
+    // now we can work with *str, which is a copy of the string in val
+else
+    // val didn't hold a string
+</code></pre>
+<p>By contrast, suppose <code>GetStringValue()</code> returned a <code>std::string const&amp;</code>, and throws if the value isn’t a string type:</p>
+<pre><code>if (val.GetValueType() == JValueType::String)
+    // now we can work with val.GetStringValue(), which is a reference - no copying is done
+else
+    // val didn't hold a string
+</code></pre>
+<p>Not that different! However, it can be much more efficient, because it avoids copying a string.</p>
+<pre><code>std::string GetName() const { return name_; }
+</code></pre>
+<p>As I mentioned, I’m not really sure of the point of <code>_name</code>. But in any case, this accessor makes an unnecessary copy. You could return a <code>std::string const&amp;</code>, and also make it <code>noexcept</code>.</p>
+<pre><code>bool JValue::AddArrayChild(JValue&amp;&amp; value)
+{
+    bool success = false;
+
+    if (this-&gt;value_type_ == JValueType::Array)
+    {
+        success = true;
+        //move() here is superfluous, but leaving it just in case `value` changes to a regular value in the future
+        this-&gt;children_.emplace_back(std::move(value)); 
+    }
+
+    return success;
+}
+</code></pre>
+<p>Couple things here.</p>
+<p>First, the comment is wrong. <code>std::move()</code> is absolutely <em>not</em> superfluous there. If this weren’t a member function, it wouldn’t compile without the <code>std::move()</code>, because the copy constructor is private. (If you don’t believe me, you can try commenting out <code>Clone()</code> and deleting the copy ops to see for yourself.)</p>
+<p>You see, <code>value</code> is an rvalue reference… but it is not an rvalue. An rvalue reference <em>takes</em> (ie, binds to) rvalues… but it is not an rvalue itself. The function can only be called with rvalue arguments… but <em>within the function</em>, the argument is an lvalue.</p>
+<p>The easiest way to understand when something is an rvalue is to ask: “can this be used after this point?”. In that function, if you did <code>this-&gt;children_.emplace_back(value);</code>, could <code>value</code> be used again after that line? Why yes, yes it could. You could even repeat that line to add two copies of <code>value</code> to <code>children_</code>. Therefore, <code>value</code> is not an rvalue.</p>
+<p>The second thing is: this function really shouldn’t be taking its argument as an rvalue reference. What’s the point? The general rule for (non-template) function parameters is:</p>
+<ul>
+<li>If the function is only <em>using</em> the parameter’s value, and not <em>taking</em> it (for example, only inspecting or viewing it), take the parameter as <code>const&amp;</code>.</li>
+<li>If the function is <em>taking</em> the parameter’s value (for example, taking the value for an object’s data member, or otherwise storing it somewhere), take the parameter by value.</li>
+<li>(RARE! Prefer returning.) If the function is <em>changing</em> the parameter’s value, take it by <code>&amp;</code> (non-<code>const</code>).</li>
+</ul>
+<p>Note there’s nothing there about <code>&amp;&amp;</code>. That’s because the only time you should ever use <code>&amp;&amp;</code> parameters is in special cases for optimization purposes. (The rule is different for function templates, where <code>&amp;&amp;</code> is a forwarding reference. But that’s not relevant here.)</p>
+<p>Finally… for what this function actually does, it’s sure complicated. That’s because of all the acrobatics you do with the <code>success</code> flag. Is that really necessary? Why not:</p>
+<pre><code>bool JValue::AddArrayChild(JValue value)
+{
+    if (value_type_ == JValueType::Array)
+    {
+        children_.emplace_back(std::move(value));
+        return true;
+    }
+
+    return false;
+}
+</code></pre>
+<p>Or even better, in my opinion:</p>
+<pre><code>bool JValue::AddArrayChild(JValue value)
+{
+    if (value_type_ != JValueType::Array)
+        return false;
+
+    children_.emplace_back(std::move(value));
+    return true;
+}
+</code></pre>
+<p>That seems to require the least amount of cognitive overhead. Once the check is done at the top of the function, you know that everything’s kosher from there on out; you don’t need to be thinking, “okay, at this line, are we in a state where we’re dealing with an error or failure or not?” or keeping track of scopes or anything.</p>
+<p>All of the same comments apply to <code>JValue::AddObjectChild()</code>, with one extra issue: exception safety. Consider the meat of the function:</p>
+<pre><code>value.name_ = name;
+// If the above throws an exception, no problem.
+
+this-&gt;children_.emplace_back(std::move(value));
+// If the above throws an exception, also no problem.
+
+this-&gt;children_name_indexes_[name] = this-&gt;children_.size() - 1;
+// But what if *this* throws? Now you have an element in children_ that
+// is unaccounted for in children_name_indexes_. Your object is broken.
+</code></pre>
+<p>This is the kind of headache that sometimes arises when you try to spread your class’s invariants across multiple data members. You should always aim for at least the strong exception guarantee: the function will either succeed, or, if it fails (particularly with an exception), it will have no (meaningful) effect.</p>
+<p>In this case, a potential fix is to wrap the last line in a <code>try</code> block that pops the back off the <code>children_</code> vector in the <code>catch</code> (and then rethrows), or to use some kind of “on fail” mechanism that does the same.</p>
+<pre><code>//returns true if the element exists, false otherwise
+bool RemoveChild(size_t index);
+//returns true if the element exists, false otherwise
+bool RemoveChild(const std::string&amp; name);
+</code></pre>
+<p>I’m really not a fan of this kind of interface. If you try to remove an index or name that doesn’t exist, that’s not just an “oh, well, it happens” kind of thing… <em>you have screwed up</em>. Something is seriously wrong your code and its logic. You should have that fact thrown in your face, so that you know and can fix it. It shouldn’t be something you can just ignore, especially by default.</p>
+<p>This same idea applies to the add functions as well, and to the accessors. I would call this class’s interface bad, because if I screw up, the class simply… covers that up. Mistakes vanish into return values that can just be ignored, and disappear into the æther. That’s not good; that’s very, very bad.</p>
+<p>I think a good interface is one that doesn’t reward lazy or sloppy coding. Quite the opposite, I think a good interface is one that rewards good practices, and punishes stupidity mercilessly. If you do something dumb, then the program should straight-up crash. It should do so loudly and dramatically. It should produce an error message, a core dump, and play a fart sound through the speakers.</p>
+<p>What am I talking about? Well, for example, I think the remove functions should look like this:</p>
+<pre><code>auto JValue::RemoveChild(std::size_t index) -&gt; void
+{
+    children_name_indexes_.erase(
+        std::find_if(begin(children_name_indexes), end(children_name_indexes),
+            [index](auto&amp;&amp; item)
+            {
+                return std::get&lt;1&gt;(item) == index;
+            }));
+    
+    children_.erase(children_.begin() + index);
+}
+
+auto JValue::RemoveChild(std::string const&amp; name) -&gt; void
+{
+    auto const i = children_name_indexes_.find(name);
+    
+    children_.erase(children_.begin() + std::get&lt;1&gt;(*i));
+    children_name_indexes_.erase(i);
+}
+</code></pre>
+<p>“But Indi!” you say, “if you try removing an out-of-bounds index or a non-existent name with that code, that’s UB!” Fine. Then just don’t do that.</p>
+<p>“But–but accidents!” Okay, if you accidentally remove an out-of-bounds index or a non-existent name, that should trigger some kind of panic that you can’t miss—like a crash—that would prompt you to use your debugger, find the problem, and fix it… you should <em>not</em> be shipping the program to your clients with that kind of bug hidden in it. At most you could maybe add some asserts in the functions that check that the index/name is valid… but those should disappear in release mode. I don’t want to pay for checks that should never fail, and no well-written code should ever cause those checks to fail.</p>
+<p><em>If</em> you decide you want to write code that potentially allows for non-existent indexes or names, then <em>you</em> should pay for it:</p>
+<pre><code>// q is some potentially non-existent index/name
+
+// index:
+if (q &gt;= 0 and q &lt; val.GetNumberOfChildren())
+    val.RemoveChild(q);
+else
+    // handle the error case
+
+// name:
+if (val.HasProperty(q))
+    val.RemoveChild(q);
+else
+    // handle the error case
+</code></pre>
+<p>But when I know for sure the name/index is valid, I don’t want to pay for those unnecessary checks. I just want to do <code>val.RemoveChild(q)</code>.</p>
+<p>As I mentioned, this same kind of thinking applies to the add functions as well. Adding a child to a value that isn’t an array isn’t an “oops” that should just be shrugged off. That’s a sign of a serious logic error in your code. <code>AddArrayChild()</code> should straight-up throw or terminate, or crash due to UB if you try to add a child to a non-array value. Personally, I’d recommend just making it UB, at least in release mode, so that programmers that don’t screw up don’t pay for the checks.</p>
+<p>Whew, I think that’s it for <code>JValue</code>. That was a lot, but like I said, I think <code>JValue</code> is the most critical part of your code. If <code>JValue</code> is done right, everything else becomes simple.</p>
+<p>I’m going to skip down to <code>ParserValueStack</code>, because, honestly, all of the state machine stuff looks fine to me. My opinion is that it’s over-engineered for parsing JSON—JSON is a pretty simplistic format, after all—but that doesn’t make it “wrong” or “bad”.</p>
+<h2><code>ParserValueStack.h</code> &amp; <code>ParserValueStack.cc</code></h2>
+<p>There are some problems with this class, mostly related to Unicode, and unnecessary copying of strings.</p>
+<pre><code>std::stringstream property_name_;
+std::stringstream scalar_value_;  
+</code></pre>
+<p>I’m not sure why you need string streams for these. All you do with them is append characters and strings, both tasks that <code>std::string</code> handles just fine. You don’t actually do anything that requires a stream.</p>
+<p>Worse, using string streams mean you end up having to make a bunch of unnecessary copies. Check out what’s going on in <code>PushJValue</code>:</p>
+<pre><code>void ParserValueStack::PushJValue(JValueType type)
+{
+    optional&lt;JValue&gt; new_value;
+
+    if (type == JValueType::Array || type == JValueType::Object || type == JValueType::Null)
+    {
+        new_value.emplace(type);
+    }
+    else
+    {
+        string accumulated_chars = this-&gt;scalar_value_.str();
+        // This makes a copy of the string in scalar_value_.
+
+        if (type == JValueType::String)
+            new_value.emplace(accumulated_chars);
+            // This makes *ANOTHER* copy of the same string.
+        else if (type == JValueType::Number)
+            new_value.emplace(std::stod(accumulated_chars));
+            // This is okay.
+        else if (type == JValueType::Boolean)
+            new_value.emplace(accumulated_chars == "true");
+            // This is okay.
+    }
+
+    //add the new value to the top of the stack
+    this-&gt;value_stack_.emplace(this-&gt;property_name_.str(), std::move(new_value.value()));
+    // This makes a copy of the string in property_name_.
+
+    //clear the accumulated values
+    this-&gt;property_name_.str("");
+    this-&gt;scalar_value_.str("");
+}
+</code></pre>
+<p>As long as you’re using string streams, copies are unavoidable (C++20 fixes this).</p>
+<p>Instead, suppose <code>property_name_</code> and <code>scalar_value_</code> were strings. All the places you use <code>operator&lt;&lt;</code>, just use <code>operator+=</code> instead. And <code>PushJValue()</code> could become:</p>
+<pre><code>void ParserValueStack::PushJValue(JValueType type)
+{
+    optional&lt;JValue&gt; new_value;
+
+    if (type == JValueType::Array || type == JValueType::Object || type == JValueType::Null)
+    {
+        new_value.emplace(type);
+    }
+    else
+    {
+        if (type == JValueType::String)
+            new_value.emplace(std::move(scalar_value_));
+            // No copying, just a move. This is fine because
+            // scalar_value_ is never used again (until it's
+            // reset).
+        else if (type == JValueType::Number)
+            new_value.emplace(std::stod(scalar_value_));
+            // This is okay.
+        else if (type == JValueType::Boolean)
+            new_value.emplace(scalar_value_ == "true");
+            // This is okay.
+    }
+
+    //add the new value to the top of the stack
+    this-&gt;value_stack_.emplace(std::move(this-&gt;property_name_), std::move(new_value.value()));
+    // No copying, just a move. Also fine because property_name_ is
+    // not used again.
+
+    //clear the accumulated values
+    this-&gt;property_name_ = std::string{};
+    this-&gt;scalar_value_ = std::string{};
+    // These variables may or may not have been moved from
+    // (property_value_ is definitely moved-from, scalar_value_ might
+    // be). Either way, we can reset them this way safely.
+}
+</code></pre>
+<p>Another benefit from doing it this way is that it makes exception safety easier. This function still isn’t entirely exception safe (if <code>value_stack_.emplace()</code> throws, <code>scalar_value_</code> might be moved-from, which would be bad). But it’s definitely closer. Those assignments at the end are totally no-fail.</p>
+<p>Before I get into the Unicode stuff, there’s one more function I want to call attention to:</p>
+<pre><code>void ParserValueStack::CollectUnicodeCodePoint(char input_char)
+{
+    std::stringstream ss;
+    ss &lt;&lt; input_char;
+
+    //convert the hex char to a number       
+    unsigned char hex_num;
+    ss &gt;&gt; std::hex &gt;&gt; hex_num;
+
+    //each hex digit represents 1/2 a byte, so shift by 4
+    this-&gt;unicode_code_point_ = (this-&gt;unicode_code_point_ &lt;&lt; 4) | (hex_num &amp; 0x0F);
+}
+</code></pre>
+<p>This function is <em>exceptionally</em> inefficient for what it does. Consider: you have a character <code>input_char</code> that is one of 0–9, a–f, or A–F (we’re assuming it <em>MUST</em> be one of those, because the function does no error checking), and all you want to do is convert that to the value 0–9 (if it’s a digit) or 10–15 (if it’s a letter). For that, you construct a stream (which is a whole lot of baggage) that does both input and output (more baggage) that constructs a string internally, and then you use the stream’s conversion operator.</p>
+<p>Not only is that wildly expensive for the task… it might not even work. If the global locale isn’t what you think it is, you could get weird results. What you <em>should</em> do is <code>ss.imbue(std::locale::classic());</code> before doing anything else.</p>
+<p>All you want to do is a simple, non-locale-aware conversion. <code>std::from_chars()</code> is actually built for that kind of thing, with JSON specifically in mind. Unfortunately, it won’t help much if you’re working one character at a time.</p>
+<p>For the digits, things are easy: the standard guarantees that digits are contiguous. So you can just do <code>input_char - '0'</code>. For the letters, which are <em>not</em> guaranteed to be contiguous… things are trickier, but not <em>difficult</em>. You have options. You could create a static <code>constexpr</code> lookup table. You could <code>static_assert</code> that the letters <em>are</em> contiguous, then simply do <code>input_char - 'A'</code> or <code>input_char - 'a'</code>. Whatever floats your boat.</p>
+<p>You might end up with something like this:</p>
+<pre><code>void ParserValueStack::CollectUnicodeCodePoint(char input_char)
+{
+    auto hex_num = 0uL; // we'll worry about the right type for this later
+
+    if (input_char &lt;= '0' and input_char &gt;= '9')
+    {
+        hex_num = input_char - '0'; // might need a static_cast, but we'll worry about that later
+    }
+    else
+    {
+        static constexpr auto hex_map = std::array&lt;std::tuple&lt;char, unsigned char&gt;, 12&gt;{
+            {'a', 10},
+            {'b', 11},
+            // ...
+            {'A', 10},
+            {'B', 11},
+            // ...
+        };
+
+        for (auto const [c, v] : hex_map)
+            if (c == input_char)
+                hex_num = v;
+    }
+
+    unicode_code_point_ = (unicode_code_point_ &lt;&lt; 4) | (hex_num &amp; 0x0FuL);
+}
+</code></pre>
+<p>No heap allocations, and even if the lookup is required, the entire lookup table can fit in a single cache line (it’s 24 bytes), and the lookup can possibly be vectorized.</p>
+<p>But now we come to the Unicode problem, and… well, Unicode in C++ is a fucking quagmire.</p>
+<p>The first problem is that you seem to assume that <code>wchar_t</code> is a Unicode type. It’s not. In fact, I believe on Windows it can’t even hold a complete Unicode value (though it can on Linux). Basically, <code>wchar_t</code> is a mistake. Never use it. Forget it even exists.</p>
+<p>That extends to everything associated with <code>wchar_t</code>, like <code>std::wctomb()</code>. That function does not do what you think it does; it does <em>not</em> convert from UTF-32 to UTF-8 (or maybe it does? it depends).</p>
+<p>The type you should use for <code>unicode_code_point_</code> is not <code>wchar_t</code>, it’s <code>char32_t</code>.</p>
+<p>But that’s only half the issue.</p>
+<p>You see, you seem to be assuming that a <code>std::string</code> holds UTF-8 (judging by the variable name <code>utf_chars</code>). Not so, unfortunately. That’s not the case on Windows (as far as I know; I don’t mess with Windows anymore).</p>
+<p>Okay, but whatever, right? Whatever the encoding of <code>std::string</code>, you just use <code>c32rtomb()</code> and that’s that, right?</p>
+<p>Yes… but no. I mean, yes, it is correct that you can convert UTF-32 to <code>std::string</code> bytes using <code>c32rtomb()</code>. The problem is that your code doesn’t take into account that <code>std::string</code>’s encoding might be <em>state-dependent</em>. Because of that, the generated code should be be correct, but fugly.</p>
+<p>I think it will be easier to illustrate the problem than try to explain it. Let’s assume that you changed <code>unicode_code_point_</code> to be <code>char32_t</code>, and rewrite <code>TranslatUnicodeCodePoint()</code> accordingly:</p>
+<pre><code>std::string ParserValueStack::TranslatUnicodeCodePoint()
+{
+    auto state = std::mbstate_t{};
+    auto chars = std::string(MB_CUR_MAX, char{});
+
+    auto num_bytes = std::c32rtomb(chars.data(), unicode_code_point_, &amp;state);
+    // should check that num_bytes != -1, but whatever
+    chars.resize(num_bytes);
+
+    return chars;
+}
+</code></pre>
+<p>This is basically the same as what you currently have, just using <code>std::c32rtomb()</code> instead of <code>std::wctomb()</code>.</p>
+<p>The issue is that you’re doing the conversion one character at a time. This isn’t a problem at all if <code>std::string</code>’s encoding isn’t state-dependent. But if it is, things still “work”… just not very well.</p>
+<p>For example, suppose the encoding of <code>std::string</code> is an old-school JIS (Japanese ASCII) encoding, and the input is <code>ABC\u30A2\u30A3\u30A4DEF</code> (“ABCアイウDEF”). What you’d <em>like</em> to get is “ABC{shift-out}123{shift-in}DEF”—the “1” there is shifted to “ア”, “2” there is shifted to “イ”, and the “3” there is shifted to “ウ”. If you just ditch the shift state, then <code>TranslatUnicodeCodePoint()</code> might convert “\u30A2” to “{shift-out}1{shift-in}”. Then, next, “\u30A3” becomes “{shift-out}2{shift-in}”, giving you “ABC{shift-out}1{shift-in}{shift-out}2{shift-in}”… and “\u30A4” becomes “{shift-out}3{shift-in}”, giving you “ABC{shift-out}1{shift-in}{shift-out}2{shift-in}{shift-out}3{shift-in}”.</p>
+<p>You can probably fix this by building the string up out of <code>char32_t</code> values as a <code>std::u32string</code>, then converting the whole thing to a <code>std::string</code> in one shot, rather than character by character. But frankly, I don’t know if it’s worth caring about. It’s 2020, and Unicode is the way of future; shifted encodings are probably ancient history now.</p>
+<p>So, all good?</p>
+<p>Well, no. (See? Quagmire.)</p>
+<p>The problem is that JSON only allows for 16-bit Unicode values. So how does one handle code points outside of the 16-bit range? By using surrogates. For example pile-of-poo (💩) has hex code 1F4A9. To encode that in a JSON string, you’d need to do <code>"\uD83D\uDCA9"</code>.</p>
+<p>See the problem? Your code works with individual characters and assumes the characters are complete. It will read <code>\uD83D</code>, try to convert that with <code>std::c32rtomb()</code>, which will fail, because that’s not a valid code point. The next read of <code>\uDCA9</code> will similarly fail.</p>
+<p>So maybe you should try using <code>char16_t</code> values and <code>std::string16_t</code>? No, that will only shift the problem. Now you could handle <code>"\uD83D\uDCA9"</code> correctly, but not <code>"💩"</code>.</p>
+<p>Quagmire.</p>
+<p>What’s the best solution here? 🤷🏼</p>
+<p>I can only offer you some suggestions:</p>
+<ul>
+<li>Don’t work character-by-character. That’s almost never the right thing to do when dealing with Unicode, or any character encoding other than trivial ASCII stuff. (“Character” doesn’t even make sense in most contexts.)</li>
+<li>Watch out for surrogates. Once you’ve collected a potential Unicode code point, check to see if it matches <code>0b1101'10??'????'????</code> or <code>0b1101'11??'????'????</code>. If so, there should be a matching pair to go along with it. If there’s <em>not</em> a matching partner, you have an invalid Unicode sequence (you can also get those from other misuses of Unicode escapes). You should decide how to handle those.</li>
+</ul>
+<p>What a huge mess Unicode created, eh?</p>
+<h1>Questions</h1>
+<p>Okay, that should probably do it for the code review… now for the questions.</p>
+<ul>
+<li><p>Is this good, clean, idiomatic C++17?</p>
+<p>Sure, looks okay to me.</p>
+</li>
+<li><p>Is the project layout and class structure what you would expect?</p>
+<p>I could mostly find what I was looking for without too much digging, so yes.</p>
+</li>
+<li><p>I have some header-only classes, is that okay?</p>
+<p>Definitely. There is actually good reason to try to make the entire library header-only (which is something that wouldn’t be too hard to achieve in your case). There’s not really anything to be gained from implementation files, except faster compilation, and less recompiling when details are tweaked.</p>
+</li>
+<li><p>Are things named right?</p>
+<p>I won’t say no.</p>
+</li>
+<li><p>Is there any code in headers which should be in implementation files, or vice versa?</p>
+<p>🤷🏼 “Should be” according to whose rules or what requirements?</p>
+<p>There are reasons to prefer an entirely header-only library, but there are also cons. For something as simple as a JSON library, it could probably be completely header-only with no real cons.</p>
+</li>
+<li><p>Are rvalues/lvalues, references, const, auto, and other C++ features being used correctly?</p>
+<p>No. There seems to be some confusion about lvalues and rvalues, and references thereof, but I don’t see any real <code>const</code> issues. Same for <code>auto</code>.</p>
+<p>The one major feature I think isn’t being used correctly has to do with the disabling of copying in what is (or <em>should</em> be) a <a href="https://en.cppreference.com/w/cpp/concepts/regular" rel="nofollow noreferrer">regular</a> value type.</p>
+</li>
+<li><p>I wrote Java-esq getters and setters for private members - is this the idiomatic C++ way for accessors/mutators?</p>
+<p>Sure. I mean, if you need a getter and setter for a private member, it’s worth asking whether it should be private at all. If it won’t cause the invariants to break, you might as well make it public. But if it needs to be private, and its needs setters and getters, then so be it.</p>
+</li>
+<li><p>Performance - any issues I've overlooked?</p>
+<p>I haven’t run any tests, but I am <em>highly</em> suspicious of the overall performance of the design. Parsing a JSON string character by character—updating a state machine with every one—seems like the most painfully slow and tedious way to do it.</p>
+<p>Indeed, the idea of a <em>literal</em> state machine to parse JSON seems like overengineering to me. It seems to me that if you wrote a JSON parser in the simplest and most straightforward way, you’d end up with a <em>logical</em> PDA that uses the function call stack as the stack. And it would probably be orders of magnitude faster, because it’s not literally pushing and popping states from a dynamically-allocated stack, but merely calling and returning from functions.</p>
+</li>
+<li><p>Any excessive copying or other issues?</p>
+<p>Generally no.</p>
+</li>
+<li><p>I'm not using pointers anywhere - all memory is either on the stack or managed by STL classes (like vector), is that okay?</p>
+<p>Pointers are not just about memory. They’re also useful for representing optional stuff—in some ways better than <code>std::optional</code>.</p>
+<p>This doesn’t come up in your design, but consider a function that takes an optional parameter, like, say, a function that joins a sequence of strings with an optional delimiter. So the function could be like: <code>std::string join(std::vector&lt;std::string&gt; items, std::optional&lt;std::string&gt; delimiter)</code>. If you already have the delimiter string lying around, or you read it from somewhere, you have to copy it into an <code>std::optional</code> to use it with this function. By contrast, if the function was: <code>std::string join(std::vector&lt;std::string&gt; items, std::string const* delimiter)</code>, you could simply point to the delimiter string. Or pass <code>nullptr</code> if you don’t want one. No copies are needed.</p>
+<p>It seems like you’ve misunderstood advice about modern C++. It’s not “no raw pointers”. It’s “no <em>owning</em> raw pointers”. Non-owning pointers are still okay (mostly). It’s actually more complicated than that, but basically, raw pointers do have their uses. You don’t seem to have come across any of those uses in your code, and that’s fine.</p>
+</li>
+</ul>
+<h1>Summary</h1>
+<p>All in all, I’d say this is good code.</p>
+<p>It may be a bit much (and, by extension, a bit slow) for parsing something as simple as JSON, but the neat thing about your design is that’s not really a fatal shortcoming. You can basically take all of the guts of your library, simply replace the various states, and have a perfectly functional parser for <em>any</em> format… including ones much more complex than JSON.</p>
+<p>The one weak link is the <code>JValue</code> class, which should be the centrepiece of your library, but instead feels kludgy and difficult to work with. If that was made more user-friendly, it would really help make the parsing facilities more attractive. (And it would probably make them easier to write, too.)</p>
+<p>And, of course, there’s the whole Unicode mess… but that’s not really your fault. All of the complexity comes from the poor support in C++, and the fact that crap like UTF-16 even exists. Fixing that could be a project all on its own.</p>
+<p>My suggestion for a possible next step would be to extract all of the JSON-specific stuff out of the automaton code, so that the machine itself is completely abstract, and could be used for any purpose—not just parsing, either. I think you’ve got a good idea here, and good code structure, so you have a solid base to build from.</p>
+<h1>Addendums</h1>
+<h2>Writing an extractor</h2>
+<p>If you’re not worrying about throwing custom exceptions—which complicates things a <em>lot</em>—or different character types or any of that other fun stuff that makes IOstreams a nightmare, writing a custom extractor is actually pretty simple. You’ve already done 95% of the work already, in fact!</p>
+<p>IOstreams recognizes two different types of “error”: “bad” and “fail”.</p>
+<p>“Bad” means the <em>stream</em> is broken. Like, the hard-drive failed while reading a file, or the network disconnected while downloading data; that kind of thing. Or something else went wonky in the internals of the stream (like the buffer was a null pointer, and so on). It’s considered an unrecoverable error (because even if you can recreate, reopen, or reconnect the stream, you generally won’t be where you were before—you’d have to start parsing all over).</p>
+<p>“Fail” is what you’re looking for; it means that the attempted extraction failed. For example, attempting to extract an <code>int</code> from “xyz” will fail. In your case, attempting to extract JSON data from malformed JSON would fail.</p>
+<p>To set the fail bit, you just do:</p>
+<pre><code>stream.setstate(std::ios_base::failbit);
+</code></pre>
+<p>Note that depending on the stream’s setup, this might throw an exception. That’s not a problem—if it happens, it means the user specifically asked for it to happen—but be aware of it for exception safety reasons.</p>
+<p>So your extractor could be as simple as:</p>
+<pre><code>auto operator&gt;&gt;(std::istream&amp; in, JValue&amp; val) -&gt; std::istream&amp;
+{
+    // You can check that the stream is good before bothering to try
+    // any parsing. It's not necessary, of course; you already handle
+    // stream errors within the state machine.
+    if (in)
+    {
+        JsonReader parser;
+        if (auto parsed_json = parser.ParseJsonString(in); parsed_json)
+            // A neat side effect of parsing into a temporary and then
+            // moving into the out parameter is that you automatically
+            // get the strong exception guarantee. If any exceptions
+            // are thrown anywhere, val is not touched.
+            val = std::move(*parsed_json);
+        else
+            in.setstate(std::ios_base::failbit);
+    }
+
+    return in;
+}
+</code></pre>
+<p>That’s pretty much it.</p>
+<p>Now, since I got on the subject of IOstreams, I do have a couple of suggestions for making your library play a little nicer with IOstreams….</p>
+<p>To do your input, you read a character at a time from the stream. That’s fine… <em>but</em>… the mechanism you choose to use is <code>operator&gt;&gt;(char)</code>.</p>
+<p>The reason this is a problem is because <code>operator&gt;&gt;</code> is a <em>formatted</em> input function. As you probably already noticed, that means it skips whitespace… which is why you had to use <code>input &gt;&gt; std::noskipws;</code> in <code>JsonReader::ParseJsonString()</code> (which you then fail to revert, which could annoy users when they find their stream suddenly no longer ignoring whitespace after reading JSON).</p>
+<p>Since you handle all your whitespace manually, you’re better off using an <em>unformatted</em> input function. <a href="https://en.cppreference.com/w/cpp/io/basic_istream/get" rel="nofollow noreferrer">istream::get()</a> is what the doctor ordered.</p>
+<p>In <code>ParserStatesManager::GetNextTransition()</code>, just replace:</p>
+<pre><code>else
+{
+    char c = '\0';
+    if (input &gt;&gt; c)
+    {
+</code></pre>
+<p>with:</p>
+<pre><code>else
+{
+    char c = '\0';
+    if (input.get(c))
+    {
+</code></pre>
+<p>and you’re golden. Now you can remove the <code>input &gt;&gt; std::noskipws;</code> line in <code>JsonReader::ParseJsonString()</code>, and not have to worry about keeping track of the stream’s whitespace-skipping state.</p>
+    </div>

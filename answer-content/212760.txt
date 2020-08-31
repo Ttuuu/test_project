@@ -1,0 +1,177 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>Review:</strong></p>
+
+<blockquote>
+  <p>The idea here is that UniformBuffer can be copied/assigned without
+  destroying the resource held on the GPU, but when all shared instances
+  of the UniformBuffer go out of scope/are deleted the GPU resource is
+  then destroyed.</p>
+</blockquote>
+
+<p>You may run into problems with this approach if you need to store any other data in the <code>UniformBuffer</code> (or other classes containing a <code>GLResource</code>). Changes made to data in one instance will not be applied to the data in the other instances (unless we put it all in shared_ptrs). It would probably be safer and easier to wrap the <code>UniformBuffer</code> itself in a <code>shared_ptr</code>.</p>
+
+<p>This isn't a problem with the <code>UniformBuffer</code> as it stands, and you'll be ok as long as you don't add any extra state into the user class (i.e. the class directs all state requests to OpenGL).</p>
+
+<p>e.g. For an OpenGL <code>Buffer</code> object used for storing vertex data, we might want to store some state in the class to make OpenGL calls easier:</p>
+
+<pre><code>class Buffer
+{
+    ...
+
+    template&lt;class ElementT&gt;
+    void SetData(GLenum target, ElementT const* data, std::size_t elementCount, GLenum usage)
+    {
+        ...
+        m_elementCount = elementCount;
+    }
+
+private:
+
+    std::shared_ptr&lt;GLResource&lt;GLuint&gt;&gt; m_resource;
+
+    std::size_t m_elementCount; // extra state: number of vertices in the buffer
+};
+
+Buffer buffer1; // create a buffer to use for vertex data
+buffer1.SetData(GL_ARRAY_BUFFER, positions.data(), positions.size(), GL_DYNAMIC_DRAW); // sets m_elementCount
+
+Buffer buffer2 = buffer1; // copy -&gt; buffer2 is the same resource
+
+// lets say we now have fewer vertices (positions.size() is smaller)
+buffer2.SetData(GL_ARRAY_BUFFER, positions.data(), positions.size(), GL_DYNAMIC_DRAW); // OpenGL state is updated, buffer2 m_elementCount is changed, but buffer1 m_elementCount is not!
+
+assert(buffer2.GetElementCount() == buffer1.GetElementCount()); // will fail!
+</code></pre>
+
+<hr>
+
+<p>I think it's reasonable here for <code>UniformBuffer</code> to inherit from <code>GLResource</code>. The <code>UniformBuffer</code> <em>is a</em> resource, and should inherit its semantics / interface.</p>
+
+<p>We can support move assignment for the <code>GLResource</code> by making the id value non-const and private, and adding a <code>T GetID() const</code> public member function. This also would allow move assignment for derived resource types.</p>
+
+<hr>
+
+<p>Does OpenGL use any other resource ID type than <code>GLuint</code> (i.e. does <code>GLResource</code> actually need to be templated on it)?</p>
+
+<hr>
+
+<p><strong>An alternative example:</strong></p>
+
+<p>My own OpenGL resource class from a while ago looks like this:</p>
+
+<pre><code>template&lt;class T&gt;
+class Handle
+{
+public:
+
+    Handle();
+
+    Handle(Handle const&amp;) = delete;
+    Handle&amp; operator=(Handle const&amp;) = delete;
+
+    Handle(Handle&amp;&amp; other);
+    Handle&amp; operator=(Handle&amp;&amp; other);
+
+    GLuint GetID() const;
+
+protected:
+
+    ~Handle();
+
+private:
+
+    static GLuint Create();
+    static void Destroy(GLuint id);
+
+    GLuint m_id;
+};
+
+template&lt;class T&gt;
+Handle&lt;T&gt;::Handle():
+    m_id(Create())
+{
+    assert(m_id != 0u);
+}
+
+template&lt;class T&gt;
+Handle&lt;T&gt;::~Handle()
+{
+    if (m_id != GLuint{ 0 })
+    {
+        Destroy(m_id);
+        m_id = GLuint{ 0 };
+    }
+}
+</code></pre>
+
+<p>It uses the <a href="https://en.wikipedia.org/wiki/Curiously_recurring_template_pattern" rel="nofollow noreferrer">CRTP</a> and template specialization to avoid storing a deleter (or creator). Users specialize the static <code>Create()</code> and <code>Destroy()</code> functions to generate the appropriate ID:</p>
+
+<pre><code>namespace Detail
+{
+
+    template&lt;&gt;
+    GLuint Handle&lt;Buffer&gt;::Create()
+    {
+        auto id = GLuint{ 0 };
+        glGenBuffers(1, &amp;id);
+        return id;
+    }
+
+    template&lt;&gt;
+    void Handle&lt;Buffer&gt;::Destroy(GLuint id)
+    {
+        glDeleteBuffers(1, &amp;id);
+    }
+
+} // Detail
+
+class Buffer : public Detail::Handle&lt;Buffer&gt;
+{
+public:
+
+    Buffer();
+
+    Buffer(Buffer&amp;&amp;) = default;
+    Buffer&amp; operator=(Buffer&amp;&amp;) = default;
+
+    ...
+};
+</code></pre>
+
+<p>The downside to this is that certain OpenGL objects need additional parameters to the create function. When I first implemented it, the best solution I could find was to specialize the entire <code>Detail::Handle</code> class, e.g.:</p>
+
+<pre><code>namespace Detail
+{
+
+    template&lt;&gt;
+    class Handle&lt;ShaderObject&gt;
+    {
+    public:
+
+        explicit Handle(GLenum shaderType);
+
+        Handle(Handle const&amp;) = delete;
+        Handle&amp; operator=(Handle const&amp;) = delete;
+
+        Handle(Handle&amp;&amp; other);
+        Handle&amp; operator=(Handle&amp;&amp; other);
+
+        GLuint GetID() const;
+
+    protected:
+
+        ~Handle();
+
+    private:
+
+        static GLuint Create(GLenum shaderType);
+        static void Destroy(GLuint id);
+
+        GLuint m_id;
+    };
+
+} // Detail
+</code></pre>
+
+<p>This could probably be avoided by using variable template arguments for the constructor and <code>Create()</code> functions.</p>
+    </div>

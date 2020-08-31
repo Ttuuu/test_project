@@ -1,0 +1,238 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+<p>I tried to solve the Problem Euler 67 with Go, because I started to
+study Go recently.</p>
+<p>What could be a better approach? Could I use goroutines to increase
+performance?</p>
+</blockquote>
+<hr>
+<p>Code should be correct, maintainable, robust, reasonably efficient, and, most importantly, readable.</p>
+<p>I'm going to skip a full code review and narrowly focus my code review on the use of performance benchmarks. Go has several tools to measure performance, including the Go standard library <code>testing</code> package <code>Benchmark</code> type.</p>
+<hr>
+<p>The elapsed time for the program is somewhat interesting but not very useful. Some results from running my program code and your program code several times to prime the Linux file buffer cache:</p>
+<p>peterGo:</p>
+<pre><code>$ go run euler67.go
+7273
+175.641µs
+</code></pre>
+<p>Mdsp:</p>
+<pre><code>$ go run mdsp.go
+Total sum: 7273, Elapsed time: 277.556µs
+</code></pre>
+<hr>
+<p>Here's how I benchmarked your <a href="https://projecteuler.net/problem=67" rel="nofollow noreferrer">Project Euler Problem 67</a> maximum sum path algorithm using <a href="https://projecteuler.net/project/resources/p067_triangle.txt" rel="nofollow noreferrer"><code>p067_triangle.txt</code></a> as input.</p>
+<p><code>BenchmarkEuler67</code> measures overall (load and sum) performance while ignoring the effects of hardware (for example, HDD I/O), operating system (for example, cached disk data), and other extraneous effects. The triangle has 100 rows with a total of 5050 (= 100 * (100 + 1) / 2) elements.</p>
+<pre><code>$ go test euler67_test.go euler67.go -bench=. -benchmem
+BenchmarkEuler67-4   13299   89766 ns/op   68440 B/op   210 allocs/op
+</code></pre>
+<p>These are benchmarks for <code>BenchmarkEuler67</code> components.</p>
+<pre><code>$ go test euler67_test.go euler67.go -bench=. -benchmem
+BenchmarkLoad-4      16959   70742 ns/op   68440 B/op   210 allocs/op
+BenchmarkRow-4     1000000    1137 ns/op   896 B/op       1 allocs/op
+BenchmarkSum-4       60830   19595 ns/op   0 B/op         0 allocs/op
+</code></pre>
+<p><code>BenchmarkLoad</code> measures loading the in-memory text triangle values into a triangle of <code>int</code> slices.</p>
+<p><code>BenchmarkRow</code> measures parsing the text for the maximum (100 integer) triangle row into to a slice of Go <code>ints</code>. <code>parseInts</code>, a specialization, provides an improvement over <code>strings.Fields</code> for the <code>loadTriangle</code> function.</p>
+<p><code>strings.Fields</code>:</p>
+<pre><code>BenchmarkLoad-4      10000  114958 ns/op  153304 B/op   310 allocs/op
+</code></pre>
+<p><code>parseInts</code>:</p>
+<pre><code>BenchmarkLoad-4      16959   70742 ns/op   68440 B/op   210 allocs/op
+</code></pre>
+<p><code>BenchmarkSum</code> measures the fundamental maximum sum path algorithm performance: 19.6 microseconds. The <code>maxPathSum</code> function reduces memory bytes and allocations to zero by reusing the input for intermediate results.</p>
+<p>Clearly, the major expense is loading the inefficient input into an efficient data structure for the maximum sum path algorithm.</p>
+<p>To see how the code scales, here are benchmarks for a triangle with 1000 rows with a total of 500500 (= 1000 * (1000 + 1) / 2) elements.</p>
+<pre><code>BenchmarkEuler67-4     174   6810618 ns/op   5941675 B/op   2015 allocs/op
+BenchmarkLoad-4        186   6399151 ns/op   5941685 B/op   2015 allocs/op
+BenchmarkRow-4       93747     12505 ns/op      8192 B/op      1 allocs/op
+BenchmarkSum-4        1916    622193 ns/op         0 B/op      0 allocs/op
+</code></pre>
+<p>6.8 milliseconds for 1000 rows is not unreasonable.</p>
+<p>Improving performance is an iterative process and there is more that we can do, but is it worth it. The CPU, memory, and allocation numbers are small. Unless we expect many iterations, it doesn't seem like further optimization is worth much time, effort, and loss of readability.</p>
+<hr>
+<p><code>euler67.go</code>:</p>
+<pre><code>package main
+
+import (
+    "bufio"
+    "flag"
+    "fmt"
+    "io"
+    "os"
+    "strconv"
+    "time"
+)
+
+func parseInts(s string, buf []int) ([]int, error) {
+    buf = buf[:0]
+    inInt := false
+    i := 0
+    for j := 0; j &lt;= len(s); j++ {
+        if j == len(s) || ('0' &gt; s[j] || s[j] &gt; '9') {
+            if inInt {
+                n, err := strconv.Atoi(s[i:j])
+                if err != nil {
+                    return buf[:0], err
+                }
+                buf = append(buf, n)
+            }
+            inInt = false
+        } else if !inInt {
+            inInt = true
+            i = j
+        }
+    }
+    return buf, nil
+}
+
+func loadTriangle(r io.Reader) ([][]int, error) {
+    var ta [][]int
+    s := bufio.NewScanner(r)
+    for s.Scan() {
+        buf := make([]int, 0, len(ta)+1)
+        row, err := parseInts(s.Text(), buf)
+        if err != nil {
+            return nil, err
+        }
+        if len(row) != len(ta)+1 {
+            err := fmt.Errorf(
+                "triangle: %d cols for row %d",
+                len(row), len(ta)+1,
+            )
+            return nil, err
+        }
+        ta = append(ta, row)
+    }
+    if err := s.Err(); err != nil {
+        return nil, err
+    }
+    return ta, nil
+}
+
+func maxPathSum(ta [][]int) int {
+    for r := len(ta) - 2; r &gt;= 0; r-- {
+        r0, r1 := ta[r], ta[r+1]
+        for c0 := range r0 {
+            left, right := r1[c0], r1[c0+1]
+            if left &gt;= right {
+                r0[c0] += left
+            } else {
+                r0[c0] += right
+            }
+        }
+    }
+    if len(ta) == 0 || len(ta[0]) == 0 {
+        return 0
+    }
+    return ta[0][0]
+}
+
+func euler67(r io.Reader) (int, error) {
+    ta, err := loadTriangle(r)
+    if err != nil {
+        return 0, err
+    }
+    return maxPathSum(ta), nil
+}
+
+func since(start time.Time) { fmt.Println(time.Since(start)) }
+
+func main() {
+    defer since(time.Now())
+
+    flag.Parse()
+    // https://projecteuler.net/project/resources/p067_triangle.txt
+    // 100 rows 15.2 kB (15,150 bytes)
+    filename := `p067_triangle.txt`
+    if len(flag.Arg(0)) &gt; 0 {
+        filename = flag.Arg(0)
+    }
+    f, err := os.Open(filename)
+    if err != nil {
+        fmt.Fprintln(os.Stderr, err)
+        os.Exit(1)
+    }
+    defer f.Close()
+
+    sum, err := euler67(f)
+    if err != nil {
+        fmt.Fprintln(os.Stderr, err)
+        os.Exit(1)
+    }
+    fmt.Println(sum)
+}
+</code></pre>
+<p><code>euler67_test.go</code>:</p>
+<pre><code>package main
+
+import (
+    "bufio"
+    "bytes"
+    "io/ioutil"
+    "strings"
+    "testing"
+)
+
+func BenchmarkEuler67(b *testing.B) {
+    for N := 0; N &lt; b.N; N++ {
+        _, err := euler67(bytes.NewReader(benchData))
+        if err != nil {
+            b.Fatal(err)
+        }
+    }
+}
+
+func BenchmarkLoad(b *testing.B) {
+    for N := 0; N &lt; b.N; N++ {
+        _, err := loadTriangle(bytes.NewReader(benchData))
+        if err != nil {
+            b.Fatal(err)
+        }
+    }
+}
+
+func BenchmarkRow(b *testing.B) {
+    var last string
+    s := bufio.NewScanner(bytes.NewReader(benchData))
+    for s.Scan() {
+        last = s.Text()
+    }
+    if err := s.Err(); err != nil {
+        b.Fatal(err)
+    }
+    cols := len(strings.Fields(last))
+    b.ResetTimer()
+
+    for N := 0; N &lt; b.N; N++ {
+        buf := make([]int, 0, cols)
+        _, err := parseInts(last, buf)
+        if err != nil {
+            b.Fatal(err)
+        }
+    }
+}
+
+func BenchmarkSum(b *testing.B) {
+    for N := 0; N &lt; b.N; N++ {
+        b.StopTimer()
+        ta, err := loadTriangle(bytes.NewReader(benchData))
+        if err != nil {
+            b.Fatal(err)
+        }
+        b.StartTimer()
+        _ = maxPathSum(ta)
+    }
+}
+
+var benchData = func() []byte {
+    // https://projecteuler.net/project/resources/p067_triangle.txt
+    // 100 rows 15.2 kB (15,150 bytes)
+    filename := `p067_triangle.txt`
+    data, err := ioutil.ReadFile(filename)
+    if err != nil {
+        panic(err)
+    }
+    return data
+}()
+</code></pre>
+    </div>

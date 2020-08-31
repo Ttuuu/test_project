@@ -1,0 +1,99 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>It's tricky to review something like this where you're imitating an overcomplicated design, so you <em>know</em> certain things are unimplemented (such as iterators), but then other things might also be unimplemented by accident. For example:</p>
+
+<ul>
+<li><p>You take a parameter <code>Traits = std::char_traits&lt;CharType&gt;</code> but then you don't use it! The real <code>basic_string</code> would use the traits class for things like where you use <code>std::copy</code>.</p></li>
+<li><p>You take an allocator parameter <code>Allocator = std::allocator&lt;CharType&gt;</code> and do use it, kind of, but you don't go through <code>std::allocator_traits&lt;Allocator&gt;</code>. Since all you use is <code>a.allocate()</code> and <code>a.deallocate()</code>, this is probably fine in all real-world situations; but really you should be using <code>allocator_traits</code>. It can't hurt.</p></li>
+<li><p>You don't store an <code>Allocator</code> data member of <code>kbasic_string</code>; instead, you default-construct one <em>ex nihilo</em> every time you want to use the allocator. This (plus the previous bullet point, technically) means that your container is not <em>allocator-aware</em>: it won't work with user-defined allocators or allocators such as <code>std::pmr::polymorphic_allocator&lt;char&gt;</code>. You get away with it in your tests right now only because <code>std::allocator&lt;char&gt;</code> is (A) empty and (B) default-constructible.</p></li>
+<li><p>You do have tests, right?</p></li>
+</ul>
+
+<hr>
+
+<pre><code>  std::memcpy(&amp;data_, &amp;other.data_, sizeof(CharType*));
+  std::memset(&amp;other.data_, 0, sizeof(CharType*));
+</code></pre>
+
+<p>This is a very strange way of writing</p>
+
+<pre><code>  data_ = other.data_;
+  other.data_ = nullptr;
+</code></pre>
+
+<p>...oh, I see, your <code>data_</code> is a <code>char[23]</code>, not a <code>char *</code>. Well, okay. I would strongly recommend making it a <code>union</code> of <code>char[23]</code> and <code>char *</code> so that you can copy the pointer member without weird type-punning tricks.</p>
+
+<p>Pedantic nit: Setting all-bits-zero is not technically the same thing as setting to <code>nullptr</code> — the in-memory representation of <code>nullptr</code> need not be all-bits-zero (even though, in practice, it will be).</p>
+
+<p>Also, notice that to be <em>allocator-aware</em> you will have to store a pointer of type <code>std::allocator_traits&lt;Allocator&gt;::pointer</code>, which you <em>definitely</em> cannot assume is all-bits-zero when it's null! For example, <code>boost::interprocess::offset_ptr&lt;char&gt;</code> is not all-bits-zero when it's null.</p>
+
+<hr>
+
+<pre><code>bool operator==(const kbasic_string&amp; other)
+</code></pre>
+
+<p>Here and throughout, you forgot the trailing <code>const</code>. These days I recommend making every operator an "ADL friend" non-member:</p>
+
+<pre><code>friend bool operator==(const kbasic_string&amp; other, const kbasic_string&amp; other) {
+    return std::equal(begin(), end(), other.begin(), other.end());
+}
+</code></pre>
+
+<p>Then it's really obvious if you forget one of the two <code>const</code>s.</p>
+
+<hr>
+
+<pre><code>  template&lt;typename Iter, typename = std::enable_if_t&lt;std::_Is_iterator_v&lt;Iter&gt;&gt;&gt;
+  kbasic_string&amp; append(Iter first, Iter last)
+  {
+    if (last - first &gt; capacity_)
+      reserve(last - first);
+    std::copy(first, last, begin() + size_);
+    return *this;
+  }
+</code></pre>
+
+<p>Write a test case for this function! For example, <code>string("123456789").append(a, a+3)</code>. There's a bug in the <code>if</code> condition that leads quickly to undefined behavior.</p>
+
+<pre><code>kbasic_string&amp; append(const kbasic_string&amp; str)
+{
+    return append(str.data());
+}
+</code></pre>
+
+<p>Also write tests for this function! Since <code>str</code> knows its own <code>size()</code>, does it make sense to throw away that information here? What happens if <code>str</code> contains an embedded <code>'\0'</code> character — what is <code>string("abc").append(string("d\0e", 3))</code>?</p>
+
+<hr>
+
+<p>Your use of <code>std::_Is_iterator_v&lt;Iter&gt;</code> is sketchy. I would recommend writing your own portable type-trait, something like this:</p>
+
+<pre><code>template&lt;class, class = void&gt; struct is_iterator : std::false_type {};
+template&lt;class T&gt; struct is_iterator&lt;T, decltype(void(std::iterator_traits&lt;T&gt;::iterator_category{}))&gt; : std::true_type {};
+</code></pre>
+
+<p>Orthogonally, you seem to be using <code>_Is_iterator_v</code> almost like pseudocode that magically does whatever you want done. Here you use it to mean "is an input iterator or better":</p>
+
+<pre><code>template&lt;typename Iter, typename = std::enable_if_t&lt;std::_Is_iterator_v&lt;Iter&gt;&gt;&gt;
+kbasic_string&amp; append(Iter first, Iter last)
+</code></pre>
+
+<p>Here you use it to mean "is either <code>kbasic_string::iterator</code> or <code>kbasic_string::const_iterator</code>":</p>
+
+<pre><code>template&lt;typename Iter, typename = std::enable_if_t&lt;std::_Is_iterator_v&lt;Iter&gt;&gt;&gt;
+kbasic_string&amp; erase(Iter it)
+</code></pre>
+
+<p><code>erase</code> should certainly be rewritten as a non-template:</p>
+
+<pre><code>kbasic_string&amp; erase(const_iterator it)
+</code></pre>
+
+<hr>
+
+<p>Finally, consider whether you could save space by replacing every instance of <code>on_heap_</code> with the condition <code>(capacity_ &gt; 22)</code>. And consider moving the magic number 22 into a variable!</p>
+
+<pre><code>static constexpr size_t SBO_CAPACITY = 22;
+size_t size_ = 0;
+size_t capacity_ = SBO_CAPACITY;
+CharType data_[SBO_CAPACITY + 1] = {0};
+</code></pre>
+    </div>

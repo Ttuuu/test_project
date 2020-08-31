@@ -1,0 +1,162 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+<p>I'd like commentary on the overall query, structure, organization, style.</p>
+</blockquote>
+<p>The query is consistent for style. Its structure and organization seems to match the functional decomposition you did to achieve the desired result.</p>
+<p>While the use of a temporary table to shape, reduce and transform your data isn't uncommon SQL Server does offer an alternative called <a href="https://docs.microsoft.com/en-us/sql/t-sql/queries/with-common-table-expression-transact-sql?view=sql-server-2017" rel="nofollow noreferrer">Common Table Expression</a> and if you don't have special needs (like indexes for example) I would prefer one or more common table expressions (shorthand CTE).</p>
+<p>For reference, here is the Execution plan:</p>
+<p><a href="https://i.stack.imgur.com/4eT0z.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/4eT0z.png" alt="execution plan showing updates and spooling"></a></p>
+<p>You could still have each functional step in your query be represented as an CTE and join them later. As the columns that you add are a projection over the same row each time there is not really a need to separate those in different statement. So the temptable #ph can be replaced with a CTE where I think you can still capture the functional steps:</p>
+<pre class="lang-sql prettyprint-override"><code>-- migration prefix length
+DECLARE @mhpl INT, @mapl INT, @mhid INT, @maid INT;
+
+SET @mhpl = LEN(N'from http://')
+SET @mapl = LEN(N'to http://'  )
+
+SELECT @mhid = Id from PostHistoryTypes where Name = N'Post Migrated Here'
+SELECT @maid = Id from PostHistoryTypes where Name = N'Post Migrated Away'
+
+-- Create copy of PostHistory table with
+-- all the posts migrated here from other sites
+;WITH ph as (
+  SELECT *
+        -- Add "migration direction" column 
+       , (CASE PostHistoryTypeId 
+          WHEN @mhid THEN '&lt;'
+          WHEN @maid THEN '&gt;'
+          END
+         ) mDir
+         -- Add column for site where question was migrated from
+         -- Parse migration source site from comment field
+         -- and put into column
+       , replace( 
+            CASE WHEN PostHistoryTypeId = @mhid THEN 
+              substring(
+                         COMMENT, @mhpl, 
+                         charindex('.',COMMENT,@mhpl) - @mhpl
+                       )
+            ELSE 
+              substring(
+                         COMMENT, @mapl, 
+                         charindex('.',COMMENT,@mapl) - @mapl
+                       )
+            END,
+            N'/', ''
+          ) mSite
+       -- Add calendar quarter column column for site where question was migrated from
+      , N'FY' + 
+         RIGHT(
+                CAST( YEAR(CreationDate) AS CHAR(4) ), 
+                2 
+         ) +
+         N'Q' + 
+         CAST( CEILING(
+                       CAST(
+                            MONTH(CreationDate) AS DECIMAL(4,2)
+                            ) / 3 
+                       ) AS char(1)
+         ) CalendarQuarter
+  FROM posthistory 
+  WHERE PostHistoryTypeId in (@mhid, @maid)
+)
+</code></pre>
+<p>Here is the Execution plan of the whole query:</p>
+<p><a href="https://i.stack.imgur.com/xrGed.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/xrGed.png" alt="single execution stream"></a></p>
+<p>With that tackled lets move on to your raised concerns:</p>
+<blockquote>
+<p>Particular areas of concern:</p>
+<ul>
+<li>The duplication of the charindex('.',COMMENT,@mhpl) - @mhpl logic in the migration-site parsing UPDATE statement bugs me,</li>
+<li>as does the general verbosity and complexity of the CalendarQuarter-formatting code.</li>
+<li>You'll also see I use vertical indentation for most deeply-nested function calls. Is this normal or useful practice for complicated SQL queries? If not, how do you help the reader visually parse deeply-nested parens, without wasting so much real estate?</li>
+</ul>
+</blockquote>
+<p>If you had your own SQL Server instance you can reduce duplication to introduce <a href="https://docs.microsoft.com/en-us/sql/t-sql/statements/create-function-transact-sql?view=sql-server-2017" rel="nofollow noreferrer">User-defined functions</a> but unfortunately that is not allowed on SEDE. We lack the permission to create those. So it is not easy to prevent duplication in this setting.</p>
+<p>Looking at the content of the comment field we find that it contains either <code>from https://somesite.stackexchange.com</code> or <code>to https://somesite.stackexchange.com</code> with the added complexity that older records still have <code>http://</code> in it.
+You're interested in the <code>somesite</code> part.</p>
+<p>Except the <code>charindex</code> function there also exists <a href="https://docs.microsoft.com/en-us/sql/t-sql/functions/patindex-transact-sql?view=sql-server-2017" rel="nofollow noreferrer"><code>patindex</code></a>. It let's you search for a pattern and I used it to search for <code>%http%://</code> but I found that I couldn't handle http or https nicely so in the end I kept the <code>patindex</code> for demo purposes but <code>charindex</code> would have worked as well. What I basically did is: search for <code>:\\</code> and search for a single dot, substract those and you'll have the first part of the domainname. That eliminates the need for the CASE/THEN/ELSE construction.</p>
+<p>Applying that will give you this expression:</p>
+<pre class="lang-sql prettyprint-override"><code>DECLARE @http NVARCHAR(9), @httplen INT
+
+SET @http = '%://%';
+SET @httplen = LEN(@http) - 2; -- don't count the %
+
+-- in the query
+SUBSTRING(
+   COMMENT, 
+   PATINDEX(@http, comment) + @httplen, 
+   CHARINDEX('.', COMMENT) - (PATINDEX(@http, comment) + @httplen)
+ ) mSite
+</code></pre>
+<p>For the CalendarQuarter formatting I would prefer to leave that to the final stage. So in the CTE we only need to supply columns for the year and the quarter. SQL Server has a <a href="https://docs.microsoft.com/en-us/sql/t-sql/functions/datepart-transact-sql?view=sql-server-2017" rel="nofollow noreferrer">DATEPART</a> function that does allow to specify quarter as a datepart. To reduce the Year to the part without the century I apply a modulo of 100. That makes that in the CTE you no longer have to fiddle with varchars and casts.</p>
+<p>Here is how those functions pan out for Year and Quarter:</p>
+<pre class="lang-sql prettyprint-override"><code>, DATEPART(yy, CreationDate) % 100 fy
+, DATEPART(qq, CreationDate) q
+</code></pre>
+<p>In the final query you can now combine those however you like, for example:</p>
+<pre class="lang-sql prettyprint-override"><code>CONCAT('FY', fy, 'Q', q) as CalendarQuarter,
+</code></pre>
+<p>which leaves the conversion of values to the correct type to SQL Server.</p>
+<p>Do note that you can now add extra columns to the CTE for different time/date series and only adapt the group by and projection to show the result.</p>
+<p>For completeness here is <a href="https://data.stackexchange.com/english/query/1093953?opt.withExecutionPlan=true#executionPlan" rel="nofollow noreferrer">the complete query</a>:</p>
+<pre class="lang-sql prettyprint-override"><code>DECLARE @http NVARCHAR(5), @httplen INT, @mhid INT, @maid INT;
+
+SET @http = '%://%';
+SET @httplen = LEN(@http) - 2; -- don't count the %
+
+SELECT @mhid = Id from PostHistoryTypes where Name = N'Post Migrated Here'
+SELECT @maid = Id from PostHistoryTypes where Name = N'Post Migrated Away'
+
+;WITH ph as (
+  SELECT *
+       , (
+          CASE PostHistoryTypeId 
+          WHEN @mhid THEN '&lt;'
+          WHEN @maid THEN '&gt;'
+          END
+         ) mDir
+       , SUBSTRING(
+           COMMENT, 
+           PATINDEX(@http, comment) + @httplen, 
+           CHARINDEX('.', COMMENT) - (PATINDEX(@http, comment) + @httplen)
+         ) mSite
+       , DATEPART(yy, CreationDate) % 100 fy
+       , DATEPART(qq, CreationDate) q
+  FROM posthistory 
+  WHERE PostHistoryTypeId in (@mhid, @maid)
+)
+
+
+SELECT 
+  CONCAT('FY', fy, 'Q', q) as CalendarQuarter,
+  SUM(CASE WHEN mDir='&gt;' THEN 1 ELSE  0 END) as Departing,
+  SUM(CASE WHEN mDir='&lt;' THEN 1 ELSE  0 END) as Arriving,
+  SUM(CASE WHEN mDir='&gt;' THEN 1 ELSE -1 END) as NetDepartures
+FROM ph
+WHERE mSite='ell'
+GROUP BY fy,
+         q
+ORDER BY fy DESC,
+          q DESC
+</code></pre>
+<p>A final word about indenting. I have seen enough variations over the years and I'm not religious about it. If anything, you could stick to indent <em>one stop</em>, being it 2 or 4 spaces, instead of <em>aligning</em> vertical. To apply that to something we saw in the first snippet will give you this:</p>
+<pre class="lang-sql prettyprint-override"><code>replace( 
+  CASE WHEN PostHistoryTypeId = @mhid THEN 
+    substring(
+      COMMENT, 
+      @mhpl, 
+      charindex('.', COMMENT, @mhpl) - @mhpl
+    )
+  ELSE 
+    substring(
+      COMMENT, 
+      @mapl, 
+      charindex('.', COMMENT, @mapl) - @mapl
+    )
+  END,
+  N'/', 
+  ''
+) mSite
+</code></pre>
+<p>That is a bit more compact without compromising too much of readability.</p>
+    </div>

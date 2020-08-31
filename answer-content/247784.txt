@@ -1,0 +1,156 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'll first offer some critique of your code, and then I'll show you how I would approach the problem.</p>
+<ul>
+<li>Commented out code should be removed before asking for a code review <code>#print(f"start={start}\tstop={stop}\tcount={count}")</code></li>
+<li>Many of the comments don't add value. <code># last position</code> doesn't mean much on its own. Why do you want the last position? Why doesn't the code do a good enough job explaining that?</li>
+<li>Generally an if/else in a loop where one of branches is only taken once, either at the start or end, can be removed. You can iterate less, and deal with the case explicitly. You can add a sentinel value so you don't have to check if you are at the end of the iterator. You can used the available libraries or built-in functions, which will deal with the case for you.</li>
+</ul>
+<hr>
+<pre><code># load with pandas
+df = pd.read_csv(file, sep='\t', header=None)
+
+# set colnames
+header = ['chr','start','stop','strand','count']
+df.columns = header[:len(df.columns)]
+
+# index where count=1
+col_count = df['count'].tolist()
+li = [i for i, n in enumerate(col_count) if n == 1]
+</code></pre>
+<p>If the header is cut short <code>len(df.columns) &lt; len(header)</code>, the first thing to be cut off is the column <code>df['count']</code>. You then assume it exists straight away after by using it. Which is it? Will it always exist, or sometimes will there not be enough columns? Erring on the side of it always exists, the code becomes</p>
+<pre><code># load with pandas
+df = pd.read_csv(file, sep='\t', names=('chr', 'start', 'stop', 'strand', 'count'), header=None)
+
+# index where count=1
+col_count = df['count'].tolist()
+li = [i for i, n in enumerate(col_count) if n == 1]
+</code></pre>
+<hr>
+<pre><code># index where count=1
+col_count = df['count'].tolist()
+li = [i for i, n in enumerate(col_count) if n == 1]
+
+...
+
+for idx, elem in enumerate(li):
+</code></pre>
+<p>If you are using pandas (or numpy) it is generally not the best to move the data back and forth between the library and Python. You lose most of the efficiency of the library, and the code generally becomes far less readable.</p>
+<p>Don't use names like <code>li</code>. It doesn't give any information to the reader. If you have a list of indices, what will you use the list for? That would make a much better name.</p>
+<p>Using pandas more, and renaming gives something like</p>
+<pre><code>splitting_indices = df.index[df['count'] == 1].tolist()
+
+for idx, elem in enumerate(splitting_indices):
+</code></pre>
+<hr>
+<pre><code>if next_elem - (elem+1) == 1: # cases where only one position and we cannot compute median
+    count = df.iloc[elem+1]['count']
+    #print(f"start={start}\tstop={stop}\tcount={count}")
+else:
+    count = df.iloc[elem+1:next_elem]['count'].median()
+</code></pre>
+<p>Finding this logic in amongst getting the data out from the dataframe is not easy. This is the core logic, and should be treated as such. Put this in a function at the very least.</p>
+<pre><code>def extract_median(df, elem, next_elem):
+    if next_elem - (elem+1) == 1: # cases where only one position and we cannot compute median
+        count = df.iloc[elem+1]['count']
+    else:
+        count = df.iloc[elem+1:next_elem]['count'].median()
+    return count
+</code></pre>
+<p>Now it should be much more apparent that the comment is bogus. You CAN compute the median of a single element list. So why are we special casing this? <code>df.iloc[elem+1:next_elem]</code> works even if <code>next_elem</code> is only one bigger than <code>elem+1</code>.</p>
+<pre><code>def extract_median(df, elem, next_elem):
+    return df.iloc[elem+1:next_elem]['count'].median()
+</code></pre>
+<p>And now we can see that a function is probably not necessary.</p>
+<hr>
+<p>The approach I would take to implementing this is to try and stay using pandas as long as possible. No loops. No tolist. Since I won't want loops, indices are probably not needed too, so I can limit usage of iloc and df.index.</p>
+<p>First, read in the data</p>
+<pre><code>df = pd.read_csv(file, sep='\t', names=('chr', 'start', 'stop', 'strand', 'count'), header=None)
+
+     chr  start   stop strand  count
+0   chr1      0  13320      -      1
+1   chr1  13320  13321      -      2
+2   chr1  13321  13328      -      1
+3   chr1  13328  13342      -      2
+4   chr1  13342  13343      -     18
+5   chr1  13343  13344      -     36
+6   chr1  13344  13345      -     18
+7   chr1  13345  13346      -      6
+8   chr1  13346  16923      -      1
+9   chr1  16923  16942      -      3
+10  chr1  16942  16943      -      2
+</code></pre>
+<p>Then, find every row of interest. That would be everywhere <code>count</code> is not 1.</p>
+<pre><code>df['count'] != 1
+
+0     False
+1      True
+2     False
+3      True
+4      True
+5      True
+6      True
+7      True
+8     False
+9      True
+10     True
+</code></pre>
+<p>I want to group all the consecutive rows that are True together. The usual method to group consecutive rows by a column value is</p>
+<ol>
+<li>Keep a running tally.</li>
+<li>Compare each value in the column with the next one.</li>
+<li>If they are the same, don't do anything.</li>
+<li>If they are different, add 1 to a running tally.</li>
+<li>Associate the tally to that value.</li>
+<li>Groupby the tally.</li>
+</ol>
+<p>In code</p>
+<pre><code>mask = df['count'] != 1
+tally = (mask != mask.shift()).cumsum()
+
+    count   mask  tally
+0       1  False      1
+1       2   True      2
+2       1  False      3
+3       2   True      4
+4      18   True      4
+5      36   True      4
+6      18   True      4
+7       6   True      4
+8       1  False      5
+9       3   True      6
+10      2   True      6
+</code></pre>
+<p>Grouping then gives</p>
+<pre><code>df.groupby(tally).groups
+
+{1: Int64Index([0], dtype='int64'),
+ 2: Int64Index([1], dtype='int64'),
+ 3: Int64Index([2], dtype='int64'),
+ 4: Int64Index([3, 4, 5, 6, 7], dtype='int64'),
+ 5: Int64Index([8], dtype='int64'),
+ 6: Int64Index([9, 10], dtype='int64')}
+</code></pre>
+<p>Since you only want the rows where count is not 1, we can reuse the mask to filter them out.</p>
+<pre><code>df[mask].groupby(tally).groups
+
+{2: Int64Index([1], dtype='int64'),
+ 4: Int64Index([3, 4, 5, 6, 7], dtype='int64'),
+ 6: Int64Index([9, 10], dtype='int64')}
+</code></pre>
+<p>And finally the median is quick to get from a grouper</p>
+<pre><code>df[mask].groupby(tally).median()
+
+         start     stop  count
+count                         
+2      13320.0  13321.0    2.0
+4      13343.0  13344.0   18.0
+6      16932.5  16942.5    2.5
+</code></pre>
+<hr>
+<p>In the end, the code is a lot shorter</p>
+<pre><code>df = pd.read_csv(file, sep='\t', names=('chr', 'start', 'stop', 'strand', 'count'), header=None)
+mask = df['count'] != 1
+tally = (mask != mask.shift()).cumsum()
+df[mask].groupby(tally).median()
+</code></pre>
+    </div>

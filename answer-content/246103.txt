@@ -1,0 +1,98 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Some thoughts:</p>
+<ul>
+<li>You are using <code>async</code> but not "using" it.  You can simplify this code for the reader by doing <code>const accessToken = await axios.post(...);</code> and similar to de-nest and make the code more understandable. This also helps your avoid bad variable names like <code>res1</code>, <code>res2</code>, <code>res3</code>, etc.</li>
+<li><code>Promise.all()</code> is your friend when it comes to making batch calls like this.  Combined with a tool like your <code>waitFor</code> function, you can introduce any kind of request pattern you want.  Right now you are making calls in series which is kind of harder to throttle when it comes to meeting rate limits, as now you have to account for response times in determining when to make next call vs. an up-front staggered triggering of the requests that can be possible with <code>Promise.all()</code> (see example below).</li>
+<li>If you are going to use a tool like axios or Fetch API that require a <code>res.data</code> or <code>res.json()</code> type of step, you might consider putting a simple wrapper around the response handling to clean up code a bit. This is also a good way to standardize error handling at the client level. In this case, I think such a wrapper could also be used to manage the access token state (though not shown that way in my example below).</li>
+<li>Break down your code along logical functional lines (another option available to you after using <code>async</code> more conventionally).  For example, the status request and strapi update are one logical operational unit.  Getting the server list is another logical piece of functionality.</li>
+<li>If you control your <code>strapi</code> endpoint/database you should consider adding/leveraging bulk query support for the datapoint updates. Querying in loops is kind of an anti-pattern and pretty much any modern data store supports bulk updates.</li>
+<li>I would recommend defining key constants/variables for aiding in code understanding and maintenance. For example, if I wanted to migrate to <code>v2</code> of this API at some point, I don't want to have to go replace <code>v1</code> with <code>v2</code> in a bunch of places.  Centralize how you hold such module "configuration" logic. This makes your code's dependencies much more visible. For example, defining <code>apiKey</code> and <code>email</code> from <code>process.env</code> in my example below makes it really clear to the reader that this dependency exists, without having to find the variable mixed into a string definition deep down in the code somewhere.</li>
+<li>Consider implementing more appropriate error handling. My guess is that this server monitoring process shouldn't be designed to just silently swallow errors.</li>
+</ul>
+<p>Putting it together might yield something like:</p>
+<pre><code>import axios from 'axios';
+import strapi from 'your-strapi-module';
+
+const apiBase = `https://api.cloudways.com/api/v1`;
+const apiKey = process.env.CLOUDWAYS_API;
+const email = process.env.CLOUDWAYS_EMAIL;
+const maxRps = 10; // max requests per second for throttling
+const throttleInterval = 1000 / maxRps;
+
+// a small wrapper around axios for this particular API
+// this might best live in a separate module
+const apiRequest = async ({ headers = {}, method = 'get', url }) =&gt; {
+  const opts = {
+    baseUrl: apiBase,
+    headers,
+    method,
+    url
+  };
+  return axios(opts).then( (res) =&gt; res.data );
+};
+
+// method to obtain OAuth token, again perhaps best in separate module with API axios wrapper.
+// this could be made to lazily provision the token on any API request if not already received
+const getAccessToken = async () =&gt; {
+  const method = 'post';
+  const url = `/oauth/access_token?email=${ email }&amp;api_key=${ apiKey }`;
+
+  const data = await apiRequest({ method, url});
+  return data.access_token;
+};
+
+const getServerList = async () =&gt; strapi.query('server').find({});
+
+const wait = (ms) =&gt; new Promise( (resolve) =&gt; setTimeout(resolve, ms) );
+
+const updateServerStatus = async (serverId, accessToken) =&gt; {
+  const url = `/server/monitor/summary?server_id=${ serverId }&amp;type=db`;
+  const headers = {
+    Authorization: 'Bearer ' + accessToken
+  };
+
+  return apiRequest({ headers, url })
+    .then( ({ content }) =&gt; {
+      // I am not throttling here as no need to throttle this data store query was noted
+      // Ideally, this could be made into single update query though
+      const promises = content.map( (app) =&gt; {
+        return strapi.query('subscription').update(
+          { ApplicationSlug: app.name },
+          { DiskUsage: Math.ceil(app.datapoint[0]) }
+        );
+      });
+
+      return Promise.all(promises);
+    });
+};
+
+const updateAll = async () = {
+  // we can parallelize getting access token and getting server list
+  const initPromises = [
+    getServerList(),
+    getAccessToken()
+  ];
+
+  const [ serverList, accessToken ] = await Promise.all(initPromises);
+
+  // map your server list to an array of update promises
+  const updatePromises = serverList.map((server, i) =&gt; {
+    // stagger the requests to meet rate limits
+    return wait(i * throttleInterval)
+      .then( () =&gt; updateServerStatus(server.ServerId, accessToken) );
+  });
+
+  return Promise.all(updatePromises);
+};
+
+// call the main function somehow (could be exported from module for example)
+export {
+  updateAll as default,
+  updateAll,
+  // again, following probably make sense in separate module
+  apiRequest,
+  getAccessToken
+}
+</code></pre>
+<p>Note that since we are now "using" <code>async</code> in a more appropriate fashion you now begin to make your logic available in specific functions.  For example, if I just wanted to allow one to update the status of a single server, I could expose the <code>updateServerStatus</code> function in exports. There would have been no way to offer that sort of code flexibility with your current approach of using nested thenables.</p>
+    </div>

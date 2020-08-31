@@ -1,0 +1,131 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Your algorithm seems to be working as expected, and for very small data sets it is okay. But for larger data sets it is not optimal and for sets larger than 1000 it is very inefficient.</p>
+
+<p><strong>Some minor problems:</strong></p>
+
+<blockquote>
+<pre><code>foreach (var item in items.Where(item =&gt; parentKeyProperty(item).Equals(parentKeyValue)))
+{
+    var parentProperty = (parentPropertySelector.Body as MemberExpression).Member as PropertyInfo;
+    var childrenProperty = (childrenPropertySelector.Body as MemberExpression).Member as PropertyInfo;
+</code></pre>
+</blockquote>
+
+<p>The member information for the child and parent properties are invariant per item, so place their statements before the loop:</p>
+
+<pre><code>var parentProperty = (parentPropertySelector.Body as MemberExpression).Member as PropertyInfo;
+var childrenProperty = (childrenPropertySelector.Body as MemberExpression).Member as PropertyInfo;
+
+foreach (var item in items.Where(item =&gt; parentKeyProperty(item).Equals(parentKeyValue)))
+{
+</code></pre>
+
+<hr>
+
+<p>Personally I try to only use reflection as the last resort and here it is not necessary. You can change your method signatures to something like this instead:</p>
+
+<pre><code>public static IEnumerable&lt;TEntity&gt; AsHierarchyReview&lt;TEntity, TKeyProperty&gt;(
+  this IEnumerable&lt;TEntity&gt; items,
+  Func&lt;TEntity, TKeyProperty&gt; keyProperty,
+  Func&lt;TEntity, TKeyProperty&gt; parentKeyProperty,
+  Action&lt;TEntity, TEntity&gt; parentSetter,
+  Action&lt;TEntity, TEntity&gt; childSetter)
+{
+  return items.AsHierarchyReview(keyProperty, parentKeyProperty, parentSetter, childSetter, default(TKeyProperty), default(TEntity));
+}
+
+private static IEnumerable&lt;TEntity&gt; AsHierarchyReview&lt;TEntity, TKeyProperty&gt;(
+    this IEnumerable&lt;TEntity&gt; items,
+    Func&lt;TEntity, TKeyProperty&gt; keyProperty,
+    Func&lt;TEntity, TKeyProperty&gt; parentKeyProperty,
+    Action&lt;TEntity, TEntity&gt; parentSetter,
+    Action&lt;TEntity, TEntity&gt; childSetter,
+    TKeyProperty parentKeyValue,
+    TEntity parentValue)
+{
+  foreach (var item in items.Where(item =&gt; parentKeyProperty(item).Equals(parentKeyValue)))
+  {
+    parentSetter(item, parentValue);
+
+    var childrenValues = items.AsHierarchyReview(keyProperty, parentKeyProperty, parentSetter, childSetter, keyProperty(item), item).ToList();
+    foreach (var child in childrenValues)
+    {
+      childSetter(child, item);
+    }
+
+    yield return item;
+  }
+</code></pre>
+
+<hr>
+
+<p><strong>But the overall problem with your algorithm is this:</strong></p>
+
+<blockquote>
+<pre><code>  foreach (var item in items.Where(item =&gt; parentKeyProperty(item).Equals(parentKeyValue)))
+  {
+    ...
+</code></pre>
+</blockquote>
+
+<p>Here you requery the entire collection for every item in the collection to find possible child elements to the argument parent and that is too expensive. </p>
+
+<p>If you know that the elements in the data set are given in hierarchical order, the most optimized solution would be to go along with <a href="https://codereview.stackexchange.com/questions/138524/recreating-a-tree-from-a-flat-collection-or-unflatten-a-tree#138532">Nikita B</a>'s answer in the link suggested by t3chb0t.</p>
+
+<p>If not, you could go along the below path:</p>
+
+<pre><code>public delegate void ParentSetter&lt;T&gt;(T child, T parent);
+public delegate void ChildSetter&lt;T&gt;(T child, T parent);
+
+public static IEnumerable&lt;T&gt; AsHierarchy&lt;T, TID&gt;(
+  this IEnumerable&lt;T&gt; elements,
+  Func&lt;T, TID&gt; idSelector,
+  Func&lt;T, TID&gt; parentIdSelector,
+  ParentSetter&lt;T&gt; parentSetter,
+  ChildSetter&lt;T&gt; childAdder,
+  TID rootId)
+{
+  Dictionary&lt;TID, T&gt; lookUp = elements.ToDictionary(e =&gt; idSelector(e));
+
+  foreach (T element in lookUp.Values)
+  {
+    TID parentId = parentIdSelector(element);
+    if (!lookUp.TryGetValue(parentId, out T parent))
+    {
+      if (parentId.Equals(rootId))
+      {
+        yield return element;
+        continue;
+      }
+      else
+        throw new InvalidOperationException($"Parent not found for: {element}");
+    }
+
+    parentSetter(element, parent);
+    childAdder(element, parent);
+  }
+}
+</code></pre>
+
+<p>Here a dictionary is created as a look up table for the parent of each element. To create a dictionary is a remarkable inexpensive operation. </p>
+
+<p>When an elements parent is not found it is checked if the parent id is the root id. If true the element is returned otherwise an exception is thrown.</p>
+
+<p>A pair of explicit delegates for setting the parent and child are provided in order to show which argument is supposed to be the child and which the parent.</p>
+
+<hr>
+
+<p><strong>EDIT</strong></p>
+
+<p>You can then call the method like:</p>
+
+<pre><code>  Category[] categories = new Category[1000]; // TODO: Convert from DTO-object
+  IEnumerable&lt;Category&gt; tree = categories.AsHierarchy(
+    c =&gt; c.CategoryId, 
+    c =&gt; c.CategoryParentId, 
+    (child, parent) =&gt; child.ParentCategory = parent, 
+    (child, parent) =&gt; parent.ChildCategories.Add(child), 0);
+</code></pre>
+
+<p>Here the last <code>0</code> is the supposed rootId.</p>
+    </div>

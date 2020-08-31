@@ -1,0 +1,158 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>Exception safety</h3>
+
+<p>Your <code>locked_queue</code> isn't exception safe. In particular:</p>
+
+<pre><code>    queue.pop();
+    return value;
+</code></pre>
+
+<p>If the copy (or move) constructor for <code>_T</code> throws, you could have popped the item from the queue, then the constructor throws as you return the value, and the value is lost and can't be recovered. This is exactly why the standard library separates retrieving the value from removing the value from the collection--you copy first, then if (and only if) that succeeds, you remove it from the collection.</p>
+
+<p>If you're sure you'll never use this with a type whose copy/move ctor can throw, what you're doing should be fine though. Unfortunately, you're using it with <code>std::string</code>, which has a copy ctor that can throw.</p>
+
+<h3>YAGNI</h3>
+
+<p>You have some of what might be termed "YAGNI violations". For example:</p>
+
+<pre><code>    void NetworkServer::SendToAll(std::string message, bool guaranteed)
+    {
+        for (auto client: clients)
+            send(message, client.right);
+    };
+</code></pre>
+
+<p>Here you're passing the function a <code>bool</code>, apparently to indicate whether it should attempt to guarantee delivery, but the function completely ignores that value. At least in normal use, such a guarantee basically is specified when you create the initial connection (TCP guarantees delivery, UDP doesn't).</p>
+
+<h3>bool parameters</h3>
+
+<p>You're using a bool as a parameter in a non-obvious way. I normally recommend against <code>bool</code> parameters in general. There are exceptions, but in this case it's not immediately obvious how <code>SendToAll("whatever", true)</code> and <code>SendToAll("whatever", false)</code> differ, and what the parameter is intended to mean (though, as noted above, in this case it means absolutely nothing).</p>
+
+<p>Assuming you fix the code so the parameter means something, it would probably be better to replace the <code>bool</code> with an <code>enum</code> so the intent is directly visible in the code, something like this:</p>
+
+<pre><code>enum { ATTEMPT, GUARANTEE };
+
+SendToAll("whatever", ATTEMPT);
+</code></pre>
+
+<p>...or, given C++11, you probably want to use an <code>enum class</code> instead:</p>
+
+<pre><code>enum class delivery { ATTEMPT, GUARANTEE };
+
+SendToAll("whatever", delivery::ATTEMPT);
+</code></pre>
+
+<p>The same comment applies to <code>SendToAllExcept</code>.</p>
+
+<h3>member initializer lists</h3>
+
+<p>Prefer member initialization lists for initialization. An obvious example would be:</p>
+
+<pre><code>receivedBytes = sentBytes = receivedMessages = sentMessages = 0;
+</code></pre>
+
+<p>(inside the body of a ctor). In this case, you're probably better off with something like:</p>
+
+<pre><code>NetworkClient::NetworkClient(std::string host, std::string server_port, unsigned short local_port) : 
+    socket(io_service, udp::endpoint(udp::v4(), local_port)), 
+    service_thread(std::bind(&amp;NetworkClient::run_service, this)),
+    receivedBytes(0),
+    sentBytes(0),
+    receivedMessages(0),
+    sentMessages(0)
+{
+    udp::resolver resolver(io_service);
+    udp::resolver::query query(udp::v4(), host, server_port);
+    server_endpoint = *resolver.resolve(query);
+    Send("");
+}
+</code></pre>
+
+<p>Alternatively, you might want to at least consider a small type specifically for counters:</p>
+
+<pre><code>class counter {
+    size_t count;
+public:
+    counter &amp;operator=(size_t val) { count = val; return *this; }
+    counter(size_t count=0) : count(count) {}
+    operator size_t() { return count; }
+    count &amp;operator++() { ++count; return *this; }
+    count operator++(int) { counter ret(count); ++count; return ret; }
+    bool operator==(counter const &amp;other) { return count == other.count; }
+    bool operator!=(counter const &amp;other) { return count != other.count; }
+};
+</code></pre>
+
+<p>With this, you simply define <code>sentBytes</code>, <code>receivedBytes</code> and so on as objects of the <code>counter</code> class, and it's impossible to create an object of that type that's not initialized.</p>
+
+<h3>prefer portability when possible</h3>
+
+<p>For one obvious example, you use <code>unsigned __int64</code> in a number of places. <code>__int64</code> is specific to VC++. Lacking a reason to do otherwise, I'd prefer to use <code>unsigned long long</code>, which works just as well on VC++, but also works with any other conforming implementation (of C++11). The counterpoint is that before C++11, some compilers (most notably VC++) did <em>not</em> support <code>long long</code>. If that's a concern, I'd use an intermediate typedef:</p>
+
+<pre><code>#ifdef _MSC_VER
+typedef unsigned __int64 ulonglong;
+#else
+typedef unsigned long long ulonglong;
+#endif
+</code></pre>
+
+<p>...then the rest of the code would use <code>ulonglong</code>. If you need more compiler-specific code than above, you'd still just change it in one place by adding a <code>typedef</code> for that specific compiler, with (hopefully) no changes necessary to the rest of the code.</p>
+
+<h3>const correctness</h3>
+
+<p>For example, you have four functions:</p>
+
+<pre><code>inline unsigned __int32 GetStatReceivedMessages(){return receivedMessages;};
+inline unsigned __int64 GetStatReceivedBytes(){return receivedBytes;};
+inline unsigned __int32 GetStatSentMessages(){return sentMessages;};
+inline unsigned __int64 GetStatSentBytes(){return sentBytes;};
+</code></pre>
+
+<p>Since these functions should not modify the state of the object, they should probably be <code>const</code> member functions:</p>
+
+<pre><code>inline unsigned __int32 GetStatReceivedMessages() const {return receivedMessages;};
+inline unsigned __int64 GetStatReceivedBytes() const {return receivedBytes;};
+inline unsigned __int32 GetStatSentMessages() const {return sentMessages;};
+inline unsigned __int64 GetStatSentBytes() const {return sentBytes;};
+</code></pre>
+
+<h3>Consider more data grouping</h3>
+
+<p>For the same four functions as above, I'd prefer to create a <code>stats</code> class. The parent would return an object of that class, and then you'd query the class for the specific detail(s) you care about:</p>
+
+<pre><code>class stats {
+    inline unsigned GetReceivedMessages() const { return receivedMessages; }
+    // ...
+};
+
+class NetworkClient { 
+    stats s;
+public:
+    stats Stats() const { return s; }
+};
+
+// ... and in client code, something like:
+NetworkClient c;
+
+std::cout &lt;&lt; c.Stats().GetReceivedMessages();
+</code></pre>
+
+<p>Depending on the situation, you might also want to overload <code>operator&lt;&lt;</code> for that type so you can print out the stats even more easily:</p>
+
+<pre><code> std::cout &lt;&lt; c.Stats();
+</code></pre>
+
+<h3>Avoid extraneous syntax</h3>
+
+<p>Although you're <em>allowed</em> to insert a semicolon after the body of a member function, it's unnecessary. IMO, it's better to leave it out, so (for example):</p>
+
+<pre><code>inline unsigned __int32 GetStatReceivedMessages() const {return receivedMessages;};
+</code></pre>
+
+<p>...becomes:</p>
+
+<pre><code>inline unsigned __int32 GetStatReceivedMessages() const { return receivedMessages; }
+</code></pre>
+
+<p>While I'm (a lot) less insistent about it than some people, I do think the extra white space helps readability in this case as well.</p>
+    </div>

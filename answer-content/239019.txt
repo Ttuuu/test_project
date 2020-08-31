@@ -1,0 +1,56 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Starting with the first function, I would make a few changes:</p>
+
+<ul>
+<li><code>Task.IsCompleted</code> covers all completion states already (<a href="https://docs.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.iscompleted?view=netframework-4.8" rel="nofollow noreferrer">https://docs.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.iscompleted?view=netframework-4.8</a>)</li>
+<li>Tasks are all about not blocking the current thread. Never use <code>Thread.Sleep</code> and always use <code>Task.Delay</code>.</li>
+<li>Cancellation can be more succinctly handled with <code>Task.ThrowIfCancellationRequested</code></li>
+</ul>
+
+<pre><code>public static async Task&lt;T&gt; SynchronizeWithCancellationToken&lt;T&gt;(this Task&lt;T&gt; task, int delayMilliseconds = 10, CancellationToken cancellationToken = default)
+{
+    if (task == null)
+        throw new ArgumentNullException(nameof(task));
+
+    while (!task.IsCompleted)
+    {
+        await Task.Delay(delayMilliseconds);
+        cancellationToken.ThrowIfCancellationRequested();
+    }
+
+    return await task;
+}
+</code></pre>
+
+<p>This is about as good as it gets to "add cancellation" to a Task that doesn't do cancellation. The key to understanding Task cancellation in .NET is that it is cooperative. This means that simply passing a cancellation token around doesn't do anything on its own; instead the Task implementation itself has to handle cancellation. This makes a lot of sense since only the Task implementation itself knows when best to allow cancellation without causing invalid state or corruption.</p>
+
+<p>I would definitely recommend taking the time to do a read-through of the MSDN article on this: <a href="https://docs.microsoft.com/en-us/dotnet/standard/parallel-programming/task-cancellation?view=netframework-4.8" rel="nofollow noreferrer">https://docs.microsoft.com/en-us/dotnet/standard/parallel-programming/task-cancellation?view=netframework-4.8</a></p>
+
+<p>Your second function attempts to use the <code>Task.Run</code> overload that takes a <code>CancellationToken</code> in order to cancel the operation. However, <code>Task.Run</code> only uses the token to avoid starting the Task (if it's already cancelled when it goes to run it), and it's left to the user to use the token inside the implementation passed to <code>Task.Run</code> to handle further cancellation. See here: <a href="https://stackoverflow.com/questions/22637642/using-cancellationtoken-for-timeout-in-task-run-does-not-work">https://stackoverflow.com/questions/22637642/using-cancellationtoken-for-timeout-in-task-run-does-not-work</a></p>
+
+<p>The first method is definitely the one you want to use. Just remember that it isn't <em>true cancellation</em> which would require you to modify the implementation of the API function and add the cooperative cancellation bits. When you add cancellation like this, without the implementation bits, you're only cancelling the wait for the Task to finish, not the Task itself. If the Task has further operations to carry out, they will still be carried out. This can often times be a deal breaker with some APIs, and you might be forced to find an alternative implementation that handles cancellation, or even implement your own.</p>
+
+<p><strong>Edit:</strong></p>
+
+<p>It also slipped my mind that you can use <code>CancellationToken.Register</code> to asynchronously wait and get rid of the polling...</p>
+
+<pre><code>    public static async Task ToTask(this CancellationToken token)
+    {
+        var source = new TaskCompletionSource&lt;object&gt;();
+        using (token.Register(() =&gt; source.SetResult(null)))
+            await source.Task;
+    }
+
+    public static async Task&lt;T&gt; SynchronizeWithCancellationToken&lt;T&gt;(this Task&lt;T&gt; task,
+        CancellationToken cancellationToken = default, string message = default)
+    {
+        if (task == null)
+            throw new ArgumentNullException(nameof(task));
+
+        if (await Task.WhenAny(task, cancellationToken.ToTask()) == task)
+            return await task;
+        else
+            throw new OperationCanceledException(message ?? "The operation was canceled.");
+    }
+</code></pre>
+    </div>

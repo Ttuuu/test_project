@@ -1,0 +1,195 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The overall first impression is a very good one. Procedures are small, focused, generally well-named, everything is pretty much in its place - well done!</p>
+
+<p>What follows is a series of observations, and suggestions / how I'd go about "fixing" them.</p>
+
+<hr>
+
+<h3>Controlling object lifetime</h3>
+
+<p>In my view, it's important to be able to reliably <em>know</em> whether any object pointer is valid at any given point in the code that needs to dereference that pointer: for any object we create and consume, we want to be able to control when it's created, <em>and when it's destroyed</em>.</p>
+
+<p>So while this is procedural code and we're not going to fuss much about coupling, we can still <a href="http://rubberduckvba.com/Inspections/Details/SelfAssignedDeclaration" rel="nofollow noreferrer">flag the auto-instantiated object</a>:</p>
+
+<blockquote>
+<pre><code>'@Ignore EncapsulatePublicField
+Public Fso As New FileSystemObject
+</code></pre>
+</blockquote>
+
+<p>While convenient, a global-scope auto-instantiated FSO object isn't something I'd recommend. Kudos for early-binding (side note: consider qualifying the library, e.g. <code>As Scripting.FileSystemObject</code>), but like anything accessing external resources (e.g. database connection, file handle, etc.), IMO its scope and lifetime should be as limited as possible. With a global-scope <code>As New</code> declaration, you give VBA the entire control over that object's actual lifetime.</p>
+
+<p>Alternatively, a <code>With</code> block could hold the object reference in a tight, well-defined local scope, and we wouldn't even need to declare a variable for it:</p>
+
+<pre><code>Private Sub Workbook_AfterSave(ByVal Success As Boolean)
+
+    Dim ExportFolder As String
+    ExportFolder = ThisWorkbook.Path &amp; "\src"
+
+    With New Scripting.FileSystemObject
+        If Not .FolderExists(ExportFolder) Then
+            .CreateFolder ExportFolder
+        End If
+    End With
+
+    SourceControlH.ExportProjectComponents ThisWorkbook, ExportFolder
+
+End Sub
+</code></pre>
+
+<p>Note that the <code>{bool-expression} = False</code> condition is redundant - comparing a Boolean expression to a Boolean literal is always redundant: <code>Not {bool-expression}</code>  is more idiomatic, more concise, and more expressive.</p>
+
+<hr>
+
+<h3>Portability</h3>
+
+<p>VBA code that doesn't need to be tied to a particular specific VBA host application's object model library, should avoid such dependencies.</p>
+
+<blockquote>
+<pre><code>Public Sub ExportProjectComponents(ByVal Source As Workbook, ByVal Path As String)
+</code></pre>
+</blockquote>
+
+<p>The <code>Source</code> parameter should be a <code>VBProject</code> object, not a <code>Workbook</code>; by taking in an <code>Excel.Workbook</code> dependency, the module becomes needlessly coupled with the Excel object model: if you needed to reuse this code in the future for, say, a Word VBA project, you'd need to make changes.</p>
+
+<hr>
+
+<h3>Consistency</h3>
+
+<p>Qualifying members is nice! <em>Consistently</em> qualifying members is <em>better</em> :)</p>
+
+<blockquote>
+<pre><code>If Tools.Fso.FolderExists(Path) = False Then
+</code></pre>
+</blockquote>
+
+<p>Why is <em>this</em> <code>Fso</code> qualified with the module name, but not the one in <code>ThisWorkbook</code>? Without Rubberduck to help, a reader would need to navigate to the definition to make sure it's referring to the same object.</p>
+
+<p>But, then again, I'd <code>New</code> up the FSO on the spot, and let VBA claim that pointer as soon as it's no longer needed:</p>
+
+<pre><code>With New Scripting.FileSystemObject
+    If Not .FolderExists(Path) Then
+        Exception.DirectoryNotFoundException "Path", ModuleName &amp; "." &amp; MethodName
+    End If
+End With
+</code></pre>
+
+<hr>
+
+<h3>Other notes</h3>
+
+<p>I like your centralized approach to error-raising very much! I find the term "exception" a bit misleading though (if it's an exception, where's my stack trace?), and the procedure names read like properties. I'd propose something like this:</p>
+
+<pre><code>    Errors.OnDirectoryNotFound "Path", ModuleName &amp; "." &amp; MethodName
+</code></pre>
+
+<p>It removes the doubled-up "Exception" wording from the instruction, and the <code>On</code> prefix is reminiscent of the .NET convention to name event-raising methods with that prefix.</p>
+
+<p>The <code>Exception</code> module being a class feels a bit wrong, even more so given the <code>@PredeclaredId</code> Rubberduck annotation, which presumably was synchronized and indicates the class has a <code>VB_PredeclaredId = True</code> attribute value: the class is never instantiated, only its default instance is ever invoked. The .NET equivalent is a <code>static class</code> with <code>static</code> methods, and the idiomatic VBA equivalent is a standard procedural module.</p>
+
+<p>Of course <code>Public Sub</code> procedures in a standard module would be visibly exposed as macros in Excel, and using a class module prevents that... but so does <code>Option Private Module</code>!</p>
+
+<p>Side note, there's a spelling error in this message:</p>
+
+<pre><code>    Exception.InvalidOperationException "Source.VBProject.Protection", _
+                                        "The VBA project, in this workbook is protected " &amp; _
+                                        "therefor, it is not possible to export the components. " &amp; _
+                                        "Unlock your VBA project and try again. " &amp; ModuleName &amp; "." &amp; MethodName
+</code></pre>
+
+<p>The comma after <code>The VBA project</code> is superfluous, there should be a dot after <code>is protected</code>, and so <code>therefor</code> should be <code>Therefore</code>, capital-T.</p>
+
+<p>That said, VBA project protection <a href="https://stackoverflow.com/a/27508116/1188513">can easily be programmatically thwarted</a>, so with a little tweaking I think you could make this macro a bad boy that can just unlock a locked project to export it - but yeah, prompting the user with "oops, it's locked, try again" is probably the more politically-correct way to go about handling project protection.</p>
+
+<p>I'm not finding any uses for the <code>LinesCount</code> function, and it validating whether the stream is open strikes me as weird: raising this error would clearly only ever happen because of a bug, and should be a <code>Debug.Assert</code> check, if present at all.</p>
+
+<blockquote>
+<pre><code>If ArrayH.Exists(Component.Type, ExportableComponentsTypes) = False Then
+</code></pre>
+</blockquote>
+
+<p>That <code>H</code> again? I'm starting to think it just stands for <code>Helper</code>, which is a code smell in itself. Once more, this condition would read better as <code>If Not ArrayH.Exists(...) Then</code>, but I'd like to point out that these helper methods feel very much like what would be <em>extension methods</em> in .NET-land, and <code>ArrayExt.Exists</code> - or better, a fully spelled-out <code>ArrayExtensions.Exists</code> would raise fewer eyebrows. Kudos for avoiding the trap of just dumping all "helper" procedures and functions into some <code>Helpers</code> bag-of-whatever module.</p>
+
+<blockquote>
+<pre><code>' Path to the folder where components will be saved.
+Private pExportFolderPath As String
+
+' Indicates if empty components should be exported or not.
+Private pExportEmptyComponents As Boolean
+</code></pre>
+</blockquote>
+
+<p>This very much <a href="https://www.joelonsoftware.com/2005/05/11/making-wrong-code-look-wrong/" rel="nofollow noreferrer">Systems Hungarian</a> <code>p</code> prefix is distracting: there's no Hungarian Notation anywhere in the code and it reads like a charm - yes, <em>naming is hard</em>. Yes, naming is <em>even harder</em> in a case-insensitive language like VBA (or VB.NET).</p>
+
+<p>You could make a simple, private data structure to hold the configuration state, and with that you wouldn't need any prefixing scheme:</p>
+
+<pre><code>Private Type ConfigState
+    ExportFolderPath As String
+    WillExportEmptyComponents As Boolean
+End Type
+
+Private Configuration As ConfigState
+</code></pre>
+
+<p>Note that because <code>Export</code> is a <em>noun</em> in the <code>String</code> variable, but a <em>verb</em> in the <code>Boolean</code> one, a distinction is necessary IMO. Adding a <code>Will</code> prefix to the <code>Boolean</code> name clarifies everything I find. And now you can have properties named exactly after the <code>ConfigState</code> members, without any prefixing scheme - note the Rubberduck annotation opportunity for a <code>@Description</code> annotation, too:</p>
+
+<pre><code>'@Description("Indicates if empty components should be exported or not.")
+Public Property Get WillExportEmptyComponents() As Boolean
+    WillExportEmptyComponents = Configuration.WillExportEmptyComponents
+End Property
+
+Public Property Let WillExportEmptyComponents(ByVal Value As Boolean)
+    Configuration.WillExportEmptyComponents = Value
+End Property
+</code></pre>
+
+<p>Speaking of Rubberduck opportunities, the <code>@Folder</code> organization can be enhanced - <a href="https://github.com/rubberduck-vba/Rubberduck/wiki/Using-@Folder-Annotations" rel="nofollow noreferrer">using @Folder annotations</a> on the project's wiki describes how the annotation can be used to create <em>sub</em>folders:</p>
+
+<blockquote>
+<pre><code>'@Folder("Parent.Child.SubChild")
+</code></pre>
+</blockquote>
+
+<p>We have <code>SourceControlH</code> and <code>ArrayH</code> modules under <code>'@Folder("Helper")</code>, some <code>Tools</code> module (FWIW "Tools" has the exact same smell as "Helper" does) under <code>'@Folder("Lapis")</code>; the <code>Exception</code> module is under <code>'@Folder("Lapis")</code> as well, which means the tree structure looks like this:</p>
+
+<pre><code>- [Helper]
+   - ArrayH
+   - SourceControlH
+- [Lapis]
+   - Tools
+   - Exception
+</code></pre>
+
+<p>Not sure what <code>Lapis</code> means, but the contents of the <code>Tools</code> module has this "whatever couldn't neatly fit anywhere else" bag-of-whatever feeling to it. What I wonder though, is why there's no clear dedicated <code>SourceControl</code> folder.</p>
+
+<p>I'm not going to claim a more OOP approach would even be warranted here (procedural is perfectly fine), but the basis for sticking to procedural feels wrong: it's <em>not</em> a self-contained module, it <em>has</em> dependencies and <em>must</em> be packaged as a "bunch of modules that need to be imported together" anyway.</p>
+
+<p>Having a <code>Helpers.SourceControl</code> folder would give you the dedicated space to cleanly split responsibilities while keeping the components neatly regrouped (in Rubberduck's Code Explorer toolwindow, that is).</p>
+
+<blockquote>
+<pre><code>' Full name means - name of the component with an extension.
+Dim FullName As String: FullName = GetComponentFullName(Component)
+</code></pre>
+</blockquote>
+
+<p>I've seen Microsoft claim using the <code>:</code> instruction separator like this is "good practice" and "helps transition to VB.NET syntax". I'm not buying it at all. It looks awful and crowded. That comment is also very informative: it reads "this GetComponentFullName procedure needs a better name". In the Excel object model, <code>FullName</code> includes not only the file extension, but also the full path: your version of "full" isn't quite as "full" as it should be. In fact, <code>FullName</code> is actually nothing more than a <code>fileName</code>:</p>
+
+<pre><code>Dim fileName As String
+fileName = GetComponentFileName(Component)
+</code></pre>
+
+<p>Kudos here:</p>
+
+<blockquote>
+<pre><code>       .Add vbext_ct_Document, "doccls"
+</code></pre>
+</blockquote>
+
+<p>This file extension is compatible with Rubberduck's own handling of document modules. By default, the VBIDE API exports document modules with a .cls file extension, which makes them import as class modules: to import them back into a <code>Worksheet</code> module, or into <code>ThisWorkbook</code>, you need some special handling, and that different file extension works great.</p>
+
+<p>Source-controlling VBA code is hard, because the code in a document module (e.g. <code>Worksheet</code>) can very well include references to objects that exist in the host document, like <code>ListObject</code> tables and whatnot - and these can't really be under source control (not without having the whole host document under source control too!). Worksheet layout can't be restored from source code, unless the worksheet layout is itself actually coded: this means a VBA project restored from source control can't really ever fully restore a project without the original host document anyway. So, kudos for tackling this thorny issue.</p>
+
+<p>Note that the last few pre-release builds of Rubberduck include bulk import/export functionality that does everything your code does, out of the box, without requiring programmatic access to the VBIDE Extensibility library, and without needing to share and manage versions for a <code>SourceControlH</code> module across devs and projects:</p>
+
+<p><img src="https://i.stack.imgur.com/WXQCE.png" alt="Rubberduck Code Explorer's &quot;Sync Project&quot; features"></p>
+    </div>

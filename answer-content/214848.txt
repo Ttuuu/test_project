@@ -1,0 +1,115 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First, kudos for teaching yourself VBA - I was once in your shoes and how I wish I could have had Code Review to help me back then!</p>
+
+<p>Let's start with the function's <em>signature</em>:</p>
+
+<blockquote>
+<pre><code>Function defineRange(mySheet As Object, startRow As Long, firstColumn As Long, Optional endRow As Long, Optional secondColumn As Long) As Object
+</code></pre>
+</blockquote>
+
+<p>It's not clear whether the function's implicit public accessibility is intended or not. If it means to be accessible from outside the module it's declared in, then it should be explicitly <code>Public</code>. Otherwise, it should be <code>Private</code> - a private procedure/function/method can only be invoked from within the module it belongs to. I'm thinking the intent is for it to be <code>Public</code> here.</p>
+
+<p>You probably noticed pretty much everything in VBA type libraries is <code>PascalCase</code>. From <code>Range</code> to <code>Worksheet.Name</code> - best practice is to "blend in" and write code that adheres to the naming standard. Hence, <code>DefineRange</code> would be better. I like how the name begins with a verb (as it should!), however "define" doesn't strike me as the best choice in this case. The function is <em>getting</em>, or rather <em>acquiring</em> a <code>Range</code> object. The Excel object model already provides an API for this, so <a href="/questions/tagged/reinventing-the-wheel" class="post-tag" title="show questions tagged 'reinventing-the-wheel'" rel="tag">reinventing-the-wheel</a> is appropriate here :)</p>
+
+<p>The parameters are all implicitly passed <em>by reference</em> (<code>ByRef</code>), which is an unfortunate default. Would this be expected/desired behavior?</p>
+
+<pre><code>Dim firstRow As Long
+firstRow = 12
+
+Dim lastRow as Long
+lastRow = 0
+
+Dim target As Range
+Set target = defineRange(Sheet1, firstRow, 1, lastRow)
+
+Debug.Print lastRow ' prints 12, not 0. is that expected?
+</code></pre>
+
+<p>By passing the parameters <code>ByVal</code>, instead of passing a <em>pointer</em> ("reference") to the value, you essentially pass a <em>copy</em> of that value, and the calling code's variables can't get modified by the function. In VB.NET and many other languages, the implicit default is to pass arguments <em>by value</em>: it's somewhat rare that a parameter <em>needs</em> to be passed by reference.</p>
+
+<p><code>mySheet</code> is declared as an <code>Object</code>, which means the function will happily take a <code>Collection</code>, some <code>UserForm1</code>, any <code>Range</code>, or even <code>MyClass</code> for this <code>mySheet</code> parameter... and then the <code>mySheet.Range</code> call will fail at run-time with error 438 "can't find property or method" (unless there's a method named <code>Range</code> on that <code>UserForm1</code> or <code>MyClass</code> object, of course). By declaring it <code>As Object</code>, you made every member calls against that object <em>late-bound</em>, meaning the compiler can't help you, and will happily let you try to invoke <code>mySheet.Rnge</code>.</p>
+
+<p>It's usually best to avoid deferring failures to run-time, and fail at compile-time instead, whenever possible. We do this with <em>early binding</em>, by declaring objects using a specialized interface we know we can work with - in this case, <code>Excel.Worksheet</code>, or just <code>Worksheet</code>. We can do this, because when VBA is hosted in Excel, the VBA project is guaranteed to have a reference to the <code>Excel</code> type library. If we were hosted in Word or PowerPoint, we would have to explicitly add that reference (through tools/references), or work late-bound and keep it <code>As Object</code>.</p>
+
+<p>The parameter names are meant to be pairs, but they're inconsistent:</p>
+
+<ul>
+<li><strong>start</strong>Row, <strong>end</strong>Row</li>
+<li><strong>first</strong>Column, <strong>second</strong>Column</li>
+</ul>
+
+<p>"Start/End" was a better, clearer idea than "First/Second" - I'd go and rename the parameters to have <code>startColumn</code> and <code>endColumn</code>, matching <code>startRow</code> and <code>endRow</code>.</p>
+
+<p>Kudos for declaring an explicit return type - all <code>Function</code> procedures return something, whether you declare a return type or not. Then again, it would be better to return a <code>Range</code> rather than an <code>Object</code>.</p>
+
+<p>So, that covers the function's signature :)</p>
+
+<hr>
+
+<p>There are a number of possible bugs and edge cases that should be handled. The first thing any function should do, is validate its inputs.</p>
+
+<p>VBA doesn't have unsigned integer types, so a <code>Long</code> could very well be a negative number, or it could be zero -- but Excel's object model isn't going to like you trying to get the cell at row <code>0</code> and column <code>-728</code>.</p>
+
+<p>There are several ways to deal with this. The simplest is to use <code>Debug.Assert</code> at the very top of the function, i.e. halt program execution if assumptions aren't validated:</p>
+
+<pre><code>'Debug.Assert TypeOf mySheet Is Excel.Worksheet
+Debug.Assert startRow &gt; 0
+Debug.Assert firstColumn &gt; 0
+</code></pre>
+
+<p>Another way is to have a <em>guard clause</em>, again at the very top of the function, that explicitly throws an error given invalid arguments:</p>
+
+<pre><code>If startRow &gt; 0 Then Err.Raise 5, "defineRange", "Argument 'startRow' must be greater than zero."
+If firstColumn &gt; 0 Then Err.Raise 5, "defineRange", "Argument 'firstColumn' must be greater than zero."
+</code></pre>
+
+<p>One advantage of using <em>guard clauses</em>, is that if a function is given arguments it cannot possibly work with, then we <strong>fail early</strong>. This makes it easier to debug if something goes wrong later: instead of dealing with a cryptic and rather useless "Method 'Range' of class 'Worksheet' failed" error, the code that tried to invoke our function now knows exactly what went wrong, and how to fix it.</p>
+
+<p>The return value assignment will fail if <code>mySheet</code> isn't the <code>ActiveSheet</code>:</p>
+
+<pre><code>mySheet.Range(Cells(startRow, firstColumn).Address, Cells(endRow, secondColumn).Address)
+</code></pre>
+
+<p>That's because the unqualified <code>Cells</code> calls are context-dependent.</p>
+
+<p>If the function is written in a worksheet module's code-behind, then it's implicitly <code>Me.Cells</code>.</p>
+
+<p>If the function is written anywhere else, then it's implicitly <code>[_Global].Cells</code>, which ultimately resolves to <code>ActiveSheet.Cells</code>. That isn't a problem if <code>mySheet</code> is active, but then if it isn't...</p>
+
+<pre><code>Sheet1.Range(Sheet2.Cells(...), Sheet2.Cells(...))
+</code></pre>
+
+<p>That's guaranteed to throw the dreaded run-time error 1004 "application-defined error", because only <a href="https://en.wikipedia.org/wiki/Schr%C3%B6dinger%27s_cat" rel="nofollow noreferrer">Schrödinger's Range</a> can belong to two worksheets at the same time.</p>
+
+<p>You can fix this with a <code>With</code> block:</p>
+
+<pre><code>With mySheet
+    Set defineRange = .Range(.Cells(startRow, firstColumn).Address, .Cells(endRow, secondColumn).Address)
+End With
+</code></pre>
+
+<p>Note the <code>.</code> dereferencing operators qualifying the <code>Cells</code> member calls with the object reference held by the <code>With</code> block. It's equivalent to this:</p>
+
+<pre><code>Set defineRange = mySheet.Range(mySheet.Cells(startRow, firstColumn).Address, mySheet.Cells(endRow, secondColumn).Address)
+</code></pre>
+
+<p>That said, you don't need to work off the <code>.Address</code> string: <code>Range</code> is more than happy to work with the <code>Range</code> references returned by <code>Cells(...)</code>:</p>
+
+<pre><code>Set defineRange = mySheet.Range(mySheet.Cells(startRow, firstColumn), mySheet.Cells(endRow, secondColumn))
+</code></pre>
+
+<p>While that works, I find it quite a mouthful, and as shown above, it has too many reasons to fail to my taste - I'd probably split it up:</p>
+
+<pre><code>Dim startCell As Range
+Set startCell = mySheet.Cells(startRow, firstColumn)
+
+Dim endCell As Range
+Set endCell = mySheet.Cells(endRow, secondColumn)
+</code></pre>
+
+<p>Making the return assignment rather trivial:</p>
+
+<pre><code>Set defineRange = mySheet.Range(startCell, endCell)
+</code></pre>
+    </div>

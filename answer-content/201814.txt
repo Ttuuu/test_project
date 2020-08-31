@@ -1,0 +1,354 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>As Jason Tyler said in a comment, this has a problem that <code>[Flags]</code> enumerations won't be properly handled.</p>
+
+<p>I ran this in C# interactive, and it threw an exception (as expected, but not desired) for a <strong>valid</strong> <code>[Flags]</code> value:</p>
+
+<blockquote>
+<pre><code>&gt; public static T ToEnum&lt;T&gt;(this int value)
+. {
+.     Type type = typeof(T);
+. 
+.     if (!type.IsEnum)
+.     {
+.         throw new ArgumentException($"{type} is not an enum.");
+. 
+.     }
+. 
+.     if (!type.IsEnumDefined(value))
+.     {
+.         throw new ArgumentException($"{value} is not a valid ordinal of type {type}.");
+.     }
+. 
+.     return (T)Enum.ToObject(type, value);
+. }
+&gt; [Flags] public enum Test { Flag1 = 0x01, Flag2 = 0x02 }
+&gt; ToEnum&lt;Test&gt;(3);
+3 is not a valid ordinal of type Submission#1+Test.
+  + Submission#0.ToEnum&lt;T&gt;(int)
+</code></pre>
+</blockquote>
+
+<p>So, we might have to look at a different way of going about this.</p>
+
+<p>There's an answer <a href="https://stackoverflow.com/a/23177585/4564272">on Stack Overflow</a>, but I don't like it. They use string comparison and validation, and it just feels like a hack.</p>
+
+<p>So what can we do?</p>
+
+<p>Well, we have <a href="https://docs.microsoft.com/en-us/dotnet/api/system.enum.getvalues?redirectedfrom=MSDN&amp;view=netframework-4.7.2#System_Enum_GetValues_System_Type_" rel="noreferrer"><code>Enum.GetValues</code></a>, I bet we can come up with a solution there, assuming we interpret all the values as a numeric type.</p>
+
+<p>The hard part is picking the type. Enums can be any numeric type, so we have to decide on one.</p>
+
+<p>Fun fact: every numeric type can be cast to the others in C#, there just might be overflow issues. So if we look at all the numeric types, we can find that we should always be able to cast them to a <code>long</code> or <code>ulong</code>, depending on whether they're signed or not.</p>
+
+<p>OK, so how do we figure out what number type it is?</p>
+
+<p>There's another magic function in <code>Enum</code>: <a href="https://docs.microsoft.com/en-us/dotnet/api/system.enum.getunderlyingtype?redirectedfrom=MSDN&amp;view=netframework-4.7.2#System_Enum_GetUnderlyingType_System_Type_" rel="noreferrer"><code>Enum.GetUnderlyingType</code></a>, I think that'll do.</p>
+
+<p>Of course, this also means we can no longer take an <code>int</code> input, because we want to support <em>any</em> number. We <em>could</em> take in an <code>object</code>, but then we have to deal with boxing/unboxing, and that can get prohibitively expensive with frequent use, but we'll work that out-of-the-way later.</p>
+
+<p>We can use some bit-fiddling to find out if a value is only composed of valid Enum values. Basically, we'll do the following:</p>
+
+<ul>
+<li>Loop through the valid flags options:
+
+<ul>
+<li>If <code>providedValue ∧ enumValue &gt; 0</code>, then <code>providedValue = providedValue ⊕ enumValue</code></li>
+</ul></li>
+<li>If <code>providedValue &gt; 0</code> then it is not composed strictly of the valid enum options</li>
+</ul>
+
+<p>For those unfamiliar with boolean algebra:</p>
+
+<ul>
+<li><code>∧</code> = "AND", take all bits of both values and compare them such that the result value only contains those that are <code>1</code> in each value, this is <code>&amp;</code> in C#;</li>
+<li><code>⊕</code> = "XOR", take all bits of both values and compare them such that the result value only contains those that are <code>1</code> in one value, and <code>0</code> in another, this is <code>^</code> in C#;</li>
+</ul>
+
+<p>So, if we rewrite this, it gets a bit ugly, but we'll clean some of that up:</p>
+
+<pre><code>public static TEnum ToEnum&lt;TEnum&gt;(this object value)
+{
+    Type type = typeof(TEnum);
+
+    if (!type.IsEnum)
+    {
+        throw new ArgumentException($"{type} is not an enum.");
+    }
+
+    if (type.GetCustomAttributes(typeof(FlagsAttribute), true).Length &gt; 0)
+    {
+        var values = Enum.GetValues(type);
+        switch (Enum.GetUnderlyingType(type).FullName)
+        {
+            case "System.Byte":
+                {
+                    var myVal = (byte)value;
+                    foreach (byte val in values)
+                    {
+                        if ((myVal &amp; val) &gt; (byte)0)
+                        {
+                            myVal ^= val;
+                        }
+                    }
+                    if (myVal &gt; (byte)0)
+                    {
+                        throw new ArgumentException($"{value} is not a valid ordinal of type {type}.");
+                    }
+                }
+                break;
+            case "System.SByte":
+                {
+                    var myVal = (sbyte)value;
+                    foreach (sbyte val in values)
+                    {
+                        if ((myVal &amp; val) &gt; (sbyte)0)
+                        {
+                            myVal ^= val;
+                        }
+                    }
+                    if (myVal &gt; (sbyte)0)
+                    {
+                        throw new ArgumentException($"{value} is not a valid ordinal of type {type}.");
+                    }
+                }
+                break;
+            case "System.UInt16":
+                {
+                    var myVal = (ushort)value;
+                    foreach (ushort val in values)
+                    {
+                        if ((myVal &amp; val) &gt; (ushort)0)
+                        {
+                            myVal ^= val;
+                        }
+                    }
+                    if (myVal &gt; (ushort)0)
+                    {
+                        throw new ArgumentException($"{value} is not a valid ordinal of type {type}.");
+                    }
+                }
+                break;
+            case "System.Int16":
+                {
+                    var myVal = (short)value;
+                    foreach (short val in values)
+                    {
+                        if ((myVal &amp; val) &gt; (short)0)
+                        {
+                            myVal ^= val;
+                        }
+                    }
+                    if (myVal &gt; (short)0)
+                    {
+                        throw new ArgumentException($"{value} is not a valid ordinal of type {type}.");
+                    }
+                }
+                break;
+            case "System.UInt32":
+                {
+                    var myVal = (uint)value;
+                    foreach (uint val in values)
+                    {
+                        if ((myVal &amp; val) &gt; (uint)0)
+                        {
+                            myVal ^= val;
+                        }
+                    }
+                    if (myVal &gt; (uint)0)
+                    {
+                        throw new ArgumentException($"{value} is not a valid ordinal of type {type}.");
+                    }
+                }
+                break;
+            case "System.Int32":
+                {
+                    var myVal = (int)value;
+                    foreach (int val in values)
+                    {
+                        if ((myVal &amp; val) &gt; (int)0)
+                        {
+                            myVal ^= val;
+                        }
+                    }
+                    if (myVal &gt; (int)0)
+                    {
+                        throw new ArgumentException($"{value} is not a valid ordinal of type {type}.");
+                    }
+                }
+                break;
+            case "System.UInt64":
+                {
+                    var myVal = (ulong)value;
+                    foreach (ulong val in values)
+                    {
+                        if ((myVal &amp; val) &gt; (ulong)0)
+                        {
+                            myVal ^= val;
+                        }
+                    }
+                    if (myVal &gt; (ulong)0)
+                    {
+                        throw new ArgumentException($"{value} is not a valid ordinal of type {type}.");
+                    }
+                }
+                break;
+            case "System.Int64":
+                {
+                    var myVal = (long)value;
+                    foreach (long val in values)
+                    {
+                        if ((myVal &amp; val) &gt; (long)0)
+                        {
+                            myVal ^= val;
+                        }
+                    }
+                    if (myVal &gt; (long)0)
+                    {
+                        throw new ArgumentException($"{value} is not a valid ordinal of type {type}.");
+                    }
+                }
+                break;
+            default:
+                throw new ArgumentException($"{type} does not have a valid backing type ({underlyingType}).");
+                break;
+        }
+    }
+    else
+    {
+        if (!type.IsEnumDefined(value))
+        {
+            throw new ArgumentException($"{value} is not a valid ordinal of type {type}.");
+        }
+    }
+
+    return (TEnum)Enum.ToObject(type, value);
+}
+</code></pre>
+
+<p>This will work <em>as expected</em> on <code>[Flags]</code> enumerations, which is great! But, there's some improvement to be made.</p>
+
+<p>First and foremost: how do we get rid of that <code>object</code> parameter?</p>
+
+<p>Well, we have a few options, but the easiest is to redefine our <code>ToEnum</code> on each numeric type, and create a version that takes a <code>dynamic</code>. It's ugly, but works:</p>
+
+<pre><code>public static TEnum ToEnum&lt;TEnum&gt;(this byte value) =&gt; DynamicToEnum&lt;TEnum&gt;(value);
+public static TEnum ToEnum&lt;TEnum&gt;(this sbyte value) =&gt; DynamicToEnum&lt;TEnum&gt;(value);
+public static TEnum ToEnum&lt;TEnum&gt;(this ushort value) =&gt; DynamicToEnum&lt;TEnum&gt;(value);
+public static TEnum ToEnum&lt;TEnum&gt;(this short value) =&gt; DynamicToEnum&lt;TEnum&gt;(value);
+public static TEnum ToEnum&lt;TEnum&gt;(this uint value) =&gt; DynamicToEnum&lt;TEnum&gt;(value);
+public static TEnum ToEnum&lt;TEnum&gt;(this int value) =&gt; DynamicToEnum&lt;TEnum&gt;(value);
+public static TEnum ToEnum&lt;TEnum&gt;(this ulong value) =&gt; DynamicToEnum&lt;TEnum&gt;(value);
+public static TEnum ToEnum&lt;TEnum&gt;(this long value) =&gt; DynamicToEnum&lt;TEnum&gt;(value);
+
+private static TEnum DynamicToEnum&lt;TEnum&gt;(dynamic value)
+{
+    ...
+</code></pre>
+
+<p>For each repeated <code>case</code> body, there's no good way to do this. With the use <code>dynamic</code>, we lose all safety of our types. There's no way to constrain it generically, because we can't say "it can be any number."</p>
+
+<p>The best we could do would be a local function something like the following:</p>
+
+<pre><code>void testEnum&lt;T&gt;(T myVal, Func&lt;T, bool&gt; aboveZero, Func&lt;T, T, T&gt; and, Func&lt;T, T, T&gt; xor)
+{
+    foreach (T val in values)
+    {
+        if (aboveZero(and(myVal, val)))
+        {
+            myVal = xor(myVal, val);
+        }
+    }
+    if (aboveZero(myVal))
+    {
+        throw new ArgumentException($"{value} is not a valid ordinal of type {type}.");
+    }
+}
+</code></pre>
+
+<p>Which means, we can use it to create a more readable version of our function:</p>
+
+<pre><code>public static TEnum ToEnum&lt;TEnum&gt;(this byte value) =&gt; DynamicToEnum&lt;TEnum&gt;(value);
+public static TEnum ToEnum&lt;TEnum&gt;(this sbyte value) =&gt; DynamicToEnum&lt;TEnum&gt;(value);
+public static TEnum ToEnum&lt;TEnum&gt;(this ushort value) =&gt; DynamicToEnum&lt;TEnum&gt;(value);
+public static TEnum ToEnum&lt;TEnum&gt;(this short value) =&gt; DynamicToEnum&lt;TEnum&gt;(value);
+public static TEnum ToEnum&lt;TEnum&gt;(this uint value) =&gt; DynamicToEnum&lt;TEnum&gt;(value);
+public static TEnum ToEnum&lt;TEnum&gt;(this int value) =&gt; DynamicToEnum&lt;TEnum&gt;(value);
+public static TEnum ToEnum&lt;TEnum&gt;(this ulong value) =&gt; DynamicToEnum&lt;TEnum&gt;(value);
+public static TEnum ToEnum&lt;TEnum&gt;(this long value) =&gt; DynamicToEnum&lt;TEnum&gt;(value);
+
+private static TEnum DynamicToEnum&lt;TEnum&gt;(dynamic value)
+{
+    Type type = typeof(TEnum);
+
+    if (!type.IsEnum)
+    {
+        throw new ArgumentException($"{type} is not an enum.");
+    }
+
+    if (type.GetCustomAttributes(typeof(FlagsAttribute), true).Length &gt; 0)
+    {
+        var values = Enum.GetValues(type);
+
+        void testEnum&lt;T&gt;(T myVal, Func&lt;T, bool&gt; aboveZero, Func&lt;T, T, T&gt; and, Func&lt;T, T, T&gt; xor)
+        {
+            foreach (T val in values)
+            {
+                if (aboveZero(and(myVal, val)))
+                {
+                    myVal = xor(myVal, val);
+                }
+            }
+            if (aboveZero(myVal))
+            {
+                throw new ArgumentException($"{value} is not a valid ordinal of type {type}.");
+            }
+        }
+
+        var underlyingType = Enum.GetUnderlyingType(type).FullName;
+        switch (underlyingType)
+        {
+            case "System.Byte":
+                testEnum((Byte)value, (v) =&gt; v &gt; (Byte)0, (v1, v2) =&gt; (Byte)(v1 &amp; v2), (v1, v2) =&gt; (Byte)(v1 ^ v2));
+                break;
+            case "System.SByte":
+                testEnum((SByte)value, (v) =&gt; v &gt; (SByte)0, (v1, v2) =&gt; (SByte)(v1 &amp; v2), (v1, v2) =&gt; (SByte)(v1 ^ v2));
+                break;
+            case "System.UInt16":
+                testEnum((UInt16)value, (v) =&gt; v &gt; (UInt16)0, (v1, v2) =&gt; (UInt16)(v1 &amp; v2), (v1, v2) =&gt; (UInt16)(v1 ^ v2));
+                break;
+            case "System.Int16":
+                testEnum((Int16)value, (v) =&gt; v &gt; (Int16)0, (v1, v2) =&gt; (Int16)(v1 &amp; v2), (v1, v2) =&gt; (Int16)(v1 ^ v2));
+                break;
+            case "System.UInt32":
+                testEnum((UInt32)value, (v) =&gt; v &gt; (UInt32)0, (v1, v2) =&gt; (UInt32)(v1 &amp; v2), (v1, v2) =&gt; (UInt32)(v1 ^ v2));
+                break;
+            case "System.Int32":
+                testEnum((Int32)value, (v) =&gt; v &gt; (Int32)0, (v1, v2) =&gt; (Int32)(v1 &amp; v2), (v1, v2) =&gt; (Int32)(v1 ^ v2));
+                break;
+            case "System.UInt64":
+                testEnum((UInt64)value, (v) =&gt; v &gt; (UInt64)0, (v1, v2) =&gt; (UInt64)(v1 &amp; v2), (v1, v2) =&gt; (UInt64)(v1 ^ v2));
+                break;
+            case "System.Int64":
+                testEnum((Int64)value, (v) =&gt; v &gt; (Int64)0, (v1, v2) =&gt; (Int64)(v1 &amp; v2), (v1, v2) =&gt; (Int64)(v1 ^ v2));
+                break;
+            default:
+                throw new ArgumentException($"{type} does not have a valid backing type ({underlyingType}).");
+                break;
+        }
+    }
+    else
+    {
+        if (!type.IsEnumDefined(value))
+        {
+            throw new ArgumentException($"{value} is not a valid ordinal of type {type}.");
+        }
+    }
+
+    return (TEnum)Enum.ToObject(type, value);
+}
+</code></pre>
+
+<p>Overboard? Probably. But does it work? <em>Oh yeah.</em></p>
+
+<p>Additionally, as <a href="https://codereview.stackexchange.com/users/1402/peter-taylor">Peter Taylor</a> <a href="https://codereview.stackexchange.com/a/201812/73844">mentions</a>, you can use <code>where TEnum : struct</code> to help reduce some of the run-time issues, and bring them to the compile-type.</p>
+    </div>

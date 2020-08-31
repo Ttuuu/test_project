@@ -1,0 +1,175 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You are disposing the message before it even has a chance to be used by a consumer.</p>
+
+<p>Remove the <code>using</code> block in the factory method</p>
+
+<pre><code>public override MailMessage CreateMailMessage(IEmailNotification emailNotification) {
+    var mailMessage = new MailMessage();
+    mailMessage.From = new MailAddress(emailNotification.From);
+    mailMessage.To.Add(emailNotification.To);
+    mailMessage.Subject = emailNotification.Subject;
+    mailMessage.Body = emailNotification.Body;
+
+    if (emailNotification.To.ToLower().Contains("shopfehler"))
+        mailMessage.Bcc.Add(new MailAddress(_backupBccEmail));
+
+    if (!string.IsNullOrEmpty(emailNotification.CC))
+        mailMessage.CC.Add(emailNotification.CC);
+
+    if (!string.IsNullOrEmpty(emailNotification.BCC))
+        mailMessage.Bcc.Add(emailNotification.BCC);
+
+    if (!string.IsNullOrEmpty(emailNotification.ReplyToList))
+        mailMessage.ReplyToList.Add(emailNotification.ReplyToList);
+
+
+    if (emailNotification.AttachmentsPaths.Count &gt; 0) {
+        foreach (var path in emailNotification.AttachmentsPaths) {
+            mailMessage.Attachments.Add(new Attachment(path));
+        }
+    }
+
+    mailMessage.IsBodyHtml = emailNotification.IsBodyHtml;
+
+    return mailMessage;        
+}
+</code></pre>
+
+<p>Leave the responsibility of disposal to the consumer of the factory.</p>
+
+<blockquote>
+  <p>my factory method takes a parameter of type IEmailNotification, does that violates the main Job of a Factory which is only creating objects?</p>
+</blockquote>
+
+<p>A factory method can take explicit dependencies which it can use to perform its required functionality.</p>
+
+<blockquote>
+  <p>When I tried to test the logic of this method It failed because it uses an external resource at the line of adding new attachments where it cannot find the related paths on the Hard Drive, what do you people think about it?</p>
+</blockquote>
+
+<p>Implementation concerns should be encapsulated behind abstractions that avoid tight coupling to external dependencies.</p>
+
+<p>In this case, when you were testing, the <code>Attachment</code>  will try to read the file at the provided path. Since those paths may not exist when testing, you should consider refactoring the current design.</p>
+
+<p>Provide an abstraction that would allow the attachment stream to be read in isolation without any adverse behavior.</p>
+
+<pre><code>public interface IFileInfo {
+    string Name { get; }
+    string PhysicalPath { get; }
+    Stream CreateReadStream();
+}
+</code></pre>
+
+<p>Here is a simple implementation that can be used at run-time</p>
+
+<pre><code>public class AttachmentInfo : IFileInfo {
+    private readonly FileInfo innerFile;
+
+    public AttachmentInfo(string path) {
+        innerFile = new FileInfo(path);
+    }
+
+    public string Name =&gt; innerFile.Name;
+
+    public string PhysicalPath =&gt; innerFile.FullName;
+
+    public Stream CreateReadStream() =&gt; innerFile.OpenRead();
+}
+</code></pre>
+
+<p>The email notification can be refactored to use the abstraction for attachments</p>
+
+<pre><code>public interface IEmailNotification : INotification {
+    string From { get; }
+    string Subject { get; }
+    bool IsBodyHtml { get; }
+    string CC { get; }
+    string BCC { get; }
+    string ReplyToList { get; }
+    List&lt;IFileInfo&gt; Attachments { get; }
+}
+</code></pre>
+
+<p>Resulting in the factory method to become</p>
+
+<pre><code>public class EmailMailMessageFactory : MailMessageFactory {
+
+    public EmailMailMessageFactory(string backupBccEmail)
+        : base(backupBccEmail) {
+    }
+
+    public override MailMessage CreateMailMessage(IEmailNotification emailNotification) {
+        var mailMessage = new MailMessage {
+            From = new MailAddress(emailNotification.From),
+            Subject = emailNotification.Subject,
+            Body = emailNotification.Body,
+            IsBodyHtml = emailNotification.IsBodyHtml
+        };
+        mailMessage.To.Add(emailNotification.To);
+
+        if (emailNotification.To.ToLower().Contains("shopfehler"))
+            mailMessage.Bcc.Add(new MailAddress(_backupBccEmail));
+
+        if (!string.IsNullOrEmpty(emailNotification.CC))
+            mailMessage.CC.Add(emailNotification.CC);
+
+        if (!string.IsNullOrEmpty(emailNotification.BCC))
+            mailMessage.Bcc.Add(emailNotification.BCC);
+
+        if (!string.IsNullOrEmpty(emailNotification.ReplyToList))
+            mailMessage.ReplyToList.Add(emailNotification.ReplyToList);
+
+        if (emailNotification.Attachments.Count &gt; 0) {
+            foreach (var file in emailNotification.Attachments) {
+                Stream stream = file.CreateReadStream();
+                string filename = file.Name;
+                var attachment = new Attachment(stream, filename);
+                mailMessage.Attachments.Add(attachment);
+            }
+        }
+        return mailMessage;
+    }
+}
+</code></pre>
+
+<p>When testing in isolation, a fake stream can be given to the attachment to allow the subject under test to be exercised.</p>
+
+<pre><code>[TestClass]
+public class EmailMailMessageFactoryTests {
+    [TestMethod]
+    public void CreateMailMessage_WhenCalled_CreatesMailMessage() {
+        //Arrange
+        var stream = new MemoryStream();
+        var attachments = new List&lt;IFileInfo&gt; {
+            Mock.Of&lt;IFileInfo&gt;(_ =&gt; _.Name == "1" &amp;&amp; _.CreateReadStream() == stream)
+        };
+        var _emailNotification = Mock.Of&lt;IEmailNotification&gt;(_ =&gt;
+            _.From == "from@test.com" &amp;&amp;
+            _.To == "to@test.com" &amp;&amp;
+            _.Subject == "subject" &amp;&amp;
+            _.Body == "body" &amp;&amp;
+            _.IsBodyHtml == true &amp;&amp;
+            _.CC == "cc@test.com" &amp;&amp;
+            _.BCC == "bcc@test.com" &amp;&amp;
+            _.Attachments == attachments
+        );
+        var emailMailMessageFactory = new EmailMailMessageFactory("backup@test.com");
+
+        //Act
+        MailMessage result = emailMailMessageFactory.CreateMailMessage(_emailNotification);
+
+        //Assert
+        result.From.Address.Should().BeEquivalentTo(_emailNotification.From);
+        result.To[0].Address.Should().BeEquivalentTo(_emailNotification.To.Split(',')[0]);
+        result.Subject.Should().BeEquivalentTo(_emailNotification.Subject);
+        result.Body.Should().BeEquivalentTo(_emailNotification.Body);
+        result.IsBodyHtml.Should().Be(_emailNotification.IsBodyHtml);
+
+        result.Attachments.Count.Should().Be(_emailNotification.Attachments.Count);
+
+        result.CC[0].Address.Should().BeEquivalentTo(_emailNotification.CC);
+        result.Bcc[0].Address.Should().BeEquivalentTo(_emailNotification.BCC);
+    }
+}
+</code></pre>
+    </div>

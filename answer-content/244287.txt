@@ -1,0 +1,137 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>There are a lot of performance aspects that can be improved in your code. I will cover general suggestions assuming that this code is for Win32 target. I will use minGw compiler with c11 standard.</p>
+<p><strong>Compiler Optimizations:</strong>
+Without optimization code runs about 12.8 seconds on my PC. With -O3 optimization flag it takes about 10.6 seconds (about 17% faster).</p>
+<p><strong>Data types and arithmetic operations:</strong>
+double type and constants with high precision are used in the code. Do you really need this precision? Moreover infinity is used in maxerror variable: <code>double maxerror = 1.0/0.0;</code> Consider to use <code>DBL_MAX</code> instead of inf. If performance is important then general algorythm of data types selection is following:</p>
+<ol>
+<li>Can I use integer arithmetics? Prefereably int/uint types with logical/shift operations.</li>
+<li>If not, then can I use float?</li>
+<li>If not, then chose double or more precise types.</li>
+<li>If floating point data types are used then consider NOT using floating point exceptions, NaN, Inf and denormal values. All these things can be very slow.</li>
+</ol>
+<p>For example, you extract color components in the following way:</p>
+<pre><code>color1[0] = sRGBtolinear((color/65536%256)/255.0);
+</code></pre>
+<p>Here integer division can be replaced by bitwise/shift operations which is much faster. Assembly code will be almost 3 times shorter.</p>
+<pre><code>color1[0] = sRGBtolinear(((color &gt;&gt; 16) &amp; 0xff)/255.0);
+</code></pre>
+<p><strong>Inlining:</strong>
+As it has been already mentioned <code>inline</code> keyword is confusing nowadays. Compilers have attributes or pragmas to always_inline/force_inline or noinline functions, because it is very important in some cases. E.g. if you want to insert assembly code with label in function wich compiler decided to inline. In this case compilation will fail. Only prohibiting inlining can help. In our case functions <code>lineartosRGBOrig</code> and <code>lineartosRGBderivativeOrig</code> can't be inlined because they are recursive. By the way, this recursion is not needed because input to these functions is always positive in current algorithm.</p>
+<p><strong>Algorithm changes and code rearrangment:</strong></p>
+<ul>
+<li>It is better to move variables declarations from the loop.</li>
+<li>Values related to <code>color</code> in function <code>selectnearest</code> can be calculated only once istead of recalculation <code>palettelength</code> times.</li>
+<li><code>RGBtolinear</code> data can be precalculated as a table with 255 elements to significantly improve performance.</li>
+<li><code>initdistance</code> and brightness values are used only in comparison which allows us to remove <code>sqrt</code> operation and some divisions because we don't need exact values. Only relation is important.</li>
+</ul>
+<p><strong>Some brief optimizations:</strong>
+I have made some optimizations that improved performance by 86% to original code compiled with -O3 flag and by 89% to code compiled without optimization. The code is not perfect but it is much faster.</p>
+<pre><code>#pragma GCC push_options
+#pragma GCC optimize ("O3")
+
+double gRgbToLinearTable[255];
+
+void InitRgbToLinearTable(){
+    for (size_t i = 0u; i &lt; 255u; ++i)
+    {
+        double val = i / 255.0;
+        gRgbToLinearTable[i] = (val &gt; 0.0404482362771082 ? pow((val+0.055)/1.055, 2.4) : val/12.92);
+    }
+}
+
+[[gnu::always_inline]] inline double square(double x) { return x*x; }
+
+[[gnu::always_inline, gnu::flatten]] inline void sRGBtolinear(double* outComponents, uint32_t color){
+    outComponents[0] = gRgbToLinearTable[(color &gt;&gt; 16) &amp; 0xff];
+    outComponents[1] = gRgbToLinearTable[(color &gt;&gt; 8) &amp; 0xff];
+    outComponents[2] = gRgbToLinearTable[color &amp; 0xff];
+}
+
+[[gnu::always_inline, gnu::flatten]] inline double lineartosRGB(double input){
+    if (input &gt; 0.00313066844250063)
+        return (pow(input, 0.4166666666666667)*1.055-0.055);
+    else
+        return input*12.92;
+}
+
+[[gnu::always_inline, gnu::flatten]] inline double lineartosRGBderivative(double input){
+    if(std::abs(input) &gt; 0.00313066844250063) return pow(input, -0.5833333333333334)*0.4166666666666667*1.055;
+    else return 12.92;
+}
+
+size_t selectnearest(const uint32_t* palette, size_t palettelength, uint32_t color)
+{
+    size_t index = 0;
+    double maxerror = DBL_MAX;
+    double colors[2][3];
+    double initdistance, brightness[2], rgbBrightness[2], brightnessdifference, sRGBbrightnessdifference;
+    sRGBtolinear(colors[0], color);
+    brightness[0] = (0.212671*colors[0][0])+(0.715160*colors[0][1])+(0.072169*colors[0][2]);
+    rgbBrightness[0] = lineartosRGB(brightness[0]);
+
+    for (size_t i = 0; i &lt; palettelength; i++)
+    {
+        if (palette[i] != color)
+        {
+            sRGBtolinear(colors[1], palette[i]);
+
+            initdistance = (square(0.212671*(colors[0][0]-colors[1][0]))+square(0.212671*(colors[0][1]-colors[1][1]))+square(0.072169*(colors[0][2]-colors[1][2])));
+            brightness[1] = (0.212671*colors[1][0])+(0.715160*colors[1][1])+(0.072169*colors[1][2]);
+            rgbBrightness[1] = lineartosRGB(brightness[1]);
+
+            if(brightness[0] != brightness[1])
+            {
+                brightnessdifference = brightness[1] - brightness[0];
+                sRGBbrightnessdifference = rgbBrightness[1] - rgbBrightness[0];
+            }
+            else
+            {
+                brightnessdifference = 1.0 ;
+                sRGBbrightnessdifference = lineartosRGBderivative(brightness[0]);
+            }
+
+            double result = initdistance*(sRGBbrightnessdifference/brightnessdifference);
+            if(result &lt; maxerror){
+                index = i;
+                maxerror = result;
+            }
+        }
+        else
+        {
+            return i;
+        }
+    }
+
+    return index;
+}
+
+uint32_t* MakeSamplePalette(size_t amountOfColors)
+{
+    uint32_t* pResult = new uint32_t[amountOfColors];
+    for(size_t i = 0; i &lt; amountOfColors; i++)
+    {
+        pResult[i] = i%6*0x000033 + i/6%6*0x003300 + i/36%6*0x330000;
+    }
+
+    return pResult;
+}
+
+int main()
+{
+    const size_t amountofcolors = 216u;
+    uint32_t* palette = MakeSamplePalette(amountofcolors);
+    volatile uint32_t color;
+
+    InitRgbToLinearTable();
+    for(size_t i = 0; i &lt; 65536u; i++){
+        color = (static_cast&lt;unsigned int&gt;(rand()) &amp; 0xfff)+(static_cast&lt;unsigned int&gt;((rand()) &amp; 0xfff) &lt;&lt; 12);
+        color = palette[selectnearest(palette, amountofcolors, color)];
+    }
+
+    delete[] palette;
+    return color;
+}
+#pragma GCC pop_options
+</code></pre>
+    </div>

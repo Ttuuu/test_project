@@ -1,0 +1,101 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p>I just wrote four lines of code...</p>
+
+<pre><code>template&lt;typename T, typename ...&gt;
+using sfinae = T;
+
+template&lt;typename T, typename ...&gt;
+using SFINAE = T;
+</code></pre>
+</blockquote>
+
+<p>You should have written just <em>two</em> lines of code — either the first two or the last two. Not both. "There's more than one way to [spell] it" is the Perl way, not the C++ way. ;) (At least not intentionally! Not intentionally pre-C++2a! Now we're getting both <code>std::filesystem</code> and <code>std::fs</code>, that's a less airtight position.)</p>
+
+<hr>
+
+<p>As you show, your thing can be used for</p>
+
+<pre><code>template&lt;class T, 
+    sfinae&lt;bool,
+        std::enable_if_t&lt;std::is_integral_v&lt;T&gt;&gt;,
+        std::enable_if_t&lt;std::is_arithmetic_v&lt;T&gt;&gt;
+    &gt; = true&gt;
+void foo();
+</code></pre>
+
+<p>However, this is pretty verbose; surely we'd rather write <code>std::enable_if_t&lt;std::is_integral_v&lt;T&gt; &amp;&amp; std::is_arithmetic_v&lt;T&gt;&gt;</code> than <code>std::enable_if_t&lt;std::is_integral_v&lt;T&gt;&gt;, std::enable_if_t&lt;std::is_arithmetic_v&lt;T&gt;&gt;</code>. </p>
+
+<p>So personally I have a different alias that accomplishes the same goal: <code>bool_if_t</code>.</p>
+
+<pre><code>template&lt;bool B&gt;
+using bool_if_t = std::enable_if_t&lt;B, bool&gt;;
+
+template&lt;class T, 
+    bool_if_t&lt;
+        std::is_integral_v&lt;T&gt; &amp;&amp;
+        std::is_arithmetic_v&lt;T&gt;
+    &gt; = true&gt;
+void foo();
+</code></pre>
+
+<p>This has the advantage that the inner expression is written using normal C++ syntax rules. We don't have to remember some arbitrary rule like "<code>x, y</code> means both <code>x</code> and <code>y</code> must be true"; we just write <code>x &amp;&amp; y</code>. And if we want to enable this function when <em>either</em> <code>x</code> <em>or</em> <code>y</code> is true, we don't have to invent a new primitive; we just write <code>bool_if_t&lt;x || y&gt;</code>. <code>bool_if_t</code> is much more composable than your <code>sfinae&lt;Ts...&gt;</code>, because <code>bool_if_t</code> can exploit the existing expression syntax of C++.</p>
+
+<hr>
+
+<p>Recommended viewing: <a href="https://www.youtube.com/watch?v=ybaE9qlhHvw" rel="noreferrer">"A Soupçon of SFINAE"</a> (Arthur O'Dwyer, CppCon 2017). (Yes, that's me.)</p>
+
+<p>You picked examples that don't really show off the power of <code>sfinae</code>, by the way.
+Consider this example:</p>
+
+<pre><code>// 3) as a function return type:
+template &lt;typename T&gt; 
+sfinae&lt;T,
+    std::enable_if_t&lt;std::is_integral_v&lt;T&gt;&gt;,
+    std::enable_if_t&lt;std::is_arithmetic_v&lt;T&gt;&gt;
+&gt; const &amp; foo(T const &amp; val);
+</code></pre>
+
+<p>You take a "value-space" boolean (<code>is_integral_v&lt;T&gt;</code>), lift it up into "SFINAE-space" with <code>enable_if_t</code>, and then apply a logical AND operation in SFINAE-space using your <code>sfinae</code> alias.</p>
+
+<pre><code>template &lt;typename T&gt; 
+std::enable_if_t&lt;
+    std::is_integral_v&lt;T&gt; &amp;&amp;
+    std::is_arithmetic_v&lt;T&gt;, T
+&gt; const &amp; foo2(T const &amp; val);
+</code></pre>
+
+<p>Here I take the same "value-space" boolean, perform the logical AND <em>in value space</em> where we have a dedicated operator <code>&amp;&amp;</code> for maximum expressiveness; and I lift it up into SFINAE-space <em>after</em> doing the AND. This is clearer and also probably more efficient in terms of compile time.</p>
+
+<p>Where your version helps is when your values <em>start</em> in SFINAE-space!</p>
+
+<pre><code>template&lt;class T&gt; 
+sfinae&lt;T,
+    decltype(std::declval&lt;T&gt;() + std::declval&lt;T&gt;()),
+    T*,
+    T&amp;
+&gt; const &amp; foo3(T const &amp; val);
+</code></pre>
+
+<p>If we were trying to replicate this code's behavior with the standard tools, we'd say something like</p>
+
+<pre><code>template&lt;class, class=void&gt; struct has_plus : std::false_type {};
+template&lt;class T&gt; struct has_plus&lt;T, decltype(void(std::declval&lt;T&gt;() + std::declval&lt;T&gt;()))&gt; : std::true_type {};
+template&lt;class T&gt; inline constexpr bool has_plus_v = has_plus&lt;T&gt;::value;
+
+template&lt;class T&gt; 
+std::enable_if_t&lt;
+    has_plus_v&lt;T&gt; &amp;&amp;
+    not std::is_reference_v&lt;T&gt; &amp;&amp;
+    not std::is_void_v&lt;T&gt;, T
+&gt; const &amp; foo4(T const &amp; val);
+</code></pre>
+
+<p>That is, we start with a value in SFINAE-space (<code>decltype(std::declval&lt;T&gt;() + std::declval&lt;T&gt;())</code>), lift it into value-space (<code>has_plus_v&lt;T&gt;</code>), do the logical AND in value-space, and lift the result back into SFINAE-space.</p>
+
+<p>Whereas with your <code>foo3</code>, you start in SFINAE-space, do the logical AND via <code>sfinae&lt;...&gt;</code> <em>without leaving SFINAE-space</em>, and then you're done. Much simpler! But harder to read, I think.</p>
+
+<hr>
+
+<p>A simple way to improve readability is to pick a good name. <code>sfinae_space_and&lt;Ts...&gt;</code> might be clearer. Can you think of a way to write <code>sfinae_space_or&lt;Ts...&gt;</code>? How about <code>sfinae_space_not&lt;T&gt;</code>? Does it make sense, maintainability-wise, to provide one without the others?</p>
+    </div>

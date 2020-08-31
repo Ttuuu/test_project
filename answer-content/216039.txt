@@ -1,0 +1,146 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The RDRAND instruction generated from the <code>_rdrand64_step</code> intrinsic is actually very slow, though high quality (modulo some concerns about back doors). Depending on the processor it may take hundreds (Ivy Bridge through Skylake) or even <em>thousands</em> (Intel Atom, AMD) of cycles per RDRAND. So just replacing the random number generator will help a lot.</p>
+
+<p>For example, xoroshiro128+ is a relatively fast PRNG, it has <a href="https://lemire.me/blog/2017/08/22/cracking-random-number-generators-xoroshiro128/" rel="nofollow noreferrer">some weaknesses</a> but they don't seem too bad for this purpose. An interesting aspect is that it contains no operation that must go to execution port 1 on Intel processors, so its operations do not "fight" the <code>popcnt</code> much, in contrast to PRNGs that contain multiplication.</p>
+
+<p>So overall, something like this:</p>
+
+<pre><code>static inline uint64_t rotl(const uint64_t x, int k) {
+    return (x &lt;&lt; k) | (x &gt;&gt; (64 - k));
+}
+
+
+static uint64_t s[2];
+
+uint64_t next(void) {
+    const uint64_t s0 = s[0];
+    uint64_t s1 = s[1];
+    const uint64_t result = s0 + s1;
+
+    s1 ^= s0;
+    s[0] = rotl(s0, 24) ^ s1 ^ (s1 &lt;&lt; 16); // a, b
+    s[1] = rotl(s1, 37); // c
+
+    return result;
+}
+
+int64_t rbinom(int64_t size) {
+    if (!size) {
+        return 0;
+    }
+
+    int64_t result = 0;
+    while (size &gt;= 64) {
+        result += _popcnt64(next());
+        size -= 64;
+    }
+
+    result += _popcnt64(next() &amp; ~(UINT64_MAX &lt;&lt; size));
+
+    return result;
+}
+</code></pre>
+
+<p>Elsewhere in the application, the state <code>s</code> must be seeded with a non-zero random-enough number. For example, you could use <code>_rdrand64_step</code> to seed it once, at the start of the application.</p>
+
+<hr>
+
+<p>But different strategies are possible. With a <code>size</code> in the thousands or even millions (as indicated in the comments), SIMD could be used both to generate pseudo-random bits and to accumulate the pop-counts. Using some techniques from <a href="https://arxiv.org/pdf/1611.07612.pdf" rel="nofollow noreferrer">Faster Population Counts Using AVX2 Instructions</a> (mainly, reducing the amount of actual pop-counting by using carry-save addition) and Xorshift+ as PRNG (I avoid rotate because AVX2 does not have them built in, and multiplication because AVX2 also has no 64bit integer multiply built in), it could look like this:</p>
+
+<pre><code>__m256i bigstate0, bigstate1;
+
+__m256i xorshift128plus_avx2(__m256i *state0, __m256i *state1)
+{
+    __m256i s1 = *state0;
+    const __m256i s0 = *state1;
+    *state0 = s0;
+    s1 = _mm256_xor_si256(s1, _mm256_slli_epi64(s1, 23));
+    *state1 = _mm256_xor_si256(_mm256_xor_si256(_mm256_xor_si256(s1, s0),
+        _mm256_srli_epi64(s1, 18)),
+        _mm256_srli_epi64(s0, 5));
+    return _mm256_add_epi64(*state1, s0);
+}
+
+__m256i popcnt_AVX2(__m256i x) {
+    const __m256i popcntLUT = _mm256_setr_epi8(
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4
+    );
+    const __m256i nibmask = _mm256_set1_epi8(15);
+    const __m256i zero = _mm256_setzero_si256();
+
+    __m256i L = _mm256_shuffle_epi8(popcntLUT, _mm256_and_si256(x, nibmask));
+    x = _mm256_srli_epi16(x, 4);
+    __m256i H = _mm256_shuffle_epi8(popcntLUT, _mm256_and_si256(x, nibmask));
+    return _mm256_sad_epu8(_mm256_add_epi8(L, H), zero);
+}
+
+__m256i CSA(__m256i a, __m256i b, __m256i c, __m256i *carry) {
+    __m256i t0 = _mm256_xor_si256(a, b);
+    __m256i t1 = _mm256_xor_si256(t0, c);
+    *carry = _mm256_or_si256(_mm256_and_si256(a, b), _mm256_and_si256(t0, c));
+    return t1;
+}
+
+int64_t rbinom_AVX2(int64_t size) {
+    if (!size) {
+        return 0;
+    }
+
+    int64_t result = 0;
+
+    __m256i sum1 = _mm256_setzero_si256();
+    __m256i sum2 = sum1;
+    __m256i sum4 = sum1;
+    __m256i sum = sum1;
+    while (size &gt;= 2048) {
+        __m256i sample0 = xorshift128plus_avx2(&amp;bigstate0, &amp;bigstate1);
+        __m256i sample1 = xorshift128plus_avx2(&amp;bigstate0, &amp;bigstate1);
+        __m256i sample2 = xorshift128plus_avx2(&amp;bigstate0, &amp;bigstate1);
+        __m256i sample3 = xorshift128plus_avx2(&amp;bigstate0, &amp;bigstate1);
+        __m256i sample4 = xorshift128plus_avx2(&amp;bigstate0, &amp;bigstate1);
+        __m256i sample5 = xorshift128plus_avx2(&amp;bigstate0, &amp;bigstate1);
+        __m256i sample6 = xorshift128plus_avx2(&amp;bigstate0, &amp;bigstate1);
+        __m256i sample7 = xorshift128plus_avx2(&amp;bigstate0, &amp;bigstate1);
+        // reduce weight 1
+        __m256i c0, c1, c2, c3;
+        __m256i t0 = CSA(sample0, sample1, sample2, &amp;c0);
+        __m256i t1 = CSA(sample3, sample4, sample5, &amp;c1);
+        __m256i t2 = CSA(sample6, sample7, sum1, &amp;c2);
+        sum1 = CSA(t0, t1, t2, &amp;c3);
+        // reduce weight 2
+        __m256i c4, c5;
+        __m256i t3 = CSA(c0, c1, c2, &amp;c4);
+        sum2 = CSA(c3, t3, sum2, &amp;c5);
+        // reduce weight 4
+        __m256i c6;
+        sum4 = CSA(sum4, c4, c5, &amp;c6);
+        sum = _mm256_add_epi64(sum, _mm256_slli_epi64(popcnt_AVX2(c6), 3));
+        size -= 2048;
+    }
+    sum1 = popcnt_AVX2(sum1);
+    sum2 = popcnt_AVX2(sum2);
+    sum4 = popcnt_AVX2(sum4);
+    sum = _mm256_add_epi64(sum, sum1);
+    sum = _mm256_add_epi64(sum, _mm256_slli_epi64(sum2, 1));
+    sum = _mm256_add_epi64(sum, _mm256_slli_epi64(sum4, 2));
+    result += _mm256_extract_epi64(sum, 0);
+    result += _mm256_extract_epi64(sum, 1);
+    result += _mm256_extract_epi64(sum, 2);
+    result += _mm256_extract_epi64(sum, 3);
+
+    while (size &gt;= 64) {
+        result += _mm_popcnt_u64(next());
+        size -= 64;
+    }
+
+    result += _mm_popcnt_u64(next() &amp; ~(UINT64_MAX &lt;&lt; size));
+
+    return result;
+}
+</code></pre>
+
+<hr>
+
+<p>Algorithmic tricks such as the <a href="https://en.wikipedia.org/wiki/Alias_method" rel="nofollow noreferrer">alias method</a> may be appropriate. I have no experience with this so I cannot explain it or even really recommend it, but it's something to look into.</p>
+    </div>

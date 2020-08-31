@@ -1,0 +1,254 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<ul>
+<li><p>Making functions in header files static means that <a href="https://stackoverflow.com/questions/780730/c-c-static-function-in-header-file-what-does-it-mean">each translation unit gets its own separate definition</a>. This usually isn't what we want. Standard practice is to declare the function in the header, and then define it in a <code>.cpp</code> file, e.g.:</p>
+
+<pre><code>// header:
+
+#include &lt;string&gt;
+
+namespace lwlog
+{
+    namespace datetime
+    {
+        std::string get_current_time_and_date(const char* format);
+    }
+}
+</code></pre>
+
+<p>.</p>
+
+<pre><code>// .cpp:
+
+#include &lt;iomanip&gt;
+#include &lt;sstream&gt;
+#include &lt;chrono&gt;
+#include &lt;ctime&gt;
+
+namespace lwlog
+{
+    namespace datetime
+    {
+        static std::string get_current_time_and_date(const char* format)
+        {
+            auto now = std::chrono::system_clock::now();
+            auto in_time_t = std::chrono::system_clock::to_time_t(now);
+
+            std::stringstream ss;
+            ss &lt;&lt; std::put_time(std::localtime(&amp;in_time_t), format);
+            return ss.str();
+        }
+    }
+}
+</code></pre>
+
+<p>While this is a pain in the butt, it means that anyone including <code>datetime.h</code> doesn't also get the <code>sstream</code> <code>chrono</code>, etc. headers as an unnecessary side-effect.</p></li>
+</ul>
+
+<hr>
+
+<ul>
+<li><p>Prefer to declare variables as close to the point of use as possible, and (ideally) assign the necessary value directly, e.g. for the local variables in the print function.</p></li>
+<li><p>Descriptive names are nice, but something like <code>detail::populate_vec_with_variadic_params</code> is probably overkill. Maybe <code>detail::string_vec_from_args</code> instead? Likewise with the local variables: <code>variadic_arguments_vec</code> -&gt; <code>arguments</code>, <code>format_string_tokens_vec</code> -&gt; <code>format_tokens</code>.</p></li>
+</ul>
+
+<hr>
+
+<p>The various <code>detail</code> functions used to print with could be simplified quite a bit:</p>
+
+<ul>
+<li><p>Rather than <code>populate_vec_with_variadic_params</code> we can define our own to_string function, and then do something like:</p>
+
+<pre><code>namespace detail
+{
+
+    std::string to_string(std::string s) { return s; }
+
+    template&lt;class T&gt;
+    std::string arg_to_string(T&amp;&amp; t)
+    {
+        using detail::to_string;
+        using std::to_string;
+        return to_string(std::forward&lt;T&gt;(t));
+    }
+
+} // detail
+
+...
+
+    auto arguments = std::vector&lt;std::string&gt;{ detail::arg_to_string(std::forward&lt;Args&gt;(args))... };
+</code></pre>
+
+<p><a href="https://stackoverflow.com/a/37425306/673679">This has the advantage of allowing users to specify to_string functions for their own classes too.</a></p></li>
+</ul>
+
+<hr>
+
+<ul>
+<li><p><code>populate_vec_with_regex_matches_from_str</code>:</p>
+
+<ul>
+<li>shouldn't take <code>s</code> by reference, as it doesn't change <code>s</code> (this allows us to eliminate the temp variable).</li>
+<li>should simply return a vector, instead of altering one.</li>
+<li>should use iterators to avoid unnecessary copies (both internally, and in the vector it returns).</li>
+<li>rather than capturing the curly brackets and then removing them later, we can just capture the number inside the curly brackets.</li>
+<li><p>we need to capture one or more digit inside the brackets, not a single digit character, or the function will stop working when we get to 10 arguments.</p>
+
+<pre><code>using substring_view = std::pair&lt;std::string::const_iterator, std::string::const_iterator&gt;;
+
+std::vector&lt;substring_view&gt; find_matches(std::regex rg, std::string const&amp; s)
+{
+    auto result = std::vector&lt;substring_view&gt;();
+
+    auto begin = s.cbegin();
+    auto const end = s.cend();
+
+    std::smatch match;
+    while (std::regex_search(begin, end, match, rg))
+    {
+        result.push_back({ match[1].first, match[1].second });
+        begin = match.suffix().first;
+    }
+
+    return result;
+}
+
+...
+
+    auto format_strings = detail::find_matches(std::regex("\\{(\\d+)\\}"), format_str);
+</code></pre></li>
+</ul></li>
+</ul>
+
+<hr>
+
+<ul>
+<li><code>remove_duplicates_in_vec</code>:
+
+<ul>
+<li>can be a call to <code>std::unique</code>. </li>
+<li>should be applied to <code>format_strings_tokens_vec</code> instead of <code>variadic_arguments_vec</code>!!! We want to remove duplicate indices, not duplicate arguments.</li>
+</ul></li>
+</ul>
+
+<hr>
+
+<ul>
+<li><p><code>string_to_numeric_vec</code>:</p>
+
+<ul>
+<li>could use <code>std::transform</code>.</li>
+<li>should produce indices of <code>std::size_t</code> (a.k.a. <code>std::vector&lt;T&gt;::size_type</code>), not <code>int</code>.</li>
+<li>should probably do some sort of error handling on conversion failure (even just assertions).</li>
+<li><p><code>std::from_chars</code> is probably the best standard converter available for this.</p>
+
+<pre><code>std::vector&lt;std::size_t&gt; convert_indices(std::vector&lt;substring_view&gt; const&amp; s)
+{
+    auto result = std::vector&lt;std::size_t&gt;(s.size(), 0);
+
+    auto convert = [] (substring_view const&amp; v)
+    {
+        auto const begin = &amp;*v.first;
+        auto end = &amp;*v.second;
+        auto value = std::size_t{ 0 };
+        auto result = std::from_chars(begin, end, value);
+
+        assert(result.ptr == end);
+        assert(result.ec == std::errc{ });
+
+        return value;
+    };
+
+    std::transform(s.begin(), s.end(), result.begin(), convert);
+
+    return result;
+}
+</code></pre></li>
+</ul></li>
+</ul>
+
+<hr>
+
+<ul>
+<li><p><code>replace_in_string</code> is called for every format token index, and iterates over the whole string each time, turning the complexity from O(n) to O(n^2). Yikes!</p>
+
+<p>We'll be doing much less work if we do the "replacement" at the same time as we do the regex search.</p></li>
+</ul>
+
+<p>So I'd probably do something like this:</p>
+
+<pre><code>#include &lt;cassert&gt;
+#include &lt;charconv&gt;
+#include &lt;iostream&gt;
+#include &lt;regex&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+namespace detail
+{
+
+    std::string to_string(std::string s) { return s; }
+
+    template&lt;class T&gt;
+    std::string arg_to_string(T&amp;&amp; t)
+    {
+        using detail::to_string;
+        using std::to_string;
+        return to_string(std::forward&lt;T&gt;(t));
+    }
+
+    std::size_t convert_index(std::string::const_iterator begin, std::string::const_iterator end)
+    {
+        auto value = std::size_t{ 0 };
+        auto result = std::from_chars(&amp;*begin, &amp;*end, value);
+
+        assert(result.ptr == &amp;*end);
+        assert(result.ec == std::errc{ });
+
+        return value;
+    };
+
+} // detail
+
+template&lt;typename... Args&gt;
+std::string format(std::string const&amp; format_str, Args&amp;&amp;... args)
+{
+    auto const arguments = std::array&lt;std::string, sizeof...(Args)&gt;{ detail::arg_to_string(std::forward&lt;Args&gt;(args))... };
+
+    auto arguments_total_size = std::size_t{ 0 };
+    for (auto const&amp; a : arguments)
+        arguments_total_size += a.size();
+
+    auto result = std::string();
+    result.reserve(format_str.size() + arguments_total_size);
+
+    auto begin = format_str.cbegin();
+    auto const end = format_str.cend();
+    auto const regex = std::regex("\\{(\\d+)\\}");
+
+    while (true)
+    {
+        std::smatch match;
+        if (!std::regex_search(begin, end, match, regex))
+            break;
+
+        result.append(match.prefix().first, match.prefix().second);
+
+        auto index = detail::convert_index(match[1].first, match[1].second);
+        result.append(arguments.at(index));
+
+        begin = match.suffix().first;
+    }
+
+    result.append(begin, end);
+
+    return result;
+}
+
+int main()
+{
+    std::cout &lt;&lt; format("test: {0}, {1}, {0}, {3}", "5", 5, 123.f, std::string("test")) &lt;&lt; std::endl;
+}
+</code></pre>
+
+<p>N.B. We could just send everything straight to <code>std::cout</code> instead of building the formatted string.</p>
+    </div>

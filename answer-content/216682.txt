@@ -1,0 +1,138 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Naming nits:</p>
+
+<ul>
+<li><p>Why <code>threadSafeQueue</code> instead of <code>ThreadSafeQueue</code>? You CamelCaps all your other class names. Why not this one?</p></li>
+<li><p><code>class TaskECB { /* Task eventCallBack */</code> is a very verbose way of writing <code>class TaskEventCallback {</code>. If you have to spell it out in a comment anyway, just spell it out <em>in the code</em>. Your readers will thank you.</p></li>
+<li><p><code>bool threadSafeQueue&lt;T&gt;::Empty() const</code>: Since you're diverging from the traditional STL naming convention anyway (<code>Empty</code> is not <code>empty</code>), I recommend prefixing boolean accessors with <code>Is</code>, as in, <code>myQueue.IsEmpty()</code>. This way you don't confuse it with the verb "to empty," as in, "this function <em>empties</em> the queue." Orthogonally, you might mark this function <code>[[nodiscard]]</code> just to emphasize that it has no side effects.</p></li>
+<li><p><code>deAllocatePool()</code> would more traditionally be spelled <code>deallocatePool()</code>. "Deallocate" is a single word in English.</p></li>
+</ul>
+
+<hr>
+
+<pre><code>template&lt;typename T&gt;
+void threadSafeQueue&lt;T&gt;::Push(T newData) { /* TODO: size check before pushing */
+    std::shared_ptr&lt;T&gt; data(std::make_shared&lt;T&gt;(std::move(newData)));
+                                           /* construct the object before lock*/
+    std::lock_guard&lt;std::mutex&gt; lk(mut);
+    taskQueue.push(data);
+    dataCond.notify_one();
+}
+</code></pre>
+
+<p>Personally, I would simplify this to</p>
+
+<pre><code>template&lt;class T&gt;
+void threadSafeQueue&lt;T&gt;::Push(T newData) { /* TODO: size check */
+    auto data = std::make_shared&lt;T&gt;(std::move(newData));
+    std::lock_guard&lt;std::mutex&gt; lk(mut);
+    taskQueue.push(std::move(data));
+    dataCond.notify_one();
+}
+</code></pre>
+
+<p>Notice the use of <code>=</code> for initialization — it helps distinguish <code>bool foo(int)</code> from <code>bool foo(true)</code>, and helps readability in general. I also put a <code>std::move</code> on the push, so that we're not unnecessarily copying the <code>shared_ptr</code> and incurring an extra atomic increment and decrement of the refcount. (No big deal.) Notice that we are <em>still</em> incurring an extra call to <code>T</code>'s move-constructor; we might want to take <code>T</code> by reference here, in which case we might want two versions — one that takes <code>const T&amp;</code> and one that takes <code>T&amp;&amp;</code>.</p>
+
+<p>In fact, we might want to cut out the middleman entirely:</p>
+
+<pre><code>template&lt;class T&gt;
+template&lt;class... Args&gt;
+void threadSafeQueue&lt;T&gt;::Emplace(Args&amp;&amp;... args) { /* TODO: size check */
+    auto data = std::make_shared&lt;T&gt;(std::forward&lt;Args&gt;(args)...);
+    std::lock_guard&lt;std::mutex&gt; lk(mut);
+    taskQueue.push(std::move(data));
+    dataCond.notify_one();
+}
+</code></pre>
+
+<hr>
+
+<pre><code>typedef variant&lt;TaskECB,TaskRPCB&gt; taskTypes;
+</code></pre>
+
+<p>You're missing a <code>std::</code> there. Also, isn't it weird to have a <em>single</em> type named <code>taskTypes</code> (plural)? When I see the name "task<strong>Types</strong>", I expect to see <em>multiple</em> types — like a parameter pack or something. Here I think this type alias wants to be just a <code>taskType</code> or <code>taskVariant</code>, singular.</p>
+
+<hr>
+
+<pre><code>    auto tid = std::this_thread::get_id();
+    std::stringstream ss;
+    ss &lt;&lt; tid;
+    std::string s = ss.str();
+</code></pre>
+
+<p>Yuck. In an ideal world, <code>std::to_string(std::this_thread::get_id())</code> would Do The Right Thing; but we don't live in an ideal world.</p>
+
+<p>However, why are you using <code>std::string</code> as your map key, anyway? Why not just define</p>
+
+<pre><code>std::map&lt;std::thread::id, std::string&gt; tidToTname;
+</code></pre>
+
+<p>and skip the expensive stringification?</p>
+
+<p>Then, instead of</p>
+
+<pre><code>printf("%s is executing now : ",tidToTname[s].c_str());
+</code></pre>
+
+<p>you would write simply</p>
+
+<pre><code>printf("%s is executing now : ",tidToTname.at(tid).c_str());
+</code></pre>
+
+<p>(notice that we no longer risk <em>modifying</em> <code>tidToTname</code> accidentally!), and instead of</p>
+
+<pre><code>tidToTname[ss.str()] = tnames[i];
+</code></pre>
+
+<p>you'd write simply</p>
+
+<pre><code>tidToTname.insert_or_assign(tid, tnames[i]);
+</code></pre>
+
+<p>(Still beware: using <code>emplace</code> instead of <code>insert_or_assign</code> will still compile, but it will do the wrong thing if the key is already present! The STL's <code>map</code> is a very tricky beast. You have to be careful with it.)</p>
+
+<hr>
+
+<pre><code>if((*task).index() == 0) {      // TODO: change 0 and 1 to enums
+    auto func = get&lt;TaskECB&gt;(*task);
+    func();
+}else if((*task).index() == 1) {
+    auto func = get&lt;TaskRPCB&gt;(*task);
+    func();                 
+}
+</code></pre>
+
+<p>First of all, <code>(*task).index()</code> is traditionally spelled <code>task-&gt;index()</code>, and I strongly recommend that you do so. Nested parentheses make things hard to read. That's why the <code>-&gt;</code> operator was added to C back in the '70s! (Probably late '60s, actually. Maybe earlier.)</p>
+
+<p>Second, this is not a typical way to interact with <code>std::variant</code>. The library really intends you to interact with it like this:</p>
+
+<pre><code>std::visit([](auto&amp; callback) {
+    callback();
+}, *task);
+</code></pre>
+
+<p>If you want to preserve your inefficient copying, just change <code>auto&amp;</code> to <code>auto</code>.</p>
+
+<p>Really, IMO, it should be <code>const auto&amp;</code>; but in order to make that work, you'll have to make your <code>callback</code> types const-callable. Right now their <code>operator()</code>s are non-const member functions:</p>
+
+<pre><code>void operator()() /* NO CONST HERE -- INTENTIONAL? */ {
+    higLog("%s","TaskECB function is executing...");
+    func();
+}
+</code></pre>
+
+<p>If you're allergic to <code>visit</code> — which you shouldn't be! — but if you are, then a <em>slightly</em> more idiomatic way to write your chain of <code>if</code>s would be</p>
+
+<pre><code>if (auto *func = std::get_if&lt;TaskECB&gt;(task.get())) {
+    (*func)();
+} else if (auto *func = std::get_if&lt;TaskRPCB&gt;(task.get())) {
+    (*func)();
+}
+</code></pre>
+
+<p>Having to use <code>task.get()</code> to get a raw pointer, instead of just <code>task</code> or <code>*task</code>, definitely isn't ideal API design on the STL's part. But again, the ideal solution is to just use <code>std::visit</code>! You should use <code>std::visit</code>.</p>
+
+<hr>
+
+<p>I didn't check the multithreading parts. Odds are, there are bugs. Multithreaded code always has at least one bug. :)</p>
+    </div>

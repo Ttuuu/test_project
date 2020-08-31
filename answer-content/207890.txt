@@ -1,0 +1,75 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Putting these comments into an answer...</p>
+
+<p>As pointed out, it will be a tall order to beat or even approach the computation times of the native <code>sort</code> function, as it is compiled from C. Often with R, the trick to make your code faster consists in composing with some of these fast compiled building blocks that are native functions. In particular, we would look to substitute <code>for</code> loops like the one you have with vectorized functions. Unfortunately, your use of a <code>for</code> loop here is particular in the sense that each iteration has a side-effect to the <code>x</code> vector. This means that the order of the operations is important and we cannot run the loop iterations independently in parallel or via vectorized functions.</p>
+
+<p>If we cannot get rid of the <code>for</code> loop, we are left trying to optimize the code within the body of the loop. Let's start with a profile of your code:</p>
+
+<pre><code>x &lt;- sample(10000)
+Rprof(tmp &lt;- tempfile())
+for (i in 1:10) z &lt;- radix_sort(x)
+Rprof()
+summaryRprof(tmp)$by.total
+#                         total.time total.pct self.time self.pct
+# "radix_sort"                  8.26     99.76      0.72     8.70
+# "split"                       7.34     88.65      0.06     0.72
+# "split.default"               7.28     87.92      0.54     6.52
+# "as.factor"                   6.74     81.40      0.08     0.97
+# "factor"                      6.64     80.19      1.72    20.77
+# "as.character"                4.34     52.42      4.34    52.42
+# "unique"                      0.42      5.07      0.04     0.48
+# "unique.default"              0.38      4.59      0.38     4.59
+# "%%"                          0.14      1.69      0.14     1.69
+# "get_digit"                   0.14      1.69      0.00     0.00
+# "sort.list"                   0.12      1.45      0.02     0.24
+# "order"                       0.08      0.97      0.06     0.72
+# "unlist"                      0.06      0.72      0.06     0.72
+# [...]
+</code></pre>
+
+<p>We see that the main culprit here is the use of <code>split</code>. Another surprise here is the use of <code>order</code> (it seems to be applied when figuring out the levels of <code>x_digit_i</code>) which you could consider like cheating given your objective.</p>
+
+<p>So what alternative do we have to your use of <code>split</code>/<code>unsplit</code>? Essentially, you have a vector <code>x</code> that you want to reorder based on a vector of digits <code>x_digit_i</code>. One way is to use <code>outer</code> to create a matrix of <code>TRUE</code>/<code>FALSE</code> where each column locates a different digit (for a total of ten columns):</p>
+
+<pre><code>z &lt;- outer(x_digit_i, 0:9, "==")
+</code></pre>
+
+<p>Then, you want to turn this matrix into a vector of indices, such that the first few indices will locate the zeroes, then the ones, etc (the equivalent of <code>idx &lt;- order(x_digit_i)</code>. You can do so by doing:</p>
+
+<pre><code>idx &lt;- row(z)[z]
+</code></pre>
+
+<p>or (harder to understand but a bit faster)</p>
+
+<pre><code>idx &lt;- 1L + (which(z) - 1L) %% length(x)  
+</code></pre>
+
+<p>Finally, you just have to do:</p>
+
+<pre><code>x &lt;- x[idx]
+</code></pre>
+
+<p>Also note that since you are dealing with integers, your code might be a little faster (and more robust by avoiding floating point errors) if you make sure to use integers everywhere possible. In particular, your <code>get_digit</code> function could be rewritten as follows:</p>
+
+<pre><code>get_digit &lt;- function(x, d) (x %% as.integer(10^d)) %/% as.integer(10^(d-1))
+</code></pre>
+
+<p>The benchmarks below show decent progress (where my suggestions are implemented under the name <code>sort_radix2</code>) bridging the gap with the native <code>sort</code>. I hope it helps!</p>
+
+<pre><code>x &lt;- sample(100)
+microbenchmark(radix_sort(x), radix_sort2(x), sort(x))
+# Unit: microseconds
+#            expr     min       lq       mean   median       uq      max neval
+#   radix_sort(x) 964.692 972.3675 1025.35180 984.3775 1012.178 2233.397   100
+#  radix_sort2(x) 250.642 256.5720  282.58952 261.2910  282.449 1266.061   100
+#         sort(x)  82.270  86.1605   92.22669  88.0230   90.943  223.249   100
+
+x &lt;- sample(10000)
+microbenchmark(radix_sort(x), radix_sort2(x), sort(x))
+# Unit: microseconds
+#            expr       min         lq       mean     median         uq        max neval
+#   radix_sort(x) 71939.706 76147.1715 80028.7541 78389.8140 81512.4140 144632.484   100
+#  radix_sort2(x) 24218.810 27613.3190 34841.8724 29477.7115 31772.9415 143283.337   100
+#         sort(x)   411.691   454.4015   563.4825   492.6165   558.0925   3412.719   100
+</code></pre>
+    </div>

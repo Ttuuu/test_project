@@ -1,0 +1,160 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Instead of the class, I would use just methods, and string those together:</p>
+
+<ul>
+<li>query the information for a station</li>
+<li>parsing this info to get the departure information</li>
+<li>sort that info in the requested order</li>
+<li>display this information</li>
+</ul>
+
+<h1><code>sys.exit</code></h1>
+
+<p>Why do you exit the program if an error occurs? Now no one else can use this method. Better would be to raise an appropriate exception, and let the caller handle this. Fail fast, fail hard, but also fail clearly, so you can find out what exactly happened.</p>
+
+<h1>getting the response</h1>
+
+<p>This can be as simple as </p>
+
+<p>BART_URL = "<a href="http://api.bart.gov/api/edt.aspx" rel="nofollow noreferrer">http://api.bart.gov/api/edt.aspx</a>"</p>
+
+<pre><code>def get_edt(
+    station_code: str, *, api_key: str = API_KEY_PROVIDED, url: str = BART_URL,
+):
+    """queries api.bart.gov for the departure data of the station"""
+    request_parameters = {
+        "cmd": "edt",
+        "key": api_key,
+        "json": "y",
+        "orig": station_code,
+    }
+    response = requests.get(url, request_parameters)
+    return response.json()
+</code></pre>
+
+<p>This will raise a <code>ConnectionError</code> when no connection can be established, or a <code>JSONDecodeError</code> if the response is not parsable. You can extend this method in a few ways</p>
+
+<pre><code>class FetchException(Exception): pass
+
+def get_edt(
+    station_code: str, *, api_key: str = API_KEY_PROVIDED, url: str = BART_URL,
+):
+    """queries api.bart.gov for the departure data of the station"""
+    request_parameters = {
+        "cmd": "edt",
+        "key": api_key,
+        "json": "y",
+        "orig": station_code,
+    }
+    try:
+        response = requests.get(url, request_parameters)
+    except requests.ConnectionError:
+        raise FetchException(f"no connection to {url} could be established")
+    if response.status_code != "200":
+        raise FetchException(f"""
+        something went wrong when fetching the data. status_code: {response.status_code}
+        {response.text}
+        """)
+    return response.json()
+</code></pre>
+
+<h1>parsing the response</h1>
+
+<p>Getting the time and station name out of the response is fairly easy:</p>
+
+<pre><code>def parse_header(response):
+    root = response["root"]
+    time = root["time"]
+    station = root["station"][0]
+    station_name = station["name"]
+
+    return {
+        "time": time,
+        "station": station_name
+    }
+</code></pre>
+
+<p>You can simplify this by returning a <code>tuple</code> or extend the capabilities by transforming the date and time to a <code>datetime</code>, returning a <code>namedtuple</code> or even a <code>Header</code> object, depending on how far you want to go here. I think the <code>dict</code> is a nice balance between simplicity and extensibility.</p>
+
+<p>For the example response on the Bart website this returns <code>{'time': '10:20:31 AM PDT', 'station': 'Richmond'}</code></p>
+
+<h1>parse the departures</h1>
+
+<p>What is important about these departures is the destination and minutes until departure. Since the response is a nested structures, grouped per destination, the simplest would be to use a double loop, and just yield the departures</p>
+
+<pre><code>def parse_departures(response):
+    try:
+        departures = response["root"]["station"][0]["etd"]
+    except (KeyError, IndexError):
+        raise ValueError("invalid response")
+    for destination_info in departures:
+        destination = destination_info["destination"]
+        for estimates in destination_info.get("estimate", []):
+            minutes_str = estimates["minutes"]
+            if minutes_str == "leaving":
+                minutes = 0
+            else:
+                minutes = int(minutes_str) + int(estimates.get("delay", 0))
+            yield minutes, destination
+</code></pre>
+
+<blockquote>
+<pre><code>list(parse_departures(response))
+</code></pre>
+</blockquote>
+
+<pre><code>[(239, 'Fremont'),
+ (13, 'Fremont'),
+ (28, 'Fremont'),
+ (6, 'Millbrae'),
+ (21, 'Millbrae'),
+ (36, 'Millbrae')]
+</code></pre>
+
+<p>Since this is a tuple with the minutes until departure as first element, sorting requires just a call to <code>sorted</code></p>
+
+<h2>bug</h2>
+
+<p>There is also a possible bug in your __parse_data method. In <code>delay_station_map</code>, if there is a train leaving the the same time but on another platform, <code>delay_station_map[int(d['minutes'])] = item['destination']</code> will overwrite one of those.</p>
+
+<h1>putting it together</h1>
+
+<p>This can go behind a <code>__main__</code> guard</p>
+
+<pre><code>if __name__ == "__main__":
+#     response = get_edt("MONT",)
+    header = parse_header(response)
+    departures = sorted(parse_departures(response))
+
+    print(f"trains departing from {header['station']} at {header['time']}")
+    print("=-" * 10)
+    for minutes, destination in departures[:10]:
+        print(f"in {minutes} minutes the train to {destination} leaves")
+</code></pre>
+
+<p>again, with the example response:</p>
+
+<blockquote>
+<pre><code>trains departing from Richmond at 10:20:31 AM PDT
+=-=-=-=-=-=-=-=-=-=-
+in 6 minutes the train to Millbrae leaves
+in 13 minutes the train to Fremont leaves
+in 21 minutes the train to Millbrae leaves
+in 28 minutes the train to Fremont leaves
+in 36 minutes the train to Millbrae leaves
+in 239 minutes the train to Fremont leaves
+</code></pre>
+</blockquote>
+
+<h1>overall</h1>
+
+<p>Since there is very little state, there is little reason to use a class. Especially a convoluted one as yours. Try to think of the different steps needed to get to the solution, and try to split your code according to those steps. That will generally be the clearest code, which needs the least explanation and comments, and is most easily testable. The units have the least effect on each other.</p>
+
+<p>Brandon Rhodes has a nice talk on clean architecture <a href="https://rhodesmill.org/brandon/talks/#clean-architecture-python" rel="nofollow noreferrer">here</a></p>
+
+<p>And Jack Diederich has a very well known talk about when not to use classes <a href="https://youtu.be/o9pEzgHorH0" rel="nofollow noreferrer">here</a>. This is one of the cases where a class is overkill. If you later want to display more information, like the platform, direction, color etc, you can think about introducing classes to this problem, if a dict doesn't suffice anymore.</p>
+
+<p>In your solution, the data is fetched 3 times, once for the current time, twice to get the departures. This should be a giveaway that something is wrong. </p>
+
+<p>Trying to figure out what went on in the code took some jumping back and forth as well, while using the smaller methods, strung together almost explains itself.</p>
+    </div>

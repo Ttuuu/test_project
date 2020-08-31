@@ -1,0 +1,164 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I am going to try to summarise and incorporate some findings from the very good and lively discussion in the comments above. I have put together a "best case". "Best" without going "totally silly", ie no custom SIMD ASM or anything. </p>
+
+<ul>
+<li>If the file is OS-cached in RAM the mmap can go very very fast. I have measured up to 7GB/s (140ms for 1GB file). Just with a pointer spinning over the whole file and taking an 8-bit XOR parity checksum. </li>
+<li>If I take a copy of the 1GB file into a string first and then spin over over it, I get about 14GB/s (70ms for 1GB file). That's about my RAM bandwidth since this is an old machine and only has DDR3-1600 memory.</li>
+<li>But is doing no work at all really. Getting to anywhere near that
+speed in parsing ints is going to be very very hard. Only with SIMD
+and then totally custom. </li>
+<li>The code below is a tight loop which an exact file format, not negative ints, no illegal chars etc. It cuts out charchonv, my minimal isdigit/isnumeric etc. It's pretty much the tightest loop I can invisage without spending too much time on it. And totally not error tolerant obviously. </li>
+<li>It achieves 1GB/s. Which is 1/7th of what the mmap can give me with
+an OS cached file and a little over 2x disk speed (should the disk
+get involved).</li>
+<li>Obviously, at this point, the hashmap is gone so we are not even meeting the spec anymore. Putting it back and finding the group for biggest total as per spec, slows us down to 1.7s or ~530MB/s. (Note this is a very low cardinality file with &lt; 1000 unique ints).  </li>
+</ul>
+
+<p>We <strong>might</strong> be able to use multiple threads/cores to parse and process the ints, but the synchronisation on the hash_map and also the contention on the memory bus will likely affect us quite badly. </p>
+
+<p>So, task can be "just about reasonably" done at 530MB/s or 1.7s for the 1GB file or about 2ms (plus probably some overhead there) for the small 1MB file which they gave in the reddit post. </p>
+
+<p>Thanks everyone. I learnt a few more tricks. </p>
+
+<pre><code>#include "flat_hash_map/bytell_hash_map.hpp"
+#include "os/fs.hpp"
+#include &lt;cmath&gt;
+#include &lt;cstdint&gt;
+#include &lt;iostream&gt;
+
+template &lt;typename T&gt;
+T yahtzee_upper(const std::string&amp; filename) {
+  auto mfile  = os::fs::MemoryMappedFile{filename};
+  auto buffer = mfile.get_buffer();
+  const char*       begin = buffer.begin();
+  const char*       curr  = begin;
+  const char* const end   = buffer.end();
+
+  auto dist = ska::bytell_hash_map&lt;T, T&gt;{};
+  auto val = T{0};
+  auto max_total = T{0};
+  while (curr != end) {
+    if (*curr == '\n') {
+      auto total = dist[val] += val;
+      if (total &gt; max_total) max_total = total;
+      val = 0;
+    } else {
+      val = val * 10 + (*curr - '0');
+    }
+    ++curr;
+  }
+  return max_total;
+}
+
+int main(int argc, char* argv[]) {
+  if (argc &lt; 2) return 1;
+  std::cout &lt;&lt; yahtzee_upper&lt;std::uint64_t&gt;(argv[1]) &lt;&lt; '\n'; // NOLINT
+  return 0;
+}
+
+</code></pre>
+
+<p><strong>EDIT</strong>: I worked on a threaded parser. Simple implementation below. I am far from a concurrency expert, so bear with me. No locks or atomics. Doesn't need it: <a href="https://en.wikipedia.org/wiki/Embarrassingly_parallel" rel="nofollow noreferrer">Embarrassingly parallel</a>? Memory locality / bus or L1/L2/L3 cache size for hashmap are the limits to scalability -- not sure.</p>
+
+<p>Output and simple performance stats below (baseline from above is 1.7s single threaded for the same work, and 140ms of "overhead" to spin through the mmap'd file with no work):</p>
+
+<p>4 threads:</p>
+
+<pre><code>spawn=0.218369ms
+work=680.104ms
+finalise=0.17976ms
+8605974989487699234
+</code></pre>
+
+<p>6 threads</p>
+
+<pre><code>spawn=0.451396ms
+work=437.958ms
+finalise=0.151554ms
+8605974989487699234
+
+</code></pre>
+
+<p>8 threads:</p>
+
+<pre><code>spawn=0.441865ms
+work=390.369ms
+finalise=0.202808ms
+8605974989487699234
+</code></pre>
+
+<p>Pretty happy with sub 400ms? Any feedback on the concurrent code warmly welcome. </p>
+
+<pre><code>#include "flat_hash_map/bytell_hash_map.hpp"
+#include "os/bch.hpp"
+#include "os/fs.hpp"
+#include &lt;cstdint&gt;
+#include &lt;iostream&gt;
+#include &lt;string&gt;
+#include &lt;thread&gt;
+#include &lt;vector&gt;
+
+template &lt;typename T&gt;
+T yahtzee_upper(const std::string&amp; filename) {
+  auto mfile     = os::fs::MemoryMappedFile{filename};
+  auto max_total = std::int64_t{0};
+
+  const unsigned n_threads = std::thread::hardware_concurrency();
+  auto           threads   = std::vector&lt;std::thread&gt;{};
+  auto maps = std::vector&lt;ska::bytell_hash_map&lt;T, T&gt;&gt;{n_threads, ska::bytell_hash_map&lt;T, T&gt;{}};
+  std::cout &lt;&lt; n_threads &lt;&lt; " threads"
+            &lt;&lt; "\n";
+  {
+    auto tim = os::bch::Timer("spawn");
+    auto        chunk = std::ptrdiff_t{(mfile.end() - mfile.begin()) / n_threads};
+    const char* end   = mfile.begin();
+    for (unsigned i = 0; end != mfile.end() &amp;&amp; i &lt; n_threads; ++i) {
+      const char* begin = end;
+      end               = std::min(begin + chunk, mfile.end());
+
+      while (end != mfile.end() &amp;&amp; *end != '\n') ++end; // ensure we have a whole line
+      if (end != mfile.end()) ++end;                    // one past the end
+
+      threads.push_back(std::thread(
+          [](const char* begin, const char* const end, ska::bytell_hash_map&lt;T, T&gt;&amp; map) {
+
+            const char* curr = begin;
+            auto        val  = std::int64_t{0};
+            while (curr != end) {
+              if (*curr == '\n') {
+                map[val] += val;
+                val = 0;
+              } else {
+                val = val * 10 + (*curr - '0');
+              }
+              ++curr;
+            }
+          },
+          begin, end, std::ref(maps[i])));
+    }
+  }
+  {
+    auto tim = os::bch::Timer("work");
+    for (auto&amp;&amp; t: threads) t.join();
+  }
+  {
+    auto tim       = os::bch::Timer("finalise");
+    auto final_map = ska::bytell_hash_map&lt;T, T&gt;{};
+
+    for (auto&amp;&amp; m: maps) {
+      for (auto p: m) {
+        std::int64_t total = final_map[p.first] += p.second;
+        if (total &gt; max_total) max_total = total;
+      }
+    }
+  }
+  return max_total;
+}
+
+int main(int argc, char* argv[]) {
+  if (argc &lt; 2) return 1;
+  std::cout &lt;&lt; yahtzee_upper&lt;std::uint64_t&gt;(argv[1]) &lt;&lt; '\n'; // NOLINT
+  return 0;
+}
+</code></pre>
+    </div>

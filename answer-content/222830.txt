@@ -1,0 +1,150 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>As <code>ForEach-Object</code> and <code>Where-Object</code> are slow, you had better to use the <code>foreach</code> statement instead of them when working with large data.<br>
+Also, because it is useless to get all extended properties, narrow down the property numbers to be obtained in advance.<br>
+Although <code>Select-Object</code> is useful, it will be slower if you use "calculated property", so it is better to create a new object directly using <code>[pscustomobject]@{}</code>.</p>
+
+<pre><code># settings
+$startDate = Get-Date "01-Jul-2018"
+$endDate = Get-Date "31-Mar-2029"
+$resultDir = mkdir "E:\tets\Results" -Force
+$dateTimeFormat = "dd-MMM-yyyy HH:mm:ss.fff"
+$pathList = @(
+    "\\server\ca$\los angeles\documents"
+    "\\server\ca$\san diego\documents"
+    "\\server\ca$\san francisco\documents"
+)
+
+$exAttr = @{
+    Title = 21
+    Authors = 20
+    LastPrinted = 200
+    LastSaved = 154
+    Pages = 157
+    WordCount = 160
+    TotalEditingTime = 159
+    FileCount = 163
+}
+
+
+# start
+"Execute Start: {0}" -f (Get-Date -Format $dateTimeFormat) | Write-Host
+
+$shell = New-Object -Com Shell.Application
+
+foreach ($path in $pathList) {
+
+    # create a result file.
+    $targetDir = Get-Item -LiteralPath $path
+    $resultFileName = "{0}_{1}_{2}.csv" -f @(
+        $targetDir.Parent.Parent.Name.TrimEnd("$").ToLower()
+        $targetDir.Parent.Name.ToLower() -replace "\W","-"
+        Get-Date -Format yyyyMMdd_HHmmss.fff
+    )
+    $resultsFile = New-Item -Path $resultDir -Name $resultFileName -Force
+
+    $lineNumber = 1
+
+    # create customized file information objects.
+    $list = foreach ($file in Get-Childitem $targetDir -File -Recurse) {
+
+        if ($file.LastWriteTime -le $startDate -or $file.LastWriteTime -ge $endDate) { continue }
+
+        $exData = @{}
+
+        # get extended properties of office file.
+        if ($file.Extension -in ".docx",".xlsx") {
+            $dirObj = $shell.NameSpace($file.DirectoryName)
+            $itemObj = $dirObj.ParseName($file.Name)
+            $exAttr.GetEnumerator() | &amp; { process { $exData[$_.Key] = $dirObj.GetDetailsOf($itemObj, $_.Value) -replace "\p{Cf}" } }
+
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($itemObj)
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($dirObj)
+        }
+
+        [pscustomobject]@{
+            LineNumber = $lineNumber++
+            ExtractTime = Get-Date -format $dateTimeFormat
+            FullName = $file.FullName
+            FilePath = $file.DirectoryName
+            FileName = $file.Name
+            FileSize = $file.Length / 1KB
+            CreationTime = $file.CreationTime.ToString($dateTimeFormat)
+            LastWriteTime = $file.LastWriteTime.ToString($dateTimeFormat)
+            Attributes = -join ($file.Attributes.Split(",") | &amp; { process { $_.TrimStart()[0] } })
+            Title = $exData.Title
+            Authors = $exData.Authors
+            LastPrinted = if ($exData.LastPrinted) { Get-Date $exData.LastPrinted -Format $dateTimeFormat } else { $null }
+            LastSaved = if ($exData.LastSaved) { Get-Date $exData.LastSaved -Format $dateTimeFormat } else { $null }
+            PageCount = $exData.Pages
+            WordCount = $exData.WordCount
+            TotalEditingTime = $exData.TotalEditingTime
+            FileCount = $exData.FileCount
+        }
+    }
+
+    # output to csv file.
+    $list | Export-Csv $resultsFile -NoTypeInformation
+    $resultsFile
+}
+
+[void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
+
+"`nExecute End: {0}`n" -f (Get-Date -Format $dateTimeFormat) | Write-Host
+</code></pre>
+
+<p>If you want to run in parallel, there is a way to use <code>Start-Job</code>.</p>
+
+<pre><code>$scriptBlock = {
+    param(
+        $path,
+        $startDate,
+        $endDate,
+        $resultDir,
+        $dateTimeFormat
+    )
+
+    $exAttr = @{
+        ...
+    }
+    $shell = New-Object -Com Shell.Application
+
+    # create a result file.
+    $targetDir = Get-Item -LiteralPath $path
+    ...
+    ...
+}
+
+$pathList | foreach { $i = 0 } { Start-Job -Name $_ -ScriptBlock $scriptBlock -ArgumentList $_,$startDate,$endDate,$resultDir,$dateTimeFormat }
+</code></pre>
+
+<p>If file retrieval and filtering is a bottleneck, you can write partially in C#.</p>
+
+<pre><code>Add-Type -TypeDefinition @"
+using System;
+using System.IO;
+using System.Collections.Generic;
+
+public static class MyFileIO
+{
+    public static List&lt;FileInfo&gt; GetFiles(DirectoryInfo dir, DateTime startDate, DateTime endDate)
+    {
+        var files = new List&lt;FileInfo&gt;();
+        var queue = new Queue&lt;DirectoryInfo&gt;();
+        queue.Enqueue(dir);
+        while (queue.Count &gt; 0)
+        {
+            dir = queue.Dequeue();
+            foreach (var subDir in dir.GetDirectories()) queue.Enqueue(subDir);
+            foreach(var file in dir.GetFiles())
+                if(file.LastWriteTime &gt; startDate &amp;&amp; file.LastWriteTime &lt; endDate) files.Add(file);
+        }
+        return files;
+    }
+}
+"@
+
+foreach ($file in [MyFileIO]::GetFiles($targetDir, $startDate, $endDate)) {
+    ...
+}
+</code></pre>
+    </div>

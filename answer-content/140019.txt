@@ -1,0 +1,148 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>It's a good start. Here are the changes I suggest:</p>
+
+<p>I think you should be able to execute the queries without sharepoint. To make it possible we'll remove the sharepoint stuff from the repository and put it in another one. We then combine them with a decorator pattern like this:</p>
+
+<p>The first step is to extract an interface (or an abstract class):</p>
+
+<pre><code>public interface IResourceRepository 
+{ 
+    Resource GetByLoginname(string loginname);
+}
+</code></pre>
+
+<p>Then we implement it in the first repository that will get resources from the database:</p>
+
+<pre><code>public class ResourceRepository : IResourceRepository
+{
+    public Resource GetByLoginname(string loginname)
+    {
+        return ExecuteSql(cmd =&gt;
+        {
+            cmd.CommandText = @"SELECT convert(nvarchar(36), ResourceUID) AS ResourceUID, UserClaimsAccount, ResourceName FROM MSP_EpmResource_UserView WHERE UserClaimsAccount = @userclaimsaccount";
+            cmd.Parameters.AddWithValue("@userclaimsaccount", SqlDbType.NVarChar).Value = loginname;
+
+            using (var reader = cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    var resource = Resource.From(reader);
+                    if (resource != null)
+                    {
+                        resource.Teams = GetResourceTeams(resource);
+                    }
+                    return resource;
+                }   
+                return null;            
+            }               
+        });
+    }   
+
+    private static void ExecuteSql(Action&lt;SqlCommand&gt; action)
+    {
+        string connectionString = Connectivity.GetConnectionString();
+
+        using (var conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            var cmd = conn.CreateCommand();
+
+            action(cmd);
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    private static T ExecuteSql&lt;T&gt;(Func&lt;SqlCommand, T&gt; action)
+    {
+        T result;
+
+        string connectionString = Connectivity.GetConnectionString();
+
+        using (var conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            var cmd = conn.CreateCommand();
+
+            result = action(cmd);
+            cmd.ExecuteNonQuery();
+        }
+
+        return result;
+    }
+}
+</code></pre>
+
+<p>Now you need the elevated privilages for sharepoint. So lets create a decorator for this one:</p>
+
+<pre><code>public class ElevatedPrivilegesResourceRepository : IResourceRepository
+{
+    private readonly IResourceRepository _resourceRepository;
+
+    public ElevatedPrivilegesResourceRepository(IResourceRepository resourceRepository)
+    {
+        _resourceRepository = resourceRepository;
+    }
+
+    public Resource GetByLoginname(string loginname)
+    {
+        var result = default(Resource);
+
+        Microsoft.SharePoint.SPSecurity.RunWithElevatedPrivileges(
+            () =&gt; result = _resourceRepository.GetByLoginname(loginname));
+
+        return result;
+    }
+}
+</code></pre>
+
+<p>You will pass an instance of the first repository to this one and it will execute the query with sharepoint's elevated privilages.</p>
+
+<pre><code>var repo = new ElevatedPrivilegesResourceRepository(new ResourceRepository());
+
+var resource = repo.GetByLoginname("foo");
+</code></pre>
+
+<hr>
+
+<p>There is one more change that I've made. I put the cretion of a resource into a factory method of this class:</p>
+
+<pre><code>public class Resource
+{
+    public string RessourceUID { get; set; }
+    public string RessourceName { get; set; }
+    public List&lt;Team&gt; Teams { get; set; }
+    public string Loginname { get; set; }
+
+    public static Resource From(SqlDataReader reader)
+    {
+        var resource = new Resource
+        {
+            RessourceUID = SqlReaderHelper.GetValue&lt;string&gt;(dr, "ResourceUID"),
+            RessourceName = SqlReaderHelper.GetValue&lt;string&gt;(dr, "ResourceName"),
+            Loginname = SqlReaderHelper.GetValue&lt;string&gt;(dr, "UserClaimsAccount")
+        }
+
+        return resource;
+    }
+}
+</code></pre>
+
+<p>and I also modified the query itself:</p>
+
+<pre><code>using (var reader = cmd.ExecuteReader())
+{
+    while (reader.Read())
+    {
+        var resource = Resource.From(reader);
+        if (resource != null)
+        {
+            resource.Teams = GetResourceTeams(resource);
+        }
+        return resource;
+    }
+    return null;                
+}
+</code></pre>
+
+<p>As you are looking for only one resource the reader won't proceed if there is none so you don't have to check whether it has any rows. You can just return the result after the first one.</p>
+    </div>

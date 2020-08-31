@@ -1,0 +1,123 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Let's set up code to benchmark different approaches. Every word counter will implement this interface:</p>
+
+<pre><code>interface IWordCounter
+{
+    IDictionary&lt;string, int&gt; CountWords(string path);
+}
+</code></pre>
+
+<p>And here's our benchmark runner:</p>
+
+<pre><code>var wordCounters = new IWordCounter[]
+{
+    // ...
+};
+
+foreach (var wordCounter in wordCounters)
+{
+    GC.Collect();
+    GC.WaitForPendingFinalizers();
+
+    var sw = Stopwatch.StartNew();
+    var wordCount = wordCounter.CountWords(path);
+    sw.Stop();
+
+    Console.WriteLine("{0}, {1} entries, {2}", wordCounter.GetType().Name, wordCount.Count, sw.Elapsed);
+}
+</code></pre>
+
+<p>Timings were taken with a release build, on the test file provided, no debugger attached, on .NET 4.5.2.</p>
+
+<p>Here's the original code:</p>
+
+<pre><code>class OriginalWordCounter : IWordCounter
+{
+    private static readonly char[] separators = { ' ' };
+
+    public IDictionary&lt;string, int&gt; CountWords(string path)
+    {
+        var wordCount = new Dictionary&lt;string, int&gt;();
+
+        using (var fileStream = File.Open(path, FileMode.Open, FileAccess.Read))
+        using (var streamReader = new StreamReader(fileStream))
+        {
+            string line;
+            while ((line = streamReader.ReadLine()) != null)
+            {
+                var words = line.Split(separators, StringSplitOptions.RemoveEmptyEntries);
+
+                foreach (var word in words)
+                {
+                    if (wordCount.ContainsKey(word))
+                    {
+                        wordCount[word] = wordCount[word] + 1;
+                    }
+                    else
+                    {
+                        wordCount.Add(word, 1);
+                    }
+                }
+            }
+        }
+
+        return wordCount;
+    }
+}
+</code></pre>
+
+<p>On my machine, this takes about <strong>8.2s</strong>.</p>
+
+<p>We see an improvement using Heslacher's suggestion to use <code>TryGet</code>:</p>
+
+<pre><code>class OriginalTryGetWordCounter : IWordCounter
+{
+    private static readonly char[] separators = { ' ' };
+
+    public IDictionary&lt;string, int&gt; CountWords(string path)
+    {
+        var wordCount = new Dictionary&lt;string, int&gt;();
+
+        foreach (var line in File.ReadLines(path, Encoding.UTF8))
+        {
+            var words = line.Split(separators, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var word in words)
+            {
+                int count;
+                wordCount.TryGetValue(word, out count);
+                wordCount[word] = count + 1;
+            }
+        }
+
+        return wordCount;
+    }
+}
+</code></pre>
+
+<p>This takes about <strong>6.7s</strong>. (The use of <code>File.ReadLines</code> here doesn't seem to effect the timing, it's just a bit cleaner.)</p>
+
+<p>We get another improvement with <code>Parallel.ForEach</code> together with a <code>ConcurrentDictionary</code>:</p>
+
+<pre><code>class ParallelWordCounter : IWordCounter
+{
+    public IDictionary&lt;string, int&gt; CountWords(string path)
+    {
+        var result = new ConcurrentDictionary&lt;string, int&gt;();
+        Parallel.ForEach(File.ReadLines(path, Encoding.UTF8), line =&gt;
+        {
+            var words = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var word in words)
+            {
+                result.AddOrUpdate(word, 1, (_, x) =&gt; x + 1);
+            }
+        });
+
+        return result;
+    }
+}
+</code></pre>
+
+<p>This takes about <strong>5.2s</strong>.</p>
+
+<p>You might want to try some of the <a href="https://msdn.microsoft.com/en-us/library/system.threading.tasks.parallel.foreach%28v=vs.110%29.aspx" rel="nofollow"><code>Parallel.Foreach</code></a> overloads to see if you can get any further improvements, and remember to take these results with a grain of salt.</p>
+    </div>

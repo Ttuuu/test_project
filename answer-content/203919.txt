@@ -1,0 +1,152 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Ugly typedef</h2>
+
+<p>I'm not a big fan of this:</p>
+
+<pre><code>typedef std::future&lt;int&gt; FutureResultInt;
+</code></pre>
+
+<p>It's not significantly shorter or easier to read, it doesn't isolate the user from an underlying type, and it only serves to slow down my reading every time I hit it.  That's somewhat subjective, of course, but I don't believe it adds value.  I'd be happier with it if it told us what it's <em>for</em>, rather than merely what it <em>is</em>.  I'm thinking of something like:</p>
+
+<pre><code>using TimerTaskResult = std::future&lt;int&gt;;
+</code></pre>
+
+<p>Now the name conveys something that's not just duplicating the standard name.</p>
+
+<hr>
+
+<h2>Member initialization</h2>
+
+<p>My compiler warns me that the initializer list is in a misleading order:</p>
+
+<pre class="lang-none prettyprint-override"><code>203856.cpp:47:54: warning: ‘CFutureTest::m_start’ will be initialized after [-Wreorder]
+203856.cpp:46:19: warning:   ‘FutureResultInt CFutureTest::m_result’ [-Wreorder]
+203856.cpp:33:3: warning:   when initialized here [-Wreorder]
+   CFutureTest(FutureResultInt&amp;&amp; fr)
+   ^~~~~~~~~~~
+</code></pre>
+
+<p>I'd also recommend <em>value-initializing</em> <code>m_result</code> rather than <em>default-constructing</em> followed by <em>move-assigning</em>:</p>
+
+<pre><code>  CFutureTest(FutureResultInt&amp;&amp; fr)
+      : m_result{std::move(fr)}
+      , m_start{std::chrono::system_clock::now()}
+  {
+  }
+</code></pre>
+
+<hr>
+
+<h2>Missing <code>case</code></h2>
+
+<pre class="lang-none prettyprint-override"><code>203856.cpp: In function ‘int main()’:
+203856.cpp:63:14: warning: enumeration value ‘ready’ not handled in switch [-Wswitch]
+       switch (stat)
+              ^
+</code></pre>
+
+<p>I like to have this warning enabled.  We could provide a minimal <code>case std::​future_status::​ready: break;</code>, or we could unify the control flow by changing the other branches from <code>continue</code> to <code>break</code> and inlining the following code into the <code>ready</code> case like this:</p>
+
+<pre><code>        switch (stat) {
+        case std::future_status::timeout:
+            if (future.GetAge() &gt; 4000) {
+                std::cout &lt;&lt; "Thread has exceeded the time limit" &lt;&lt; std::endl;
+            }
+            break;
+
+        case std::future_status::deferred:
+            std::cout &lt;&lt; "std::future_status::deferred" &lt;&lt; std::endl;
+            break;
+
+        case std::future_status::ready:
+            {
+                const int iResult = future.m_result.get();
+                std::cout &lt;&lt; "future returned [" &lt;&lt; iResult &lt;&lt; "] (removing!)" &lt;&lt; std::endl;
+                futures.erase(it);
+
+                if (futures.empty()) {
+                    return 0;
+                } else {
+                    it = futures.begin();
+                }
+            }
+        }
+</code></pre>
+
+<p>Instead of returning to <code>futures.begin()</code> when we harvest a result, it's arguably better to keep going from the next element if there is one:</p>
+
+<pre><code>                it = futures.erase(it);
+                if (it == futures.end()) {
+                    if (futures.empty()) {
+                        return 0;
+                    } else {
+                        it = futures.begin();
+                    }
+                }
+</code></pre>
+
+<hr>
+
+<h2>Interleaved output</h2>
+
+<p>I know it's not part of your production code, but it's quite irritating to have the different threads' output interrupting each other mid-line.  We can provide a class to hold a lock while several items are written to a stream:</p>
+
+<pre><code>class LogStream
+{
+    static std::mutex mutex;
+
+    std::lock_guard&lt;std::mutex&gt; guard{mutex};
+    std::ostream&amp; stream{std::clog};
+
+public:
+    LogStream() {}
+    template&lt;typename T&gt;
+    std::ostream&amp; operator&lt;&lt;(T&amp;&amp; t) { return stream &lt;&lt; std::forward&lt;T&gt;(t); }
+};
+
+std::mutex LogStream::mutex;
+</code></pre>
+
+<p>And use it like this:</p>
+
+<pre><code>LogStream() &lt;&lt; "ThreadFunc waiting for [" &lt;&lt; iRand &lt;&lt; "] ms ... " &lt;&lt; std::endl;
+</code></pre>
+
+<hr>
+
+<h2>Be clear about units</h2>
+
+<p>I don't like this function name:</p>
+
+<pre><code>int GetAge() const
+</code></pre>
+
+<p>Perhaps change it to <code>getAgeMillis()</code>, or how about making it a template method? Like this:</p>
+
+<pre><code>template&lt;typename TimeUnit = std::chrono::seconds&gt;
+int GetAge() const
+{
+    auto now = std::chrono::system_clock::now();
+    return std::chrono::duration_cast&lt;TimeUnit&gt;(now - m_start).count();
+}
+</code></pre>
+
+<p>That also helps us deal with the very long lines that are a perennial problem with <code>duration_cast</code>.</p>
+
+<hr>
+
+<h2>Avoid polling</h2>
+
+<p>This is the big one.  It's very power-inefficient to poll every 1ms to see whether you have any results; that's a bad thing on battery-powered systems, but it's just as important in a server farm.</p>
+
+<p>What we need to do instead is have each finishing thread notify a condition variable.  When we're woken, we then examine all the futures, picking up any where <code>is_ready()</code>.</p>
+
+<p>Unfortunately, that means we can't use <code>std::async()</code>, as its future isn't made ready until the called function has returned.  We'll need to implement our own version that can accept a <code>std::condition_variable&amp;</code> to be notified <em>after</em> it sets the future's value.</p>
+
+<p>You might be able to pick up some advice from Stack Overflow - here's a couple of starting points that might have something relevant:</p>
+
+<ul>
+<li><a href="//stackoverflow.com/q/45852218">Signaling main thread when <code>std::future</code> is ready to be retrieved</a></li>
+<li><a href="//stackoverflow.com/q/44355747">How to implement <code>std::when_any</code> without polling?</a></li>
+</ul>
+    </div>

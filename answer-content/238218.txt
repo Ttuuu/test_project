@@ -1,0 +1,72 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>There's a couple of things to consider when designing a class -&gt; test relationship.</p>
+
+<p>First, I'd try hard to avoid the situation you're setting up where a command class can crash in its own constructor. It's usually a better idea to make sure that constructors are exception-safe if possible, since you never know what calling code may want to do with them. So the first thing I'd consider is simply turning <code>_extract_files()</code> into a regular public method and not calling it in the constructor.  Among other things, it simplifies the test code by allowing you to create test objects without pre-configuring things -- but it's also better in general.</p>
+
+<p>Which leads to number 2: it's better not to rely on the state of a local hard drive in tests. Ideally a test suite runs in a completely reproducible, zero-entropy environment which never changes  -- not even if your build machine is low on hard drive space, the network connection goes down, a user doesn't actually have a writable tempdir, and so on.  These kinds of conditions are often hard to work around, but thinking them through tends to make for better <em>testing</em>  - and that, in turn, leads to better code.</p>
+
+<p>In your case, <code>_files_from_rgx</code> really wants to be operating on the state of a local directory.  However the 'work' is really coming from the way the regex parses the file list.  So, one way to get good coverage is to refactor <code>Command</code> so that the parsing logic works on a file list (or better yet, any iterable since that's more generous).  In this case if you took the regex-filter function out you might get something like this for a start:</p>
+
+<pre><code>def _files_from_rgx(self, rgx):
+    """
+    Looks for files in the directory `self.dir_path` with names 
+    matched to the provided regex and returns those files names.
+    """
+    f = []
+    # incidentally since you're not using the recursion here,
+    # you could probably replace this with  
+    # f = os.listdir(self.dir_path)
+
+    for (dir_path, dirnames, filenames) in os.walk(self.dir_path):
+        f.extend(filenames)
+        break
+
+    return list(self._filter_by_regex(rgx, f))
+
+
+def _filter_by_regex(self, rgx, inputs):
+    """
+    loop over &lt;inputs&gt; yielding out values which are full-name
+    matches for the regex &lt;rgx&gt;
+    """
+    compiled_rgx = re.compile(rgx)
+
+    for each_file in inputs:
+        matched = compiled_rgx.match(each_file)
+        if matched and matched.span()[1] == len(each_file):
+            yield each_file
+</code></pre>
+
+<p>Now you can test the <code>_filter_by_regex</code> function in isolation :</p>
+
+<pre><code>  def test_filter_by_regex(self):
+       example = Command(some_test_args):
+       known_regex = ".*\.py"
+       sample_data = ['a.py', 'b.py', 'c.cpp', 'd.exe', 'e.py']
+       results = list(example._test_filter_by_regex(known_regex, sample_data))
+       self.assetListEqual(results, ['a.py', 'b.py', 'e.py']
+</code></pre>
+
+<p>This doesn't require you to actually create temp files and so on (note that you have to be a good citizen if you do create temp files, because if the tests are running on a build server you don't want to be leaking test files all over the place!).</p>
+
+<p>You didn't include source for <code>_file_from_name()</code> and <code>_names_from_file</code> but it would be a good idea to structure them and their tests so you can test them in the same way, without going to disk.  You'll eventually have a function somewhere what will have to call <code>os.listdir()</code> or <code>os.walk</code> and feed those functions -- but at least the part of the logic that is all yours will be covered by tests.</p>
+
+<p>The test you wrote does one thing that's really great, which is guaranteeing the exception raised by an empty file list.  That's a very good test, because it guarantees predictable behavior for users.  You can make that functionality independently testable with a similar small refactor that moves that into a separate function:</p>
+
+<pre><code>def _validate_file_list(self, file_list):
+   if not file_list:
+        raise FileNotFoundError("No files match")
+</code></pre>
+
+<p>And a matching test:</p>
+
+<pre><code>def test_validate_raises_on_empty_file(self):
+       example = command(some_test_args)
+       should_raise = lambda: example._validate_file_list([])
+       self.assertRaises(FileNotFoundError, should_raise)
+</code></pre>
+
+<p>There's another approach you could take, but I would recommend learning how to do the "old-fashioned" way first.  The <a href="https://docs.python.org/3/library/unittest.mock.html" rel="nofollow noreferrer"><code>mock module</code></a> would allow you to simulate the state of a disk by replacing calls to things like <code>os.walk</code> with a dummy function that return the same results every time without looking at the disk.  It's a very  powerful technique, but it can encourage code that's otherwise not easily testable.  I'd figure out more ways to isolate and test key code paths without <code>mock</code> before adding it in as a final level of testing. </p>
+
+<p>For a good look at the philosophy of breaking out logic and IO, I highly recommend this talk by Python core dev Brandon Rhodes:  <a href="https://youtu.be/PBQN62oUnN8" rel="nofollow noreferrer">https://youtu.be/PBQN62oUnN8</a></p>
+    </div>

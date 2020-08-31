@@ -1,0 +1,131 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>1. Review</h3>
+
+<p>The large bounty suggests that getting a review of this code is important. But there are some other things you could have done to make reviewing this code more productive:</p>
+
+<ol>
+<li><p>Give us some more context. What is the purpose of this code? What do these rotated rectangles represent?</p></li>
+<li><p>Tell us how the data computed in <code>main</code> relates to your problem. Is this the actual data you are using in your application? Or is it example/test data?</p></li>
+<li><p>Write docstrings. What does <code>jaccard</code> do? What arguments does it take? What does it return? Both arguments seem to be arrays of rotated rectangles, but how are they specified?</p></li>
+<li><p><code>box_a</code> seems to be an array of 5-tuples (<em>centre x</em>, <em>centre y</em>, <em>width</em>, <em>height</em>, <em>rotation in quarter-turns</em>), while <code>box_b</code> seems to be an array of 768×768 rasterizations. Giving different kinds of data similar names is asking for confusion: it would be clearer to use a name like <code>box_images_b</code>. Or even better, take the two arrays of rectangles in the same format and do the rasterization for both in the function, instead of doing one in the caller and one in the function.</p></li>
+<li><p>It is unusual to represent angles as anything other than degrees or radians, so the representation as quarter-turns requires an explanation.</p></li>
+<li><p>Write comments. What do the values mean in the variables <code>anc_grids</code>, <code>anc_zooms</code> etc.?</p></li>
+<li><p>Remove unused variables like <code>grid_sizes</code>.</p></li>
+<li><p>Follow the advice in <a href="https://www.python.org/dev/peps/pep-0008/#maximum-line-length" rel="noreferrer">PEP 8</a> and keep the lines to 79 characters or fewer, so that we don't have to scroll the code horizontally to read it.</p></li>
+</ol>
+
+<p>You've written more than a hundred answers on Code Review, so it seems to me that you ought to be aware of all this advice already! Documentation, clean code, and consistency is good for everyone, not just for beginners.</p>
+
+<h3>2. Use shapely for fast geometric operations</h3>
+
+<p>Finding the intersection-over-union for a pair of polygons is trivial if you use the <a href="http://toblerity.org/shapely/" rel="noreferrer">shapely</a> geometry package. For example, suppose we have two polygons:</p>
+
+<pre><code>from shapely.geometry import Polygon
+
+a = Polygon([(1, 1), (5, 1), (5, 4), (1, 4)])
+b = Polygon([(2, 2), (6, 3), (5, 7), (1, 6)])
+</code></pre>
+
+<p>Here <code>a</code> is shown as a green rectangle in the figure below, and <code>b</code> as a red square. The intersection over union can be computed like this:</p>
+
+<pre><code>&gt;&gt;&gt; a.intersection(b).area / a.union(b).area
+0.2275132275132275
+</code></pre>
+
+<p>This takes about 300 µs on my laptop:</p>
+
+<pre><code>&gt;&gt;&gt; from timeit import timeit
+&gt;&gt;&gt; timeit(lambda:a.intersection(b).area / a.union(b).area, number=1000) / 1000
+0.0003085929369844962
+</code></pre>
+
+<p><img src="https://i.stack.imgur.com/XIUoM.png" alt=""></p>
+
+<p>The geometric approach produces more accurate results than the rasterization approach in the post. For example, if we take the first pair of rectangles, <code>test_tensor[0]</code> and <code>anchors[0]</code>, the sample run in the post shows that an intersection-over-union of 0.0020 was computed. But the correct result is 0.0016 to 2 significant digits.</p>
+
+<h3>3. Use rtree for finding candidate intersections</h3>
+
+<p>Efficiently find objects that might intersect an axis-aligned rectangle by putting the axis-aligned bounding boxes for the objects into a <a href="https://en.wikipedia.org/wiki/R-tree" rel="noreferrer">R-tree</a> (for example, using the <a href="http://toblerity.org/rtree/" rel="noreferrer">rtree</a> package) and then query the rectangle of interest (for example, using the <a href="http://toblerity.org/rtree/tutorial.html#intersection" rel="noreferrer"><code>intersection</code></a> method).</p>
+
+<h3>4. Example implementation</h3>
+
+<pre><code>import rtree.index
+from shapely.affinity import rotate, translate
+from shapely.geometry import Polygon
+
+
+def rect_polygon(x, y, width, height, angle):
+    """Return a shapely Polygon describing the rectangle with centre at
+    (x, y) and the given width and height, rotated by angle quarter-turns.
+
+    """
+    w = width / 2
+    h = height / 2
+    p = Polygon([(-w, -h), (w, -h), (w, h), (-w, h)])
+    return translate(rotate(p, angle * 90), x, y)
+
+
+def intersection_over_union(rects_a, rects_b):
+    """Calculate the intersection-over-union for every pair of rectangles
+    in the two arrays.
+
+    Arguments:
+    rects_a: array_like, shape=(M, 5)
+    rects_b: array_like, shape=(N, 5)
+        Rotated rectangles, represented as (centre x, centre y, width,
+        height, rotation in quarter-turns).
+
+    Returns:
+    iou: array, shape=(M, N)
+        Array whose element i, j is the intersection-over-union
+        measure for rects_a[i] and rects_b[j].
+
+    """
+    m = len(rects_a)
+    n = len(rects_b)
+    if m &gt; n:
+        # More memory-efficient to compute it the other way round and
+        # transpose.
+        return intersection_over_union(rects_b, rects_a).T
+
+    # Convert rects_a to shapely Polygon objects.
+    polys_a = [rect_polygon(*r) for r in rects_a]
+
+    # Build a spatial index for rects_a.
+    index_a = rtree.index.Index()
+    for i, a in enumerate(polys_a):
+        index_a.insert(i, a.bounds)
+
+    # Find candidate intersections using the spatial index.
+    iou = np.zeros((m, n))
+    for j, rect_b in enumerate(rects_b):
+        b = rect_polygon(*rect_b)
+        for i in index_a.intersection(b.bounds):
+            a = polys_a[i]
+            intersection_area = a.intersection(b).area
+            if intersection_area:
+                iou[i, j] = intersection_area / a.union(b).area
+
+    return iou
+</code></pre>
+
+<p>Using the test data from the post, I find that computing the 5×756 array of results takes less than a quarter of a second:</p>
+
+<pre><code>&gt;&gt;&gt; len(TEST_RECTS_A), len(TEST_RECTS_B)
+(5, 756)
+&gt;&gt;&gt; intersection_over_union(TEST_RECTS_A, TEST_RECTS_B).shape
+(5, 756)
+&gt;&gt;&gt; timeit(lambda:intersection_over_union(TEST_RECTS_A, TEST_RECTS_B), number=1)
+0.22243631538003683
+</code></pre>
+
+<p>The memory used by the R-tree will be <span class="math-container">\$O(m)\$</span>, so the overall memory usage of this approach will be dominated by the size of the result, which is <span class="math-container">\$Θ(mn)\$</span>. You might be able to avoid building this array of results if you were willing to process the results one at a time, but that depends on how you are using this array, which you didn't tell us (see §1.1 above).</p>
+
+<h3>5. Further optimizations</h3>
+
+<p>If you're looking at further optimizations, the important thing to note is that the R-tree very efficiently disposes of the vast majority of possible intersections. With the example data from the post, there are 5×756 = 3780 pairs of rectangles, but the R-tree produces only 74 candidate pairs, of which 52 actually intersect.</p>
+
+<p>So if this behaviour is representative of the real problem space, then there's little to gain by clever optimization of the intersection-over-union calculation. Profiling shows that (roughly) 66% of runtime is spent in <code>rect_polygon</code> (mostly inside <code>translate</code> and <code>rotate</code>), 12% in <code>a.bounds</code> and <code>b.bounds</code>, but only 3% in <code>a.intersection(b).area</code> and 2% in <code>a.union(b).area</code>.</p>
+
+<p>So the first place to look for further speedups is in the affine transformation of the coordinates of the rotated rectangles. This would probably go faster if vectorized using NumPy.</p>
+    </div>

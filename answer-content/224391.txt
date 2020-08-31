@@ -1,0 +1,326 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>A little late answer. I have focused on <code>CommMemory</code> and tried to refactor it as I see fit. You have discussed most of the issues with dfhwze, so I have not much to add other than what I have commented inline in the code below. You may agree or not in my changes and/or use it as you want. Any way it was fun to review.</p>
+
+<p>I have removed most of your own comments in order to clear it up a little bit (while reviewing - I don't mean your comments are misplaced) and my comments all start with "HH:".</p>
+
+<pre><code>  // HH: I definitely don't like the concept of self-disposing, so the below omits that possibility
+  //     as well as the Disposed event. Instead is introduced a reinforced cancellation pattern, that allows for
+  //     cancellation via a constructor supplied cancellation token, and the read and write processes react to the state of that.
+
+  public sealed class CommMemory&lt;TValue&gt; : IDisposable
+  {
+    // HH: Added a CancellationToken as mandatory argument
+    public CommMemory(int capacity, bool clearOnRead, CancellationToken cancellationToken)
+      : this(new Memory&lt;TValue&gt;(new TValue[CheckCapacity(capacity)]), clearOnRead, cancellationToken)
+    {
+      // nix
+    }
+
+    // HH: Added a CancellationToken as mandatory argument
+    public CommMemory(Memory&lt;TValue&gt; buffer, bool clearOnRead, CancellationToken cancellationToken)
+    {
+      if (buffer.Length == 0)
+        throw new ArgumentException("Cannot use a buffer of length 0 for CommMemory");
+
+      memoryBuffer = buffer;
+      ClearOnRead = clearOnRead;
+      this.cancellationToken = cancellationToken;
+      memPosition = 0;
+      memUsed = 0;
+    }
+
+    // HH: All these fields:...
+    //private int ReadPosition;
+    //private int ReadAvailable;
+    //private int WritePosition;
+    //private int WriteAvailable;
+    // HH: ... can be replaced with these:
+    private int memPosition;
+    private int memUsed; // HH: See further below.
+
+    private readonly Memory&lt;TValue&gt; memoryBuffer;
+    private readonly CancellationToken cancellationToken; // HH: Added this to the constructor in order to cancel from both read and write clients
+    public int Capacity =&gt; memoryBuffer.Length; // HH: Capacity is a property of memoryBuffer
+
+    private readonly object availabilityLock = new object();
+    private readonly object disposeLock = new object();
+    private readonly object guardLock = new object();
+
+    // HH: changed name from ReadAvailableSemaphore
+    private readonly SemaphoreSlim readGuard = new SemaphoreSlim(0);
+    // HH: Guard against concurrent read
+    private readonly SemaphoreSlim readEntryGuard = new SemaphoreSlim(1);
+    // HH: changed named from WriteAvailableSemaphore
+    private readonly SemaphoreSlim writeGuard = new SemaphoreSlim(0);
+    // HH: Guard against concurrent write
+    private readonly SemaphoreSlim writeEntryGuard = new SemaphoreSlim(1);
+
+    private volatile bool isDisposed = false;
+    public bool IsDisposed =&gt; isDisposed;
+    public bool ClearOnRead { get; }
+
+    private static int CheckCapacity(int capacity)
+    {
+      if (capacity &lt;= 0)
+        throw new ArgumentOutOfRangeException("Capacity must be non-negative (greater than 0)");
+
+      return capacity;
+    }
+
+    public async ValueTask WriteAsync(ReadOnlyMemory&lt;TValue&gt; source)
+    {
+      if (source.Length == 0) return;
+
+      // HH: IMO all the EnsureAlive() is false security, because everywhere in between these calls in both read and write
+      //     anything can happen. Therefore two initial checks of disposed state here:
+      CheckDisposed();
+
+      try
+      {
+        // HH: Guard against concurrent entrence to write
+        await writeEntryGuard.WaitAsync(cancellationToken);
+
+        CheckDisposed();
+
+        int written = 0;
+
+        while (written &lt; source.Length)
+        {
+          cancellationToken.ThrowIfCancellationRequested();
+          int currentWritten = PerformWrite(ref source, written);
+          written += currentWritten;
+          // HH: Here I let it be up to the read thread to determine if there is anything to read so far. If not read will wait
+          CompleteWrite(currentWritten);
+          TryReleaseGuard(readGuard);
+
+          if (currentWritten == 0)
+          {
+            await writeGuard.WaitAsync(cancellationToken);
+          }
+        }
+      }
+      finally
+      {
+        writeEntryGuard.Release();
+      }
+    }
+
+    private int PerformWrite(ref ReadOnlyMemory&lt;TValue&gt; source, int sourcePosition)
+    {
+      (int writePosition, int length) = GetWriteInfo();
+      if (length == 0) return length;
+
+      length = Math.Min(length, source.Length - sourcePosition);
+
+      // HH: Moved all manipulation of source and memoryBuffer to here
+      //     So no magic happens in the call to this method...
+      ReadOnlyMemory&lt;TValue&gt; slice = source.Slice(sourcePosition, length);
+
+      // HH: I don't think the below will ever happen (in the original), because you guard carefully against that in WriteAsync()
+      //     And that holds for PerformRead() as well. That eliminates - as I see it - the possibility/need to self-dispose
+      //if (required &gt; WriteAvailable)
+      //{
+      //  DisposeInternal();
+      //  throw new Exception("Internal error in CommMemory: attempted to perform a write with insufficient space available.");
+      //}
+
+      // determine whether we need to cut the write in two
+      if (writePosition + length &gt; Capacity)
+      {
+        int headLength = Capacity - writePosition; // length of the first write
+        int tailLength = length - headLength; // length of the second write
+
+        var s0 = slice.Slice(0, headLength);
+        var m0 = memoryBuffer.Slice(writePosition, headLength);
+        s0.CopyTo(m0);
+
+        var s1 = slice.Slice(headLength, tailLength);
+        var m1 = memoryBuffer.Slice(0, tailLength);
+        s1.CopyTo(m1);
+      }
+      else
+      {
+        Memory&lt;TValue&gt; m = memoryBuffer.Slice(writePosition, length);
+        slice.CopyTo(m);
+      }
+
+      return length;
+    }
+
+    public async ValueTask ReadAsync(Memory&lt;TValue&gt; destination)
+    {
+      if (destination.Length == 0) return;
+
+      // HH: Equivalent considerations as for WriteAsync()
+
+      CheckDisposed();
+
+      try
+      {
+        await readEntryGuard.WaitAsync(cancellationToken);
+
+        CheckDisposed();
+
+        int read = 0;
+
+        while (read &lt; destination.Length)
+        {
+          cancellationToken.ThrowIfCancellationRequested();
+          int currentRead = 0;
+          currentRead = PerformRead(ref destination, read);
+          read += currentRead;
+          CompleteRead(currentRead);
+          TryReleaseGuard(writeGuard);
+
+          if (currentRead == 0)
+          {
+            await readGuard.WaitAsync(cancellationToken);
+          }
+        }
+      }
+      finally
+      {
+        readEntryGuard.Release();
+      }
+    }
+
+    private int PerformRead(ref Memory&lt;TValue&gt; destination, int destinationStart)
+    {
+      // HH: The same considerations as for PerformWrite()
+
+      (int readPosition, int length) = GetReadInfo();
+
+      if (length == 0) return 0;
+
+      length = Math.Min(length, destination.Length - destinationStart);
+
+      Memory&lt;TValue&gt; slice = destination.Slice(destinationStart, length);
+
+      // determine whether we need to cut the read in two
+      if (readPosition + length &gt; Capacity)
+      {
+        int headLength = Capacity - readPosition; // length of the first read
+        int tailLength = length - headLength; // length of the second read
+
+        var d0 = slice.Slice(0, headLength);
+        var m0 = memoryBuffer.Slice(readPosition, headLength);
+        m0.CopyTo(d0);
+
+        var d1 = slice.Slice(headLength, tailLength);
+        var m1 = memoryBuffer.Slice(0, tailLength);
+        m1.CopyTo(d1);
+
+        if (ClearOnRead)
+        {
+          m0.Span.Fill(default(TValue));
+          m1.Span.Fill(default(TValue));
+        }
+      }
+      else
+      {
+        var m = memoryBuffer.Slice(readPosition, length);
+        m.CopyTo(slice);
+
+        if (ClearOnRead)
+        {
+          m.Span.Fill(default(TValue));
+        }
+      }
+
+      return length;
+    }
+
+    private (int position, int length) GetWriteInfo()
+    {
+      lock (availabilityLock)
+      {
+        // HH: The available memory for writing is all that are not waiting to be read.
+        int position = (memPosition + memUsed) % Capacity;
+        return (position, Capacity - memUsed);
+      }
+    }
+
+    private (int position, int length) GetReadInfo()
+    {
+      lock (availabilityLock)
+      {
+        // HH: Avialable memory for reading is represented by the values of memPosition and memUsed
+        return (memPosition, memUsed);
+      }
+    }
+
+    private void CompleteWrite(int consumed)
+    {
+      if (consumed &lt;= 0) return;
+      lock (availabilityLock)
+      {
+        // HH: Just add the consumed memory to the already used
+        memUsed += consumed;
+      }
+    }
+
+    private void CompleteRead(int consumed)
+    {
+      if (consumed &lt;= 0) return;
+
+      lock (availabilityLock)
+      {
+        // HH: Offest memPosition by consumed and align to Capacity
+        memPosition = (memPosition + consumed) % Capacity;
+        // HH: reduce memUsed by the memory read 
+        memUsed -= consumed;
+      }
+    }
+
+    private void TryReleaseGuard(SemaphoreSlim guard)
+    {
+      lock (guardLock)
+      {// HH: I'm not quite sure this is necessary, but I try to prevent the guard to allow more than one entrence at a time
+        if (guard.CurrentCount == 0)
+        {
+          guard.Release();
+        }
+      }
+    }
+
+    public void Dispose()
+    {
+      Dispose(true);
+    }
+
+    // HH: renamed DisposeInternal() and implemented the normal Dispose pattern
+    private void Dispose(bool isDisposing)
+    {
+      if (isDisposing)
+      {
+        lock (disposeLock)
+        {
+          if (isDisposed) return;
+          isDisposed = true;
+
+          memoryBuffer.Span.Clear();
+
+          readEntryGuard.Release();
+          readEntryGuard.Dispose();
+          readGuard.Release();
+          readGuard.Dispose();
+
+          writeEntryGuard.Release();
+          writeEntryGuard.Dispose();
+          writeGuard.Release();
+          writeGuard.Dispose();
+        }
+      }
+    }
+
+    private void CheckDisposed()
+    {
+      if (isDisposed)
+      {
+        // HH: changed from CommMemoryDisposedException
+        throw new ObjectDisposedException(nameof(CommMemory&lt;TValue&gt;));
+      }
+    }
+  }
+</code></pre>
+    </div>

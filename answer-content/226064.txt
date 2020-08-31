@@ -1,0 +1,204 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This is some really nifty code. Good job. :)</p>
+
+<hr>
+
+<p>Use constructor initializer lists where practical (and initialize variables in the order written in the class). We can request value-initialization of the arrays to fill them with zeros, rather than using <code>fill</code>. We can use <code>std::copy</code> to put the <code>fontset</code> in <code>memory</code>:</p>
+
+<pre><code>Chip8::Chip8():
+    memory(),
+    V(),
+    stack(),
+    keys(),
+    graphics(),
+    delay_timer(0),
+    sound_timer(0),
+    I(0),
+    pc(0),
+    sp(0),
+    gen(std::random_device()()),
+    draw_flag(false)
+{
+    std::array&lt;std::uint8_t, 80&gt; fontset = ...;
+    std::copy(fontset.begin(), fontset.end(), memory.begin());
+}
+</code></pre>
+
+<hr>
+
+<p>It looks like <code>rd</code> isn't used anywhere except the constructor, so it doesn't need to be a member variable. <code>opcode</code> isn't used outside of <code>emulate_cycle()</code>, so it can be a local variable.</p>
+
+<hr>
+
+<p>In <code>load_rom()</code> we can pass the <code>path</code> argument by <code>const&amp;</code> to avoid an unnecessary copy:</p>
+
+<pre><code>void Chip8::load_rom(std::string const&amp; path) { ...
+</code></pre>
+
+<p>There's a lot that can go wrong in this function, and we need to handle those cases. We don't want to keep running with invalid data.</p>
+
+<pre><code>bool Chip8::load_rom(std::string const&amp; path) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+
+    if (!file) // failed to open file!
+        return false;
+
+    std::ifstream::pos_type file_size = file.tellg();
+
+    if (file_size == std::ifstream::pos_type(-1)) // tell failed!
+        return false;
+
+    file.seekg(0, std::ios::beg);
+
+    if (!file) // seek failed!
+        return false;
+
+    if (file_size &gt; memory.size() - 512) // won't fit in memory!
+        return false;
+
+    std::vector&lt;std::uint8_t&gt; buffer(file_size);
+    file.read(reinterpret_cast&lt;char*&gt;(buffer.data()), file_size);
+
+    if (!file) // read failed!
+        return false;
+
+    std::copy(buffer.begin(), buffer.end(), memory.begin() + 512);
+}
+</code></pre>
+
+<p>It would probably be a good idea to make that <code>512</code> offset a named constant of <code>std::size_t</code>.</p>
+
+<hr>
+
+<p>As previously mentioned, it looks like <code>opcode</code> can be a local variable:</p>
+
+<pre><code>void Chip8::emulate_cycle() {
+    std::uint16_t opcode = memory[pc] &lt;&lt; 8 | memory[pc + 1];  // get instruction
+</code></pre>
+
+<p>The <code>emulate_cycle</code> functionality could helpfully be split into separate functions. There's a lot of duplication in the code (e.g. incrementing the current address) that we can eliminate. The code is quite concise, so adding functions will make it longer overall, but it should also become more readable and need fewer comments.</p>
+
+<p>Note that <code>x</code>, <code>y</code>, <code>kk</code> and <code>n</code> aren't needed for every operation, so we can wait until we've identified the actual operation we need before extracting them. e.g.</p>
+
+<pre><code>...
+    case 0x1000: // 0x1nnn
+        op_jump(opcode);
+        break;
+    case 0x2000: // 0x2nnn
+        op_call(opcode);
+        break;
+    case 0x3000: // 0x3xnn
+        op_skip_eq_x_nn(opcode);
+        break;
+    case 0x4000: // 0x4xnn
+        op_skip_ne_x_nn(opcode);
+        break;
+...
+</code></pre>
+
+<p>The nested switch statements also create a lot of overhead (in terms of code) in selecting the operation we need to execute. Ideally we'd like to map directly from <code>opcode</code> to the relevant operation... something like this:</p>
+
+<pre><code>// in the constructor:
+std::map&lt;std::uint16_t, op_t&gt; ops = {
+    { 0x00E0, op_clear_display },
+    { 0x00EE, op_return },
+    ...
+};
+
+// in emulate_cycle():
+std::uint16_t opcode = ...;
+auto ops_entry = ops.find(opcode);
+
+if (ops_entry == ops.end()) ...; //  handle error
+
+op_entry.second(opcode); // execute the operation
+</code></pre>
+
+<p>Obviously this won't work since the opcode isn't an exact value. But we can work around that by changing the index type to store a mask and defining some custom comparison operators. e.g.:</p>
+
+<pre><code>#include &lt;cstdint&gt;
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+
+using op_t = std::function&lt;void(std::uint16_t)&gt;;
+
+struct Mask
+{
+    std::uint16_t value;
+    std::uint16_t mask;
+};
+
+bool operator&lt;(Mask const&amp; a, Mask const&amp; b) {
+    return a.value &lt; (a.mask &amp; b.value);
+}
+
+bool operator&lt;(Mask const&amp; a, std::uint16_t b) {
+    return a.value &lt; (a.mask &amp; b);
+}
+
+bool operator&lt;(std::uint16_t a, Mask const&amp; b) {
+    return b.value &lt; (b.mask &amp; a);
+}
+
+int main()
+{
+    std::cout &lt;&lt; std::hex;
+
+    op_t op_clear_display = [] (std::uint16_t) {
+        std::cout &lt;&lt; "clear" &lt;&lt; "\n";
+    };
+
+    op_t op_return = [] (std::uint16_t) {
+        std::cout &lt;&lt; "return" &lt;&lt; "\n";
+    };
+
+    op_t op_jump_nnn = [] (std::uint16_t opcode) {
+        std::uint16_t address = (opcode &amp; 0x0FFF);
+        std::cout &lt;&lt; "jump to: " &lt;&lt; address &lt;&lt; "\n";
+    };
+
+    std::map&lt;Mask, op_t, std::less&lt;&gt;&gt; ops = {
+        { { 0x00E0, 0xFFFF }, op_clear_display },
+        { { 0x00EE, 0xFFFF }, op_return },
+        { { 0x1000, 0xF000 }, op_jump_nnn },
+        // ...
+        // { { 0x3000, 0xF000 }, op_skip_eq_x_nn },
+        // ...
+        // { { 0x8000, 0xF00F }, op_add_x_y },
+        // ...
+        // { { 0xA000, 0xF000 }, op_set_i_nnn },
+        // ...
+        // { { 0xE09E, 0xF0FF }, op_skip_eq_k_x },
+        // ... 
+    };
+
+    std::uint16_t opcode = 0x10E0;
+
+    auto ops_entry = ops.find(opcode);
+
+    if (ops_entry == ops.end())
+    {
+        std::cout &lt;&lt; "op not found!" &lt;&lt; "\n";
+        return EXIT_SUCCESS;
+    }
+
+    ops_entry-&gt;second(opcode);
+
+    return EXIT_SUCCESS;
+}
+</code></pre>
+
+<hr>
+
+<p>Member functions that don't change any internal state should be declared <code>const</code>, e.g.:</p>
+
+<pre><code>bool get_draw_flag() const;
+std::uint8_t get_pixel_data(int i) const;
+std::uint8_t get_sound_timer() const;
+</code></pre>
+
+<hr>
+
+<p>(I'll try to come back to this later if I have some more time).</p>
+    </div>

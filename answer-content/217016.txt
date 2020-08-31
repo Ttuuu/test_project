@@ -1,0 +1,547 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>That's my parallel merge sort. It's a class with thread-pooling and attached to each thread there is a sort buffer which is recycled when a standby-thread gets another segment to sort; this ensures that the thread works with its memory already lying in the most local caches. The code uses the thread with the most-fitting sort-buffer or when all standby-threads have to small sort-buffers, one thread is arbitrarily chosen and the size of the sort-buffer is adjusted accordingly.</p>
+
+<p>The class is instantiated once with the predicate and you can call .sort() multiple times with the thread- and buffer-pool recycled for each call. Or you can create a temporary object and then call .sort on it, i.e. call parallel_merge_sort().sort( ... ).</p>
+
+<pre><code>#include &lt;vector&gt;
+#include &lt;list&gt;
+#include &lt;thread&gt;
+#include &lt;memory&gt;
+#include &lt;mutex&gt;
+#include &lt;condition_variable&gt;
+#include &lt;algorithm&gt;
+#include &lt;utility&gt;
+#include &lt;exception&gt;
+#include &lt;cassert&gt;
+#include &lt;iterator&gt;
+
+template&lt;typename T&gt;
+struct invoke_on_destruct
+{
+private:
+    T    &amp;m_t;
+    bool  m_enabled;
+
+public:
+    invoke_on_destruct( T &amp;t ) :
+        m_t( t ), m_enabled( true )
+    {
+    }
+
+    ~invoke_on_destruct()
+    {
+        if( m_enabled )
+            m_t();
+    }
+
+    void invoke_and_disable()
+    {
+        m_t();
+        m_enabled = false;
+    }
+};
+
+struct sort_exception : public std::exception
+{
+};
+
+template&lt;typename InputIt, typename P = std::less&lt;typename std::iterator_traits&lt;InputIt&gt;::value_type&gt;&gt;
+class parallel_merge_sort
+{
+public:
+                parallel_merge_sort( P const &amp;p = P() );
+                ~parallel_merge_sort();
+    void        sort( InputIt itBegin, size_t n, std::size_t minThreaded );
+    std::size_t get_buffer_size();
+    void        empty_buffers();
+
+private:
+    typedef typename std::iterator_traits&lt;InputIt&gt;::value_type value_type;
+    typedef typename std::vector&lt;value_type&gt;                   buffer_type;
+    typedef typename buffer_type::iterator                     buffer_iterator;
+
+    struct pool_thread
+    {
+        enum CMD : int { CMD_STOP = -1, CMD_NONE = 0, CMD_SORT    = 1 };
+        enum RSP : int { RSP_ERR  = -1, RSP_NONE = 0, RSP_SUCCESS = 1 };
+
+        std::thread             m_thread;
+        std::mutex              m_mtx;
+        std::condition_variable m_sigInitiate;
+        CMD                     m_cmd;
+        buffer_iterator         m_itBegin;
+        std::size_t             m_n;
+        std::condition_variable m_sigResponse;
+        RSP                     m_rsp;
+        std::vector&lt;value_type&gt; m_sortBuf;
+
+                           pool_thread( parallel_merge_sort *pPMS );
+                           ~pool_thread();
+        void               sort_thread( parallel_merge_sort *pPMS );
+        static std::size_t calc_buffer_size( size_t n );
+    };
+
+    P                      m_p;
+    std::size_t            m_minThreaded;
+    unsigned               m_maxRightThreads;
+    buffer_type            m_callerSortBuf;
+    std::mutex             m_mtxPool;
+    std::list&lt;pool_thread&gt; m_standbyThreads;
+    std::list&lt;pool_thread&gt; m_activeThreads;
+
+    template&lt;typename InputIt2&gt;
+    void threaded_sort( InputIt2 itBegin, std::size_t n, buffer_iterator itSortBuf );
+    template&lt;typename InputIt2&gt;
+    void unthreaded_sort( InputIt2 itBegin, std::size_t n, buffer_iterator itSortBuf );
+    template&lt;typename OutputIt&gt;
+    void merge_back( OutputIt itUp, buffer_iterator itLeft, buffer_iterator itLeftEnd, buffer_iterator itRight, buffer_iterator itRightEnd );
+};
+
+template&lt;typename InputIt, typename P&gt;
+parallel_merge_sort&lt;InputIt, P&gt;::parallel_merge_sort( P const &amp;p ) :
+    m_p( p )
+{
+    unsigned hc = std::thread::hardware_concurrency();
+    m_maxRightThreads = hc != 0 ? (hc - 1) : 0;
+}
+
+template&lt;typename InputIt, typename P&gt;
+void parallel_merge_sort&lt;InputIt, P&gt;::sort( InputIt itBegin, size_t n, std::size_t minThreaded )
+{
+    size_t const MIN_SIZE = 2;
+    if( n &lt; MIN_SIZE )
+        return;
+    if( (m_minThreaded = minThreaded) &lt; (2 * MIN_SIZE) )
+        m_minThreaded = 2 * MIN_SIZE;
+    try
+    {
+        std::size_t s = pool_thread::calc_buffer_size( n );
+        if( m_callerSortBuf.size() &lt; s )
+            m_callerSortBuf.resize( s );
+        threaded_sort( itBegin, n, m_callerSortBuf.begin() );
+    }
+    catch( ... )
+    {
+        throw sort_exception();
+    }
+}
+
+template&lt;typename InputIt, typename P&gt;
+parallel_merge_sort&lt;InputIt, P&gt;::~parallel_merge_sort()
+{
+    assert(m_activeThreads.size() == 0);
+}
+
+template&lt;typename InputIt, typename P&gt;
+inline
+std::size_t parallel_merge_sort&lt;InputIt, P&gt;::pool_thread::calc_buffer_size( std::size_t n )
+{
+    for( std::size_t rest = n, right; rest &gt; 2; )
+        right  = rest - (rest / 2),
+        n     += right,
+        rest   = right;
+    return n;
+}
+
+template&lt;typename InputIt, typename P&gt;
+parallel_merge_sort&lt;InputIt, P&gt;::pool_thread::~pool_thread()
+{
+    using namespace std;
+    unique_lock&lt;mutex&gt; threadLock( m_mtx );
+    m_cmd = pool_thread::CMD_STOP;
+    m_sigInitiate.notify_one();
+    threadLock.unlock();
+    m_thread.join();
+}
+
+template&lt;typename InputIt, typename P&gt;
+template&lt;typename InputIt2&gt;
+void parallel_merge_sort&lt;InputIt, P&gt;::threaded_sort( InputIt2 itBegin, std::size_t n, buffer_iterator itSortBuf )
+{
+    using namespace std;
+    unique_lock&lt;mutex&gt; poolLock( m_mtxPool );
+
+    if( n &lt; m_minThreaded || (m_standbyThreads.empty() &amp;&amp; m_activeThreads.size() &gt;= m_maxRightThreads) )
+    {
+        poolLock.unlock();
+        unthreaded_sort( itBegin, n, itSortBuf );
+        return;
+    }
+
+    typedef typename list&lt;pool_thread&gt;::iterator pt_it;
+    pt_it        itPT;
+    pool_thread *pPT;
+    size_t       left  = n / 2,
+                 right = n - left;
+    if( !m_standbyThreads.empty() )
+    {
+        pt_it  itPTScan;
+        size_t optimalSize = pool_thread::calc_buffer_size( right ),
+               bestFit     = (size_t)(ptrdiff_t)-1,
+               size;
+        for( itPT = m_standbyThreads.end(), itPTScan = m_standbyThreads.begin();
+             itPTScan != m_standbyThreads.end(); ++itPTScan )
+            if( (size = itPTScan-&gt;m_sortBuf.size()) &gt;= optimalSize &amp;&amp; size &lt; bestFit )
+                itPT    = itPTScan,
+                bestFit = size;
+        if( itPT == m_standbyThreads.end() )
+            itPT = --m_standbyThreads.end();
+        m_activeThreads.splice( m_activeThreads.end(), m_standbyThreads, itPT );
+        poolLock.unlock();
+        pPT = &amp;*itPT;
+    }
+    else
+        m_activeThreads.emplace_back( this ),
+        itPT = --m_activeThreads.end(),
+        pPT = &amp;*itPT,
+        poolLock.unlock();
+
+    auto pushThreadBack = [&amp;poolLock, &amp;itPT, this]()
+        {
+            poolLock.lock();
+            m_standbyThreads.splice( m_standbyThreads.end(), m_activeThreads, itPT );
+        };
+    invoke_on_destruct&lt;decltype(pushThreadBack)&gt; autoPushBackThread( pushThreadBack );
+
+    buffer_iterator itMoveTo = itSortBuf;
+    for( InputIt2 itMoveFrom = itBegin, itEnd = itMoveFrom + n; itMoveFrom != itEnd; *itMoveTo = move( *itMoveFrom ), ++itMoveTo, ++itMoveFrom );
+
+    buffer_iterator    itLeft  = itSortBuf,
+                       itRight = itLeft + left;
+    unique_lock&lt;mutex&gt; threadLock( pPT-&gt;m_mtx );
+    pPT-&gt;m_cmd     = pool_thread::CMD_SORT;
+    pPT-&gt;m_rsp     = pool_thread::RSP_NONE;
+    pPT-&gt;m_itBegin = itRight;
+    pPT-&gt;m_n       = right;
+    pPT-&gt;m_sigInitiate.notify_one();
+    threadLock.unlock();
+
+    auto waitForThread = [&amp;threadLock, pPT]()
+        {
+            threadLock.lock();
+            while( pPT-&gt;m_rsp == pool_thread::RSP_NONE )
+                pPT-&gt;m_sigResponse.wait( threadLock );
+            assert(pPT-&gt;m_rsp == pool_thread::RSP_SUCCESS || pPT-&gt;m_rsp == pool_thread::RSP_ERR);
+        };
+    invoke_on_destruct&lt;decltype(waitForThread)&gt; autoWaitForThread( waitForThread );
+
+    threaded_sort( itLeft, left, itSortBuf + n );
+
+    autoWaitForThread.invoke_and_disable();
+    if( pPT-&gt;m_rsp == pool_thread::RSP_ERR )
+        throw sort_exception();
+    threadLock.unlock();
+
+    merge_back( itBegin, itLeft, itLeft + left, itRight, itRight + right );
+}
+
+template&lt;typename InputIt, typename P&gt;
+template&lt;typename InputIt2&gt;
+void parallel_merge_sort&lt;InputIt, P&gt;::unthreaded_sort( InputIt2 itBegin, std::size_t n, buffer_iterator itSortBuf )
+{
+    assert(n &gt;= 2);
+    using namespace std;
+    if( n == 2 )
+    {
+        if( m_p( itBegin[1], itBegin[0] ) )
+        {
+            value_type temp( move( itBegin[0] ) );
+            itBegin[0] = move( itBegin[1] );
+            itBegin[1] = move( temp );
+        }
+        return;
+    }
+
+    buffer_iterator itMoveTo = itSortBuf;
+    for( InputIt2 itMoveFrom = itBegin, itEnd = itMoveFrom + n; itMoveFrom != itEnd; *itMoveTo = move( *itMoveFrom ), ++itMoveTo, ++itMoveFrom );
+
+    size_t          left   = n / 2,
+                    right  = n - left;
+    buffer_iterator itLeft  = itSortBuf,
+                    itRight = itLeft + left;
+    if( left &gt;= 2 )
+        unthreaded_sort( itLeft,  left,  itSortBuf + n );
+    if( right &gt;= 2 )
+        unthreaded_sort( itRight, right, itSortBuf + n );
+    merge_back( itBegin, itLeft, itLeft + left, itRight, itRight + right );
+}
+
+template&lt;typename InputIt, typename P&gt;
+template&lt;typename OutputIt&gt;
+inline
+void parallel_merge_sort&lt;InputIt, P&gt;::merge_back( OutputIt itUp, buffer_iterator itLeft, buffer_iterator itLeftEnd, buffer_iterator itRight, buffer_iterator itRightEnd )
+{
+    assert(itLeft &lt; itLeftEnd &amp;&amp; itRight &lt; itRightEnd);
+    using namespace std;
+    for( ; ; )
+        if( m_p( *itLeft, *itRight ) )
+        {
+            *itUp = move( *itLeft );
+            ++itUp, ++itLeft;
+            if( itLeft == itLeftEnd )
+            {
+                for( ; itRight != itRightEnd; *itUp = move( *itRight ), ++itUp, ++itRight );
+                break;
+            }
+        }
+        else
+        {
+            *itUp = move( *itRight );
+            ++itUp, ++itRight;
+            if( itRight == itRightEnd )
+            {
+                for( ; itLeft != itLeftEnd; *itUp = move( *itRight ), ++itUp, ++itLeft );
+                break;
+            }
+        }
+}
+
+template&lt;typename InputIt, typename P&gt;
+std::size_t parallel_merge_sort&lt;InputIt, P&gt;::get_buffer_size()
+{
+    std::size_t s = 0;
+    for( pool_thread &amp;pt : m_standbyThreads )
+        s += pt.m_sortBuf.capacity();
+    return s + m_callerSortBuf.capacity();
+}
+
+template&lt;typename InputIt, typename P&gt;
+void parallel_merge_sort&lt;InputIt, P&gt;::empty_buffers()
+{
+    for( pool_thread &amp;pt : m_standbyThreads )
+        pt.m_sortBuf.clear(),
+        pt.m_sortBuf.shrink_to_fit();
+    m_callerSortBuf.clear();
+    m_callerSortBuf.shrink_to_fit();
+}
+
+template&lt;typename InputIt, typename P&gt;
+parallel_merge_sort&lt;InputIt, P&gt;::pool_thread::pool_thread( parallel_merge_sort *pPMS ) :
+    m_mtx(),
+    m_sigInitiate(),
+    m_cmd( pool_thread::CMD_NONE ),
+    m_thread( std::thread( []( pool_thread *pPT, parallel_merge_sort *pPMS ) -&gt; void { pPT-&gt;sort_thread( pPMS ); }, this, pPMS ) )
+{
+}
+
+template&lt;typename InputIt, typename P&gt;
+void parallel_merge_sort&lt;InputIt, P&gt;::pool_thread::sort_thread( parallel_merge_sort *pPMS )
+{
+    using namespace std;
+    for( ; ; )
+    {
+        unique_lock&lt;mutex&gt; threadLock( m_mtx );
+        while( m_cmd == CMD_NONE )
+            m_sigInitiate.wait( threadLock );
+        if( m_cmd == CMD_STOP )
+            return;
+        assert(m_cmd == pool_thread::CMD_SORT);
+        m_cmd = CMD_NONE;
+        threadLock.unlock();
+        bool success;
+        try
+        {
+            size_t size = calc_buffer_size( m_n );
+            if( m_sortBuf.size() &lt; size )
+                m_sortBuf.resize( size );
+            pPMS-&gt;threaded_sort( m_itBegin, m_n, m_sortBuf.begin() );
+            success = true;
+        }
+        catch( ... )
+        {
+            success = false;
+        }
+        threadLock.lock();
+        m_rsp = success ? RSP_SUCCESS : RSP_ERR,
+        m_sigResponse.notify_one();
+    }
+}
+
+template&lt;typename InputIt, typename P = std::less&lt;typename std::iterator_traits&lt;InputIt&gt;::value_type&gt;&gt;
+class ref_parallel_merge_sort
+{
+private:
+    struct ref
+    {
+        InputIt it;
+    };
+
+    struct ref_predicate
+    {
+        ref_predicate( P p );
+        bool operator ()( ref const &amp;left, ref const &amp;right );
+        P m_p;
+    };
+
+public:
+                ref_parallel_merge_sort( P const &amp;p = P() );
+    void        sort( InputIt itBegin, size_t n, std::size_t maxUnthreaded );
+    std::size_t get_buffer_size();
+    void        empty_buffers();
+
+private:
+    parallel_merge_sort&lt;ref, ref_predicate&gt; m_sorter;
+};
+
+template&lt;typename InputIt, typename P&gt;
+inline
+ref_parallel_merge_sort&lt;InputIt, P&gt;::ref_predicate::ref_predicate( P p ) :
+    m_p ( p )
+{
+}
+
+template&lt;typename InputIt, typename P&gt;
+inline
+bool ref_parallel_merge_sort&lt;InputIt, P&gt;::ref_predicate::operator ()( ref const &amp;left, ref const &amp;right )
+{
+    return m_p( *left.it, *right.it );
+}
+
+template&lt;typename InputIt, typename P&gt;
+inline
+ref_parallel_merge_sort&lt;InputIt, P&gt;::ref_parallel_merge_sort( P const &amp;p ) :
+    m_sorter( ref_predicate( p ) )
+{
+}
+
+template&lt;typename InputIt, typename P&gt;
+void ref_parallel_merge_sort&lt;InputIt, P&gt;::sort( InputIt itBegin, size_t n, std::size_t maxUnthreaded )
+{
+    using namespace std;
+    try
+    {
+        typedef typename iterator_traits&lt;InputIt&gt;::value_type value_type;
+        vector&lt;ref&gt; refBuf;
+        InputIt     it;
+        int         i;
+
+        refBuf.resize( n );
+        for( i = 0, it = itBegin; i != n; refBuf[i].it = it, ++i, ++it );
+        m_sorter.sort( &amp;refBuf[0], n, maxUnthreaded );
+
+        vector&lt;value_type&gt; reorderBuf;
+        reorderBuf.resize( n );
+        for( i = 0, it = itBegin; i != n; reorderBuf[i] = move( *it ),           ++i, ++it );
+        for( i = 0, it = itBegin; i != n; *it           = move( reorderBuf[i] ), ++i, ++it );
+    }
+    catch( ... )
+    {
+        throw sort_exception();
+    }
+}
+
+template&lt;typename InputIt, typename P&gt;
+inline
+std::size_t ref_parallel_merge_sort&lt;InputIt, P&gt;::get_buffer_size()
+{
+    return m_sorter.get_buffer_size();
+}
+
+template&lt;typename InputIt, typename P&gt;
+inline
+void ref_parallel_merge_sort&lt;InputIt, P&gt;::empty_buffers()
+{
+    m_sorter.empty_buffers();
+}
+
+#include &lt;iostream&gt;
+#include &lt;cstdlib&gt;
+#include &lt;functional&gt;
+#include &lt;random&gt;
+#include &lt;cstdint&gt;
+#include &lt;iterator&gt;
+#include &lt;type_traits&gt;
+
+#if defined(_MSC_VER)
+    #include &lt;Windows.h&gt;
+
+double get_usecs()
+{
+    LONGLONG liTime;
+    GetSystemTimeAsFileTime( &amp;(FILETIME &amp;)liTime );
+    return (double)liTime / 10.0;
+}
+#elif defined(__unix__)
+    #include &lt;sys/time.h&gt;
+
+double get_usecs()
+{
+    timeval tv;
+    gettimeofday( &amp;tv, nullptr );
+    return (double)tv.tv_sec * 1'000'000.0 + tv.tv_usec;
+}
+#elif
+    #error no OS-support for get_usecs()
+#endif
+
+using namespace std;
+
+void fill_with_random( double *p, size_t n, unsigned seed = 0 )
+{
+    default_random_engine re( seed );
+    uniform_real_distribution&lt;double&gt; distrib;
+    for( double *pEnd = p + n; p != pEnd; *p++ = distrib( re ) );
+}
+
+template&lt;typename T, typename = typename enable_if&lt;is_unsigned&lt;T&gt;::value, T&gt;::type&gt;
+string decimal_unsigned( T t );
+
+int main()
+{
+    typedef typename vector&lt;double&gt;::iterator it_type;
+    size_t const   SIZE = (size_t)1024 * 1024 * 1024 / sizeof(double);
+    unsigned       hc   = thread::hardware_concurrency();
+    vector&lt;double&gt; v;
+    double         t;
+
+    hc = hc ? hc : 1;
+    v.resize( SIZE );
+
+    parallel_merge_sort&lt;it_type&gt; sd;
+
+    fill_with_random( &amp;v[0], SIZE );
+    t = get_usecs();
+    sd.sort( v.begin(), SIZE, SIZE / hc );
+    t = get_usecs() - t;
+    cout &lt;&lt; (t / 1'000'000.0) &lt;&lt; " seconds parallel" &lt;&lt; endl;
+    cout &lt;&lt; decimal_unsigned( sd.get_buffer_size() * sizeof(double) ) &lt;&lt; endl;
+    sd.empty_buffers();
+
+    fill_with_random( &amp;v[0], SIZE );
+    t = get_usecs();
+    sd.sort( v.begin(), SIZE, SIZE );
+    t = get_usecs() - t;
+    cout &lt;&lt; (t / 1'000'000.0) &lt;&lt; " seconds sequential" &lt;&lt; endl;
+    cout &lt;&lt; decimal_unsigned( sd.get_buffer_size() * sizeof(double) ) &lt;&lt; endl;
+    sd.empty_buffers();
+}
+
+#include &lt;sstream&gt;
+
+string decify_string( string const &amp;s );
+
+template&lt;typename T, typename&gt;
+string decimal_unsigned( T t )
+{
+    using namespace std;
+    ostringstream oss;
+    return move( decify_string( (oss &lt;&lt; t, oss.str()) ) );
+}
+
+string decify_string( string const &amp;s )
+{
+    using namespace std;
+    ostringstream oss;
+    size_t        length   = s.length(),
+                  head     = length % 3,
+                  segments = length / 3;
+    if( head == 0 &amp;&amp; segments &gt;= 1 )
+        head = 3,
+        --segments;
+    oss &lt;&lt; s.substr( 0, head );
+    for( size_t i = head; i != length; i += 3 )
+        oss &lt;&lt; "." &lt;&lt; s.substr( i, 3 );
+    return move( oss.str() );
+}
+</code></pre>
+    </div>

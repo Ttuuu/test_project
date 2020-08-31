@@ -1,0 +1,210 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>There’s actually quite a bit you can do to simplify the listener class, while at the same time making it easier and more flexible to use!</p>
+<p>Let’s start with deleting the default constructor: you actually don’t need to do this. Classes get an automatically-generated default constructor <em>only if there are no other constructors defined</em>. But in your class, there <em>is</em> another constructor defined! So the default constructor is already deleted.</p>
+<p>See for yourself! Try this:</p>
+<pre><code>// No constructors are defined, so the class gets a default constructor.
+class foo {};
+
+// A constructor is defined, so the default constructor is suppressed.
+class bar
+{
+public:
+    explicit bar(int) {}
+};
+
+// This will compile:
+auto f = foo{};
+
+// This will not:
+//auto b1 = bar{};
+
+// But of course, this will compile:
+auto b2 = bar{42};
+</code></pre>
+<p>So right away, you can drop the line deleting the default constructor.</p>
+<p>Now, this is <em>not</em> wrong:</p>
+<pre><code>void (*number_changed)(int old_number, int new_number);
+
+void (*number_increased)(int increased_value);
+</code></pre>
+<p>That is indeed the correct way to have two data members that are function pointers.</p>
+<p><em>However</em>…</p>
+<p>There is actually a better way:</p>
+<pre><code>std::function&lt;void (int, int)&gt; number_changed;
+std::function&lt;void (int)&gt; number_increased;
+</code></pre>
+<p>The reason this is better is because <code>std::function</code> is a <em>LOT</em> more powerful than a function pointer. A function pointer only works for regular, free functions, class static functions, and lambdas with no captures.</p>
+<p>But <a href="https://en.cppreference.com/w/cpp/utility/functional/function" rel="nofollow noreferrer"><code>std::function</code></a> works with <em>literally anything</em> that even remotely <em>looks</em> like a function. It works for all the same things a function pointer works for. But it also works for member functions, lambdas with captures (closures), general function objects, bound-argument functions, … and so on and so forth. Like, literally everything works.</p>
+<p>For example:</p>
+<pre><code>class my_int_listener
+{
+public:
+    void number_changed(int, int) { /* whatever you want */ }
+    void number_increased(int) { /* whatever you want */ }
+
+    // This class could have data members, a constructor... whatever
+    // you want, and you can use all that stuff in your callbacks.
+};
+
+// Constructed however you want, wherever you want - global var, on the
+// heap, whatever - just so long as it outlives integer.
+auto mil = my_int_listener{};
+
+auto integer = Integer{1};
+
+using namespace std::placeholders;
+integer.add_number_changed_listener(
+    {
+        std::bind(&amp;my_int_listener::number_changed, &amp;mil, _1),
+        std::bind(&amp;my_int_listener::number_increased, &amp;mil, _1)
+    }
+);
+</code></pre>
+<p>The other benefit of <code>std::function</code> is the syntax is <em>soooo</em> much nicer. Function pointers are ghastly. Even when I’m forced to use them, I always use typedefs to hide the ugliness:</p>
+<pre><code>class IntegerListener {
+public :
+    using number_changed_function = void (*)(int, int);
+    using number_increased_function = void (*)(int);
+
+    number_changed_function number_changed = nullptr;
+    number_increased_function number_increased = nullptr;
+
+    IntegerListener(number_changed_function&amp;&amp; number_changed, number_increased_function&amp;&amp; number_increased) {
+        this-&gt;number_changed = number_changed;
+        this-&gt;number_increased = number_increased;
+    }
+};
+</code></pre>
+<p>That just looks a lot more like natural C++. And of course, with <code>std::function</code>:</p>
+<pre><code>class IntegerListener {
+public :
+    std::function&lt;void (int, int)&gt; number_changed = nullptr;
+    std::function&lt;void (int)&gt; number_increased = nullptr;
+
+    IntegerListener(std::function&lt;void (int, int)&gt;&amp;&amp; number_changed, std::function&lt;void (int, int)&gt;&amp;&amp; number_increased) {
+        this-&gt;number_changed = number_changed;
+        this-&gt;number_increased = number_increased;
+    }
+};
+</code></pre>
+<p>Although you could use typedefs there too, which is probably a good idea for avoiding needless repetition.</p>
+<p>The one downside of using <code>std::function</code> over raw function pointers is that <code>std::function</code> objects are larger—sometimes quite a bit larger, in order to do the type erasure necessary to do all its tricks. But unless you want to accept the rather severe restrictions that raw function pointers come with, there’s no other option. (Well, there <em>are</em> other options, but they would require a redesign: you could, for example, you could use a polymorphic base class for your listeners, and use dynamic dispatch.)</p>
+<p>Now let’s focus on that constructor:</p>
+<pre><code>IntegerListener(void (*&amp;&amp;number_changed)(int, int), void (*&amp;&amp;number_increased)(int)) {
+    this-&gt;number_changed = number_changed;
+    this-&gt;number_increased = number_increased;
+}
+</code></pre>
+<p>I’m not sure why you’d want to use rvalue-references for your constructor parameters here. Did you try something and it would’t compile without them? I can’t see what purpose rvalue-referenes here serve, even theoretically.</p>
+<p>The other thing is: when you’re initializing data members, you almost always want to use data member initializers, rather than initializing them in the constructor’s body.</p>
+<p>This is probably more what you want:</p>
+<pre><code>IntegerListener(void (*number_changed)(int, int), void (*number_increased)(int)) :
+    number_changed{number_changed},
+    number_increased{number_increased}
+{}
+</code></pre>
+<p>Or even more correctly:</p>
+<pre><code>IntegerListener(void (*number_changed)(int, int), void (*number_increased)(int)) :
+    number_changed{std::move(number_changed)},
+    number_increased{std::move(number_increased)}
+{}
+</code></pre>
+<p>The moves are because there’s no need to <em>copy</em> the arguments from the function parameters to the data members (assuming you don’t want to use the function parameters again). Moving is more logically correct, and can be <em>much</em> faster (though it doesn’t matter here).</p>
+<p>Finally, I can’t imagine any reason why this constructor couldn’t be <code>noexcept</code>. If all it’s doing is just taking the parameters and moving them into the data members, then so long as the moves are <code>noexcept</code> (which, moves should <em>always</em> be <code>noexcept</code> wherever possible, and they are both for raw function pointers and <code>std::function</code>), there’s no chance of failure.</p>
+<p>So putting it altogether, if I were writing your listener class, I might do:</p>
+<pre><code>class IntegerListener
+{
+public:
+    using number_changed_type = std::function&lt;void (int, int)&gt;;
+    using number_increased_type = std::function&lt;void (int)&gt;;
+
+    number_changed_type number_changed = nullptr;
+    number_increased_type number_increased = nullptr;
+
+    IntegerListener(
+        number_changed_type number_changed,
+        number_increased_type number_increased) noexcept :
+            number_changed{std::move(number_changed)},
+            number_increased{std::move(number_increased)}
+    {}
+};
+</code></pre>
+<p>Now on to the dispatcher….</p>
+<pre><code>std::vector&lt;IntegerListener *&gt; integer_listeners;
+</code></pre>
+<p>I don’t see any reason why you’d want to store <em>pointers</em> to the listeners, rather than just storing the listeners directly. You’re not doing dynamic dispatch (<code>IntegerListener</code> doesn’t have a virtual destructor), and there is no functional difference between storing the objects directly in the vector or storing them remotely. Using pointers for this just means poor performance due to the extra indirection and cache busting, and the need to manage memory, with no benefits.</p>
+<p>In fact, as I pointed out in my other comment, what you’re doing is actually just storing the address of temporary objects, which immediately die, leaving you with dangling pointers. If you actually wanted to store pointers, you would have to either manually allocate those pointers (or use global or static objects, I guess)—which means you also have to manually manage that memory with custom copy constructors and a destructor—or (and, really, this is the only option in modern C++… do <em>NOT</em> try manually allocating and managing memory), use smart pointers.</p>
+<p>But, as I said, there’s no benefit to using pointers <em>at all</em>, so there’s nothing to be gained from using smart pointers. Just store the objects in the vector directly. It’ll be faster, easier to code, and you won’t end up with critical bugs involving dangling pointers like the one you have (or leaks or double-frees or any of the other crap that comes with manual memory management… seriously <em>do not do manual memory management in C++</em>).</p>
+<pre><code>void set_number(int new_number) {
+    for (IntegerListener *&amp;integer_listener:integer_listeners) {
+        (*integer_listener).number_changed(number, new_number);
+    }
+    if (new_number &gt; number) {
+        for (IntegerListener *&amp;integer_listener:integer_listeners) {
+            (*integer_listener).number_increased(new_number - number);
+        }
+    }
+    number = new_number;
+}
+</code></pre>
+<p>If you’re going to store pointers in your vectors, there’s really no reason to iterate through them by reference. In fact, you’re just paying for a double indirection which you don’t even use.</p>
+<p><em>But!</em> If you’re going to store the actual listeners in your vectors, then, yes, you should take them by reference… but you should really take them by <code>const</code> reference, because you’re not going to be modifying them.</p>
+<p>I generally recommend to use the universal form of range-<code>for</code>. This:</p>
+<pre><code>for (auto&amp;&amp; item : range)
+</code></pre>
+<p><em>always</em> works, for <em>everything</em>, and <em>never</em> does the wrong thing. It should be the default thing you write whenever you write a range-<code>for</code>.</p>
+<p>(And no, it is <em>NOT</em> the same as doing <code>for (IntegerListener&amp;&amp; item : range)</code>. That usually <em>won’t</em> work… and it won’t work for your case. It’s <code>auto&amp;&amp;</code> or it’s a craps shoot. <em>Only</em> <code>auto&amp;&amp;</code> <em>always</em> works.)</p>
+<p><em>However</em>… if you want to be more explicit about what your code is actually doing, you could do:</p>
+<pre><code>for (auto&amp; item : range) // to signal you will be modifying the items
+// or
+for (auto const&amp; item : range) // if you'll just be reading them
+</code></pre>
+<p>These don’t <em>always</em> work, but they <em>almost</em> always work, and if you really mean what they say—that you’re either modifying the items or you’re definitely not and you’re just inspecting them—then they <em>pretty much</em> always work.</p>
+<p>So I’d probably write:</p>
+<pre><code>for (auto const&amp; integer_listener : integer_listeners)
+    integer_listener.number_changed(number, new_number);
+</code></pre>
+<p>unless I was feeling lazy, in which case I’d use the <code>auto&amp;&amp;</code> form.</p>
+<pre><code>void add_number_changed_listener(IntegerListener &amp;&amp;integer_listener) {
+    integer_listeners.push_back(&amp;integer_listener);
+}
+</code></pre>
+<p>This is really the only broken function in the code. Everything else is correct, though maybe not the most efficient, and maybe not following C++ best practices or styles.</p>
+<p>But this function has two problems. First, it takes the argument by rvalue reference. I can’t imagine why you’d want to do that. It doesn’t really make any sense. What you’re saying with that is that you <em>only</em> want to take <em>temporary-constructed</em> integer listeners. In other words, you’re saying:</p>
+<pre><code>// this is fine:
+integer.add_number_changed_listener(IntegerListener{f1, f2});
+
+// but this is absolutely wrong, and should not compile:
+auto il = IntegerListener{f1, f2};
+integer.add_number_changed_listener(il);
+</code></pre>
+<p>But why? What’s wrong with making an integer listener and passing it to <em>two</em> integers? Maybe I have two integers that I want to keep track of changes to. Why am I banned from using the same listener for both?</p>
+<p>The second problem with this function is that you only take the address of the listener. Even if you weren’t <em>requiring</em> temporary-constructed listeners, that’s an accident waiting to happen, because even if the listener isn’t temporary—which means it’s very likely to die almost immediately—it still might not live long enough to still be active when the dispatcher wants to signal an event.</p>
+<p>You have two options here:</p>
+<ul>
+<li><em>either</em> you <em>mandate</em> that users keep listener objects around for as long as needed, and make it their problem to keep track of that (which would be a terrible, bug-prone design); <em>or</em></li>
+<li>you simply keep the listener object with the dispatcher, so it <em>has</em> to stick around as long as the dispatch object exists.</li>
+</ul>
+<p>In other words, don’t muck around with pointers and the address-of operator ('&amp;'). Just do the natural thing:</p>
+<pre><code>void add_number_changed_listener(IntegerListener integer_listener) {
+    integer_listeners.push_back(integer_listener);
+}
+</code></pre>
+<p>And even better, and more technically correct: you don’t really want a <em>copy</em> of the listener stored in the vector… you want the actual listener object. So you want to move what you were given into the array:</p>
+<pre><code>void add_number_changed_listener(IntegerListener integer_listener) {
+    integer_listeners.push_back(std::move(integer_listener));
+}
+</code></pre>
+<p>Now as a user of the class, <em>I</em> have control. <em>I</em> get to decide if I want to give you a temporary-constructed listener, or if I want to copy a listener to multiple integers. And no matter what I choose, everything just works.</p>
+<p>That’s it for the line-by-line review! Overall, the only “problem” with it that would make me reject it from a code base I was responsible for is that the vector <code>integer_listeners</code> holds pointers rather than actual objects, and those pointers are almost certainly going to be dangling because <code>add_number_changed_listener()</code> only takes temporaries. If you only made two changes:</p>
+<ol>
+<li>change <code>integer_listeners</code> to be a <code>std::vector&lt;IntegerListener&gt;</code> (not <code>std::vector&lt;IntegerListener*&gt;</code>); and</li>
+<li>change <code>add_number_changed_listener()</code> to store (by copying or—better—moving) the passed listener, not just its address</li>
+</ol>
+<p>then I would consider the code acceptable. (Though, of course, there are a number of other improvements you could make, like using <code>std::function</code> rather than raw function pointers`.)</p>
+<p>To answer your concerns:</p>
+<ol>
+<li>The design is pretty optimal, yes. There are a few minor touch-ups here and there that make it even more efficient, but the basic design is sound. And, actually, it’s a pretty good design, in my opinion.</li>
+<li>Is the design good C++? Yes, I think so. Even without the changes I suggested (other than fixing those critical bugs), I’d say it fits well with good C++ philosophy. There are other ways of doing it, of course, and every design has its pros and cons. But this design is, I think, quite good. I’d use it.</li>
+</ol>
+    </div>

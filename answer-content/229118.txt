@@ -1,0 +1,334 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I don't think that what you're doing is good style. I think you're adding a lot of extra complexity and places for things to go wrong, or become hard to understand, or whatever. I don't think you lose anything by just making very small methods that call <code>super</code> and your special method. I talk about those options at the bottom of the post.</p>
+
+<p>With that out of the way, I think you can accomplish your goal as written and currently designed much more safely by using <a href="https://docs.python.org/3/howto/descriptor.html" rel="nofollow noreferrer">descriptors</a> and <a href="https://blog.ionelmc.ro/2015/02/09/understanding-python-metaclasses/" rel="nofollow noreferrer">metaclasses</a>. I don't think this is as good as the methods at the bottom of the post, but to review the code as written here is what I would say.</p>
+
+<hr>
+
+<p>What you're trying to do is (semi-automatically) change how certain data elements are retrieved and executed when called. To me, this sounds like a <a href="https://docs.python.org/3/howto/descriptor.html" rel="nofollow noreferrer">descriptor</a>. Descriptors allow you to override how you set, get, or delete an attribute on an object, like so (example taken from above documentation link):</p>
+
+<pre><code>class RevealAccess(object):
+    """A data descriptor that sets and returns values
+       normally and prints a message logging their access.
+    """
+
+    def __init__(self, initval=None, name='var'):
+        self.val = initval
+        self.name = name
+
+    def __get__(self, obj, objtype):
+        print('Retrieving', self.name)
+        return self.val
+
+    def __set__(self, obj, val):
+        print('Updating', self.name)
+        self.val = val
+
+&gt;&gt;&gt; class MyClass(object):
+...     x = RevealAccess(10, 'var "x"')
+...     y = 5
+...
+&gt;&gt;&gt; m = MyClass()
+&gt;&gt;&gt; m.x
+Retrieving var "x"
+10
+&gt;&gt;&gt; m.x = 20
+Updating var "x"
+&gt;&gt;&gt; m.x
+Retrieving var "x"
+20
+&gt;&gt;&gt; m.y
+5
+</code></pre>
+
+<p><strong>Note</strong> - if there were a way to safely identify the underlying data structure being modified when any of these operations is called, then <strong>that</strong> is what you should put the descriptor on (as that's what you actually want). Because I don't know of a safe way to do that, I suggest the approach below.</p>
+
+<p>For yours, what you need is a descriptor that auto-calls <code>super</code> for you. Note - it's important to use <code>super</code> to handle cases of multiple-inheritance; as pointed out in the comments, your current implementation will only ever call the <code>deque</code> method directly, instead of taking the time to deal with <a href="https://www.python.org/download/releases/2.3/mro/" rel="nofollow noreferrer"><code>__mro__</code></a>. In the implementation below, we:</p>
+
+<ol>
+<li>Use the <code>__get__</code> method to automatically get the class (<code>objtype</code>) and <code>self</code> (<code>obj</code>) of the instance (<strong>not</strong> the descriptor). This provides enough information for us to call <code>super()</code>. </li>
+<li>Use <code>getattr</code> to get the attribute in question from the result of <code>super</code>, and lets us ignore the complexities of <code>__mro__</code>.</li>
+<li>Create a wrapper function (don't forget to use <a href="https://docs.python.org/3/library/functools.html#functools.wraps" rel="nofollow noreferrer"><code>functools.wraps</code></a>) that calls the wrapped function with the appropriate arguments, and then the extra function you specified.</li>
+<li><code>__get__</code> returns the wrapped function, and now <code>MyClass.&lt;&lt;attr_name&gt;&gt;</code> will be that function  </li>
+</ol>
+
+
+
+<pre><code>from functools import wraps
+
+class AutoSuperDescriptor(object):
+    def __init__(self, attr_name, extra):
+        self.attr_name = attr_name
+        self.extra = extra
+
+    def __get__(self, obj, objtype):
+        wrapped_function = getattr(
+            super(objtype, obj), self.attr_name
+        )
+        extra_bits = self.extra
+
+        @wraps(wrapped_function)
+        def wrapper(yourself, *args, **kwargs):
+            result = wrapped_function(
+                yourself, *args, **kwargs
+            )
+            extra_bits(yourself)
+            return result
+
+        return wrapper
+</code></pre>
+
+<p>You create your descriptor by providing enough information to find the overwritten attribute, as well as the function we want to add on to the end. For example, you might do this:</p>
+
+<pre><code>class FileMirroredDeque(deque):
+    append = AutoSuperDescriptor("append", updates_file)
+</code></pre>
+
+<p>If that meets your needs, then you're done.</p>
+
+<hr>
+
+<h3>But wait, there's more</h3>
+
+<p>It's pretty tedious and error-prone to do this by hand for each method you want to apply this to. Wouldn't it be nice if there was a way to just tie into the creation of a class and have it do this for us?</p>
+
+<p>There is, and the answer is <a href="https://blog.ionelmc.ro/2015/02/09/understanding-python-metaclasses/" rel="nofollow noreferrer">metaclasses</a>. Metaclasses are a really complex, and really powerful, tool in the Python toolbox. Anytime you find yourself using them you should think really, really whether that is the best way to do it. I don't think this is one of those times (see start of this answer), but if you wanted to do that, I think we'd have to do something like this:</p>
+
+<ol>
+<li>Define a way to identify the elements that should be overridden at class initialization.</li>
+<li>Define a way to identify what extra behavior needs to be added to them.</li>
+<li>Add the behavior.</li>
+</ol>
+
+<p>The third one is easy - we implemented it with our descriptor up above.</p>
+
+<p>The first two are a little more complicated, and have a few options. We could choose between adding <code>kwargs</code> to the class initialization:</p>
+
+<pre><code>class FileMirroredDeque(
+    deque, 
+    metaclass=SuperChargerMetaclass, 
+    methods_to_supercharge = [""], 
+    method_to_supercharge_with = "method_name"
+):
+</code></pre>
+
+<p>I think this would get clunky and obscure things. Instead, I'm going to propose that we define a special attribute (I used the <code>__&lt;&lt;name&gt;&gt;__</code> naming convention, which is a no-no, but I thought made it clearer for demonstrative purposes) to list the attributes to override, and then set an attribute on the extra method itself to find it. The final implementation of the class looks like so:</p>
+
+<pre><code>def supercharger(func):
+    func.__is_supercharger = True
+    return func
+
+class FileMirroredDeque(
+    deque, metaclass=SuperChargerMetaClass
+):
+    __supercharge__ = [
+        "__delitem__",
+        "__iadd__",
+        "__imul__",
+        "__setitem__",
+        "append",
+        "appendleft",
+        "extend",
+        "extendleft",
+        "insert",
+        "pop",
+        "popleft",
+        "remove",
+        "reverse",
+        "rotate",
+    ]
+
+
+    @supercharger
+    def _update_file(self):
+        with open(self.path, "w") as f:
+            json.dump(list(self), f, indent=self._indent)
+
+    def __init__(
+        self,
+        cache_path,
+        maxlen=None,
+        clean=False,
+        file_indent=None,
+    ):
+        super().__init__((), maxlen)
+
+        self.path = cache_path
+        self._indent = file_indent
+        self._bak_file = None
+
+        if clean:
+            self._update_file()  # Overwrite contents of file.
+            return  # Don't import data from file.
+
+        with open(
+            self.path, "a+"
+        ) as f:  # Creates file if it doesn't exist
+            f.seek(
+                0, 0
+            )  # Seek back to beginning of file for json decode.
+            contents = f.read()
+
+        try:
+            contents = json.loads(contents or "[]")
+            self.extend(
+                contents
+            )  # initializes internal list with persistent data or empty list.
+
+        except json.decoder.JSONDecodeError:
+            new_file = (
+                os.path.basename(self.path)
+                + datetime.datetime.utcnow().strftime(
+                    "_%Y_%m_%d_%H_%M_%S"
+                )
+                + ".bak"
+            )
+
+            new_path = os.path.join(
+                os.path.dirname(self.path), new_file
+            )
+
+            print(
+                f"File: {self.path} was not valid JSON. It will be copied to {new_path} and a new "
+                f"file will be created."
+            )
+
+            shutil.copyfile(self.path, new_path)
+            self._bak_file = new_path
+</code></pre>
+
+<p>But how do we actually get this to happen? Like so!</p>
+
+<pre><code>class SuperChargerMetaClass(type):
+    _SUPERCHARGER_ATTRNAME = "__supercharge__"
+
+    @classmethod
+    def _get_supercharger(cls, klass_attrs):
+        return next(
+            method
+            for name, method in klass_attrs.items()
+            if getattr(method, "__is_supercharger", False)
+        )
+
+    def __init__(cls, name, bases, attrs):
+        supercharger = cls._get_supercharger(attrs)
+        superchargees = attrs.get(
+            cls._SUPERCHARGER_ATTRNAME, ()
+        )
+
+        for method_to_supercharge in superchargees:
+
+            attrs[
+                method_to_supercharge
+            ] = AutoSuperDescriptor(
+                method_to_supercharge, supercharger
+            )
+
+        return super().__init__(name, bases, attrs)
+</code></pre>
+
+<p>In the <code>__init__</code> method (<code>__new__</code> would probably work too, but I ended up getting this to work as <code>__init__</code> so I left it), we get the "supercharger" method to append to our functions, and our list of "superchargees" that need the behavior added to them. From there, its just a matter of making the relevant attribute look to our descriptor instead of whatever (if anything) was there before.</p>
+
+<hr>
+
+<p>Despite being personally proud of coming up with that, I still feel pretty strongly that its the wrong way to go. As such, I wanted to show how easy this would be. For example, if you inherit from <code>deque</code>:</p>
+
+<pre><code>class FileMirroredDeque(deque):
+
+    # _update_file and __init__ unchanged
+
+    def __delitem__(self, idx):
+        super().__delitem__(idx)
+        self._update_file()
+
+    # Same for each method
+</code></pre>
+
+<p>If you don't actually want inheritance, or want to deal with multiple inheritance, then you could just use composition instead, like so:</p>
+
+<pre><code>class FileMirroredDeque:
+
+    def __init__(self, cache_path, maxlen=None, clean=False, file_indent=None):
+        # Only addition to __init__
+        self.data = deque((), maxlen)
+
+        # Any references to self with the intent of hitting the deque should now reference self.data
+
+
+    def __delitem__(self, idx):
+        self.data.__delitem__(idx)
+        self._update_file()
+
+    # Same for each method
+</code></pre>
+
+<p>We can actually take that a step further then, by creating a generic descriptor that handles file mirroring any arbitrary collection, like so:</p>
+
+<pre><code>class FileMirroredCollection:
+
+    # This is virtually identical to your previous __init__
+    def __init__(self, collection, cache_path, clean=False, file_indent=None):
+        self.collection = collection
+        self.path = cache_path
+        self._indent = file_indent
+        self._bak_file = None
+
+        if clean:
+            self._update_file()  # Overwrite contents of file.
+            return  # Don't import data from file.
+
+        with open(self.path, 'a+') as f:  # Creates file if it doesn't exist
+            f.seek(0, 0)  # Seek back to beginning of file for json decode.
+            contents = f.read()
+
+        try:
+            # You'd need to have some intelligent way to extend the arbitrary collection; duck typing is your friend here
+            self.collection.extend(json.loads(contents or "[]"))  # initializes internal list with persistent data or empty list.
+
+        except json.decoder.JSONDecodeError:
+            new_file = os.path.basename(self.path) \
+                       + datetime.datetime.utcnow().strftime("_%Y_%m_%d_%H_%M_%S") + ".bak"
+
+            new_path = os.path.join(os.path.dirname(self.path), new_file)
+
+            logger.warning(f"File: {self.path} was not valid JSON. It will be copied to {new_path} and a new "
+                           f"file will be created.")
+
+            shutil.copyfile(self.path, new_path)
+            self._bak_file = new_path
+
+    def _update_file(self):
+        with open(self.path, 'w') as f:
+            json.dump(list(self.collection), f, indent=self._indent)
+
+    def __get__(self, obj, objtype):
+        self._update_file()
+        return self.collection
+
+    def __set__(self, obj, value):
+        self.collection = value
+        self._update_file()
+
+    def __delete__(self, obj):
+        del self.collection
+        self._update_file()
+
+
+class FileMirroredDeque:
+
+    def __init__(self, cache_path, clean=False, file_indent=None, max_len=None):
+        self.data = FileMirroredCollection(deque((), max_len), cache_path, clean, file_indent)
+
+        # other stuff
+</code></pre>
+
+<p>This still needs a bit more work (e.g. this doesn't handle <code>self.data.append</code> very well), but you can see how it might be useful to separate your concerns.</p>
+
+<p>Lastly, there are a few other miscellaneous improvements that might benefit you, including:</p>
+
+<ol>
+<li>Support for more formats - json is nice, but what if I want to serialize it another way?</li>
+<li>Not writing to file every time; this will be inefficient if you have lots of small changes. Potentially include a <code>flush</code> method, or some way to identify that you need to write any recent changes.</li>
+<li>As I allude to with the generic descriptor approach, supporting other data structures could be good - you might not want a deque forever, and as-is you're pretty locked down.</li>
+</ol>
+    </div>

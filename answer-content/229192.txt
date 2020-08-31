@@ -1,0 +1,531 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Code style</h1>
+
+<p>Try to use an IDE which integrates with linters (Pycodestyle, Pylama, Mypy,...). This alone found some 97 warning, ranging from no whitespaces after a comma, trailing whitespace, redundant backslashes, closing brackets not matching the indentation,...</p>
+
+<p>All of these are no big issues, but they make the code look messy, and are easy to fix. I use a code formatter (<a href="https://github.com/psf/black" rel="nofollow noreferrer">black</a>, but there is also yapf) with a maximum line length of 79 to take care of these smaller issues for me</p>
+
+<p>Classes <a href="https://www.python.org/dev/peps/pep-0008/#class-names" rel="nofollow noreferrer">should</a> be in <code>CapWords</code></p>
+
+<p>The <code>np_</code> prefix in some variable names is not helpful</p>
+
+<h1>Python is not JAVA</h1>
+
+<p>Not everything needs to be in a class, and not every class needs to be in a separate file.</p>
+
+<h1>pd.set_option('mode.chained_assignment', None)</h1>
+
+<p>This is a sign that you are doing something dangerous with views or copies, and data might be lost when you change a subset. It is better to use <code>.loc</code> then to make sure you get a copy, and not a view</p>
+
+<h1>ratio</h1>
+
+<p>You have 2 ratio's, so better call the second <code>demographic_ratio</code> or something</p>
+
+<h1>keyword-only arguments</h1>
+
+<p>Methods with a lot of arguments can cause confusion, and are called with the wrong order from time to time. To prevent this, use keyword-only arguments if there are a lot, especially if they are of the same type, so the code does not trow an error immediately, but just gives a garbage answer</p>
+
+<h1>occupation</h1>
+
+<p><code>df_allhouses["Agent/Empty"]</code> lists whether a property is occupied. Since this is simply a flag, you can use 0 and 1 of <code>True</code> and <code>False</code> instead of <code>"Empty"</code> or <code>"Agent"</code> This will simplify a lot of the further processing. There is also no need to make this a column in <code>df_allhouses</code>. </p>
+
+<p>I would also extract the method to provide this random population to a separate method:</p>
+
+<pre><code>def random_population(size, ratio):
+    samples = np.zeros(size, dtype=np.bool)
+    samples[: round(size * ratio)] = 1
+    return np.random.permutation(samples)
+</code></pre>
+
+<p>So the houses that are ocupied are defined by <code>occupied = random_population(size=len(all_houses), ratio=1 - empty_ratio)</code></p>
+
+<h1>architecture</h1>
+
+<p>What <code>geo_schelling_populate</code> does is provide an empty simulation, that you later populate. You never do anything else with this object, apart from getting the shapefile. A more logic architecture would be a method to read the shapefile, and another method to deliver a populated simulation. No need for the class, and no need for the extra file</p>
+
+<p>This is an interesting talk: <a href="https://www.youtube.com/watch?v=o9pEzgHorH0" rel="nofollow noreferrer">Stop writing classes</a>  by Jack Diederich</p>
+
+<p>I will convert the example of the populate here, but the same way of working can be done for the other parts. No need for a class, with just an <code>__init__</code> that populates the object variables, and then 1 action method that uses those object variables. It is better to just pass those as argument to a function</p>
+
+<p>There is still a lot of other stuff to improve, especially on vectorisation, but I don't have time for that at this moment</p>
+
+<hr>
+
+<pre><code>from pathlib import Path
+
+import geopandas as gp
+import numpy as np
+import pandas as pd
+from shapely.geometry import Point
+
+
+def _generate_points(polygon, spacing):
+    """It returns a DataFrame with all the coordiantes inside a certain
+        shape passed in as an parameter.
+
+        Parameters
+        ----------
+
+            polygon : shapely.geometry.Polygon
+                A polygon object which contains the geometry of a county in
+                a state.
+
+        Returns
+        -------
+
+            A pandas DataFrame with all the coordiantes generated inside the
+            polygon object.
+    """
+
+    (minx, miny, maxx, maxy) = polygon.bounds
+    x_coords = np.arange(np.floor(minx), int(np.ceil(maxx)), spacing)
+    y_coords = np.arange(np.floor(miny), int(np.ceil(maxy)), spacing)
+    grid = np.column_stack(
+        (
+            np.meshgrid(x_coords, y_coords)[0].flatten(),
+            np.meshgrid(x_coords, y_coords)[1].flatten(),
+        )
+    )
+    df_points = pd.DataFrame.from_records(grid, columns=["X", "Y"])
+    df_points = df_points[
+        df_points[["X", "Y"]].apply(
+            lambda x: Point(x[0], x[1]).within(polygon), axis=1
+        )
+    ]
+    return df_points.round(2)
+
+
+def random_population(size, ratio):
+    samples = np.zeros(size, dtype=np.bool)
+    samples[: round(size * ratio)] = 1
+    return np.random.permutation(samples)
+
+
+def populate_simulation(
+    *,
+    shape_file: gp.GeoDataFrame,
+    spacing: float,
+    empty_ratio: float,
+    demographic_ratio: float,
+    races=2
+):
+    """provides a random populated simulation
+
+    ...
+
+    """
+    all_houses = pd.concat(
+        iter(
+            shape_file.geometry.apply(lambda x: _generate_points(x, spacing))
+        ),
+        ignore_index=True,
+    )
+    occupied = random_population(size=len(all_houses), ratio=1 - empty_ratio)
+
+    agent_houses = all_houses.loc[occupied, ["X", "Y"]].reset_index(drop=True)
+    empty_houses = all_houses.loc[~occupied, ["X", "Y"]].reset_index(drop=True)
+
+    agent_houses["Race"] = random_population(
+        len(agent_houses), demographic_ratio
+    )
+    # +1 if you need it to be 1 and 2
+    return empty_houses, agent_houses
+
+
+if __name__ == "__main__":
+    shapefilename = Path(r"../../data/CA_Counties_TIGER.shp")
+    shape_file = gp.read_file(shapefilename)  # no need
+
+    spacing = 0.05
+    empty_ratio = 0.2
+    similarity_threshhold = 0.65
+    n_iterations = 100
+    demographic_ratio = 0.41
+    empty_houses, agent_houses = populate_simulation(
+        shape_file=shape_file,
+        spacing=spacing,
+        empty_ratio=empty_ratio,
+        demographic_ratio=demographic_ratio,
+        races=2,
+    )
+
+    ...
+</code></pre>
+
+<hr>
+
+<p>Part 2:</p>
+
+<h1>random seed</h1>
+
+<p>When simulating, always give the possibility to give a random seed, so you can repeat the same simulation to verify certain results.</p>
+
+<h1>Geopandas</h1>
+
+<p>You do a lot of distance calculations, and checks whether coordinates are withing Polygons semi-manually. It is a lot cleaner if you can let <code>GeoPandas</code> do that for you. If you keep the coordinates as <code>Point</code>s, instead of x and y columns:</p>
+
+<pre><code>def generate_points(polygon, spacing):
+    (minx, miny, maxx, maxy) = polygon.bounds
+    x_coords = np.arange(np.floor(minx), (np.ceil(maxx)), spacing)
+    y_coords = np.arange(np.floor(miny), (np.ceil(maxy)), spacing)
+    grid_x, grid_y = map(np.ndarray.flatten, np.meshgrid(x_coords, y_coords))
+    grid = gp.GeoSeries([Point(x, y) for x, y in zip(grid_x, grid_y)])
+    return grid[grid.intersects(polygon)].reset_index(drop=True)
+</code></pre>
+
+<p>To get the houses in Los Angeles County:</p>
+
+<blockquote>
+<pre><code>generate_points(shape_file.loc[5, "geometry"], .05).plot()
+</code></pre>
+</blockquote>
+
+<p><a href="https://i.stack.imgur.com/USudH.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/USudH.png" alt="Los Angeles County"></a></p>
+
+<h1>grid creation</h1>
+
+<p>Best would be to extract the grid creation. This way you could in the future reuse the raw grid, with different simulation characteristics.</p>
+
+<pre><code>def create_grid(counties: gp.GeoSeries, spacing: float, random_seed=None):
+    return gp.GeoDataFrame(
+        pd.concat(
+            {
+                county.NAME: generate_points(county.geometry, spacing)
+                for county in counties.itertuples()
+            },
+            names=["county"],
+        )
+        .rename("geometry")
+        .reset_index(level="county")
+        .reset_index(drop=True)
+        .astype({"county": "category"}),
+        geometry="geometry",
+    )
+</code></pre>
+
+<blockquote>
+<pre><code>all_houses = create_grid(counties=shape_file, spacing=spacing, random_seed=0)
+</code></pre>
+</blockquote>
+
+<pre><code>def populate_simulation(
+    *,
+    all_houses,
+    empty_ratio: float,
+    demographic_ratio: float,
+    races=2,
+    random_seed=None,
+):
+    """provides a random populated simulation
+
+    ...
+
+    """
+
+    if random_seed is not None:
+        np.random.seed(random_seed)
+
+    occupied = random_population(size=len(all_houses), ratio=1 - empty_ratio)
+    race = random_population(size=int(occupied.sum()), ratio=demographic_ratio)
+
+    agent_houses = gp.GeoDataFrame(
+        {
+            "race": race.astype(int),
+            "county": all_houses.loc[occupied, "county"],
+        },
+        geometry=all_houses.loc[occupied, "geometry"].reset_index(drop=True),
+    )
+    empty_houses = all_houses[~occupied].reset_index(drop=True)
+    return empty_houses, agent_houses
+</code></pre>
+
+<blockquote>
+<pre><code>empty_houses, agent_houses = populate_simulation(
+    all_houses=all_houses,
+    empty_ratio=.1,
+    demographic_ratio=.3,
+    races=2,
+    random_seed=0,
+)
+</code></pre>
+</blockquote>
+
+<p>The <code>agent_houses</code> then looks like this:</p>
+
+<blockquote>
+<pre><code>    Race  geometry
+0 0   POINT (-4 -9)
+1 0   POINT (-3 -9)
+2 0   POINT (-2 -9)
+3 1   POINT (-1 -9)
+4 0   POINT (0 -9)
+</code></pre>
+</blockquote>
+
+<p>To plot this:</p>
+
+<blockquote>
+<pre><code> agent_houses.plot(column="race", categorical=True, figsize=(10, 10))
+</code></pre>
+</blockquote>
+
+<p><a href="https://i.stack.imgur.com/o1FJ7.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/o1FJ7.png" alt="California population"></a></p>
+
+<p>To check the neighbours who live within a perimeter of an agent is simple:</p>
+
+<pre><code>def get_neighbours(agent, agent_houses: gp.GeoDataFrame, spacing):
+    """
+    returns all the agents that live within  `perimeter` of the `agent`
+
+    The `agent` excluding"""
+    surroundings = agent.geometry.buffer(spacing * 1.5)  
+    return agent_houses.loc[
+        agent_houses.intersects(surroundings)
+        &amp; (agent_houses != agent).any(axis=1)
+    ]
+</code></pre>
+
+<p>this can be tested:</p>
+
+<pre><code>agent = agent_houses.loc[4]
+neighbours = get_neighbours(agent, agent_houses, radius=0.05 * 5)
+neighbours
+</code></pre>
+
+<blockquote>
+<pre><code>  race    county  geometry
+5     0   Sierra  POINT (-120.4500000000001 39.44999999999997)
+17    1   Sierra  POINT (-120.5500000000001 39.49999999999997)
+18    0   Sierra  POINT (-120.5000000000001 39.49999999999997)
+19    0   Sierra  POINT (-120.4500000000001 39.49999999999997)
+12321     0   Nevada  POINT (-120.5500000000001 39.39999999999998)
+12322     0   Nevada  POINT (-120.5000000000001 39.39999999999998)
+12323     0   Nevada  POINT (-120.4500000000001 39.39999999999998)
+12334     0   Nevada  POINT (-120.5500000000001 39.44999999999997)
+</code></pre>
+</blockquote>
+
+<p>This is rather slow (500ms for a search among 15510 occupied houses)</p>
+
+<p>Of you add x and y columns to a copy of the original:</p>
+
+<pre><code>agent_houses_b = agent_houses.assign(x=agent_houses.geometry.x, y=agent_houses.geometry.y)
+</code></pre>
+
+<p>and then use these column:</p>
+
+<pre><code>def get_neighbours3(agent, agent_houses: gp.GeoDataFrame, spacing):
+    """
+    returns all the agents that live within  `perimeter` of the `agent`
+
+    The `agent` excluding"""
+    close_x = (agent_houses.x - agent.geometry.x).abs() &lt; spacing * 1.1
+    close_y = (agent_houses.y - agent.geometry.y).abs() &lt; spacing * 1.1
+    return agent_houses.loc[
+        (agent_houses.index != agent.name)  # skip the original agent
+        &amp; (close_x)
+        &amp; (close_y)
+    ]
+</code></pre>
+
+<blockquote>
+<pre><code>get_neighbours3(agent, agent_houses_b, spacing)
+</code></pre>
+</blockquote>
+
+<p>returns in about 3ms</p>
+
+<p>This will possibly go even faster of you do it per county, and use <code>DataFrame.groupby.transform</code> if the people on the border of one county don't count as neighbours for people of a neighbouring county</p>
+
+<p>To find out who is satisfied:</p>
+
+<pre><code>satisfied_agents = pd.Series(
+    {
+        id_: is_satisfied(
+            agent=agent,
+            agent_houses=agent_houses_b,
+            spacing=spacing,
+            similarity_threshold=similarity_threshold,
+        )
+        for id_, agent in agent_houses.iterrows()
+    },
+    name="satisfied",
+)
+</code></pre>
+
+<h1>value_counts</h1>
+
+<p>Checking whether an agent is satisfied becomes simple, just using <code>pd.Series.value_counts</code></p>
+
+<pre><code>def is_satisfied(*, agent, agent_houses, spacing, similarity_threshold):
+    neighbours = get_neighbours3(agent, agent_houses, spacing=spacing)
+    if neighbours.empty:
+        return False
+    group_counts = neighbours["race"].value_counts()
+    return group_counts.get(agent["race"], 0) / len(neighbours) &lt; similarity_threshold
+</code></pre>
+
+<p>To get the count per race:</p>
+
+<pre><code>agent_houses.groupby(["race"])["geometry"].count().rename("count")
+</code></pre>
+
+<p>To get the count in a county:</p>
+
+<pre><code>agent_houses.groupby(["county", "race"])["geometry"].count().rename("count")
+</code></pre>
+
+<h1>update</h1>
+
+<p>One iteration in the update can then be described as:</p>
+
+<pre><code>def update(agent_houses, empty_houses, spacing, similarity_threshold):
+    agent_houses_b = agent_houses.assign(
+        x=agent_houses.geometry.x, y=agent_houses.geometry.y
+    )
+    satisfied_agents = pd.Series(
+        {
+            id_: is_satisfied(
+                agent=agent,
+                agent_houses=agent_houses_b,
+                spacing=spacing,
+                similarity_threshold=similarity_threshold,
+            )
+            for id_, agent in agent_houses.iterrows()
+        },
+        name="satisfied",
+    )
+
+    open_houses = pd.concat(
+        (
+            agent_houses.loc[~satisfied_agents, ["county", "geometry"]],
+            empty_houses,
+        ),
+        ignore_index=True,
+    )
+
+    new_picks = np.random.choice(
+        open_houses.index, size=(~satisfied_agents).sum(), replace=False
+    )
+    new_agent_houses = agent_houses.copy()
+    new_agent_houses.loc[
+        ~satisfied_agents, ["county", "geometry"]
+    ] = open_houses.loc[new_picks]
+
+    new_empty_houses = open_houses.drop(new_picks).reset_index(drop=True)
+
+    return new_empty_houses, new_agent_houses
+</code></pre>
+
+<p>This redistributes all the empty houses and the houses of the people unsatisfied, simulating a instantaneous move of all the unsatisfied people</p>
+
+<hr>
+
+<h1><strong>part 3</strong></h1>
+
+<h1>spatial datastructures.</h1>
+
+<p>There are some datastructures which are explicitly meant for spatial data, and finding nearest neighbours. </p>
+
+<p>a <a href="https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.KDTree.html" rel="nofollow noreferrer">scipy.spatial.KDTree</a> (or implemented in cython <a href="https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.cKDTree.html" rel="nofollow noreferrer">cKDTree</a>) is specifically meant for stuff like this, and will speed up searches a lot when going to large grid.</p>
+
+<pre><code>from scipy.spatial import cKDTree
+
+
+grid_x = np.array([grid["geometry"].x, grid["geometry"].y, ]).T
+tree = cKDTree(grid_xy)
+</code></pre>
+
+<p>To query:</p>
+
+<pre><code>tree.query_ball_point((-120.4, 35.7), spacing * 1.5)
+</code></pre>
+
+<p>This query only takes 70µs for those 17233 grid points, which is 30 times faster than <code>get_neighbours3</code>. </p>
+
+<p>You can even look for all neighbour pairs with <code>tree.query_pairs(spacing * 1.5)</code>. This takes about as much time as 1 neighbour lookup in <code>neighbours3</code></p>
+
+<p>This means you can prepopulate a dict with all neighbours:</p>
+
+<pre><code>all_neighbours = defaultdict(list)
+
+for i, j in tree.query_pairs(spacing * 1.5):
+    all_neighbours[i].append(j)
+    all_neighbours[j].append(i)
+</code></pre>
+
+<p>If you now keep the information on occupation and race in 2 separate numpy arrays, you can quickly look for all satisfied people:</p>
+
+<pre><code>occupied = random_population(size=len(grid), ratio=1 - empty_ratio)
+race = random_population(size=int(occupied.sum()), ratio=demographic_ratio)
+
+
+def is_satisfied2(agent, *, all_neighbours, occupied, race, similarity_index):
+    if not occupied[agent] or agent not in all_neighbours:
+        return False
+    neighbours = all_neighbours[agent]
+    neighbours_occupied = occupied[neighbours].sum()
+    neighbours_same_race = (
+        occupied[neighbours] &amp; (race[neighbours] == race[agent])
+    ).sum()
+    return (neighbours_same_race / neighbours_occupied) &gt; similarity_index
+</code></pre>
+
+<p>and all the satisfied people:</p>
+
+<pre><code>satisfied_agents = np.array(
+    [
+        is_satisfied2(
+            agent,
+            all_neighbours=all_neighbours,
+            occupied=occupied,
+            race=race,
+            similarity_index=similarity_index,
+        )
+        for agent in np.arange(len(grid))
+    ]
+)
+</code></pre>
+
+<p>The people who want to move:</p>
+
+<pre><code>on_the_move = ~satisfied_agents &amp; occupied
+</code></pre>
+
+<p>And the houses that are free is either <code>free_houses = ~satisfied_agents</code> or <code>free_houses = ~occupied</code> depending on your definition.</p>
+
+<p>So update becomes as simple as:</p>
+
+<pre><code>def update(*, occupied, race, all_neighbours, similarity_index):
+    satisfied_agents = np.array(
+        [
+            is_satisfied2(
+                agent,
+                all_neighbours=all_neighbours,
+                occupied=occupied,
+                race=race,
+                similarity_index=similarity_index,
+            )
+            for agent in np.arange(len(grid))
+        ]
+    )
+    on_the_move = ~satisfied_agents &amp; occupied
+    free_houses = ~satisfied_agents
+    # or
+    # free_houses = ~occupied
+
+    assert len(on_the_move) &lt;= len(free_houses) # they need a place to go
+
+    new_houses = np.random.choice(
+        free_houses, size=len(on_the_move), replace=False
+    )
+
+    new_occupied = occupied[:]
+    new_occupied[on_the_move] = False
+    new_occupied[new_houses] = True
+    new_race = race[:]
+    new_race[new_houses] = race[on_the_move]
+
+    return new_occupied, new_race
+</code></pre>
+    </div>

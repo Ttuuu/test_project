@@ -1,0 +1,143 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I took a very, very wild swing at this. I also couldn't get it down to something entirely set-based, but I was able to get it to an inline TVF with a recursive CTE (two of them, unfortunately). With 1000 iterations, I needed a <code>MAXRECURSION</code> of at least 998 to get it to finish.</p>
+
+<p><strong>I wouldn't trust this as a cryptographically secure implementation</strong>. I strongly suspect that the optimizer could do something funny here that would enable timing attacks; likely some very aggressive query hinting would be needed to ensure a stable join order and methodology. With some digging, I think we would have to do the following (at a minimum) to make it cryptographically secure. All of these are to prevent <a href="https://flak.tedunangst.com/post/timing-attacks-vs-hash-tables" rel="nofollow noreferrer">timing attacks</a>:</p>
+
+<ol>
+<li>Force <code>LOOP</code> joins; <code>HASH</code> joins use hash tables, which have known timing attack vulnerabilities, and <code>MERGE</code> joins will sort, which will be impacted by the available data.</li>
+<li>Force a join order (<code>OPTION( FORCE ORDER )</code>); if the optimizer knows something about the cardinality of the data set and re-orders as a result we'll also see different numbers.</li>
+<li>Disable parallelism (<code>OPTION( MAXDOP 1 )</code>)</li>
+</ol>
+
+<p>Throughout all of this I'm heavily relying on the behavior of the <code>APPLY</code> operator where it evaluates the right-hand side for each row of the left-hand side. This was vital to get some of these complicated calculations, and I suspect is the path towards a non-recursive implementation (if there is one).</p>
+
+<p>The first thing I had to do was re-create your outer loop calculations, which I did with something like this. You might need more in the counter in the middle (just keep <code>CROSS APPLY</code>ing to <code>sys.all_objects</code>), but this was fine for my test cases.</p>
+
+<pre><code>SELECT uAOuter.Hash UA,
+       uAOuter.Hash UB,
+       OuterLooper.Counter
+  FROM ( SELECT TOP (( @derivedKeyLength + @hmacLength - 1 ) / @hmacLength )
+                ROW_NUMBER() OVER ( ORDER BY ( SELECT NULL )) [Counter],
+                @salt + CAST(ROW_NUMBER() OVER ( ORDER BY ( SELECT NULL )) AS binary(4)) U
+           FROM sys.all_objects
+           ORDER BY [Counter] ASC ) OuterLooper
+    CROSS APPLY dbo.Hmac( @password, OuterLooper.U ) uAOuter
+</code></pre>
+
+<p>After that I got really stuck on how to calculate <code>@uA</code> in terms of itself; I still think that there is probably some really, really clever <code>APPLY</code> wizardry to get this, but I spent a few hours going nowhere on that one. Instead, I ultimately settled on a recursive CTE to get the base case and then do the calculation. </p>
+
+<pre><code>WITH InnerLoopRecursive AS
+(
+  SELECT tA.Hash uA,
+         tB.Hash uB,
+         OuterLoop.Counter OuterCount,
+         1 [Counter]
+    FROM ( SELECT uAOuter.Hash UA,
+                  uAOuter.Hash UB,
+                  OuterLooper.Counter
+             FROM ( SELECT TOP (( @derivedKeyLength + @hmacLength - 1 ) / @hmacLength )
+                           ROW_NUMBER() OVER ( ORDER BY ( SELECT NULL )) [Counter],
+                           @salt + CAST(ROW_NUMBER() OVER ( ORDER BY ( SELECT NULL )) AS binary(4)) U
+                      FROM sys.all_objects
+                      ORDER BY [Counter] ASC ) OuterLooper
+               CROSS APPLY dbo.Hmac( @password, OuterLooper.U ) uAOuter ) OuterLoop
+      CROSS APPLY dbo.Hmac( @password, OuterLoop.UA ) tA
+      CROSS APPLY ( VALUES (
+                      -- unrolled loop to XOR uA and uB
+                      CAST(SUBSTRING( tA.Hash, 1, 8 ) ^ CAST(SUBSTRING( OuterLoop.UB, 1, 8 ) AS bigint) AS binary(8)) + CAST(SUBSTRING( tA.Hash, 9, 8 ) ^ CAST(SUBSTRING( OuterLoop.UB, 9, 8 ) AS bigint) AS binary(8)) + CAST(SUBSTRING( tA.Hash, 17, 8 ) ^ CAST(SUBSTRING( OuterLoop.UB, 17, 8 ) AS bigint) AS binary(8)) + CAST(SUBSTRING( tA.Hash, 25, 8 ) ^ CAST(SUBSTRING( OuterLoop.UB, 25, 8 ) AS bigint) AS binary(8)))) tB ( [Hash] )
+  UNION ALL
+  SELECT tA.Hash uA,
+         tB.Hash uB,
+         InnerLoopRecursive.OuterCount,
+         InnerLoopRecursive.Counter + 1
+    FROM InnerLoopRecursive
+      CROSS APPLY dbo.Hmac( @password, InnerLoopRecursive.uA ) tA
+      CROSS APPLY ( VALUES (
+                      -- unrolled loop to XOR uA and uB
+                      CAST(SUBSTRING( tA.Hash, 1, 8 ) ^ CAST(SUBSTRING( InnerLoopRecursive.uB, 1, 8 ) AS bigint) AS binary(8)) + CAST(SUBSTRING( tA.Hash, 9, 8 ) ^ CAST(SUBSTRING( InnerLoopRecursive.uB, 9, 8 ) AS bigint) AS binary(8)) + CAST(SUBSTRING( tA.Hash, 17, 8 ) ^ CAST(SUBSTRING( InnerLoopRecursive.uB, 17, 8 ) AS bigint) AS binary(8)) + CAST(SUBSTRING( tA.Hash, 25, 8 ) ^ CAST(SUBSTRING( InnerLoopRecursive.uB, 25, 8 ) AS bigint) AS binary(8)))) tB ( [Hash] )
+    WHERE InnerLoopRecursive.Counter + 1 &lt; @iterations
+)
+</code></pre>
+
+<p>After that I was really hoping to get away with just an aggregate (or maybe a window function), but apparently you can't do that with <code>varbinary(MAX)</code>, so I had to do another recursive CTE.</p>
+
+<pre><code>, DerivedKeyPerOuterLoop AS
+(
+  SELECT CONVERT( varbinary(MAX), '' ) DerivedKey,
+         0 [Counter]
+  UNION ALL
+  SELECT DerivedKeyPerOuterLoop.DerivedKey + CONVERT( varbinary(MAX),
+                                                      CASE WHEN DerivedKeyPerOuterLoop.Counter = (( @derivedKeyLength + @hmacLength - 1 ) / @hmacLength ) THEN LEFT(InnerLoopRecursive.uB, @derivedKeyLength - ((( @derivedKeyLength + @hmacLength - 1 ) / @hmacLength ) - 1 ) * @hmacLength)
+                                                           ELSE InnerLoopRecursive.uB END ) DerivedKey,
+         DerivedKeyPerOuterLoop.Counter + 1
+    FROM DerivedKeyPerOuterLoop
+      INNER JOIN InnerLoopRecursive
+        ON ( DerivedKeyPerOuterLoop.Counter + 1 ) = InnerLoopRecursive.OuterCount
+    WHERE InnerLoopRecursive.Counter = @iterations - 1
+)
+</code></pre>
+
+<p>Throughout the recursive CTEs the <code>JOIN</code>s get pretty funky as we're trying to handle a potential granularity explosion, but it should work okay-ish.</p>
+
+<p>Once we have that final CTE, then we just need to get the result from the last iteration:</p>
+
+<pre><code>CREATE OR ALTER FUNCTION dbo.Pbkdf2_modified
+(
+  @password         varbinary(8000),
+  @salt             varbinary(7996),
+  @iterations       int = 1000,
+  @derivedKeyLength int = 32,
+  @hmacLength       int = 32
+)
+RETURNS table
+AS
+  RETURN ( WITH InnerLoopRecursive AS
+           (
+             SELECT tA.Hash uA,
+                    tB.Hash uB,
+                    OuterLoop.Counter OuterCount,
+                    1 [Counter]
+               FROM ( SELECT uAOuter.Hash UA,
+                             uAOuter.Hash UB,
+                             OuterLooper.Counter
+                        FROM ( SELECT TOP (( @derivedKeyLength + @hmacLength - 1 ) / @hmacLength )
+                                      ROW_NUMBER() OVER ( ORDER BY ( SELECT NULL )) [Counter],
+                                      @salt + CAST(ROW_NUMBER() OVER ( ORDER BY ( SELECT NULL )) AS binary(4)) U
+                                 FROM sys.all_objects
+                                 ORDER BY [Counter] ASC ) OuterLooper
+                          CROSS APPLY dbo.Hmac( @password, OuterLooper.U ) uAOuter ) OuterLoop
+                 CROSS APPLY dbo.Hmac( @password, OuterLoop.UA ) tA
+                 CROSS APPLY ( VALUES (
+                                 -- unrolled loop to XOR uA and uB
+                                 CAST(SUBSTRING( tA.Hash, 1, 8 ) ^ CAST(SUBSTRING( OuterLoop.UB, 1, 8 ) AS bigint) AS binary(8)) + CAST(SUBSTRING( tA.Hash, 9, 8 ) ^ CAST(SUBSTRING( OuterLoop.UB, 9, 8 ) AS bigint) AS binary(8)) + CAST(SUBSTRING( tA.Hash, 17, 8 ) ^ CAST(SUBSTRING( OuterLoop.UB, 17, 8 ) AS bigint) AS binary(8)) + CAST(SUBSTRING( tA.Hash, 25, 8 ) ^ CAST(SUBSTRING( OuterLoop.UB, 25, 8 ) AS bigint) AS binary(8)))) tB ( [Hash] )
+             UNION ALL
+             SELECT tA.Hash uA,
+                    tB.Hash uB,
+                    InnerLoopRecursive.OuterCount,
+                    InnerLoopRecursive.Counter + 1
+               FROM InnerLoopRecursive
+                 CROSS APPLY dbo.Hmac( @password, InnerLoopRecursive.uA ) tA
+                 CROSS APPLY ( VALUES (
+                                 -- unrolled loop to XOR uA and uB
+                                 CAST(SUBSTRING( tA.Hash, 1, 8 ) ^ CAST(SUBSTRING( InnerLoopRecursive.uB, 1, 8 ) AS bigint) AS binary(8)) + CAST(SUBSTRING( tA.Hash, 9, 8 ) ^ CAST(SUBSTRING( InnerLoopRecursive.uB, 9, 8 ) AS bigint) AS binary(8)) + CAST(SUBSTRING( tA.Hash, 17, 8 ) ^ CAST(SUBSTRING( InnerLoopRecursive.uB, 17, 8 ) AS bigint) AS binary(8)) + CAST(SUBSTRING( tA.Hash, 25, 8 ) ^ CAST(SUBSTRING( InnerLoopRecursive.uB, 25, 8 ) AS bigint) AS binary(8)))) tB ( [Hash] )
+               WHERE InnerLoopRecursive.Counter + 1 &lt; @iterations
+           ),
+                DerivedKeyPerOuterLoop AS
+           (
+             SELECT CONVERT( varbinary(MAX), '' ) DerivedKey,
+                    0 [Counter]
+             UNION ALL
+             SELECT DerivedKeyPerOuterLoop.DerivedKey + CONVERT( varbinary(MAX),
+                                                                 CASE WHEN DerivedKeyPerOuterLoop.Counter = (( @derivedKeyLength + @hmacLength - 1 ) / @hmacLength ) THEN LEFT(InnerLoopRecursive.uB, @derivedKeyLength - ((( @derivedKeyLength + @hmacLength - 1 ) / @hmacLength ) - 1 ) * @hmacLength)
+                                                                      ELSE InnerLoopRecursive.uB END ) DerivedKey,
+                    DerivedKeyPerOuterLoop.Counter + 1
+               FROM DerivedKeyPerOuterLoop
+                 INNER JOIN InnerLoopRecursive
+                   ON ( DerivedKeyPerOuterLoop.Counter + 1 ) = InnerLoopRecursive.OuterCount
+               WHERE InnerLoopRecursive.Counter = @iterations - 1
+           )
+           SELECT DerivedKeyPerOuterLoop.DerivedKey
+             FROM DerivedKeyPerOuterLoop
+             WHERE DerivedKeyPerOuterLoop.Counter = (( @derivedKeyLength + @hmacLength - 1 ) / @hmacLength ));
+</code></pre>
+    </div>

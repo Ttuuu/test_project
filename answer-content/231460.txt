@@ -1,0 +1,220 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Here is the updated code based on feedback:</p>
+
+<pre><code>using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace Boltron.UI.UWP.Commands
+{
+    public class MessageBroker
+    {
+        private readonly ConcurrentDictionary&lt;(string name, Type message), ConcurrentBag&lt;Action&lt;IBrokeredMessage&gt;&gt;&gt; _brokeredMessageHandlers =
+            new ConcurrentDictionary&lt;(string name, Type message), ConcurrentBag&lt;Action&lt;IBrokeredMessage&gt;&gt;&gt;();
+
+        private readonly ConcurrentDictionary&lt;(string name, Type message), ConcurrentBag&lt;Action&lt;IBrokeredMessageWithReply&gt;&gt;&gt; _brokeredMessageWithReplyHandlers =
+            new ConcurrentDictionary&lt;(string name, Type message), ConcurrentBag&lt;Action&lt;IBrokeredMessageWithReply&gt;&gt;&gt;();
+
+        public static MessageBroker Instance { get; } = new MessageBroker();
+
+        public async Task SendAsync(
+            IBrokeredMessage message
+            , Action&lt;Guid&gt; sent = null
+            , Action&lt;Guid&gt; complete = null
+            , CancellationToken cancellationToken = default)
+        {
+            var key = (message.MessageName, message.GetType());
+
+            if (_brokeredMessageHandlers.TryGetValue(key, out var bag))
+            {
+                var subscribers = bag.ToImmutableList();
+
+                await SendMessageAsync(message, subscribers, sent, complete, cancellationToken);
+            }
+        }
+
+        public async Task SendWithReplyAsync(
+            IBrokeredMessageWithReply message
+            , Action&lt;Guid&gt; sent = null
+            , Action&lt;Guid&gt; complete = null
+            , CancellationToken cancellationToken = default)
+        {
+            var key = (message.MessageName, message.GetType());
+
+            if (_brokeredMessageWithReplyHandlers.TryGetValue(key, out var bag))
+            {
+                var subscribers = bag.Cast&lt;Action&lt;IBrokeredMessage&gt;&gt;().ToImmutableList();
+
+                await SendMessageAsync(message, subscribers, sent, complete, cancellationToken);
+            }
+        }
+
+        private async Task SendMessageAsync(
+            IBrokeredMessage message
+            , ImmutableList&lt;Action&lt;IBrokeredMessage&gt;&gt; subscribers
+            , Action&lt;Guid&gt; sent = null
+            , Action&lt;Guid&gt; complete = null
+            , CancellationToken cancellationToken = default)
+        {
+            var tasks = new List&lt;Task&gt;();
+
+            subscribers.ForEach(s =&gt; tasks.Add(Task.Factory.StartNew(() =&gt;
+            {
+                if (s != null &amp;&amp; !cancellationToken.IsCancellationRequested)
+                {
+                    s(message);
+                }
+            }, cancellationToken)));
+
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                sent?.Invoke(message.MessageUid);
+
+                await Task.Run(
+                    () =&gt; Task.WaitAll(tasks.ToArray(), cancellationToken)
+                    , cancellationToken);
+
+                if (!cancellationToken.IsCancellationRequested)
+                {
+                    complete?.Invoke(message.MessageUid);
+                }
+            }
+
+        }
+
+        public void AddHandler(string messageName
+            , Type messageType
+            , Action&lt;IBrokeredMessage&gt; brokeredMessageHandler)
+        {
+            var key = (messageName, messageType);
+
+            _brokeredMessageHandlers.TryGetValue(key, out var bag);
+
+            if (bag == null)
+            {
+                bag = new ConcurrentBag&lt;Action&lt;IBrokeredMessage&gt;&gt;();
+                _brokeredMessageHandlers.TryAdd(key, bag);
+            }
+
+            if (!bag.Contains(brokeredMessageHandler))
+            {
+                bag.Add(brokeredMessageHandler);
+            }
+        }
+
+        public void AddHandlerWithReply(string messageName
+            , Type messageType
+            , Action&lt;IBrokeredMessageWithReply&gt; brokeredMessageWithReplyHandler)
+        {
+            var key = (messageName, messageType);
+
+            _brokeredMessageWithReplyHandlers.TryGetValue(key, out var bag);
+
+            if (bag == null)
+            {
+                bag = new ConcurrentBag&lt;Action&lt;IBrokeredMessageWithReply&gt;&gt;();
+                _brokeredMessageWithReplyHandlers.TryAdd(key, bag);
+            }
+
+            if (!bag.Contains(brokeredMessageWithReplyHandler))
+            {
+                bag.Add(brokeredMessageWithReplyHandler);
+            }
+        }
+    }
+
+    public interface IBrokeredMessage
+    {
+        string MessageName { get; }
+        Guid MessageUid { get; }
+        DateTimeOffset TimestampUtc { get; }
+    }
+
+    public abstract class BrokeredMessageBase : IBrokeredMessage
+    {
+        public string MessageName { get; }
+        public Guid MessageUid { get; }
+        public DateTimeOffset TimestampUtc { get; } = DateTimeOffset.UtcNow;
+
+        protected BrokeredMessageBase(string name, Guid uid = default)
+        {
+            MessageName = name;
+            MessageUid = uid != default ? uid : Guid.NewGuid();
+        }
+    }
+
+    public class BrokeredMessage&lt;TParameter&gt; : BrokeredMessageBase
+    {
+        public TParameter Parameter { get; }
+        public BrokeredMessage(TParameter parameter, string name, Guid uid = default) : base(name, uid)
+        {
+            Parameter = parameter;
+        }
+    }
+
+    public class BrokeredMessage : BrokeredMessageBase
+    {
+        public object Parameter { get; }
+        public BrokeredMessage(object parameter, string name, Guid uid = default) : base(name, uid)
+        {
+            Parameter = parameter;
+        }
+    }
+
+    public interface IBrokeredMessageWithReply : IBrokeredMessage
+    {
+
+    }
+
+    public abstract class BrokeredMessageWithReplyBase&lt;TReturn&gt; : BrokeredMessageBase, IBrokeredMessageWithReply
+    {
+        private readonly object _owner;
+        private ConcurrentBag&lt;TReturn&gt; Replies { get; }
+
+        protected BrokeredMessageWithReplyBase(string name, object owner, Guid uid = default) : base(name, uid)
+        {
+            _owner = owner;
+            Replies = new ConcurrentBag&lt;TReturn&gt;();
+        }
+
+        public void AddReply(TReturn reply)
+        {
+            Replies.Add(reply);
+        }
+
+        public IEnumerable&lt;TReturn&gt; GetReplies(object claimant)
+        {
+            if (claimant != _owner) yield break;
+
+            foreach (var item in Replies)
+            {
+                yield return item;
+            }
+        }
+    }
+
+    public class BrokeredMessageWithReply&lt;TParameter, TReturn&gt; : BrokeredMessageWithReplyBase&lt;TReturn&gt;
+    {
+        public TParameter Parameter { get; }
+        public BrokeredMessageWithReply(TParameter parameter, string name, Guid uid = default) : base(name, uid)
+        {
+            Parameter = parameter;
+        }
+    }
+
+    public class BrokeredMessageWithReply&lt;TReturn&gt; : BrokeredMessageWithReplyBase&lt;TReturn&gt;
+    {
+        public object Parameter { get; }
+        public BrokeredMessageWithReply(object parameter, string name, Guid uid = default) : base(name, uid)
+        {
+            Parameter = parameter;
+        }
+    }
+}
+<span class="math-container">```</span>
+</code></pre>
+    </div>

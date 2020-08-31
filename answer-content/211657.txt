@@ -1,0 +1,89 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The concurrency looks bug-free to me, which is rare!</p>
+
+<p>Some nits on C++ idioms:</p>
+
+<p>It is <em>extremely</em> unusual to take a function pointer as a template parameter. This drastically limits the reusability of your class template. A more traditional, "STL-ish" interface would be</p>
+
+<pre><code>template&lt;class Buffer, class Produce, class Consume&gt;
+class triple_buffer {
+    explicit triple_buffer(Buffer bufs[3]);
+    explicit triple_buffer(Buffer bufs[3], Produce produce, Consume consume);
+    // ...
+};
+</code></pre>
+
+<p>Or, since <code>produce</code> and <code>consume</code> are used only inside the constructor — it immediately wraps them up in lambdas and passes them off to <code>std::thread</code> — you don't even need them to be template parameters of the whole class. They can be template parameters of the <em>constructor itself</em>. Something like this:</p>
+
+<pre><code>template&lt;class Buffer&gt;
+class triple_buffer {
+    template&lt;class P, class C&gt;
+    explicit triple_buffer(Buffer bufs[3], P produce, C consume) {
+        // ...
+        produce(present_.load());
+        producer_thread_ = std::thread([&amp;, produce]() {
+            while (!stop_.load()) {
+                produce(inprogress_.load());
+                inprogress_ = ready_.exchange(inprogress_);
+                stale_.store(false);
+            }
+        });
+        // ...
+    }
+};
+</code></pre>
+
+<p>(In C++14 you can capture <code>produce</code> as <code>[&amp;, produce = std::move(produce)]</code> to avoid making a copy of it.)</p>
+
+<p>Notice the <code>CamelCase</code> template parameter names.</p>
+
+<p>I also recommend sigilling the names of your member variables — <code>ready_</code> rather than <code>ready</code>, and so on. (Some coding style guides prefer <code>m_ready</code> or <code>d_ready</code>. No big deal.)</p>
+
+<p>These two naming conventions, together, will help to alleviate some of your confusingly similar naming. Right now you've got a template parameter named <code>produce</code> and a member function named <code>producer</code> (and your test harness has a global function named <code>produce</code>). Of course, I just "fixed" that naming issue by getting rid of the <code>producer</code> member function altogether!</p>
+
+<hr>
+
+<p>You use both <code>atomic&lt;bool&gt; stop</code> and <code>atomic_flag stale</code>. There's no significant difference between <code>atomic&lt;bool&gt;</code> and <code>atomic_flag</code>; you should pick one and stick to it. I recommend <code>atomic&lt;bool&gt;</code> because it's one fewer thing for your coworkers to look up on cppreference.</p>
+
+<hr>
+
+<pre><code>inprogress = ready.exchange(inprogress);
+</code></pre>
+
+<p>This line is correct, but I <em>really strongly</em> encourage you to rewrite it as two lines anyway. "One side-effect per source line" is a good rule of thumb for concurrent code. And there really are two side-effects happening here.</p>
+
+<pre><code>Buffer *p = ready.exchange(inprogress);
+inprogress.store(p);
+</code></pre>
+
+<p>Splitting it up this way makes it clear what's going on — in particular that the swap is <em>not</em> being effected atomically — and incidentally makes the code easier to stress-test (by adding instrumentation between each pair of lines) and debug (because now it's possible to pause the debugger between the two side-effects).</p>
+
+<hr>
+
+<pre><code>while (stale.test_and_set())
+</code></pre>
+
+<p>If you switch to consistently using <code>atomic&lt;bool&gt;</code>, this line would become</p>
+
+<pre><code>while (stale.exchange(true))
+</code></pre>
+
+<hr>
+
+<pre><code>consumer_thread = std::move(std::thread([this] { consumer(); }));
+</code></pre>
+
+<p>This line is overengineered. You don't need to <code>std::move</code> a prvalue. And personally, I'd capture <code>[&amp;]</code> unless I had a special reason not to. So:</p>
+
+<pre><code>consumer_thread = std::thread([&amp;]{ consumer(); });
+</code></pre>
+
+<hr>
+
+<p>Stylistically, I wonder why <code>triple_buffer</code> takes a pointer to an array of three <code>Buffer</code> objects, as opposed to either</p>
+
+<ul>
+<li><p>taking three pointers to <code>Buffer</code> objects (which then needn't be adjacent in memory), or</p></li>
+<li><p>giving <code>triple_buffer</code> three member variables of type <code>Buffer</code>.</p></li>
+</ul>
+    </div>

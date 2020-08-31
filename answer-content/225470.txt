@@ -1,0 +1,218 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p>This code is a significant part of my runtime, so any performance improving observations would be appreciated.</p>
+</blockquote>
+
+<p>I'm not sure the following will bring significant improvements, but if you want to squeeze out every bit of performance, I have a few ideas.</p>
+
+<h3>(optimizing for perf) Replace <code>printf</code> with interpolated strings</h3>
+
+<p>The main reasons to use <code>printf</code>:</p>
+
+<ul>
+<li>Print text within trailing newline (better than non-portable <code>echo -n ...</code>)</li>
+<li>Use advanced formatting features as in the C-function with similar name</li>
+</ul>
+
+<p>In many places in the code these features are not needed, either because the strings don't use special formatting features, or because the strings are only used in <code>$(...)</code> context, where the trailing newlines will be stripped anyway.
+So I suggest to replace these:</p>
+
+<blockquote>
+<pre><code>treeData="$(printf '%s\n%s' "$treeData" "$(createSubtreeRec "$fullpath")")"
+...
+printf '040000 tree %s\t%s' $hash "$(basename "$path")"
+...
+printf '%s blob %s\t%s' $mode $hash "$(basename "$path")"
+...
+local entry="$(printf '%s %s %s\t%s' '040000' tree $hash $(basename "$path"))"
+</code></pre>
+</blockquote>
+
+<p>With:</p>
+
+<pre><code>treeData=$treeData$'\n'$(createSubtreeRec "$fullpath")
+...
+echo "040000 tree $hash"$'\t'"$(basename "$path")"
+...
+echo "$mode blob $hash"$'\t'"$(basename "$path")"
+...
+local entry="040000 tree $hash"$'\t'$(basename "$path")
+</code></pre>
+
+<p>You <em>could</em> embed tab characters in a string, it would make those lines easier to read:</p>
+
+<pre><code>echo "040000 tree $hash $(basename "$path")"
+#                      ^
+#                     tab
+</code></pre>
+
+<p>But I recommend to use <code>$'\t'</code> as above, because I don't like invisible characters :-)</p>
+
+<h3>(optimizing for perf) Replace <code>basename "..."</code> with substitution</h3>
+
+<p>Instead of <code>basename "$path"</code>, you could write <code>${path##*/}</code>.
+This might be a bit faster because substitution is native Bash, while <code>basename</code> is a program, with the overhead of executing another process.
+And I think the result should be equivalent, because the path separator <code>/</code> is not allowed in file and directory names.</p>
+
+<p>It may be tempting to replace <code>dirname "$path"</code> with <code>${path%/*}</code>. That requires a bit more careful thought, because the return value won't always be the same.</p>
+
+<h3>Use here-strings</h3>
+
+<p>Instead of <code>echo ... | cmd</code>, use <code>cmd &lt;&lt;&lt; "..."</code>.</p>
+
+<h3>(optimizing for perf) Rearrange operations to avoid redundant conditions</h3>
+
+<p>Consider this piece of code from your post, with minor optimizations to remove some noise:</p>
+
+<blockquote>
+<pre><code>if [ "$path" ]; then
+    entry=$(createSubtreeRec "$workdir/$path")
+else
+    entry=$(createSubtreeRec "$workdir")
+fi
+
+if [ "$entry" ]; then
+    while [ "$path" ] &amp;&amp; [ "$path" != "." ] ; do
+        hash=$(git mktree &lt;&lt;&lt; "$entry")
+        path=$(dirname "$path")
+        entry="040000 tree $hash"$'\t'"${path##*/}"
+    done
+    echo "$hash"
+fi
+</code></pre>
+</blockquote>
+
+<p>Can you spot some odd execution paths?</p>
+
+<ul>
+<li><code>$path</code> is either empty to begin with, or it will never be empty</li>
+<li>In the last iteration of the <code>while</code> loop, <code>entry</code> is computed and it will not be used</li>
+<li>If <code>$path</code> is <code>.</code> to begin with, then <code>createSubtreeRec "$workdir/."</code> will get executed, and I doubt that's what you want.</li>
+</ul>
+
+<p>To eliminate some redundant paths, sometimes it helps to first <em>increase</em> the redundancy. This is logically equivalent to the above code:</p>
+
+<pre><code>if [ "$path" ]; then
+    entry=$(createSubtreeRec "$workdir/$path")
+    if [ "$entry" ]; then
+        while [ "$path" ] &amp;&amp; [ "$path" != "." ] ; do
+            hash=$(git mktree &lt;&lt;&lt; "$entry")
+            path=$(dirname "$path")
+            entry="040000 tree $hash"$'\t'"${path##*/}"
+        done
+        echo "$hash"
+    fi
+else
+    entry=$(createSubtreeRec "$workdir")
+    if [ "$entry" ]; then
+        while [ "$path" ] &amp;&amp; [ "$path" != "." ] ; do
+            hash=$(git mktree &lt;&lt;&lt; "$entry")
+            path=$(dirname "$path")
+            entry="040000 tree $hash"$'\t'"${path##*/}"
+        done
+        echo "$hash"
+    fi
+fi
+</code></pre>
+
+<p>Now let's try to simplify it. In the <code>else</code> branch we know that <code>$path</code> is empty, and it cannot possibly change, so we can drop the <code>while</code> loop:</p>
+
+<pre><code>else
+    entry=$(createSubtreeRec "$workdir")
+    if [ "$entry" ]; then
+        echo "$hash"
+    fi
+fi
+</code></pre>
+
+<p>And since <code>$hash</code> is only ever set in the <code>while</code> loop we dropped, we can drop that too:</p>
+
+<pre><code>else
+    entry=$(createSubtreeRec "$workdir")
+    if [ "$entry" ]; then
+        echo
+    fi
+fi
+</code></pre>
+
+<p>At this point I wonder if you really wanted to print a blank line in this case, or if it's a bug. (I let you decide!)</p>
+
+<p>Back to the <code>if</code> branch, we have this code now:</p>
+
+<pre><code>    entry=$(createSubtreeRec "$workdir/$path")
+    if [ "$entry" ]; then
+        while [ "$path" ] &amp;&amp; [ "$path" != "." ] ; do
+            hash=$(git mktree &lt;&lt;&lt; "$entry")
+            path=$(dirname "$path")
+            entry="040000 tree $hash"$'\t'"${path##*/}"
+        done
+        echo "$hash"
+    fi
+</code></pre>
+
+<p>Since at this point <code>$path</code> is not empty and will never be, we can simplify the <code>while</code> statement, eliminating one unnecessary evaluation per iteration:</p>
+
+<pre><code>        while [ "$path" != "." ] ; do
+</code></pre>
+
+<p>This is still not ideal, since this condition will always be true for the first time, and the last computation of <code>entry</code> will not be used. We can rearrange the loop to improve on both of these points:</p>
+
+<pre><code>        while true; do
+            hash=$(git mktree &lt;&lt;&lt; "$entry")
+            path=$(dirname "$path")
+            [ "$path" != "." ] || break
+            entry="040000 tree $hash"$'\t'"${path##*/}"
+        done
+        echo "$hash"
+</code></pre>
+
+<p>I doubt any of this would have a measurable performance difference except in extremely deep paths, I thought it was an interesting exercise to share.</p>
+
+<h3>Missed one important double-quoting</h3>
+
+<p>There is one spot that missed an important double-quoting:</p>
+
+<blockquote>
+<pre><code>local entry="$(printf '%s %s %s\t%s' '040000' tree $hash $(basename "$path"))"
+</code></pre>
+</blockquote>
+
+<p>If the basename of <code>$path</code> contains spaces, then the result of <code>$(basename "$path")</code> will be subject to word-splitting. Correctly quoted, the above line would be:</p>
+
+<pre><code>local entry=$(printf '%s %s %s\t%s' '040000' tree "$hash" "$(basename "$path")")
+</code></pre>
+
+<p>Note:</p>
+
+<ul>
+<li><p>It's true that in this example <em>we know</em> that <code>$hash</code> is safe even without double-quoting. You never know how the script might evolve, and somebody might assign something unsafe to this variable. Also, when <em>you</em> assign something to a variable, you don't want to verify if all uses of the variable are safe enough. If you develop the habit to always double-quote variables used in command arguments, you can rest assured that your code is safe.</p></li>
+<li><p>I dropped the double-quotes around the right-hand side of the assignment, because it's already safe like that. If the value contained literal spaces, that would have to be quoted though. If you feel safer to always write <code>v="..."</code>, that's fine.</p></li>
+</ul>
+
+<h3>No need for input validation?</h3>
+
+<p>From the posted code it's not clear if <code>createSubtree</code> is guaranteed to get safe input. It seems to me that <code>path</code> is expected to be valid relative path from <code>worktree</code>, but I don't see how that is actually enforced.
+You might want to add some sanity checks and fail fast (and with a big bang) when receiving something unexpected.</p>
+
+<h3>Minor things</h3>
+
+<p>I'm not a fan of assigning a default value and overwriting it like this:</p>
+
+<blockquote>
+<pre><code>mode=100644
+if [ -x "$path" ]; then
+    mode=100755
+fi
+</code></pre>
+</blockquote>
+
+<p>I would rather spell out an <code>else</code>.</p>
+
+<hr>
+
+<p>Instead of duplicating the pattern <code>%(mode) %(type) %(hash)\t%(name)</code> in multiple places, it might be a good idea to create a helper function for it.</p>
+
+<hr>
+
+<p>The <code>type</code> variable is assigned once and never used.</p>
+    </div>

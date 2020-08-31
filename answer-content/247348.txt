@@ -1,0 +1,184 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Your code doesn't have complete test coverage. Nor does it test <code>__getattr__</code> at all.</p>
+<ol>
+<li><p>You call <code>__getattr__</code> without providing the instance.</p>
+</li>
+<li><p>You call <code>__getattr__</code> before walking the entire <code>__mro__</code> to verify if the object exists.
+This causes any object with only <code>__getattr__</code> defined on the leaf class to break all, non-instance, attribute lookup.</p>
+</li>
+<li><p>Due to your recursive approach you return changes to an instances <code>__dict__</code> even if the attribute is a descriptor.</p>
+</li>
+<li><p>You pass the incorrect class to descriptors. They expect the type of the instance, not the type of the object the descriptor is defined on.</p>
+<p>My partially fixed version of your code only ever displays <code>Foo</code>.
+However my version and <code>getattr</code> display <code>Foo</code>, <code>Bar</code>, <code>Spam</code> and <code>Ham</code>.</p>
+</li>
+</ol>
+<p>Your code would be much simpler if you just removed any recursion:</p>
+<pre><code>def _getattr(objs, attr):
+    SENTINEL = object()
+    for obj in objs:
+        value = obj.__dict__.get(attr, SENTINEL)
+        if value is not SENTINEL:
+            return True, value
+    return False, None
+
+
+def getattribute_peilonrayz(instance, attr):
+    has_cls, value_cls = _getattr(type(instance).__mro__, attr)
+    if has_cls and hasattr(value_cls, '__get__'):
+        return value_cls.__get__(instance, type(instance))
+    has_inst, value_inst = _getattr([instance], attr)
+    if has_inst:
+        return value_inst
+    if has_cls:
+        return value_cls
+    has_attr, value_attr = _getattr(type(instance).__mro__, '__getattr__')
+    if has_attr:
+        return value_attr(instance, attr)
+    raise AttributeError("No attribute {}".format(attr))
+</code></pre>
+<p>You can test this along with a modified version of yours with the following.</p>
+<pre><code>def disp(value):
+    return
+    print value
+
+
+def object_getattribute_1(instance, klass, attrname, klass_mro=[]):
+    """This does not fix 3 or 4."""
+    disp("[ INSPECTING ]: %s" % klass)
+    if attrname in klass.__dict__.keys():
+        disp("yep, in Class.__dict__")
+        if ( hasattr( klass.__dict__[attrname], '__get__' ) 
+             and hasattr( klass.__dict__[attrname], '__set__' ) ):
+            disp("yep, DATA descriptor found")
+            return True, klass.__dict__[attrname].__get__( instance, klass )
+        else:
+            disp("nope, not a DATA descriptor")
+            pass
+    else:
+        disp("nope, not in Class.__dict__")
+        pass
+    if attrname in instance.__dict__.keys():
+        disp("yep, instance.__dict__")
+        return True, instance.__dict__[attrname]
+    else:
+        disp("nope, not in instance.__dict__")
+        pass
+    if attrname in klass.__dict__.keys():
+        disp("yep, in Class.__dict__")
+        if hasattr( klass.__dict__[attrname], '__get__' ):
+            disp("yep, NON-DATA descriptor found")
+            return True, klass.__dict__[attrname].__get__(instance, klass)
+        else:
+            disp("return from Class.__dict__[ attrname ]")
+            return True, klass.__dict__[attrname]
+    else:
+        disp("nope, not in Class.__dict__")
+        pass
+    try:
+        return object_getattribute_1( instance, 
+        klass_mro.pop(0), attrname, klass_mro=klass_mro )
+    except IndexError:
+        return False, None
+
+
+def object_getattribute_2(instance, klass, attrname, klass_mro=[]):
+    if hasattr( klass, '__getattr__' ):
+        disp("return from Class.__getattr__( attrname )")
+        return klass.__getattr__(instance, attrname)
+    else:
+        disp("nope, no __getattr__ override")
+        pass
+    return object_getattribute_2( instance, 
+    klass_mro.pop(0), attrname, klass_mro=klass_mro )
+
+
+def getattribute(instance, attribute):
+    cls = type(instance)
+    has, value = object_getattribute_1(instance, cls, attribute, list(cls.__mro__))
+    if has:
+        return value
+    return object_getattribute_2(instance, cls, attribute, list(cls.__mro__))
+
+
+def assert_eq(a, b):
+    print('assert {!r} == {!r}'.format(a, b))
+    assert a == b
+
+
+def _tests(f, fn):
+    assert_eq('foo', fn(f, 'foo'))
+    f.foo = 'foo changed'
+    assert_eq('foo changed', fn(f, 'foo'))
+    assert_eq('bar get', fn(f, 'bar'))
+    # Commented out because of 3
+    # f.__dict__['bar'] = 'bar changed'
+    # assert_eq('bar get', fn(f, 'bar'))
+    f.bar = 'bar changed'
+    assert_eq('bar changed set get', fn(f, 'bar'))
+    assert_eq('baz __getattr__', fn(f, 'baz'))
+    f.baz = 'baz changed'
+    assert_eq('baz changed', fn(f, 'baz'))
+
+
+class Descriptor(object):
+    def __init__(self, value):
+        self.value = value
+        self.values = {}
+    def __get__(self, obj, objtype):
+        print(obj, objtype)
+        return self.values.get(obj, self.value) + ' get'
+    def __set__(self, obj, value):
+        self.values[obj] = value + ' set'
+
+
+class Foo(object):
+    foo = 'foo'
+    bar = Descriptor('bar')
+    def __getattr__(self, value):
+        return value + ' __getattr__'
+
+
+class Bar(Foo):
+    pass
+
+
+class Baz(Foo):
+    pass
+
+
+class Spam(Bar, Baz):
+    pass
+
+
+class Ham(Baz, Bar):
+    pass
+
+
+def test_basic(fn):
+    _tests(Foo(), fn)
+
+
+def test_line(fn):
+    _tests(Bar(), fn)
+
+
+def test_diamond(fn):
+    _tests(Spam(), fn)
+    _tests(Ham(), fn)
+
+
+test_basic(getattr)
+test_line(getattr)
+test_diamond(getattr)
+
+test_basic(getattribute_peilonrayz)
+test_line(getattribute_peilonrayz)
+test_diamond(getattribute_peilonrayz)
+
+test_basic(getattribute)
+test_line(getattribute)
+test_diamond(getattribute)
+
+</code></pre>
+    </div>

@@ -1,0 +1,340 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Separate game for unrelated stuff</h1>
+<p>The core of a game should be independent of the user interface. It should be able to work using the DOM or a console. It could be sounds sequences, words, shapes or anything. As long as the external interfaces implement the required properties and the callback get the correct data you should not need to change any of the game code to change how its played.</p>
+<p>Your enquirers</p>
+<blockquote>
+<p>did I make good choices for the methods,</p>
+</blockquote>
+<p>No, to pick on just on</p>
+<p><code>simon.init</code> not needed. Should have one starting point and as a game it should relate to the game. <code>simon.newGame</code> would have been better. All the init can be done outside the object <code>simon</code></p>
+<p>See rewrite for an alternative approch.</p>
+<blockquote>
+<p>is there enough separation of concerns etc.</p>
+</blockquote>
+<p>No</p>
+<p>The following methods are unrelated to the game.</p>
+<pre><code>    bindControls: function() {
+    unbindControls: function() {
+    bindPads: function() {
+    unbindPads: function() {
+
+    // Related but doing too much
+    displaySequence : function() {
+</code></pre>
+<p>The Simon object should be able to function without the DOM. It creates sequences and outputs them, it then compares user input against the sequence, scores and moves to the next level or restarts.</p>
+<p>It interfaces with the outside state by providing functions to handle UI events and uses a defined interface to control the systems display state. It should not be creating listeners, it should not be querying the DOM, or getting involved in the detailed animation of display items. All it does is play Simon Says</p>
+<blockquote>
+<p>Are there any obvious conceptual errors?</p>
+</blockquote>
+<p>Yes</p>
+<ul>
+<li><code>Simon</code> is too busy with unrelated tasks.</li>
+<li>Create separate interfaces to handle display and setup UI.</li>
+<li>Games are state machines, and thus should have a way to change state that is robust (not reliant on current state) and easy to understand. Your code makes it vary hard to change between states as it is reliant on the current state to be able to change to the next. Calling a function while the object is not an appropriate state will cause the game to crash.</li>
+<li>You should not fill your code with magic numbers and names. Use a settings object to define all the variables in one place.</li>
+</ul>
+<h2>Rewrite example</h2>
+<p>The following is an example of how it could be written.</p>
+<p>As we can not use modules in these snippets much of what would be private variables are as function scoped variables shared between all. In the real world they would only be global to related code or available for import.</p>
+<p>I could not see any need for jQuery (particularly its very poor animation handling) and did not use it at all. However jQuery is a personal choice.</p>
+<p>(Note slight game play change, next level starts automatically)</p>
+<p></p><div class="snippet" data-lang="js" data-hide="true" data-console="true" data-babel="false">
+<div class="snippet-code snippet-currently-hidden">
+<pre class="snippet-code-js lang-js prettyprint-override"><code>//addEventListener("load", ()=&gt; {
+"use strict";
+/*===== Utilities not directly related to the question =====*/
+const callEach = (items, name, ...args) =&gt; { for(const item of items) { item[name](...args) } };
+const setEach = (items, name, value) =&gt; { for(const item of items) { item[name] = value } };
+const setOf = (count, cb = (i)=&gt;i) =&gt; {var a = [],i = 0; while (i &lt; count) { a.push(cb(i ++)) } return a };
+const randShuffle = (a, l = a.length) =&gt; { while (l) { a.push(a.splice(Math.random() * (l--) | 0, 1)[0]) } return a };
+const ease = v =&gt; v &lt; 0 ? 0 : v &gt; 1 ? 1 : v ** 2; 
+const query = query =&gt; document.querySelector(query);
+
+/*=========== All game related constants =====================*/
+const settings = {
+    autoStart : true,  // if true next level plays auto
+    autoStartPause : 1000, // Time to wait before auto start
+    endLevelPause : 1500, // in ms
+    text : {
+        score : "Score: ##", // The ## is replaced with the score,
+        instructions : "Repeat using sledge hammer (gently though)",
+        lost : "You lost.",
+        won : "You won.",
+        continue : "Click Start to continue.",
+        start : "Click Start to play.",
+        showingSequence : "Simon says..",
+    }, 
+    pad : {
+        flashTime : 600, // in ms
+        offOpacity : 0.4,
+        onOpacity : 1,
+    }
+};
+
+/*====Get refereneces to the DOM intergaces needed====*/
+const UI = {
+    start : query("#start-button"),
+    pads : query("#play-area"),
+    info : query("#info"),
+    score : query("#score"),
+};
+
+/*==== All game states ====*/
+const states = {
+    showingSequence : 1,
+    waitingForStart : 2,
+    waitingForUserSequence : 3, // waiting for the player to input sequence
+    pause : 4,                 // this state is always followed by waitingForStart
+    autoStart : 5,
+};    
+
+/*= Variables. Normaly these would be with the related code, but as the demo can not use modules 
+    they are gust globals */
+var score, level, sequence, sequencePos, gameState, globalTime = 0;        
+
+
+/*== Handles pad animation. call flash to flash a padd, Give it a callback to call when flash complete */
+function pad(element) {
+    var offAt = -1, onflashoff, on = true; // init state so that pad goes from on to off state
+    return {
+        update() {
+            var opacity;
+            if (on) {
+                if (offAt === undefined) { offAt = globalTime + settings.pad.flashTime }
+                const time = (offAt - globalTime) / settings.pad.flashTime;
+                opacity = ease(time) * (settings.pad.onOpacity - settings.pad.offOpacity) + settings.pad.offOpacity;
+                if (time &lt;= 0) {
+                    on = false;
+                    offAt = undefined;
+                    opacity = settings.pad.offOpacity;
+                    if (onflashoff) { onflashoff() }
+                }
+                element.style.opacity = opacity;
+            }
+        },
+        flash() { 
+            offAt = undefined;
+            on = true;
+        },
+        set onflashoff(callback) {
+            if (typeof callback === "function") { onflashoff = callback }
+            else { onflashoff = undefined }
+        } 
+    }
+}
+// Again as there are not modules this is just in global scope 
+const pads = [...UI.pads.querySelectorAll(".pad")].map(padElement =&gt; pad(padElement));
+// controls the pads 
+function animations(time) {
+    globalTime = time;
+    callEach(pads, "update");
+    requestAnimationFrame(animations);
+}
+requestAnimationFrame(animations);
+
+
+
+    
+const simon = {
+    set gameState(state) {
+        // block states changes that are not expected
+        if(gameState === states.autoStart &amp;&amp; state !== states.showingSequence) { return }
+        if(gameState === states.pause &amp;&amp; state !== states.waitingForStart) { return }
+        
+        
+        gameState = state;
+        switch (state) {
+            case states.waitingForStart:
+                simon.info = level === 1 ? settings.text.start : settings.text.continue;
+                if (settings.autoStart &amp;&amp; level &gt; 1) { simon.gameState = states.autoStart }
+                break;             
+            case states.autoStart:
+                setTimeout(() =&gt; simon.gameState = states.showingSequence, settings.autoStartPause);
+                break;
+            case states.waitingForUserSequence:
+                simon.info = settings.text.instructions;
+                sequencePos = 0;
+                break;
+            case states.showingSequence:
+                simon.generateSequence();
+                simon.info = settings.text.showingSequence;
+                break;
+            case states.pause:
+                setTimeout(() =&gt; simon.gameState = states.waitingForStart, settings.endLevelPause);
+                break;
+        }
+    },
+    set score(add) {  // zero reset score else score added to
+        if (add === 0) {
+            simon.level = 0;
+            score = 0;
+        } else {
+            score += add;
+            simon.level = 1;
+        }
+        UI.score.textContent = settings.text.score.replace("##",score);
+    },
+    set level(add) { level = add === 0 ? 1 : level + add }, // zero resets else adds to
+    set info(text) { UI.info.textContent = text },        
+    
+    generateSequence() { 
+        const r = Math.random() * pads.length | 0;
+        sequence = randShuffle(setOf(level, i =&gt; (i + r) % pads.length));
+        sequencePos = 0;
+        pads[sequence[sequencePos]].flash();
+    },
+    nextPad() {
+        if (gameState === states.showingSequence) {
+            sequencePos ++;
+            if(sequencePos &lt; sequence.length){
+                pads[sequence[sequencePos]].flash();
+            }else{
+                simon.gameState = states.waitingForUserSequence;
+            }
+        }
+    },
+    startClicked() {
+        if (gameState === states.waitingForStart) {
+            simon.gameState = states.showingSequence;                
+        }
+    },
+    padClicked(event) {
+        if (gameState === states.waitingForUserSequence) {
+            const padId = +event.target.dataset.pad;
+            if (padId === sequence[sequencePos]) {
+                pads[padId].flash();
+                sequencePos ++;
+                if (sequencePos === sequence.length) {
+                    simon.win();
+                }
+            } else {
+                simon.lost();
+            }
+        }
+    },
+    win(){
+        simon.info = settings.text.won;
+        simon.score = level;
+        simon.gameState = states.pause;
+    },
+    lost() {
+        simon.info = settings.text.lost;
+        simon.score = 0;
+        simon.gameState = states.pause;
+    }
+};
+
+/* bind UI and display related stuff to Simon */
+UI.start.addEventListener("click", simon.startClicked);
+UI.pads.addEventListener("click", simon.padClicked);
+setEach(pads, "onflashoff", simon.nextPad);
+
+/* Clear the score. This also set the level to 1*/
+simon.score = 0;
+/* Set the starting state. */
+simon.gameState = states.waitingForStart;
+//} );</code></pre>
+<pre class="snippet-code-css lang-css prettyprint-override"><code>* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background-color: grey;
+    font-family: "Lucida Console", Monaco, monospace;
+}
+
+#wrapper{
+    width: 600px;
+    height: 400px;
+    margin: auto;
+    position: relative;
+}
+
+#control-area{
+    width: 200px;
+    height: 400px;
+    background-color: black;
+    float: left;
+}
+
+#start-button{
+    display: block;
+    width: 100px;
+    margin: 20px auto;
+    background-color: white;
+    border: none;
+    border-radius: 30px;
+    padding: 5px;
+    top: 200px;
+    font-size: inherit;
+    font-family:inherit;
+    outline: none;
+    cursor : pointer;
+
+}
+
+#info{
+    background-color: white;
+    width: 150px;
+    height: 90px;
+    padding: 5px;
+    margin: 20px auto;
+    border-radius: 5px;
+}
+
+#score{
+    background-color: white;
+    width: 100px;
+    padding: 5px;
+    margin: 20px auto;
+    border-radius: 5px;
+}
+
+#play-area{
+    width: 400px;
+    height: 400px;
+    float: right;
+}
+
+.pad{
+    width: 200px;
+    height: 200px;
+    float: left;
+    opacity: 0.4;
+    cursor : pointer;
+}
+
+.pad--color-green{
+    background: #66ff00;
+}
+
+.pad--color-red{
+    background: red;
+}
+
+.pad--color-yellow{
+    background: yellow;
+}
+
+.pad--color-blue{
+    background: #0099FF;
+}</code></pre>
+<pre class="snippet-code-html lang-html prettyprint-override"><code>&lt;div id="wrapper"&gt;
+    &lt;h1 id="title"&gt;Simon Says&lt;/h1&gt;
+    &lt;div id="control-area"&gt;
+        &lt;p id="info"&gt; &lt;/p&gt;
+        &lt;div id="score"&gt;Score: 0&lt;/div&gt;
+        &lt;button id="start-button"&gt;Start&lt;/button&gt;
+    &lt;/div&gt;
+    &lt;div id="play-area"&gt;
+        &lt;div class = "pad pad--color-green"  data-pad = "0"&gt;&lt;/div&gt;
+        &lt;div class = "pad pad--color-red"    data-pad = "1"&gt;&lt;/div&gt;
+        &lt;div class = "pad pad--color-yellow" data-pad = "2"&gt;&lt;/div&gt;
+        &lt;div class = "pad pad--color-blue"   data-pad = "3"&gt;&lt;/div&gt;
+    &lt;/div&gt;
+&lt;/div&gt;</code></pre>
+</div>
+</div>
+
+    </div>

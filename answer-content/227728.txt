@@ -1,0 +1,186 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>General</h1>
+
+<p>Classes should be <code>final</code> unless you intend and have designed them to be extended. Marking local variables as <code>final</code> will clue the reader in that they don't change once assigned, which improves readability.</p>
+
+<p>Use full, descriptive variable names. The extra characters don't cost you anything, and they make the code more clear and easier to read.</p>
+
+<p>The suggested keyword order is <code>private static final</code>, not <code>final private static</code>.</p>
+
+<p>Most of your comments are noise.</p>
+
+<p><code>terminating</code> and <code>terminated</code> are <code>false</code> by default and don't need to be explicitly assigned.</p>
+
+<p>In idiomatic java, </p>
+
+<ul>
+<li>there is no whitespace between the end of method name and the `(`.
+</li><li>there is no whitespace between a constructor name and the `(`.
+</li><li>there is no whitespace after a variable type declaration and before the `[]`.
+</li><li>curly braces are always used, even when they are optional. This makes your code consistent and removes a common class of error when refactoring existing code.
+</li><li>only constants use UPPERCASE, and all constants should use UPPERCASE.
+</li></ul>
+
+<h1>UdpServer</h1>
+
+<p>You should be instantiating <code>Runnable</code>, not extending <code>Thread</code>. You have not created a generally-useful thread that adds new functionality, but rather a set of functionality that happens to want to run on a thread.</p>
+
+<p>Adding testing-specific methods is usually a bad idea. In this case, it would be very reasonable for the timeout to be an optional constructor parameter, since clients may very well want a non-default value set. Your test client certainly does.</p>
+
+<p>Try to provide meaningful failure messages. Don't just say something is wrong, give a hint on how to fix it.</p>
+
+<p>You're performing the same check twice in the block that starts <code>if (!validator.isValidInet6Address</code>.</p>
+
+<p>Your debug-mode code doesn't do anything and should be removed. Generally, code shouldn't have this kind of property. You're basically compiling in how much information the client is getting, rather than making it configurable in some way.</p>
+
+<h3>run()</h3>
+
+<p>Sockets should always be closed. This is not the case in your code, where an exception can cause the socket to remain open. Move socket instantiation to <code>run</code> and put it in a try-with-resources block.</p>
+
+<p>It seems to me that you want to stop accepting new data on <code>terminating</code>, not <code>terminated</code>. I don't know your requirements, but at a high level it seems wrong to accept new requests while you're trying to shut down the server. If you do make that logical change, then you can switch from two variables to one, <code>running</code>, which doesn't need to be negated everywhere it's used.</p>
+
+<p>You don't need to check for termination in your <code>catch</code> of <code>SocketTimeoutException</code>. Just <code>continue</code> and the while loop condition will handle the check for you.</p>
+
+<p>Always catch the most specific exception you know how to handle. Catching <code>Exception</code> is a bad idea because it will automatically handle any checked exceptions that get added your <code>try</code> block later, whether that was your intent or not.</p>
+
+<h3>terminate()</h3>
+
+<p>This method doesn't actually throw an IOException. You should turn on compiler warnings aggressively to help notice mistakes like this.</p>
+
+<p>It's probably a better idea to <code>shutdownNow()</code> if somebody sends an interrupt. If you feel strongly against it, inside your catch block you should put <code>Thread.currentThread().interrupt()</code>. This preserves the interrupted status, rather than consuming it.</p>
+
+<h1>Responder</h1>
+
+<p><code>Responder</code>'s constructor should be public. You've declared a class that can only be seen by its parent and who can't be constructed by anybody outside the class. You want a class that can only be seen by its parent but can be constructed by anybody who can see it.</p>
+
+<p>I don't know what a <code>DatagramResponder</code> is, but declaring all those thrown exception types in your <code>send()</code> signature is probably not idea. It's typical to only include checked exceptions in the method signature, and to document in your JavaDoc what unchecked exceptions might be thrown. Typically unchecked exceptions can't be reasonably handled by callers. It also suggests that the send method might be doing too much, if it can throw so many kinds of exception.</p>
+
+<hr>
+
+<p>I'm not going to review the test code, except to say that if you really need to expose the UdpServer socket for testing, you can make it a private instance variable that gets assigned in <code>run()</code>. You can then expose it with a package-private accessor method. I'd strongly advise against testing this way, though. Test UdpServer by actually running UdpServer.</p>
+
+<hr>
+
+<p>If you were to make all these changes, your code might look something like:</p>
+
+<pre><code>public final class UdpServer implements Runnable {
+
+    private static final int BUFFER_SIZE = 512;
+
+    private static final int CONCURRENT_HANDLERS = 10;
+
+    private final int receiveTimeoutMillis;
+
+    private final SocketAddress socketAddress;
+
+    private final ThreadPoolExecutor executor;
+
+    private boolean running;
+
+    public UdpServer(final String ip, final int port)
+            throws ValidationException {
+        this(ip, port, 100);
+    }
+
+    public UdpServer(final String ip, final int port, final int receiveTimeoutMillis)
+            throws ValidationException {
+
+        if (receiveTimeoutMillis &lt;= 0) {
+            throw new ValidationException("Timeout must be greater than zero, was: " + receiveTimeoutMillis);
+        }
+        this.receiveTimeoutMillis = receiveTimeoutMillis;
+
+        if (port &lt;= 0) {
+            throw new ValidationException("Port must be greater than zero, was: " + port);
+        }
+
+        final InetAddressValidator validator = InetAddressValidator.getInstance();
+        if (!validator.isValidInet6Address(ip)) {
+            throw new ValidationException("Illegal Ip address: " + ip);
+        }
+
+        if (!Utils.isIpLocalAndUp(ip)) {
+            throw new ValidationException("Given IP is not a local IP or interface is down");
+        }
+
+        this.socketAddress = new InetSocketAddress(ip, port);
+        this.executor = (ThreadPoolExecutor) Executors.newFixedThreadPool(CONCURRENT_HANDLERS);
+    }
+
+
+    @Override
+    public void run()  {
+        this.running = true;
+
+        try (final DatagramSocket socket = new DatagramSocket(this.socketAddress)) {
+            socket.setSoTimeout(this.receiveTimeoutMillis);
+            final Responder responder = new Responder(socket);
+
+            while (this.running) {
+                final byte[] buffer = new byte[BUFFER_SIZE];
+                final DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+
+                try {
+                    socket.receive(packet);
+                } catch (final SocketTimeoutException e) {
+                    continue;
+                } catch (final IOException e) {
+                    System.err.println("Error reading from socket");
+                    e.printStackTrace();
+                    return;
+                }
+
+                if (this.running) {
+                    final Runnable handler = HandlerFactory.getHandler(packet, responder);
+                    this.executor.execute(handler);
+                }
+            }
+        } catch (final SocketException e) {
+            System.err.println("Error while opening socket");
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Stops the server. The method waits (up to 60 seconds)
+     * until all tasks have completed execution unless interrupted.
+     */
+    public void terminate() {
+        if (!this.running) {
+            return;
+        }
+
+        this.running = false;
+
+        try {
+            this.executor.awaitTermination(60, TimeUnit.SECONDS);
+            this.executor.shutdownNow();
+        } catch (final InterruptedException e) {
+            this.executor.shutdownNow();
+            // or Thread.currentThread().interrupt();
+        }
+    }
+
+
+    /*
+     * Transmitter to use by handler to send response to request
+     * originator. It encapsulates socket, so handler may only send data.
+     */
+    private static final class Responder implements DatagramResponder {
+
+        private final DatagramSocket socket;
+
+        public Responder(final DatagramSocket socket) {
+            this.socket = socket;
+        }
+
+        @Override
+        public void send(final DatagramPacket packet)
+                throws IOException, PortUnreachableException, IllegalBlockingModeException {
+            this.socket.send(packet);
+        }
+
+    }
+}
+</code></pre>
+    </div>

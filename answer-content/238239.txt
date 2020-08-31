@@ -1,0 +1,42 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Just up front, your code doesn't have any blatant bugs which would prevent its use. There are a few things that you could do to improve it though:</p>
+
+<ul>
+<li>One thing that I'd try to avoid is singletons. These are effectively globals and bring with them almost all their problems. In particular, it prevents isolating code for unit tests. The alternative is that you pass a logger to the constructor of every object that needs it. This is called dependency injection, as a keyword for future research.</li>
+<li>Instead of <code>fout.open(path)</code>, you could pass the filename to the constructor of <code>fout</code> using the initializer list.</li>
+<li>Your logger isn't copyable or assignable due to its members. I'd make that explicit though.</li>
+<li>When writing, <code>std::endl</code> already flushes the stream, so the explicit <code>std::flush</code> is redundant.</li>
+<li>The biggest issue is the way your writing thread operates. In effect, it wakes up every 10ns (that's 100.000.000 times per second) and looks for work (a.k.a. polling). Firstly, I can't imagine that this fast response time is actually relevant to a logger. If you have 0.1s delay between writing to the logger and seeing the data in the file, that should be enough by far. However, that's not a solution. What you actually want there is a <a href="https://en.cppreference.com/w/cpp/thread/condition_variable" rel="nofollow noreferrer">condition variable</a>, which allows you to only wake up the writer thread when actual works needs to be done.</li>
+<li>There is a comment <code>lock/unlock this each time messages is pushed or popped</code>, which is already in the right direction. What has helped me in the past is to document which mutex protects which data. It may even be a good idea to put just those parts into a separate <code>struct</code> in some cases, just to make it clearer. Also, for all other members, document who is allowed to access them. For example, <code>fout</code> doesn't require synchronization, because it is exclusively accessed by the writer thread.</li>
+<li>A minor fault, but still a fault is also that you access the queue without locking to check if it is non-empty. Since this typically only involves a simple pointer comparison (though that's implementation-defined), it will probably not cause issue. Using a condition variable as sketched below fixes this part as well.</li>
+<li>You could implement this using lock-free algorithms. This is a complete rewrite though and not "smoothing out the rough edges" of your current approach. Just keep that in mind as future research project perhaps.</li>
+<li>A minor flaw is that there is no way to shut down the logger. This is probably harmless, but it will probably trigger memory debuggers (leak detectors). If you decide not to implement shutdown, you don't need <code>writerThread</code> though, just call <code>t.detach()</code> after starting.</li>
+<li>If your target is C++ 17 or later, you could also use the <a href="https://en.cppreference.com/w/cpp/filesystem" rel="nofollow noreferrer">filesystem</a> library which has a dedicated path type. I'd generally prefer that over raw <code>char*</code> string. Even without C++ 17, I'd use <code>std::string</code>, unless I have good reasons not to.</li>
+<li>Concerning pushing on the queue, consider using <code>emplace_back()</code> instead, to avoid one more copying operation.</li>
+<li>Concerning removal from the queue, there is a trick: Create a second, local queue (initially empty) and swap that with the member (holding a lock for the time of that operation, of course). Then you have all the content in a local object that you can process at leasure, without having to worry about locking. This becomes important when retrieving multiple messages at once, so that you don't repeatedly lock/unlock without need. This can lead to "thread convoys": Imagine one thread perpetually writing messages using <code>lock/push/unlock</code> triples, so it becomes a stream of <code>lock/push/unlock/lock/push/unlock..</code>. Now, if this thread ever gets scheduled out while it holds the lock and the writer thread is scheduled in, it will then itself run a <code>lock/pop/unlock/lock/pop/unlock..</code> stream. On the first lock, it will block until the logging thread continues. This thread will be able to write <em>one</em> message, before it is blocked by the writer thread. In other words, ownership of the mutex will pingpong between the two threads, wrecking performance. Also, this is hard to catch, because it both comes and goes spontaneously.</li>
+</ul>
+
+<p>For reference, here is a sketch of the push and pop operations using a CV:</p>
+
+<pre><code>mutex mtx;
+condition_variable cv;
+deque&lt;string&gt; queue;
+
+void push(string s) {
+    unique_lock&lt;mutex&gt; lck(mtx);
+    queue.push_back(s);
+    lck.unlock();
+    cv.notify_one();
+}
+
+string pop() {
+     unique_lock&lt;mutex&gt; lck(mtx);
+     cv.wait(lck, []{ return !queue.empty();})
+     string res = queue.front();
+     queue.pop_front();
+     return res;
+}
+</code></pre>
+
+<p>This is not much more than the examples given by <a href="https://en.cppreference.com/w/cpp/thread/condition_variable" rel="nofollow noreferrer">cppreference</a>.</p>
+    </div>

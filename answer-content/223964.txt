@@ -1,0 +1,93 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Consider the following tips and best practices:</p>
+<ol>
+<li><p><strong>TABLE QUALIFIERS:</strong> First and foremost, always qualify all fields in all clauses (<code>SELECT</code>, <code>WHERE</code>, <code>JOIN</code>, etc.) with table names or table aliases using period denotation. Doing so facilitates readability and maintainability.</p>
+</li>
+<li><p><strong>PREFIXED FIELD NAMES:</strong> Related to above, avoid prefixing field names (<em>pl_from, tl_title, cl_to</em>). Instead, use table aliases to period qualify identifiers in query to avoid collision or confusion. Of course if this is Wikimedia's setup, there's nothing you can do.</p>
+</li>
+<li><p><strong>CASE SUBQUERIES:</strong> Avoid subqueries in <code>CASE</code> statements which requires row by row logic calculation. Instead, use multiple <code>LEFT JOIN</code> on <em>templatelinks</em> and <em>categorylinks</em> tables and then run the needed <code>CASE</code> logic where <code>NOT EXISTS</code> render as <code>NULL</code>.</p>
+</li>
+<li><p><strong>GROUP BY</strong>: Unfortunately, at a disservice to newcomers in SQL due to MySQL's <a href="https://dev.mysql.com/doc/refman/5.7/en/sql-mode.html#sqlmode_only_full_group_by" rel="nofollow noreferrer">ONLY FULL GROUP BY</a> mode turned off, your aggregate inner query is not ANSI compliant. Always include all non-aggregated columns in <code>GROUP BY</code> for consistent, valid results.</p>
+<p>Your query would fail in practically all other RDBMS's (Oracle, Postgres, etc.) as your <code>GROUP BY</code> query is incomplete and does not adhere to ANSI rules since <em>page_title</em>, <em>pl_namespace</em>, and now the new <code>LEFT JOIN</code> fields are not included. In SQL where at least one aggregate is used such as <code>COUNT</code>, all grouped columns must be included in <code>GROUP BY</code> clause but can be optionally omitted in <code>SELECT</code> (not other way around). NOTE: your results may change with such code refactoring. The Wikimedia interface may not allow setting/mode adjustments.</p>
+</li>
+<li><p><strong>AGGREGATION</strong>: Related to above, you may need to handle all unit level calculations including <code>CASE</code> statements in the inner query and move aggregation to top level <code>SELECT</code>. If you need to include other unit level fields in final resultset but not in aggregation, run a <code>JOIN</code> on the aggregated subquery or via a CTE.</p>
+</li>
+</ol>
+<hr>
+<p>Below is an adjustment to your SQL query with unit level calculations handled in derived table subquery and all aggregations moved to top level. Previous outer <code>WHERE</code> now becomes <code>HAVING</code> since aggregates are involved. Depending on your needs and results, additional adjustments may be needed. But again, be sure to run with complete <code>GROUP BY</code> to include all non-aggregated columns. As mentioned, you will not be warned by the Wikimedia engine.</p>
+<pre><code>SELECT sub.pl_from, 
+       sub.page_title, 
+       sub.L_NS, 
+       MAX(sub.NS) AS NS, 
+       GROUP_CONCAT(sub.pl_title SEPARATOR ' ') AS L_titles,
+       COUNT(sub.pl_title) AS num_L, 
+       MAX(sub.SB) AS SB, 
+       MAX(sub.IU) AS IU, 
+       MAX(sub.WP) AS WP             
+FROM 
+   (SELECT pl.pl_from,
+          CASE
+            WHEN pl.pl_from_namespace != p.page_namespace 
+            THEN CONCAT(pl.pl_from_namespace, ' vs. ', p.page_namespace)
+            ELSE pl.pl_from_namespace
+          END AS NS,
+          p.page_title,
+          pl.pl_namespace AS L_NS,      
+          pl.pl_title,
+          CASE
+            WHEN MAX(CASE WHEN pl.pl_title LIKE '%/sandbox' THEN 1 END) = 1 THEN '(SB)'
+            ELSE ''
+          END AS SB,
+          CASE 
+            WHEN t.tl_title = 'Under_construction' 
+            THEN '(C)' 
+            ELSE ''
+          END AS C,
+          CASE 
+            WHEN c.cl_to = 'Pages_using_Under_construction_with_the_placedby_parameter' 
+            THEN '(PB)' 
+            ELSE '' 
+          END AS C_PB,
+          CASE
+            WHEN (t.tl_title = 'In use' OR t.tl_title = 'GOCEinuse')
+            THEN '(IU)'
+            ELSE ''
+          END AS IU,
+          CASE
+            WHEN t.tl_title = 'Copyvio-revdel'
+            THEN '(RD1)'
+            ELSE ''
+          END AS RD1,
+          CASE
+            WHEN t.t_title = 'Wikipedia_person_user_link'
+            THEN '(WP)'
+            ELSE ''
+          END AS WP,
+          CASE
+            WHEN c.cl_to = 'Candidates_for_speedy_deletion'
+            THEN '(CSD)'
+            ELSE ''
+          END AS CSD
+    FROM pagelinks pl
+    LEFT JOIN page p ON p.page_id = pl.pl_from
+    LEFT JOIN templatelinks t ON t.tl_from = pl.pl_from
+    LEFT JOIN categorylinks c ON c.cl_from = pl.pl_from
+
+    WHERE pl.pl_from_namespace = 0
+      AND pl.pl_namespace = 2
+   ) AS sub
+
+GROUP BY sub.pl_from, 
+         sub.page_title, 
+         sub.L_NS             
+HAVING
+  (
+    (MAX(sub.C) = '' AND MAX(sub.RD1) = '' AND MAX(sub.WP) = '' AND MAX(sub.CSD) = '')
+    OR COUNT(sub.pl_title) != 1 
+  )
+  AND (MAX(sub.C_PB) = '' OR COUNT(sub.pl_title) != 2)
+  
+ORDER BY MAX(sub.SB), 
+         sub.page_title
+</code></pre>
+    </div>

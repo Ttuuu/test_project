@@ -1,0 +1,96 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You have a lot of interesting things going on in your code. There are many ways to solve your problem, here is an approach utilizing an <code>ActionBlock</code>. I used .NET Core 3.1 to build the sample, but <code>ActionBlock</code> is available in the System.Threading.Tasks.Dataflow NuGet Package if it isn't included in your framework by default.</p>
+
+<p>1) Change your entry point from <code>static void Main(string[] args</code> to <code>static async Task Main(string[] args</code> async main has been available since C#7.1 (<a href="https://docs.microsoft.com/en-us/dotnet/csharp/whats-new/csharp-7-1" rel="nofollow noreferrer">https://docs.microsoft.com/en-us/dotnet/csharp/whats-new/csharp-7-1</a>). If you can't use C#7.1 or greater, you can still do it with something like <code>DoAsyncWork().GetAwaiter().GetResult()</code></p>
+
+<p>2) <code>List</code> is not guaranteed to be thread safe and I noticed you add to your list outside your lock. I elected to use a <code>ConcurrentDictionary</code> instead since that is guaranteed thread safe. I try to avoid my own locks whenever I can and in this case, if you get rid of the Console writes, you could dump your lock altogether.</p>
+
+<p>3) I elected to use <code>Interlocked.Increment(ref requestDid)</code> instead of <code>{requestDid++}</code> and then read it with an <code>Interlocked.Read</code>. Interlocked operations are thread safe, so you would be okay to use these even if you removed <code>lock (ConsoleLock)</code> (although you are only using those variables to write to the Console anyway)</p>
+
+<p>4) In an async/await world, <code>Thread.Sleep</code> is almost always wrong. You usually want to <code>await Task.Delay</code> instead. <a href="https://stackoverflow.com/questions/20082221/when-to-use-task-delay-when-to-use-thread-sleep">https://stackoverflow.com/questions/20082221/when-to-use-task-delay-when-to-use-thread-sleep</a></p>
+
+<p>5) I didn't <code>Dispose</code> the httpclient or handler because of <a href="https://stackoverflow.com/questions/15705092/do-httpclient-and-httpclienthandler-have-to-be-disposed">https://stackoverflow.com/questions/15705092/do-httpclient-and-httpclienthandler-have-to-be-disposed</a> (although since the program is terminating anyway, it doesn't really matter in this case)</p>
+
+<p>6) As far as the <code>ActionBlock</code> goes, there are a lot of articles out there on it, but here is an ok start <a href="https://docs.microsoft.com/en-us/dotnet/standard/parallel-programming/dataflow-task-parallel-library" rel="nofollow noreferrer">https://docs.microsoft.com/en-us/dotnet/standard/parallel-programming/dataflow-task-parallel-library</a>. Note how I set <code>EnsureOrdered</code> to false. If you don't need the items to be processed in order, I find it best to set it to false. In this case, since you are writing the file after you have retrieved ALL the results, you could simply sort the values coming out of the <code>ConcurrentDictionary</code></p>
+
+<p>I set <code>SingleProducerConstrained</code> to true, because in this case post is not being called concurrently. This allows the ActionBlock to make some optimizations. <a href="https://docs.microsoft.com/en-us/dotnet/api/system.threading.tasks.dataflow.executiondataflowblockoptions.singleproducerconstrained?view=netcore-3.1" rel="nofollow noreferrer">https://docs.microsoft.com/en-us/dotnet/api/system.threading.tasks.dataflow.executiondataflowblockoptions.singleproducerconstrained?view=netcore-3.1</a></p>
+
+<p><code>MaxDegreesOfParallelism</code> can be a tough choice. I sometimes cringe when I see a hardcode for that in real world applications because the optimal value for this will likely vary based on what hardware or virtualization platform you are running on. However, the optimal value can be hard to come by, especially when running a container. This is a great example of how nuanced the choice can be. <a href="https://github.com/dotnet/runtime/issues/622" rel="nofollow noreferrer">https://github.com/dotnet/runtime/issues/622</a></p>
+
+<p>7) Finally, I have found when testing performance like this, to make sure you do so <strong>WITHOUT a debugger attached</strong>. Attached debuggers can really slow things down. I built this code in release mode and then ran it from the command line.</p>
+
+<pre><code>using System;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.IO;
+using System.Net;
+using System.Net.Http;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Threading.Tasks.Dataflow;
+
+namespace RequestTest
+{
+    static class Program
+    {
+        static async Task Main(string[] args)
+        {
+            var startTime = Stopwatch.GetTimestamp();
+            //DECLARATION           
+            int start = 1000;
+            int end = 2000;
+            long requestDid = 0;
+            var requestToDo = end - start;
+
+            object ConsoleLock = new object();
+            ConcurrentDictionary&lt;string, string&gt; jsonResponses = new ConcurrentDictionary&lt;string, string&gt;();
+            var baseAddress = new Uri("https://localhost:5001/");
+            var cookieContainer = new CookieContainer();
+            cookieContainer.Add(baseAddress, new Cookie("JSESSIONID", "xxx"));
+            var handler = new HttpClientHandler() { CookieContainer = cookieContainer };
+            var client = new HttpClient(handler) { BaseAddress = baseAddress };
+            var actionBlock = new ActionBlock&lt;string&gt;(async x =&gt;
+            {
+                var response = await client.GetStringAsync(new Uri(baseAddress + x));
+                jsonResponses.TryAdd(x, response); //note this actually returns a bool to indictate if it was added successfully, as long as x is unqiue, I can't imagine a scenario where this would return false
+                lock (ConsoleLock)
+                {
+                    Console.SetCursorPosition(0, 0);
+                    Interlocked.Increment(ref requestDid);
+                    Console.Write($"Progress {Interlocked.Read(ref requestDid)}/{requestToDo}     ");
+                }
+
+            }, new ExecutionDataflowBlockOptions { MaxDegreeOfParallelism = 8, EnsureOrdered = false, SingleProducerConstrained = true }); 
+
+            for (var counter = start; counter&lt;end; counter++)
+            {
+                actionBlock.Post("api/test?requestid="+counter.ToString());
+            }
+            actionBlock.Complete();
+            await actionBlock.Completion;
+            var endRequestTime = Stopwatch.GetTimestamp();
+            Console.WriteLine();
+            Console.WriteLine();
+            Console.WriteLine();
+            Console.WriteLine();
+            Console.WriteLine($"Executed Requests in {(endRequestTime - startTime)} ticks");
+            Console.WriteLine("Writing to file");
+
+            using (var streamWriter = new StreamWriter("C:\\temp\\sctest.txt"))
+            {
+                foreach (var sc in jsonResponses.Values)
+                {
+                    streamWriter.WriteLine(sc);
+                }
+            }
+
+            var endFileTime = Stopwatch.GetTimestamp();
+            Console.WriteLine($"Completed File write in {(endFileTime - endRequestTime)} ticks");
+        }
+    }
+}
+
+
+<span class="math-container">```</span>
+</code></pre>
+    </div>

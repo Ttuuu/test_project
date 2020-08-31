@@ -1,0 +1,80 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I’m really not a fan of this idea, on a lot of levels. First of all, it’s extremely limited; it only works for the most basic <code>enum</code> definitions. As soon as you add initializers or attributes, chaos ensues. Second, it’s just <em>absurdly</em> overcomplicated for what should be trivial code. The fact that you’re having problems with code gen should be a warning sign. There is no way I could justify the debugging effort if I tried to use this and something went sideways.</p>
+<p>In my opinion, manually rolling out a <code>to_string()</code> function for an enum isn’t <em>that</em> much extra work. Certainly not enough to justify the level of complexity of this macro. And if your primary concern is compile time (really? <em>that’s</em> the most important thing? how many enums do you have, and how big are they that this is even <em>measurable</em>, let alone the most crucial issue?), then a manually rolled function will compile <em>MUCH</em> faster than the code in that macro. Yeah, sure, you have to repeat yourself a little bit… but not <em>that</em> much. Certainly not enough to justify a state machine parser for a string (that also only works in the simplest cases).</p>
+<p>But okay, let me set aside my qualms about the overall idea, and focus on the code itself.</p>
+<pre><code>#define EnumWithUnderlying(Name, NTy, ... )\
+enum class Name : NTy {__VA_ARGS__, End };\
+</code></pre>
+<p>You don’t include any comments or documentation to explain the logic of the macro, so I don’t know if this extra <code>End</code> enumerator is a feature or a bug. In other words, I don’t know if there is a reason someone might <em>want</em> <code>End</code> added to their enumerators, or if you just added it to make your code work.</p>
+<p>Assuming it’s just there to make things work… the only purpose I can make out for it is that you use it to figure out the size of your enumerator arrays, such as in:</p>
+<pre><code>using ArrIdxTy = std::array&lt;BeginLen, NTy(Name::End)+1&gt;;
+</code></pre>
+<p>This “works” only so long as none of the enumerators have any initializers (that don’t happen to equal what their default values would be), but aside from being brittle, it’s also unnecessary. If all you need is the count of initializers, then all you need is something as simple as:</p>
+<pre><code>template &lt;typename... Args&gt;
+constexpr auto count_args(Args&amp;&amp;...) noexcept
+{
+    return sizeof...(Args);
+}
+
+using ArrIdxTy = std::array&lt;BeginLen, count_args(__VA_ARGS__) + 1&gt;;
+</code></pre>
+<p>If <code>End</code> serves some other purpose, then fine, there’s no need to remove it… but in that case you <em>still</em> might want to get the number of enumerators using a count function like the one above. That way your macro won’t break if any enumerators have initialzers. (Well, it won’t break in that particular way, anyway.)</p>
+<pre><code>namespace std {\
+    std::string_view to_string(enum Name enumIn) noexcept {\
+</code></pre>
+<p>There are a <em>very</em> limited number of cases where you are allowed to add stuff to <code>std</code>—really just a few templates that you are allowed to specialize in fairly restricted ways. Adding a completely new function? Definitely not allowed. No, not even if it’s an overload of an existing function.</p>
+<p>To make matters worse, the function lies. When I call <code>to_string()</code>… I expect to get a string. Not a <em>view</em> to a string.</p>
+<p>I figure that your goal is to be able to write <code>std::to_string(enum_value)</code>… but that goal is misguided. When I see <code>std::some_func()</code> that I’ve never seen before, the very first thing I do is go straight to my favourite standard library reference (<a href="https://en.cppreference.com/" rel="nofollow noreferrer">cppreference</a>) and read the docs. But I won’t find this function there, now will I?</p>
+<p>You might respond: “But it does the same thing <code>std::to_string()</code> does for all the types it is defined for!” Does it, though? If I do <code>auto x = Move::UP; std::cout &lt;&lt; std::to_string(x);</code>, it will print “UP”. But if I do <code>auto x = SOME_INT_CONSTANT; std::to_string(x);</code> it will not print “SOME_INT_CONSTANT”. <code>std::to_string(int)</code> prints the (locale-flavoured) <em>value</em> of an int… not its name… yet your enumerator-specific <code>std::to_string()</code> functions print the <em>name</em>. Not the same thing, now is it?</p>
+<p>You might respond: “But what it does is so obvious!” Is it, though? I mean, ignoring that it actually <em>doesn’t</em> do what it claims to (it returns a <code>std::string_view</code>, not a <code>std::string</code>), converting an enumerator value to a string doesn’t necessarily mean returning the enumerator’s name. It might actually make more sense to return the enumerator’s numeric value as a string in some cases.</p>
+<p>So in summary:</p>
+<ul>
+<li><code>std::to_string()</code> is the wrong name for this function; and</li>
+<li>even if it weren’t, you can’t use it.</li>
+</ul>
+<p>So what’s the right name? Well, why not just <code>to_string()</code> in the same namespace as the enum? (Well, better would be <code>to_string_view()</code>, but one thing at a time.) ADL would find the function when you need it, so you’d only have to call <code>to_string(enum_value)</code>… which is actually <em>shorter</em> than <code>std::to_string(enum_value)</code>.</p>
+<p>(It might also make sense to define a <code>to_string()</code> function in terms of a <code>to_string_view()</code> function. That’s actually how I usually do it.)</p>
+<p>Now to get into the meat of the code… what this does (as I understand it) is take the variadic macro arguments, translate the bunch of them into a single string, then use a state machine to parse out the enumerator names into an array. As I mentioned above, your parser is too simplistic—it can’t handle initializers or attributes—but let’s ignore that issue for now.</p>
+<p>The biggest problem with your strategy is the assumption that all the enumerators in an enumeration have their default “natural” values. If they don’t, you probably have UB, because your enumerator values won’t be valid indexes into the array.</p>
+<p>A less critical issue is that if you really only want to support trivial enumerations (that is, no initializers), that’s fine… but in that case, this seems wildly over-complicated. All you need to do to find the Nth enumerator is find the (N−1)th comma and the Nth comma, take everything between them, then trim the whitespace. Special case the first and last enumerators (or don’t! add a leading and trailing comma to the string to simplify the algorithm!), and you’re done.</p>
+<p>If you intend to support general enumerations, then this design just won’t work: you can’t simply cast the enumerator to a number and use that as an index. You need a map. No, not a <code>std::map</code>; that would be overkill. <code>std::array&lt;std::tuple&lt;Name, std::string_view&gt;&gt;</code> would suffice. To actually implement this, all you’d need is some kind of preprocessor for-each—either roll your own or use one from a library—then you could just do something like this:</p>
+<pre><code>// Takes an arbitrary enumerator string with arbitrary whitespace:
+//     *   "foo"
+//     *   "foo = N"
+//     *   "foo [[attribute]]"
+//     *   "foo [[attribute]] = N"
+// and extracts just the enumerator ("foo").
+constexpr auto extract_enumerator(std::string_view) -&gt; std::string_view;
+
+#define ENUM_STR_MAP_ITEM(enumerator) std::tuple{enumerator, extract_enumerator(#enumerator)},
+
+constexpr auto enumerator_string_map = std::array{
+    FOREACH(ENUM_STR_MAP_ITEM, __VA_ARGS__)
+};
+</code></pre>
+<p>And <code>to_string_view()</code> could use that map.</p>
+<pre><code>struct BeginLen {\
+    std::size_t begin;\
+    std::size_t len;\
+};\
+</code></pre>
+<p>So, your strategy is to parse the string into an array of <code>BeginLen</code> objects, then transform that into an array of <code>std::string_view</code>. But… why? A <code>std::string_view</code> is <em>literally</em> just a “begin” and a “len” <em>already</em>. The entire last quarter of your function is literally just a transform that does <code>std::string_view{begin, len}</code> for each <code>BeginLen</code>. Why not parse the enumerator strings directly into <code>std::string_view</code>s and skip that last bit?</p>
+<pre><code>std::size_t jbegin = 0;\
+std::size_t jend = 0;\
+</code></pre>
+<p>Why do you need <em>two</em> indexes to keep track of which enumerator you’re currently parsing? (I mean, I <em>assume</em> that’s what those variables are for, in lieu of any comments or even clear names.) Couldn’t you drop <code>jend</code>, remove the <code>jbegin++;</code>, and replace <code>jend</code> with <code>jbegin</code> in the <code>In</code> case?</p>
+<h1>Summary</h1>
+<p>You have a number of critical bugs and conformance issues:</p>
+<ul>
+<li>You are not allowed to add new functions to namespace <code>std</code>. (An overload of an existing function is still a new function.)</li>
+<li>Your method for determining the number of enumerators is broken. (It only works for trivial enums, and it adds a new enumerator, which is not ideal (unless there’s another reason for it?).)</li>
+<li>Your method for mapping enumerators to their strings is broken. (You assume a trivial enum, where you can cast the enumerator value to an index.)</li>
+<li>Your method for parsing enumerator strings will only work properly for trivial enums. (For non-trivial enums it will return weird results, but technically (so far as I can tell) won’t actually trigger UB.)</li>
+</ul>
+<p>I know your primary performance concern is the compile time, but just in case you do care about run time performance… this code is extremely inefficient for what it actually does. It sounds like you don’t care; you figure it will all be <code>constexpr</code>ed away. Well, maybe, maybe not. There doesn’t seem to be any real reason not to make it more efficient in either case.</p>
+<p>Style-wise, my biggest complaint would have to be the complete lack of any commenting or documentation. I know commenting a macro isn’t the easiest thing to do. But it’s still worth it; especially for a macro as complicated as this.</p>
+<p>It also doesn’t help that most of your identifiers are terrible. <code>jbegin</code>? What’s “j”? <code>ArrStrTy</code>? Whut? A struct that contains only the members <code>begin</code> and <code>len</code> being called <code>BeginLen</code>? That’s really not helpful at all. A function called <code>to_string()</code> that doesn’t actually convert to a string?</p>
+<p>The other thing that raises my hackles is that your macros are mixed-case. That’s just <em>BEGGING</em> for trouble. (Even more alarming is that you use mixed-case macros <em>WHILE ALSO USING MIXED-CASE IDENTIFIERS</em>!!! There’s a point where you’ve loaded a gun, pointed it at your foot, taken the safety off, and started feathering the trigger, and if you end up blowing your foot off, no one can possibly take you seriously for being surprised.)</p>
+<p>(I’d also raise complaints about the header file being named “<code>enum.h</code>”. “<code>.h</code>” is for C header files. For C++ header files, you should use “<code>.hpp</code>”, “<code>.hxx</code>”, “<code>.hh</code>”, or something similar.)</p>
+<p>Overall design-wise… I might be convinced of the utility of a make-an-<code>enum</code>-with-a-built-in-<code>to_string</code> macro. But not if that macro is as complex as this. A macro should make my code <em>easier</em>… if a macro makes things harder (to understand, to debug), then it’s not worth it. If you could make this macro much, <em>MUCH</em> simpler (I have to figure out an ad hoc <em>state machine</em> just to get enumerator strings?!), then it might be worthwhile.</p>
+    </div>

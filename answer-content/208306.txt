@@ -1,0 +1,153 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Thanks for the classes. However I did not wait for them and just created some "stubs". Here is my answer:</p>
+
+<p>When you have <em>"a huge amount of nested logic"</em> you should try to extract and distribute it somewhere else. I like to do DDD and place the business logic in my domain objects.</p>
+
+<h3>Validation</h3>
+
+<p>Let's start from the first lines of code: <code>if ( !validateInvoice(invoice) )</code>:</p>
+
+<p>You can easily extract the validation to a dedicated class. Spring provide 
+a good support for validation. You can also annotate your methods parameters 
+with <code>@Valid</code> to have them validated automatically by the framework.</p>
+
+<p>To separate the construction of the error from your business logic you can return a structure of errors instead of a <code>boolean</code>. Then you verify if thie structure 
+has errors and construct the error response or let it continue. This structure already exists into the spring framework. </p>
+
+<p>You can also hide the construction of the <code>ErrorResponse</code> in the class itself 
+or into a factory method.</p>
+
+<pre><code>Map&lt;String, Set&lt;String&gt;&gt; errors = validator.validate(invoice);
+if ( errors.isEmpty() ) {
+  return saveInvoice(invoice);
+} else {
+  logger.error("Invalid request : {}. Json: {}.", errors, invoice);
+  return new ResponseEntity&lt;&gt;(ResponseError.of(invoice, errors), HttpStatus.BAD_REQUEST);
+}
+</code></pre>
+
+<p>Note that I have replaced the two calls to <code>logger.error</code> with one. Nothing guarantee that the two messages will be next to each other so it is better to log everything in one statement.
+If you are using Slf4j you can also use the templates expansion to format your
+message. And, please, do not use <code>toString</code> to have a JSON representation of 
+your object.</p>
+
+<h3>Transformation</h3>
+
+<p>Many use a mapping framework. But you can also create your own mapper like 
+you did with the <code>InvoiceFlattener</code>. However, it is sad that you still have to 
+set some properties to the result object. Ideally the result will be "complete".</p>
+
+<pre><code>FlatInvoice flat = InvoiceFlattener.flatten(invoice);
+// Nothing more
+</code></pre>
+
+<h3>Persistence</h3>
+
+<p>It seems that <code>saveInvoice</code> methods contains your business logic but also a 
+couple of <code>ifs</code>.</p>
+
+<p>You can already remove the <code>if</code> around <code>repository.insert(flat)</code> because usually
+a repository trows an exception when he cannot persist the entity. You can use a 
+Spring exception handler to convert the exception to a <code>ResponseError</code>. Apply 
+this to all the methods in your repository.</p>
+
+<p>The <code>tryToUpdate</code> method is confusing because it start with <em>try</em> and thus 
+we expect an exception. It is also annoying to have the effective update as a side
+effect of this test. You should better keep the test in a method but update in the 
+body of your<code>if</code>. </p>
+
+<pre><code>if ( repository.exists(invoice) ) {
+  if ( isChanged(invoice) ) {
+    repository.update(invoice.getObjectUID(), InvoiceFlattener.flatten(invoice));
+    ResponseSuccess body = new ResponseSuccess(invoice.getRequestUID(), invoice.getObjectUID(),
+        LocalTime.now());
+    return new ResponseEntity&lt;&gt;(body, HttpStatus.OK);
+  } else {
+    logger.debug("Ignoring unchanged invoice {}.", invoice);
+    return new ResponseEntity&lt;&gt;("", HttpStatus.OK);
+  }
+} else {
+  repository.insert(flat);
+  ResponseSuccess ret =  new ResponseSuccess(invoice.getRequestUID(), invoice.getObjectUID(), LocalTime.now());
+  return new ResponseEntity&lt;&gt;(ret, HttpStatus.OK);
+}
+</code></pre>
+
+<h3>Domain logic</h3>
+
+<p>Another improvement that you can do is to replace the <code>Map</code> that you receive from your repository by a class. So that you should be able to move the <code>isChanged</code> logic into this class. You can also map the <code>InvoiceRequest</code> to that new class so that you don't have to deal with <code>InvoiceRequest</code>, <code>FlatInvoice</code>  and <code>Map&lt;String, ?&gt;</code> that are all representing the same model (from what I understand). If you do that you have something that looks like a domain object. </p>
+
+<p>You can also continue the separation between the domain logic and the protocol by introducing a controller aside of your service. The controller will map the <code>InvoiceRequest</code> to your <code>Invoice</code> entity and convert the result and exceptions to <code>HttpEntity</code>.</p>
+
+<p>You should end up with something like:</p>
+
+<pre><code>@Service
+public class InvoiceService {
+    private static final Logger LOG = LoggerFactory.getLogger(InvoiceService.class);
+
+    private final InvoiceRepository repository;
+
+    public InvoiceService(InvoiceRepository repository) {
+        this.repository = repository;
+    }
+
+    public Invoice process(Invoice invoice) throws PersistenceException {
+        return repository.find(invoice.getUuid())
+                .map(existing -&gt; updateOrIgnore(existing, invoice))
+                .orElseGet(() -&gt; repository.insert(invoice));
+    }
+
+    private Invoice updateOrIgnore(Invoice existing, Invoice updated) {
+        if (existing.isAfter(updated) &amp;&amp; existing.isDifferent(updated)) {
+            return repository.update(existing.getUuid(), updated);
+        } else {
+            LOG.debug("Ignoring unchanged invoice {}.", updated);
+            return existing;
+        }
+    }
+
+}
+
+
+// ~ ----------------------------------------------------------------------
+
+@RestController
+public class InvoiceController {
+
+    private final InvoiceRequestValidator validator = new InvoiceRequestValidator();
+    private final InvoiceRequestMapper mapper = new InvoiceRequestMapper();
+    private final InvoiceService service;
+
+    public InvoiceController(InvoiceService service) {
+        this.service = service;
+    }
+
+    @PostMapping("/invoices")
+    public ResponseEntity&lt;?&gt; receive(@Valid InvoiceRequest request) throws
+            PersistenceException, ValidationException {
+        Map&lt;String, Set&lt;String&gt;&gt; errors = validator.validate(request);
+        if ( errors.isEmpty() ) {
+            Invoice invoice = mapper.map(request);
+            Invoice result = service.process(invoice);
+            return new ResponseEntity&lt;&gt;(
+                    ResponseSuccess.of(request, result),
+                    HttpStatus.OK);
+        } else {
+            return new ResponseEntity&lt;&gt;(
+                    ResponseError.of(request, errors),
+                    HttpStatus.BAD_REQUEST);
+        }
+    }
+
+    @ExceptionHandler(PersistenceException.class)
+    ResponseEntity&lt;ResponseError&gt; on(PersistenceException pe) {
+        ResponseError body = new ResponseError(pe.getRequestUID(), pe.getObjectUID(),
+                pe.getSenderDateTime(), pe.getMessage());
+        return new ResponseEntity&lt;&gt;(body, HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+
+}
+</code></pre>
+
+<p>I hope that you can find some inspiration in this answer.</p>
+    </div>

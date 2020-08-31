@@ -1,0 +1,147 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>To resolve the problem of <code>mMaxReadIdx</code> being incremented by Thread B before Thread A has stored its message, could we consider the use of an atomic boolean as below?</p>
+
+<hr>
+
+<p>Ringbuffer.h</p>
+
+<pre><code>#ifndef __RING_BUFFER_H_
+#define __RING_BUFFER_H_
+
+#include &lt;atomic&gt;
+
+class RingBuffer
+{
+    private:
+      std::vector&lt;Foo&gt; mVector;
+      std::atomic&lt;long&gt; mWriteIdx{0}; //mWriteIdx will not exceed 2,000,000,000
+      std::atomic&lt;long&gt; mMaxReadIdx{0}; //mMaxReadIdx will not exceed 2,000,000,000
+      std::vector&lt;long&gt; mReadIdxVec;
+      std::atomic&lt;bool&gt; mIsPushing{false};
+
+    public:
+      RingBuffer(int pNumOfConsumers);
+      void Push(Foo);
+      Foo * TryRead(int);
+};
+
+#endif
+</code></pre>
+
+<hr>
+
+<pre><code>#include "RingBuffer.h"
+
+static constexpr int const&amp; MAX_SIZE = 5000;
+
+RingBuffer::RingBuffer(int pNumOfConsumers) 
+{
+    for(int i=0; i &lt; MAX_SIZE; i++)
+    {
+        Foo f;
+        mVector.push_back(f);
+    }
+    mReadIdxVec.assign(pNumOfConsumers, 0);
+}
+
+void RingBuffer::Push(Foo pMsg)
+{
+    long writeIdx = mWriteIdx++;
+    long index = writeIdx % MAX_SIZE;
+    while(mIsPushing.load(std::memory_order_seq_cst)){};
+    mIsPushing.store(true,std::memory_order_seq_cst);
+    if(writeIdx &gt;= MAX_SIZE) delete mVector[index];
+    mVector[index] = pMsg;
+    mMaxReadIdx++;
+    mIsPushing.store(false,std::memory_order_seq_cst);
+}
+
+Foo * RingBuffer::TryRead(const int&amp; pConsumer) 
+{
+    if(mReadIdxVec[pConsumer] &gt;= mMaxReadIdx) return nullptr;
+    long index =  mReadIdxVec[pConsumer] % MAX_SIZE;
+    mReadIdxVec[pConsumer]++;
+    return mVector[index];
+}
+</code></pre>
+
+<hr>
+
+<p>Ringbuffer.h (Lock-free)</p>
+
+<pre><code>#ifndef __RING_BUFFER_H_
+#define __RING_BUFFER_H_
+
+#include &lt;atomic&gt;
+
+class Foo
+{
+    public:
+        long bar = 0;
+        double bar2 = 0;
+        std::atomic&lt;bool&gt; isSetting{false};
+
+        void set(long pBar, double pBar2)
+        {
+            isSetting = true;
+            bar = pBar;
+            bar2 = pBar2;
+            isSetting = false;
+        }
+        Foo(){};
+        Foo(const Foo &amp;m2) //copy constructor required as they are default-deleted for atomics
+        {
+            set(m2.bar, m2.bar2);
+        }
+};
+
+class RingBuffer
+{
+    private:
+      std::vector&lt;Foo&gt; mVector;
+      std::atomic&lt;long&gt; mWriteIdx{0}; //mWriteIdx will not exceed 2,000,000,000
+      std::atomic&lt;long&gt; mMaxReadIdx{0}; //mMaxReadIdx will not exceed 2,000,000,000
+      std::vector&lt;long&gt; mReadIdxVec;
+
+    public:
+      RingBuffer(int pNumOfConsumers);
+      void Push(Foo);
+      Foo * TryRead(int);
+};
+
+#endif
+</code></pre>
+
+<hr>
+
+<pre><code>#include "RingBuffer.h"
+
+static constexpr int const&amp; MAX_SIZE = 5000;
+
+RingBuffer::RingBuffer(int pNumOfConsumers) 
+{
+    for(int i=0; i &lt; MAX_SIZE; i++)
+    {
+        Foo f;
+        mVector.push_back(f);
+    }
+    mReadIdxVec.assign(pNumOfConsumers, 0);
+}
+
+void RingBuffer::Push(Foo pMsg)
+{
+    long writeIdx = mWriteIdx++;
+    long index = writeIdx % MAX_SIZE;
+    mVector[index].set(pMsg.bar, pMsg.bar2);
+}
+
+Foo * RingBuffer::TryRead(const int&amp; pConsumer) 
+{
+   if(mReadIdxVec[pConsumer] &gt;= mWriteIdx) return nullptr;
+   if(mVector[index].isSetting) return nullptr;
+   long index = mReadIdxVec[pConsumer] % MAX_SIZE;
+   mReadIdxVec[pConsumer]++;
+   return &amp;mVector[index];
+}
+</code></pre>
+    </div>

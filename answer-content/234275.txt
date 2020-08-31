@@ -1,0 +1,136 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3><em>Towards better design, functionality and performance</em></h3>
+
+<p>Start with good names: that means following Python naming conventions and give a meaningful names to your identifiers/functions/classes:</p>
+
+<p><code>rangeSelector</code> ---&gt; <strong><code>ping_network_range</code></strong><br>
+<code>createThread</code> ---&gt; <strong><code>start_threads</code></strong><br>
+<code>pingBox</code> ---&gt; <strong><code>check_host</code></strong><br></p>
+
+<p>As <a href="https://codereview.stackexchange.com/users/42401/peilonrayz">@Peilonrayz</a> already mentioned <code>range(256)</code> is the valid range for your case.</p>
+
+<p>The former <code>createThread</code> function tried to create a single thread with <code>start</code> ing and <code>join</code> ing it at one step. But that undermines the benefit of using <em>threading</em> for parallelizing computations. The crucial mechanics is that <strong>all</strong> treads are initiated/started at once, then, we <code>join</code> them (awaiting for their finishing) at next separate phase.<br>
+On constructing a <code>threading.Thread</code> no need to pass custom thread name through <code>kwargs={"threadName": ...}</code> - the <a href="https://docs.python.org/3/library/threading.html#threading.Thread" rel="nofollow noreferrer"><code>Thread</code></a> constructor already accepts <strong><code>name</code></strong> argument for the <em>thread name</em> which is then accessed within <em>target</em> function via <strong><code>threading.current_thread().name</code></strong>.</p>
+
+<p>The former <code>pingBox</code> function used <a href="https://docs.python.org/3/library/os.html#os.system" rel="nofollow noreferrer"><code>os.system</code></a> function (executes the command (a string) in a <em>subshell</em>) which is definitely <strong>not</strong> a good choice.<br> 
+The more robust, powerful and flexible choice is <a href="https://docs.python.org/3/library/subprocess.html#module-subprocess" rel="nofollow noreferrer"><strong><code>subprocess</code></strong></a> module:</p>
+
+<blockquote>
+  <p>The <code>subprocess</code> module allows you to spawn new processes, connect to
+  their input/output/error pipes, and obtain their return codes. This
+  module intends to replace several older modules and functions:
+  <code>os.system</code>, <code>os.spawn*</code> <br>
+  ... <br>
+  The recommended approach to invoking
+  subprocesses is to use the <code>run()</code> function for all use cases it can
+  handle. For more advanced use cases, the underlying <code>Popen</code> interface
+  can be used directly.</p>
+</blockquote>
+
+<p>Some good, user-friendly description - on this <a href="https://stackoverflow.com/a/44731082/3185459">SO link</a>.</p>
+
+<p>Furthermore, the <strong><code>ping</code></strong> command (OS network tool) can be speed up itself through adjusting specific options. The most significant ones in such context are:</p>
+
+<ul>
+<li><code>-n</code> (No attempt will be made to lookup symbolic names for host addresses. Allows to disable DNS lookup to speed up queries)</li>
+<li><code>-W &lt;number&gt;</code> (Time to wait for a response, in seconds. The option affects only timeout in absence of any responses, otherwise ping waits for two RTTs)</li>
+<li><code>-i interval</code> (Wait <code>interval</code> seconds between sending each packet. The default is to wait for one second between each packet normally, or not to wait in flood mode. Only super-user may set interval to values less than 0.2 seconds)</li>
+</ul>
+
+<p>The difference would be more noticeable on sending more than one packet (<code>-c</code> option).<br>In your case I'd apply <code>-n</code> and <code>-q</code> options. With <code>-q</code> option allows to quite the output since we'll get the <em>returned code</em> which itself indicates whether a particular host is reachable across an IP network. <code>subprocess.run</code> allows to access the <a href="https://docs.python.org/3/library/subprocess.html#subprocess.CompletedProcess.returncode" rel="nofollow noreferrer"><code>returncode</code></a> explicitly.</p>
+
+<hr>
+
+<p>The 2 nested <code>for</code> loops within the former <code>rangeSelector</code> function is flexibly replaced with <a href="https://docs.python.org/3/library/itertools.html#itertools.product" rel="nofollow noreferrer"><code>itertools.product</code></a> routine to compose an efficient generator expression yielding formatted IP addresses:</p>
+
+<pre><code>from itertools import product
+...
+start_threads(f'127.0.{i}.{j}' for i, j in product(range(256), range(256)))
+</code></pre>
+
+<hr>
+
+<p><strong><em>Designing command-line interface</em></strong></p>
+
+<p>As your program is planned to be used as part of pipeline, instead of hanging on interactive, blocking call of <code>input('Choose range A|B :')</code> - the more flexible and powerful way is using <a href="https://docs.python.org/3/library/argparse.html#module-argparse" rel="nofollow noreferrer"><code>argparse</code></a> module that allows building an extended and flexible command-line interfaces with variety of options of different types and actions.<br>
+For ex. the allowed network classes names can be supplied through <a href="https://docs.python.org/3/library/argparse.html#choices" rel="nofollow noreferrer"><code>choices</code></a>:</p>
+
+<pre><code>...
+parser = ArgumentParser(description='Ping network addresses by network class')
+parser.add_argument('-c', '--nclass', choices=('A', 'B'), required=True, help='Choose class A or B')
+</code></pre>
+
+<hr>
+
+<p>The final optimized implementation:</p>
+
+<pre><code>import threading
+from argparse import ArgumentParser
+from itertools import product
+import subprocess
+
+
+def check_host(host: str):
+    return_code = subprocess.run(["ping", "-c", "1", "-n", "-q", host],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL).returncode
+    print(f'response for pinging {threading.current_thread().name} is {return_code}')
+
+    status = 'up' if return_code == 0 else 'down'
+    print(f'{host} : is {status}')
+
+
+def start_threads(addr_range):
+    for addr in addr_range:
+        t = threading.Thread(target=check_host, args=(addr,), 
+                             name=f'Thread:{addr}')
+        t.start()
+        yield t
+
+
+def ping_network_range(net_class: str):
+    net_class = net_class.upper()
+    if net_class == 'A':
+        threads = list(start_threads(f'127.0.0.{i}' for i in range(256)))
+    elif net_class == 'B':
+        threads = list(start_threads(f'127.0.{i}.{j}' 
+                                     for i, j in product(range(256), range(256))))
+    else:
+        raise ValueError(f'Wrong network class name {net_class}')
+
+    for t in threads:
+        t.join()
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser(description='Ping network addresses by network class')
+    parser.add_argument('-c', '--nclass', choices=('A', 'B'), 
+                        required=True, help='Choose class A or B')
+    args = parser.parse_args()
+    ping_network_range(args.nclass)
+</code></pre>
+
+<p>Sample usage (with timing, under Unix <code>time</code> command):</p>
+
+<pre><code>time python3 ping_network_range.py -c B &gt; test.txt
+
+real    2m4,165s
+user    2m17,660s
+sys     4m35,790s
+</code></pre>
+
+<p>Sample <em>tail</em> contents of resulting <code>test.txt</code> file:</p>
+
+<pre><code>$ tail test.txt
+response for pinging Thread:127.0.255.250 is 0
+127.0.255.250 : is up
+response for pinging Thread:127.0.255.252 is 0
+127.0.255.252 : is up
+response for pinging Thread:127.0.255.253 is 0
+127.0.255.253 : is up
+response for pinging Thread:127.0.255.255 is 0
+127.0.255.255 : is up
+response for pinging Thread:127.0.255.254 is 0
+127.0.255.254 : is up
+</code></pre>
+    </div>

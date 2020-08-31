@@ -1,0 +1,106 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>errno_t memset_s(void *s,rsize_t smax, int c, rsize_t n)
+</code></pre>
+
+<p>You've got a missing space after that first comma. (Sure, inconsistent whitespace doesn't affect functionality; but like any spelling mistake, it indicates that you haven't proofread your code. Which means it <em>probably</em> has some other one-character typos too. Some of which <em>might</em> affect functionality. Always read your code after writing it!)</p>
+
+<p>The typedef <code>errno_t</code> is invariably <code>int</code>. So personally I'd just write <code>int</code> — unless you were planning to use the association with <code>errno</code> in some significant way. Right now your code just returns <code>0</code> on success and <code>1</code> (which is to say <code>EPERM</code>) on failure. Consider whether <code>memset_s</code> should return a more specific and helpful errno than simply <code>EPERM</code>. For example, maybe if you pass NULL to it, you should get back <code>EINVAL</code> "Invalid argument"?</p>
+
+<p>However, at the same time, <a href="https://martinfowler.com/bliki/Yagni.html" rel="nofollow noreferrer">YAGNI</a> — it may be counterproductive to spend a lot of time agonizing over what are the proper errno return values, unless you have an actual use-case for these return values. The only reason to return <code>EINVAL</code> for a null argument instead of the generic <code>EPERM</code> is that it enables a caller to detect that specific error case and handle the error accordingly. <em>But the caller can already detect that case!</em> The caller doesn't need your help to detect <code>s == NULL</code>! The caller controls the value of <code>s</code> in the first place, and can easily check for null beforehand, if they think it's possible for <code>s</code> to be null. (And if it's <em>not</em> possible for <code>s</code> to be null, then there's no point checking inside <code>memset_s</code> either. That's just a waste of CPU cycles.)</p>
+
+<p>Can you tell that I think <code>memset_s</code> is largely a waste of time, design-wise? :)</p>
+
+<hr>
+
+<p>I find your chain of <code>if</code>s difficult to match up to the specification. The specification is as follows:</p>
+
+<blockquote>
+  <p><strong>Runtime-constraints:</strong> <code>s</code> shall not be a null pointer. Neither <code>smax</code> nor <code>n</code> shall be greater than <code>RSIZE_MAX</code>. <code>n</code> shall not be greater than <code>smax</code>.</p>
+  
+  <p>If there is a runtime-constraint violation, then if <code>s</code> is not a null pointer and <code>smax</code> is not greater than <code>RSIZE_MAX</code>, the <code>memset_s</code> function stores the value of <code>c</code> (converted to an <code>unsigned char</code>) into each of the first <code>smax</code> characters of the object pointed to by <code>s</code>.</p>
+  
+  <p><strong>Description:</strong> The <code>memset_s</code> function copies the value of <code>c</code> (converted to an <code>unsigned char</code>) into each of the first <code>n</code> characters of the object pointed to by <code>s</code>.</p>
+</blockquote>
+
+<p>So I would naturally implement it something like this:</p>
+
+<pre><code>errno_t memset_s(void *s, rsize_t smax, int c, rsize_t n) {
+    bool violation = (s == NULL) || (smax &gt; RSIZE_MAX) || (n &gt; RSIZE_MAX) || (n &gt; smax);
+    if (violation) {
+        if ((s != NULL) &amp;&amp; !(smax &gt; RSIZE_MAX)) {
+            for (rsize_t i = 0; i &lt; smax; ++i) {
+                ((volatile unsigned char*)s)[i] = c;
+            }
+        }
+        return EPERM;
+    } else {
+        for (rsize_t i = 0; i &lt; n; ++i) {
+            ((volatile unsigned char*)s)[i] = c;
+        }
+        return 0;
+    }
+}
+</code></pre>
+
+<p>That seems to implement the specification 100% correctly, line for line.</p>
+
+<p>You write the second <code>for</code>-loop above as</p>
+
+<pre><code>    i = 0;
+
+
+    while ( i &lt; n )
+    {
+        *v_p++ = (unsigned char)c;
+
+        i++;
+    }
+</code></pre>
+
+<p>(yes, with <em>two</em> blank lines between the <code>i = 0</code> and the rest of the loop). That's definitely too much code for a simple <code>for</code>-loop. Even without doing anything else to your code, you could replace those 9 lines with 3 lines:</p>
+
+<pre><code>    for (int i = 0; i &lt; n; ++i) {
+        *v_p++ = (unsigned char)c;
+    }
+</code></pre>
+
+<p>A 66% reduction in lines-of-code is not bad for a day's work!</p>
+
+<hr>
+
+<pre><code>volatile unsigned char * v = s;
+// ...
+volatile unsigned char * v_p = &amp;v[0];
+</code></pre>
+
+<p>You know that <code>&amp;v[0]</code> is the same thing as <code>v</code>, right?</p>
+
+<hr>
+
+<pre><code>rsize_t i = 0;
+
+if ( violation_present == 1 ) // &amp;&amp; (s != NULL) &amp;&amp; (smax &lt;= RSIZE_MAX) )
+{
+
+    i = 0;
+</code></pre>
+
+<p>Three things:</p>
+
+<ul>
+<li><p>You initialize <code>i</code> to <code>0</code>, and then <em>again</em> initialize it to <code>0</code>. Are you worried that the first initialization might not have taken? :)</p></li>
+<li><p>The commented-out code is confusing. (I left a comment on the question referring to this and some other commented-out code; you did remove some of it, but left this snippet commented out.) If you meant for this code to take effect, you should uncomment it. If you meant for this code <em>not</em> to take effect, you should just delete it. Don't leave commented-out code hanging around. (If it's for historical interest, you should learn <code>git</code> or some other version-control system.)</p></li>
+<li><p>You branch on if <code>violation_present == 1</code>. This suggests that <code>violation_present</code> might take on other values, such as <code>0</code> (which it does) or <code>2</code> or <code>42</code> (which it does not). The compiler will likely generate code to compare <code>violation_present</code> against the constant <code>1</code>. But actually all you mean here is "If there's a violation present...", which is idiomatically expressed as <code>if (violation_present) ...</code>. Furthermore, you should look up the <code>bool</code> type (defined in <code>&lt;stdbool.h&gt;</code>) — it's tailor-made for boolean variables that can only ever take on the value <code>true</code> or <code>false</code>. (Notice the use of <code>bool</code> in my reference implementation above.)</p></li>
+</ul>
+
+<hr>
+
+<pre><code>fprintf(stderr,"memset_s: Error: void * s == NULL!\n");
+</code></pre>
+
+<p>Missing whitespace again.</p>
+
+<p>Here you have a <code>memset_s</code> function, whose job is to set a range of bytes to a value... and you've got it pulling in <code>fprintf</code> from the standard library! Does that seem appropriate to you?</p>
+
+<p><code>memset_s</code> is a very low-level function. It should be usable even on embedded systems that have never heard of <code>fprintf</code> or <code>stderr</code>. You should find a way to report errors that doesn't involve <code>&lt;stdio.h&gt;</code>. (Might I suggest <code>errno_t</code>? :))</p>
+    </div>

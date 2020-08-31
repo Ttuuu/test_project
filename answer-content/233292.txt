@@ -1,0 +1,239 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Integrating all the pieces. Quite nice now? Faster insert than my version at top (less branches I think!). </p>
+
+<p>See below for state and history:</p>
+
+<pre><code>#include &lt;algorithm&gt;
+#include &lt;iostream&gt;
+#include &lt;map&gt;
+#include &lt;string&gt;
+#include &lt;type_traits&gt;
+#include &lt;vector&gt;
+
+template &lt;class KeyT, class ValueT&gt;
+class SequencedMap {
+  // needed by std::map::operator[]
+  static_assert(std::is_default_constructible_v&lt;ValueT&gt;, "ValueT must be DefaultConstructible");
+  static_assert(std::is_default_constructible_v&lt;KeyT&gt;, "KeyT must be CopyConstructible");
+
+  struct Links;
+  struct Value;
+
+public:
+  using MapT    = std::map&lt;KeyT, Value&gt;;
+  using MapItT  = typename MapT::iterator;
+  using MapValT = typename MapT::value_type;
+
+  template &lt;class K, class V&gt; // re-template to allow perfect forwarding
+  std::pair&lt;MapItT, bool&gt; insert_or_assign(const K&amp; key, V&amp;&amp; value) {
+    auto insert_result        = map.insert_or_assign(key, Value(std::forward&lt;V&gt;(value)));
+    auto&amp; [elem_ptr, was_new] = insert_result;
+    if (was_new) linkit(elem_ptr-&gt;second.links);
+    return insert_result;
+  }
+
+  ValueT&amp; operator[](const KeyT&amp; key) {
+    auto&amp; e = map[key];
+    if (e.links.prev == e.links.next &amp;&amp; e.links.next != &amp;ends) linkit(e.links);
+    return e.value;
+  }
+
+  std::size_t erase(const KeyT&amp; key) {
+    const auto p = map.find(key);
+    if (p == map.end()) return 0;
+    unlinkit(p-&gt;second.links);
+    map.erase(p);
+    return 1;
+  }
+
+  // TODO: this shouldn't be public!
+  const MapT&amp; getMap() const { return map; }
+
+  // is this portable? How dodgy to reinterpret_cast from a pair to this?
+  struct MapExtValT {
+    KeyT first;
+    ValueT second;
+    // Links _dummy_;
+  };
+
+  class Iterator {
+  public:
+    using value_type        = MapExtValT;
+    using difference_type   = std::ptrdiff_t;
+    using pointer           = MapExtValT*;
+    using reference         = MapExtValT&amp;;
+    using iterator_category = std::bidirectional_iterator_tag;
+
+    Iterator(SequencedMap&lt;KeyT, ValueT&gt;* m_, Links* curr_) : map(m_), curr(curr_) {}
+
+    reference operator*() { return map-&gt;fromlink(*curr); }
+    pointer operator-&gt;() { return &amp;(map-&gt;fromlink(*curr)); }
+
+    // clang-format off
+    Iterator&amp; operator++() { curr = curr-&gt;next; return *this; }
+    Iterator&amp; operator--() { curr = curr-&gt;prev; return *this; }
+    // clang-format on
+
+    bool operator!=(const Iterator&amp; o) const { return curr != o.curr; }
+    bool operator==(const Iterator&amp; o) const { return curr == o.curr; }
+
+  private:
+    SequencedMap&lt;KeyT, ValueT&gt;* map;
+    Links* curr;
+  };
+
+  Iterator begin() { return Iterator(this, head); }
+  Iterator end() { return Iterator(this, &amp;ends); }
+
+private:
+  MapT map;
+
+  Links ends;
+  Links*&amp; head = ends.next;
+  Links*&amp; tail = ends.prev;
+
+  struct Links {
+    Links* prev = this;
+    Links* next = this;
+
+    Links()             = default;
+    Links(const Links&amp;) = default;
+    Links(Links&amp;&amp;)      = default;
+
+    // NOP copy/move asignment because it would break ptrs
+    Links&amp; operator=(Links&amp;) noexcept { return *this; }
+    Links&amp; operator=(Links&amp;&amp;) noexcept { return *this; }
+  };
+
+  struct Value { // Could be just a std::pair. This is cleaner
+    // default cstr needed for std::map::operator[]
+    Value() = default;
+
+    Value(ValueT&amp; v) : value{v} {}
+
+    ValueT value;
+    Links links;
+  };
+
+  MapExtValT&amp; fromlink(Links&amp; x) const noexcept {
+    // MSVC 2019 balks at this assert Clang 8 passes it, but MSVC apparently runs fine anyway
+    static_assert(std::is_standard_layout_v&lt;MapValT&gt;, "MapValT must have StandardLayout");
+    return *reinterpret_cast&lt;MapExtValT*&gt;(reinterpret_cast&lt;std::byte*&gt;(&amp;x) -
+                                       offsetof(MapValT, second.links));
+  }
+
+  void linkit(Links&amp; x) noexcept {
+    x.next     = &amp;ends;
+    tail-&gt;next = &amp;x;
+    x.prev     = tail;
+    tail       = &amp;x;
+  }
+
+  void unlinkit(Links&amp; x) noexcept {
+    x.prev-&gt;next = x.next;
+    x.next-&gt;prev = x.prev;
+  }
+
+};
+
+// EOF class: Rest is demo usage code
+
+template &lt;class KeyT, class ValueT&gt;
+void print_in_insertion_order(SequencedMap&lt;KeyT, ValueT&gt;&amp; smap) {
+  for (auto&amp; pair: smap) {
+    std::cout &lt;&lt; pair.first &lt;&lt; " -&gt; " &lt;&lt; pair.second &lt;&lt; "\n";
+  }
+}
+
+template &lt;class KeyT, class ValueT&gt;
+void print_in_map_order(const SequencedMap&lt;KeyT, ValueT&gt;&amp; smap) {
+  for (auto&amp; pair: smap.getMap()) {
+    std::cout &lt;&lt; pair.first &lt;&lt; " -&gt; " &lt;&lt; pair.second.value &lt;&lt; "\n";
+  }
+}
+
+int main() {
+  using Key   = std::string;
+  using Value = int;
+  SequencedMap&lt;Key, Value&gt; smap;
+
+  // arbitrary ad-hoc temporary structure for the data (for demo purposes only)
+
+  for (auto p: std::vector&lt;std::pair&lt;Key, Value&gt;&gt;{
+           {"Mary", 10},
+           {"Alex", 20},
+           {"Johnny", 40},
+           {"Roman", 40},
+           {"Johnny", 50},
+       }) {
+    smap.insert_or_assign(p.first, p.second);
+  }
+  std::cout &lt;&lt; "\nsorted by map\n";
+  print_in_map_order(smap);
+
+  std::cout &lt;&lt; "\nsorted by insert\n";
+  print_in_insertion_order(smap);
+
+  std::cout &lt;&lt; "\nretrieve by known key\n";
+  auto key = "Alex";
+  smap[key];
+  ++smap[key];
+  print_in_insertion_order(smap);
+
+  std::cout &lt;&lt; "\nchange value by known key: Johnny++\n";
+  ++smap["Johnny"];
+  print_in_insertion_order(smap);
+
+  std::cout &lt;&lt; "\nchange value for new key: NewGuy++\n";
+  ++smap["NewGuy"];
+  print_in_insertion_order(smap);
+
+  std::cout &lt;&lt; "\ndelete by known key: Johnny\n";
+  smap.erase("Johnny");
+  print_in_insertion_order(smap);
+
+}
+</code></pre>
+
+<p><strong>EDIT</strong> (4th Dec 2019): </p>
+
+<ol>
+<li>Refactored code above.</li>
+<li>Helper classes for "inner Value" and "links" now inner classes. Reducing public interface.</li>
+<li>No longer using char('0') "hack/trick" to prevent change of Links ptrs upon assignment to existing map-key (was deemed too confusing). Using proper "no-op" move/copy assignment operators on <code>Links</code> now. </li>
+<li>static_asserts for type restrictions</li>
+<li>better "tests"</li>
+</ol>
+
+<p><strong>EDIT</strong> (4th Dec 2019 #2): </p>
+
+<ol start="6">
+<li><p>Added Iterator for the "insertion order". works well with external ranged for loop. </p></li>
+<li><p>There is an interesting "reinterpret_cast" to <code>MapExtvalIt</code> which hides the <code>Links</code> member and gives the external user something that looks like a normal map <code>std::pair</code>. Neat. Good perf. But how portable is that?</p></li>
+<li><p>Not clear how to present the other iterator (ie the normal sorted map order). mbeing() and mend() ? that won't work with "ranged for"? </p></li>
+</ol>
+
+<p>Benchmark:</p>
+
+
+
+<pre class="lang-none prettyprint-override"><code>SequencedMap: insert 100,000=99.8293ms
+SequencedMap: iterate in insertion order=0.849751ms
+SequencedMap: Check sum=4990318
+SequencedMap: modify 100,000 in insertion order=0.964927ms
+SequencedMap: iterate in insertion order=0.914365ms
+SequencedMap: Check sum=5090318
+SequencedMap: delete 10,000=7.02706ms
+SequencedMap: iterate in insertion order=0.821281ms
+SequencedMap: Check sum=4581601
+Map: insert 100,000=83.5828ms
+Map: iterate in map order=6.86609ms
+Map: Check sum=4990318
+Map: modify 100,000 in map order=28.0204ms
+Map: iterate in map order=7.2687ms
+Map: Check sum=5090318
+Map: delete 10,000=7.07613ms
+Map: iterate in map order=5.52114ms
+Map: Check sum=4581601
+</code></pre>
+    </div>

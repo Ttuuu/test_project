@@ -1,0 +1,101 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Update to my previous answer!</p>
+
+<p>The original questioner (@Zacariaz) reported that "I'm currently looking into so-called <em>delta swaps</em>." I don't know how Zacariaz got turned onto them, but they are indeed amazingly efficient at doing bit-permutations. (So I can at least feel good that I identified the root problem here as "bit-permutation," even if I didn't know the best solution.)</p>
+
+<ul>
+<li><a href="https://reflectionsonsecurity.wordpress.com/2014/05/11/efficient-bit-permutation-using-delta-swaps/" rel="nofollow noreferrer">Here's an article on doing the DES initial permutation with delta swaps.</a></li>
+<li><a href="http://programming.sirrida.de/calcperm.php" rel="nofollow noreferrer">Here's an online generator for 32-bit permutations that will use delta swaps if it can.</a></li>
+</ul>
+
+<p>The online generator, written by Jasper Neumann, comes with C++ source code; click the link to <strong><code>calcperm.*</code></strong> at the bottom of that page.</p>
+
+<p>Using Jasper Neumann's generator, I found the best rotation code so far. It uses this primitive:</p>
+
+<pre><code>inline constexpr uint64_t delta_swap(uint64_t a, int delta, uint64_t mask)
+{
+    if (((mask &gt;&gt; delta) ^ mask) == 0xFFFF'FFFF'FFFF'FFFF) {
+        return ((a &lt;&lt; delta) &amp; mask) | ((a &amp; mask) &gt;&gt; delta);
+    } else {
+        uint64_t b = (a ^ (a &lt;&lt; delta)) &amp; mask;
+        return a ^ b ^ (b &gt;&gt; delta);
+    }
+}
+</code></pre>
+
+<p>Notice that we will only ever use this function with integer-literal <code>delta</code> and <code>mask</code> arguments, so the <code>if</code> is testing a compile-time-known value and will be optimized away by the compiler. On the other hand, neither Clang nor GCC seems smart enough to figure out that the math in the "else" branch is equivalent to the math in the "if" branch; so by providing the optimized "if" branch explicitly, we're helping Clang and GCC save a couple of instructions.</p>
+
+<p>Here's the "x" rotation:</p>
+
+<pre><code>uint64_t rotate_right_around_x_axis(uint64_t o)
+{
+    uint64_t r = o;
+    r = delta_swap(r, 32, 0xffffffff00000000);
+    r = delta_swap(r, 16, 0xffff0000ffff0000);
+    r = delta_swap(r, 24, 0x00ff00ff00000000);
+    r = delta_swap(r, 12, 0x0f0f00000f0f0000);
+    return r;
+}
+</code></pre>
+
+<p>A cool thing about delta swaps — besides how efficient they are — is that to get the <em>inverse</em> permutation (a.k.a. "rotate <em>left</em> around x axis"), all you have to do is invert the order of the swaps!  (Swaps that don't interact with each other don't have to be inverted. I found it aesthetically pleasing to keep such swaps in decreasing order of shift value.)</p>
+
+<pre><code>uint64_t rotate_left_around_x_axis(uint64_t o)
+{
+    uint64_t r = o;
+    r = delta_swap(r, 24, 0x00ff00ff00000000);
+    r = delta_swap(r, 12, 0x0f0f00000f0f0000);
+    r = delta_swap(r, 32, 0xffffffff00000000);
+    r = delta_swap(r, 16, 0xffff0000ffff0000);
+    return r;
+}
+</code></pre>
+
+<p>And the rest of the rotations:</p>
+
+<pre><code>uint64_t rotate_right_around_y_axis(uint64_t o)
+{
+    uint64_t r = o;
+    r = delta_swap(r, 32, 0xffffffff00000000);
+    r = delta_swap(r, 16, 0xffff0000ffff0000);
+    r = delta_swap(r, 34, 0xcccccccc00000000);
+    r = delta_swap(r, 17, 0xaaaa0000aaaa0000);
+    return r;
+}
+uint64_t rotate_left_around_y_axis(uint64_t o)
+{
+    uint64_t r = o;
+    r = delta_swap(r, 34, 0xcccccccc00000000);
+    r = delta_swap(r, 17, 0xaaaa0000aaaa0000);
+    r = delta_swap(r, 32, 0xffffffff00000000);
+    r = delta_swap(r, 16, 0xffff0000ffff0000);
+    return r;
+}
+uint64_t rotate_right_around_z_axis(uint64_t o)
+{
+    uint64_t r = o;
+    r = delta_swap(r, 8, 0xff00ff00ff00ff00);
+    r = delta_swap(r, 4, 0xf0f0f0f0f0f0f0f0);
+    r = delta_swap(r, 6, 0x3300330033003300);
+    r = delta_swap(r, 3, 0x5050505050505050);
+    return r;
+}
+uint64_t rotate_left_around_z_axis(uint64_t o)
+{
+    uint64_t r = o;
+    r = delta_swap(r, 6, 0x3300330033003300);
+    r = delta_swap(r, 3, 0x5050505050505050);
+    r = delta_swap(r, 8, 0xff00ff00ff00ff00);
+    r = delta_swap(r, 4, 0xf0f0f0f0f0f0f0f0);
+    return r;
+}
+</code></pre>
+
+<p>Notice that they are all very similar in flow: the four shift counts are always "power-of-two, half-that-number; non-power-of-two, half-that-number" for right rotations. This is unsurprising in retrospect because our cube-rotations are naturally isomorphic in terms of how many sets of bits are switching places. The only difference is which <em>indexes</em> are contained in those sets of bits.</p>
+
+<p>Notice that the 32-16 swap that shows up in the "x" and "y" rotations is a "reverse-words-in-the-qword" operation, and the 8-4 swap in the "z" rotations is a "reverse-nybbles-in-each-word" operation. The x86-64 processor has a built-in "reverse-bytes-in-the-qword" operation (<code>bswapq</code>) but does not have any faster way to do the 32-16 or 8-4 swaps as far as I know. (We do the former in 9 instructions and the latter in 17.)</p>
+
+<p>The code for these rotations, and (non-exhaustive) test cases for them, is now located on my GitHub at <a href="https://github.com/Quuxplusone/rot4x4x4" rel="nofollow noreferrer">https://github.com/Quuxplusone/rot4x4x4</a>.</p>
+
+<p>You can investigate the assembly code for these rotations on Matt Godbolt's Compiler Explorer: <a href="https://godbolt.org/g/DJrM6i" rel="nofollow noreferrer">https://godbolt.org/g/DJrM6i</a></p>
+    </div>

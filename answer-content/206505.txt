@@ -1,0 +1,87 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>My first attempt (without changing any of your functions nor the semantics of your handler) would be:</p>
+
+<pre><code>projects_from_json(Req=#{method := &lt;&lt;"POST"&gt;&gt;}, State) -&gt;
+    try
+        {ok, ReqBody, Req2} = cowboy_req:read_body(Req),
+        Name = get_project_name(ReqBody),
+        {ok, Conn} = moledb:connect_from_config(),
+        Data = get_project_json(Conn, Name),
+        molehill_respond:respond_status(Data, 201, Req2, State)
+    catch
+        error:{badkey, Key} -&gt;
+            molehill_respond:respond_error(
+                &lt;&lt;"MissingKey"&gt;&gt;,
+                erlang:iolist_to_binary(
+                    [&lt;&lt;"Key \""&gt;&gt;, Key, &lt;&lt;"\" does not exist in passed data"&gt;&gt;]),
+                400, Req2, State);
+        error:{error, Label, Message, Status} -&gt;
+            molehill_respond:respond_error(Label, Message, Status, Req2, State)
+    end.
+
+get_project_name(ReqBody) -&gt;
+    Name = project_name(ReqBody),
+    case validate_project_name(Name) of
+        invalid -&gt;
+            erlang:error({
+                error,
+                &lt;&lt;"InvalidValue"&gt;&gt;,
+                &lt;&lt;"The project name can only consist of ASCII characters and numbers, "
+                    "and dash in the middle of the word."&gt;&gt;,
+                400
+            });
+        ok -&gt;
+            Name
+    end.
+
+get_project_json(Conn, Name) -&gt;
+    try
+        moledb:create_project(Conn, Name),
+        prepare_project_json(Name)
+    catch
+        error:duplicate_element -&gt;
+            erlang:error({
+                error,
+                &lt;&lt;"DuplicateValue"&gt;&gt;,
+                erlang:iolist_to_binary(
+                    [&lt;&lt;"A project with name \""&gt;&gt;, Name, &lt;&lt;"\" already exists"&gt;&gt;]),
+                409
+            })
+    end.
+</code></pre>
+
+<p>I basically moved pieces of your code from <code>projects_to_json/2</code> into its own functions so you can keep your main one tidier.</p>
+
+<p>But you might have noticed that my new functions still have a lot of code for encapsulating the errors. If you can get <code>validate_project_name/1</code> and <code>prepare_project_json/1</code> to raise the errors in the proper format themselves instead of returning <code>invalid | ok</code>, this gets reduced to…</p>
+
+<pre><code>projects_from_json(Req=#{method := &lt;&lt;"POST"&gt;&gt;}, State) -&gt;
+    try
+        {ok, ReqBody, Req2} = cowboy_req:read_body(Req),
+        Name = project_name(ReqBody),
+        validate_project_name(Name),
+        {ok, Conn} = moledb:connect_from_config(),
+        moledb:create_project(Conn, Name),
+        Data = prepare_project_json(Name)
+        molehill_respond:respond_status(Data, 201, Req2, State)
+    catch
+        error:{badkey, Key} -&gt;
+            molehill_respond:respond_error(
+                &lt;&lt;"MissingKey"&gt;&gt;,
+                erlang:iolist_to_binary(
+                    [&lt;&lt;"Key \""&gt;&gt;, Key, &lt;&lt;"\" does not exist in passed data"&gt;&gt;]),
+                400, Req2, State);
+        error:{error, Label, Message, Status} -&gt;
+            molehill_respond:respond_error(Label, Message, Status, Req2, State)
+    end.
+
+%% @doc this function may raise an error like {error, binary(), binary(), 400..499}
+validate_project_name(Name) -&gt;
+    …
+
+%% @doc this function may raise an error like {error, binary(), binary(), 400..499}
+prepare_project_json(Name) -&gt;
+    …
+</code></pre>
+
+<p>Basically, the idea is to include as much information as you need on the error itself, so… instead of failing with <code>duplicate_element</code>, you fail with <code>{error, …, …}</code> so that the outer loop can catch that. If you can’t decide on how your functions will fail, just wrap them up in other functions that will translate the errors/results into the expected form.</p>
+    </div>

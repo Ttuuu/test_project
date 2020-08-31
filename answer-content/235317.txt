@@ -1,0 +1,147 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p><strong>Update</strong></p>
+</blockquote>
+
+<p>I made a bare-bones yahtzee solver with no error checking in pure C++ (no mmap). The code is considerably more complex than mmapping, but is more portable, more generic, and seems to work just fine.</p>
+
+<p>With a single-producer-single-consumer pattern and 64k buffers(arbitrary) and got <strong>(0.97s)</strong>: </p>
+
+<pre><code>$ /usr/bin/time -f "%e %U %S %M" ./a ~/yahtzee-upper-big.txt 
+31415926535000
+0.97 1.01 0.37 663528
+</code></pre>
+
+<p>I compared to an mmap implementation (without using the SPSC) <strong>(1.04s)</strong>:</p>
+
+<pre><code>/usr/bin/time -f "%e %U %S %M" ./a ~/yahtzee-upper-big.txt 
+31415926535000
+1.04 0.98 0.05 884192
+</code></pre>
+
+<p>mmap has almost no system time while fstream does, presumably memcpying or buffering. C++/fstream has about the same latency and uses less memory, but uses much more processing time. I speculate that the lower peak memory usage is due to the system being able to page-out memory faster than mmap.</p>
+
+<p>Here's the test code. It's pretty sloppy and I wasn't thinking too hard about it. It is <strong><em>not</em></strong> meant to be a reference.</p>
+
+<pre><code>#include &lt;condition_variable&gt;
+#include &lt;fstream&gt;
+#include &lt;iostream&gt;
+#include &lt;thread&gt;
+#include &lt;vector&gt;
+
+auto constexpr kReadBlockSize = size_t{1ull &lt;&lt; 15ull};
+
+int main(int argc, char** argv) {
+  if (argc != 2) return -1;
+
+  auto input_path_argument = argv[1];
+  auto file_stream = std::ifstream{input_path_argument, std::ios::binary};
+  if (file_stream.bad()) return -1;
+
+  auto mutex = std::mutex{};
+  auto condition_variable = std::condition_variable{};
+  auto shared_is_finished_reading = false;
+  auto shared_buffer_pool = std::vector&lt;std::vector&lt;uint8_t&gt;&gt;{};
+  auto shared_buffers = std::vector&lt;std::vector&lt;uint8_t&gt;&gt;{};
+  auto producer_thread = std::thread{[&amp;]() {
+    auto producer_buffer = std::vector&lt;uint8_t&gt;{};
+    while (file_stream.good()) {
+      producer_buffer.resize(kReadBlockSize);
+      if (!file_stream.read(reinterpret_cast&lt;char*&gt;(producer_buffer.data()),
+                            producer_buffer.size())) {
+        producer_buffer.resize(file_stream.gcount());
+      }
+
+      {
+        auto lock = std::lock_guard&lt;std::mutex&gt;{mutex};
+        shared_buffers.push_back(std::move(producer_buffer));
+
+        if (!shared_buffer_pool.empty()) {
+          producer_buffer = std::move(shared_buffer_pool.back());
+          shared_buffer_pool.pop_back();
+        } else {
+          producer_buffer = std::vector&lt;uint8_t&gt;{};
+        }
+      }
+      condition_variable.notify_all();
+    }
+
+    {
+      auto lock = std::lock_guard&lt;std::mutex&gt;{mutex};
+      shared_is_finished_reading = true;
+    }
+    condition_variable.notify_all();
+  }};
+
+  auto max_yahtzee_roll = 0ull;
+  auto consumer_buffers = std::vector&lt;std::vector&lt;uint8_t&gt;&gt;{};
+  auto is_finished_reading = false;
+  auto current_parsed_value = 0;
+  auto occurrance_counts = std::vector&lt;uint32_t&gt;();
+
+  while (!is_finished_reading) {
+    {
+      auto lock = std::unique_lock&lt;std::mutex&gt;{mutex};
+      condition_variable.wait(lock, [&amp;]() {
+        return !shared_buffers.empty() || shared_is_finished_reading;
+      });
+
+      is_finished_reading = shared_is_finished_reading;
+      shared_buffer_pool.insert(
+          shared_buffer_pool.end(),
+          std::make_move_iterator(consumer_buffers.begin()),
+          std::make_move_iterator(consumer_buffers.end()));
+      std::swap(shared_buffers, consumer_buffers);
+    }
+
+    for (auto&amp; buffer : consumer_buffers) {
+      for (auto c : buffer) {
+        if (auto digit_value = c - '0'; digit_value &gt;= 0 &amp;&amp; digit_value &lt;= 9) {
+          current_parsed_value *= 10u;
+          current_parsed_value += digit_value;
+        } else {
+          if (occurrance_counts.capacity() &lt;= current_parsed_value) {
+            occurrance_counts.reserve(2ull * current_parsed_value + 1ull);
+          }
+          auto current_value_count = ++occurrance_counts[current_parsed_value];
+          max_yahtzee_roll = std::max&lt;uint64_t&gt;(
+              max_yahtzee_roll,
+              (uint64_t)current_value_count * current_parsed_value);
+          current_parsed_value = 0;
+        }
+      }
+    }
+  }
+
+  std::cout &lt;&lt; max_yahtzee_roll &lt;&lt; std::endl;
+
+  producer_thread.join();
+  return 0;
+}
+
+</code></pre>
+
+<hr>
+
+<p>The internet tells me a typical SSD might read at 500MB/s, which is 0.5MB/ms or 1M in 2ms. 8ms is incredibly fast and also very close to the theoretical limit. In fact, just reading that file on a HDD is probably slower. </p>
+
+<p>The parsing code is doing a lot of unnecessary work if you're positive that the input will always be an int-per-line.</p>
+
+<p>You're accumulating the hash table by adding the value, but you actually only need to store the occurrence count since the total can be derived from the count and the key. You could store 4 byte ints instead of 8 bytes if there's only 100,000 values with a max value of 999,999,999, reducing the hash table size, though it's already so small this probably won't matter. </p>
+
+<p>You could reserve hash table space, though you might not want to reserve too much.</p>
+
+<p>You could try passing flags to the mmap to notify the os that it will be read sequentially and all the file will be read, or try to prefetch memory.</p>
+
+<p>You can skip updating the table if the current value cannot possibly be higher than the current max. For example, if a 1 is read in and the current max total is over 100,000 there's no possible way for 1s to be the highest number class so they don't need to hit the hash table. </p>
+
+<p>For small sets of data, an array might be faster than the hash map. </p>
+
+<p>You could maybe use multiple threads, but that could be challenging on small data sets to overcome the overhead of just creating them. </p>
+
+<p>At this point you could also hand optimize the parsing. Consider that the file, if well formed, will have a strict pattern of ([0-9]+\n)+. So it could be a loop that reads a byte, multiplies the current value by 10 and adds the new value - '0', or consumes the current value if it's a \n.</p>
+
+<p>Maybe play with compile flags too, in particular things that might make the code load faster, perhaps reducing the executable size so there's less to load. </p>
+
+<p>The hash map probably allocates heap memory, but if you made it use a giant chunk of 0-initialized global memory, that might be faster since it skips an allocation and should instead come free when the program launches.</p>
+    </div>

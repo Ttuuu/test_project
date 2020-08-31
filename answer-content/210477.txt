@@ -1,0 +1,219 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Performance</h2>
+
+<h3>Regex</h3>
+
+<p><code>regex.MustCompile()</code> is very expensive! Do not use this method inside a loop ! </p>
+
+<p>instead, define your regex as global variables only once: </p>
+
+<pre><code>var (
+    boldItalicReg = regexp.MustCompile(`\*\*\*(.*?)\*\*\*`)
+    boldReg       = regexp.MustCompile(`\*\*(.*?)\*\*`)
+    ...
+)
+</code></pre>
+
+<h3>Headers</h3>
+
+<p>If a line is a header, it will start by a <code>#</code>. We can check for this before calling <code>ReplaceAllString()</code> 6 times ! All we need 
+ to do is to trim the line, and then check if it starts with <code>#</code>:</p>
+
+<pre><code>line = strings.TrimSpace(line)
+if strings.HasPrefix(line, "#") {
+    // convert headings
+    ...
+}
+</code></pre>
+
+<p>We could go further and unrolling the loop to avoid unecessary allocations: </p>
+
+<pre><code>count := strings.Count(line, "#")
+switch count {
+case 1:
+    line = h1Reg.ReplaceAllString(line, `&lt;h1&gt;$2&lt;/h1&gt;`)
+case 2: 
+    ...
+}
+</code></pre>
+
+<h3>Use a scanner</h3>
+
+<p>The idiomatic way to read a file line by line in go is to use a <code>scanner</code>. It takes an <code>io.Reader</code> as parameters, so you can directly pass
+your mardown file instead of converting it into a string first: </p>
+
+<pre><code>func NewMarkdown(input io.Reader) string {
+
+
+    scanner := bufio.NewScanner(input)
+    for scanner.Scan() {
+
+        line := scanner.Text()
+        ...
+    }
+}
+</code></pre>
+
+<h3>Use <code>[]byte</code> instead of <code>string</code></h3>
+
+<p>In go, a <code>string</code> is a read-only slice of bytes. Working with strings is usually more expensive than working with slice of bytes, 
+so use <code>[]byte</code> instead of <code>strings</code> when you can:</p>
+
+<pre><code>line := scanner.Bytes()
+line = boldItalicReg.ReplaceAll(line, []byte(`&lt;b&gt;&lt;i&gt;$1&lt;/i&gt;&lt;/b&gt;`))
+</code></pre>
+
+<h3>Write result to a <code>bytes.Buffer</code></h3>
+
+<p>Instead of <code>string.Join()</code>, we can use a buffer to write each line in order to further reduce the number of allocations: </p>
+
+<pre><code>buf := bytes.NewBuffer(nil)
+scanner := bufio.NewScanner(input)
+for scanner.Scan() {
+
+    line := scanner.Bytes()
+    ...
+    buf.Write(line)
+    buf.WriteByte('\n')
+}
+
+return buf.String()
+</code></pre>
+
+<p>final code: </p>
+
+<pre><code>package parse
+
+import (
+    "bufio"
+    "bytes"
+    "io"
+    "regexp"
+)
+
+var (
+    boldItalicReg = regexp.MustCompile(`\*\*\*(.*?)\*\*\*`)
+    boldReg       = regexp.MustCompile(`\*\*(.*?)\*\*`)
+    italicReg     = regexp.MustCompile(`\*(.*?)\*`)
+    strikeReg     = regexp.MustCompile(`\~\~(.*?)\~\~`)
+    underscoreReg = regexp.MustCompile(`__(.*?)__`)
+    anchorReg     = regexp.MustCompile(`\[(.*?)\]\((.*?)\)[^\)]`)
+    escapeReg     = regexp.MustCompile(`^\&gt;(\s|)`)
+    blockquoteReg = regexp.MustCompile(`\&amp;gt\;(.*?)$`)
+    backtipReg    = regexp.MustCompile("`(.*?)`")
+
+    h1Reg = regexp.MustCompile(`^#(\s|)(.*?)$`)
+    h2Reg = regexp.MustCompile(`^##(\s|)(.*?)$`)
+    h3Reg = regexp.MustCompile(`^###(\s|)(.*?)$`)
+    h4Reg = regexp.MustCompile(`^####(\s|)(.*?)$`)
+    h5Reg = regexp.MustCompile(`^#####(\s|)(.*?)$`)
+    h6Reg = regexp.MustCompile(`^######(\s|)(.*?)$`)
+)
+
+func NewMarkdown(input io.Reader) string {
+
+    buf := bytes.NewBuffer(nil)
+
+    scanner := bufio.NewScanner(input)
+    for scanner.Scan() {
+
+        line := bytes.TrimSpace(scanner.Bytes())
+        if len(line) == 0 {
+            buf.WriteByte('\n')
+            continue
+        }
+
+        // wrap bold and italic text in "&lt;b&gt;" and "&lt;i&gt;" elements
+        line = boldItalicReg.ReplaceAll(line, []byte(`&lt;b&gt;&lt;i&gt;$1&lt;/i&gt;&lt;/b&gt;`))
+        line = boldReg.ReplaceAll(line, []byte(`&lt;b&gt;$1&lt;/b&gt;`))
+        line = italicReg.ReplaceAll(line, []byte(`&lt;i&gt;$1&lt;/i&gt;`))
+        // wrap strikethrough text in "&lt;s&gt;" tags
+        line = strikeReg.ReplaceAll(line, []byte(`&lt;s&gt;$1&lt;/s&gt;`))
+        // wrap underscored text in "&lt;u&gt;" tags
+        line = underscoreReg.ReplaceAll(line, []byte(`&lt;u&gt;$1&lt;/u&gt;`))
+        // convert links to anchor tags
+        line = anchorReg.ReplaceAll(line, []byte(`&lt;a href="$2"&gt;$1&lt;/a&gt;`))
+        // escape and wrap blockquotes in "&lt;blockquote&gt;" tags
+        line = escapeReg.ReplaceAll(line, []byte(`&amp;gt;`))
+        line = blockquoteReg.ReplaceAll(line, []byte(`&lt;blockquote&gt;$1&lt;/blockquote&gt;`))
+        // wrap the content of backticks inside of "&lt;code&gt;" tags
+        line = backtipReg.ReplaceAll(line, []byte(`&lt;code&gt;$1&lt;/code&gt;`))
+        // convert headings
+        if line[0] == '#' {
+
+            count := bytes.Count(line, []byte(`#`))
+            switch count {
+            case 1:
+                line = h1Reg.ReplaceAll(line, []byte(`&lt;h1&gt;$2&lt;/h1&gt;`))
+            case 2:
+                line = h2Reg.ReplaceAll(line, []byte(`&lt;h2&gt;$2&lt;/h2&gt;`))
+            case 3:
+                line = h3Reg.ReplaceAll(line, []byte(`&lt;h3&gt;$2&lt;/h3&gt;`))
+            case 4:
+                line = h4Reg.ReplaceAll(line, []byte(`&lt;h4&gt;$2&lt;/h4&gt;`))
+            case 5:
+                line = h5Reg.ReplaceAll(line, []byte(`&lt;h5&gt;$2&lt;/h5&gt;`))
+            case 6:
+                line = h6Reg.ReplaceAll(line, []byte(`&lt;h6&gt;$2&lt;/h6&gt;`))
+            }
+        }
+        buf.Write(line)
+        buf.WriteByte('\n')
+    }
+    return buf.String()
+}
+</code></pre>
+
+<h2>Benchmarks</h2>
+
+<p>I used the folowing code for benchmarks, on a 20kB md file: </p>
+
+<pre><code>func BenchmarkMarkdown(b *testing.B) {
+
+    md, err := ioutil.ReadFile("README.md")
+    if err != nil {
+        b.Fail()
+    }
+    raw := string(md)
+    b.ResetTimer()
+
+    for n := 0; n &lt; b.N; n++ {
+        _ = Markdown(raw)
+    }
+}
+
+func BenchmarkMarkdownNew(b *testing.B) {
+
+    for n := 0; n &lt; b.N; n++ {
+        file, err := os.Open("README.md")
+        if err != nil {
+            b.Fail()
+        }
+        _ = NewMarkdown(file)
+        file.Close()
+    }
+}
+</code></pre>
+
+<p>Results: </p>
+
+<pre><code>&gt; go test -bench=. -benchmem
+
+goos: linux
+goarch: amd64
+BenchmarkMarkdown-4               10     104990431 ns/op    364617427 B/op    493813 allocs/op
+BenchmarkMarkdownNew-4          1000       1464745 ns/op      379376 B/op      11085 allocs/op
+</code></pre>
+
+<p>benchstat diff: </p>
+
+<pre><code>name        old time/op    new time/op    delta
+Markdown-4     105ms ± 0%       1ms ± 0%   ~     (p=1.000 n=1+1)
+
+name        old alloc/op   new alloc/op   delta
+Markdown-4     365MB ± 0%       0MB ± 0%   ~     (p=1.000 n=1+1)
+
+name        old allocs/op  new allocs/op  delta
+Markdown-4      494k ± 0%       11k ± 0%   ~     (p=1.000 n=1+1)
+</code></pre>
+    </div>

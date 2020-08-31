@@ -1,0 +1,126 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Just reviewing the <code>FileGroup</code> class.</p>
+
+<h3>1. Review</h3>
+
+<ol>
+<li><p>The name <code>FileGroup</code> does not convey the intended purpose of the class (namely, that all the files in the group share an inode). A name like <code>InodeFiles</code> would be better.</p></li>
+<li><p>The intention of the class is that all the files share an inode. But the class itself does not check this: it relies on the caller to do so. It is more reliable when a data structure checks its own integrity.</p></li>
+<li><p>Adding a file to a <code>FileGroup</code> needs to be done differently depending on whether it is the first file in the group (in which case you pass its path, inode and size to the constructor), or a subsequent file in the group, in which case you call the <code>add_file</code> method, passing the path only. This causes difficulties at the point where the class is used: you have to check <code>if inode in file_groups:</code> before deciding which approach to use. It would be simpler if adding files to the collection were done in the same way for each file.</p></li>
+<li><p>If you look at the only place where <code>FileGroup</code> is used, it is initialized based on an <a href="https://docs.python.org/3/library/os.html#os.DirEntry" rel="nofollow noreferrer"><code>os.DirEntry</code></a> object. So it would be simpler for it to collect <code>os.DirEntry</code> objects instead of paths.</p></li>
+<li><p>If you implemented suggestions §3 and §4, then there would not need to be a difference between the first file and subsequent files, and in <code>dedupe</code> you could use <a href="https://docs.python.org/3/library/collections.html#collections.defaultdict" rel="nofollow noreferrer"><code>collections.defaultdict</code></a>:</p>
+
+<pre><code>file_groups = collections.defaultdict(FileGroup)
+</code></pre>
+
+<p>and in <code>scan_directory</code> you would write:</p>
+
+<pre><code>if entry.is_file() and entry.stat().st_size != 0:
+    file_groups[inode].add(entry)
+</code></pre>
+
+<p>with no need for the <code>else</code> clause.</p></li>
+<li><p>The expression <code>files[0]</code> appears in many places. I would suggest using a property with a docstring to clarify the intention:</p>
+
+<pre><code>@property
+def representative(self):
+    """A representative file from the collection.""" 
+    return self.files[0]
+</code></pre></li>
+<li><p>The method <code>get_hash</code> takes no arguments and always returns the same result. This suggests that it should be a property:</p>
+
+<pre><code>@property
+def hash(self):
+    # etc.
+</code></pre></li>
+<li><p><code>get_hash</code> uses a cache to avoid recomputing the result:</p>
+
+<pre><code>def get_hash(self):
+    if not self._hash:
+        self._compute_hash()
+    return self._hash
+</code></pre>
+
+<p>The cache logic can be simplified using the <a href="https://docs.python.org/3/library/functools.html#functools.cached_property" rel="nofollow noreferrer"><code>@cached_property</code></a> decorator:</p>
+
+<pre><code>@cached_property
+def hash(self):
+    return self._compute_hash()
+</code></pre>
+
+<p>The <code>@cached_property</code> decorator was new in Python 3.8. In earlier versions you can get a similar effect by composing <code>@property</code> with <a href="https://docs.python.org/3/library/functools.html#functools.lru_cache" rel="nofollow noreferrer"><code>@functools.lru_cache</code></a>:</p>
+
+<pre><code>def cached_property(fn):
+    return property(functools.lru_cache(maxsize=None)(fn))
+</code></pre>
+
+<p>(This implementation is not quite the same as the one in Python 3.8, in that all instances of the class share a single cache, which might not be appropriate for some use cases, but I think it will be fine in your particular case.)</p></li>
+<li><p>Having made a cached property, there's no point having a separate <code>_compute_hash</code> method.</p></li>
+<li><p>Similar remarks apply to the <code>get_byte_signature</code>, which can become the cached property <code>signature</code>, avoiding the need for a separate <code>_read_byte_signature</code> method.</p></li>
+<li><p>The <code>_read_byte_signature</code> method reads and hashes <code>NUM_BYTES</code> bytes starting at <code>self.size // 2</code>. But if <code>self.size</code> is less than <code>2 * NUM_BYTES</code>, the read will be short. In these cases I would prioritize reading more bytes, so I suggest something like:</p>
+
+<pre><code>handle.seek(min(self.size // 2, max(self.size - NUM_BYTES, 0)))
+</code></pre></li>
+<li><p>Using the <code>filehash</code> package is overkill since you could implement what you need in a handful of lines using the built-in <a href="https://docs.python.org/3/library/hashlib.html" rel="nofollow noreferrer"><code>hashlib</code></a> module:</p>
+
+<pre><code>import hashlib
+
+def filehash(algorithm, fileobj):
+    """Return hash object corresponding to the contents of a file hashed
+    using the specified algorithm.
+
+    """
+    hashobj = hashlib.new(algorithm)
+    while True:
+        chunk = fileobj.read(4096)
+        if not chunk:
+            return hashobj
+        hashobj.update(chunk)
+</code></pre>
+
+<p>(It's always tempting to use third-party packages for the convenience, even if it only replaces a few lines of code, but extra dependencies come with maintenance burdens that should be offset against the benefits.)</p></li>
+<li><p>It is inconsistent that <code>get_hash</code> returns a string (the hexdigest of the hash) while <code>get_byte_signature</code> returns a bytes object. It would make more sense to use the digest instead of the hexdigest, so that both results are bytes objects. This would allow them to be treated the same by other parts of the program.</p></li>
+</ol>
+
+<h3>2. Revised code</h3>
+
+<p>(You'll have to make the docstrings conform to your preferred style, but that should be straightforward.)</p>
+
+<pre><code>class InodeFiles:
+    """Collection of os.DirEntry objects for files that share an inode."""
+    def __init__(self):
+        self.files = []
+        self.inode = None
+
+    def add(self, entry):
+        """Add file (an os.DirEntry object) to collection."""
+        if self.inode is None:
+            self.inode = entry.inode()
+        elif self.inode != entry.inode():
+            raise ValueError("Inode does not match.")
+        self.files.append(entry)
+
+    @property
+    def representative(self):
+        """A representative file from the collection, as an os.DirEntry object."""
+        return self.files[0]
+
+    @property
+    def size(self):
+        """Size of the files (in bytes)."""
+        return self.representative.stat().st_size
+
+    @cached_property
+    def hash(self):
+        """SHA1 hash of the files, as a bytes object."""
+        with open(self.representative, 'rb') as f:
+            return filehash('sha1', f).digest()
+
+    @cached_property
+    def signature(self):
+        """Signature of the files, as a bytes object."""
+        with open(self.representative, 'rb') as f:
+            f.seek(min(self.size // 2, max(self.size - NUM_BYTES, 0)))
+            return f.read(NUM_BYTES)
+</code></pre>
+    </div>

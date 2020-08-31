@@ -1,0 +1,41 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Without knowing exactly what your old code was it is hard to pinpoint where the slowdown came from. That being said, here are some things you're doing in your query that are going to make it slower:</p>
+
+<ol>
+<li>Using a UDF prohibits parallel plans. You could throw 1000 CPUs at this problem and it would still only use one of them. If computing this is too complex to do inline, then use an inline table-valued function instead, which enables parallelism.</li>
+<li><code>JOIN</code>ing on functions (UDF or otherwise) performs really poorly. SQL Server has no cardinality estimate for <code>LEFT(input.name, 3)</code>, but it does for <code>input.name</code>. If at all possible find another way to do this join (a suggestion is below). Similarly, filtering in a <code>WHERE</code> clause has the same restrictions.</li>
+</ol>
+
+<p>To address this, I would likely change your join to just be on <code>RefCode</code> - this gets you a good hash match (probably), but will increase your granularity. Then, make your <code>edit_distance</code> function table valued, like so</p>
+
+<pre><code>SELECT &lt;&lt;stuff&gt;&gt;
+  FROM dbo.Sample input
+    INNER JOIN dbo.Company target_db
+      ON input.ReFcode = target_db.Refcode
+    CROSS APPLY dbo.edit_distance( input.name, target_db.CompanyName ) levenshtein
+</code></pre>
+
+<p>Then, inside of <code>dbo.edit_distance</code> I would include the <code>LEFT</code>, <code>SOUNDEX</code> and <code>LEN</code> calculations (<code>LEN</code> calc would also be better if you did <code>LEN( input.name ) - LEN( targetdb.CompanyName ) BETWEEN -7 AND 7</code>).</p>
+
+<p>If levenshtein returns some score, then you could do something like this to only get the best score per input name. Alternatively if you want them all, then have it return everything and do whatever calculations the consuming app needs.</p>
+
+<pre><code>SELECT name,
+       CompanyName,
+       Country,
+       RefCode,
+       levenshtein_score
+  FROM ( SELECT input.name,
+                target_db.CompanyName,
+                input.Country,
+                input.ReFcode,
+                levenshtein.levenshtein_score,
+                ROW_NUMBER() OVER ( PARTITION BY input.name
+                                    ORDER BY levenshtein.levenshtein_score ASC ) RowNumber
+           FROM dbo.Sample input
+             INNER JOIN dbo.Company target_db
+               ON input.ReFcode = target_db.Refcode
+             CROSS APPLY dbo.edit_distance( input.name, target_db.CompanyName ) levenshtein ) ComputedLevenshteinScores
+  WHERE ComputedLevenshteinScores.RowNumber = 1
+  ORDER BY levenshtein ASC;
+</code></pre>
+    </div>

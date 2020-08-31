@@ -1,0 +1,200 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Thanks for sharing your code!</p>
+<p>I won't cover all your questions but I will try my best.</p>
+<p>(warning, long post incoming)</p>
+<p><strong>Is my implementation correct? (The tests say so)</strong></p>
+<p>As far as I tried to break it I'd say yes it's correct. But see below for more thorough testing methods.</p>
+<p><strong>Can it be sped up?</strong></p>
+<p>Spoiler alert: yes</p>
+<p>First thing I did was to profile change slightly your test file (I called it <code>test_heap.py</code>) to seed the random list generation. I also changed the <code>random.sample</code> call to be more flexible with the <code>sample_size</code> parameter.</p>
+<p>It went from</p>
+<pre><code>random_numbers = random.sample(range(100), sample_size)
+</code></pre>
+<p>to</p>
+<pre><code>random.seed(7777)
+random_numbers = random.sample(range(sample_size * 3), sample_size)
+</code></pre>
+<p>So the population from <code>random.sample</code> is always greater than my <code>sample_size</code>. Maybe there is a better way?</p>
+<p>I also set the sample size to be <code>50000</code> to have a decent size for the next step.</p>
+<p>Next step was <strong>profiling</strong> the code with <code>python -m cProfile -s cumtime test_heap.py </code>. If you are not familiar with the profiler see <a href="https://docs.python.org/3.7/library/profile.html" rel="noreferrer">the doc</a>.
+I launch the command a few times to get a grasp of the variations in timing, that gives me a baseline for optimization. The original value was:</p>
+<pre><code>  7990978 function calls (6561934 primitive calls) in 3.235 seconds
+
+   Ordered by: cumulative time
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      5/1    0.000    0.000    3.235    3.235 {built-in method builtins.exec}
+        1    0.002    0.002    3.235    3.235 test_heap.py:1(&lt;module&gt;)
+        1    0.051    0.051    3.233    3.233 test_heap.py:43(automaticTest)
+   100009    0.086    0.000    2.759    0.000 heap.py:15(pop)
+1400712/100011    1.688    0.000    2.673    0.000 heap.py:70(__siftdown)
+  1400712    0.386    0.000    0.386    0.000 heap.py:104(__get_left_child)
+  1400712    0.363    0.000    0.363    0.000 heap.py:110(__get_right_child)
+   100008    0.064    0.000    0.341    0.000 heap.py:6(push)
+228297/100008    0.180    0.000    0.270    0.000 heap.py:85(__siftup)
+  1430126    0.135    0.000    0.135    0.000 heap.py:127(comparer)
+  1429684    0.128    0.000    0.128    0.000 heap.py:131(comparer)
+   228297    0.064    0.000    0.064    0.000 heap.py:98(__get_parent)
+        1    0.026    0.026    0.062    0.062 random.py:286(sample)
+</code></pre>
+<p>Now we have a target to beat and a few information on what takes time. I did not paste the entire list of function calls, it's pretty long but you get the idea.</p>
+<p>A lot of time is spent in <code>_siftdown</code> and a lot less on <code>_siftup</code>, and a few functions are called many times so let's see if we can fix that.</p>
+<p>(I should have started by <code>_siftdown</code> which was the big fish here but for some reason, I started by <code>_siftup</code>, forgive me)</p>
+<p><strong>Speeding up <code>_siftup</code></strong></p>
+<p>Before:</p>
+<pre><code>def __siftup(self, index):
+    current_value = self.__array[index]
+    parent_index, parent_value = self.__get_parent(index)
+    if index &gt; 0 and self.comparer(current_value, parent_value):
+        self.__array[parent_index], self.__array[index] =\
+            current_value, parent_value
+        self.__siftup(parent_index)
+    return
+</code></pre>
+<p>After:</p>
+<pre><code>def __siftup(self, index):
+    current_value = self.__array[index]
+    parent_index = (index - 1) &gt;&gt; 1
+    if index &gt; 0:
+        parent_value = self.__array[parent_index]
+        if self.comparer(current_value, parent_value):
+            self.__array[parent_index], self.__array[index] =\
+                current_value, parent_value
+            self.__siftup(parent_index)
+    return
+</code></pre>
+<p>I changed the way to calculate <code>parent_index</code> because I looked at the <code>heapq</code> module source and they use it. (see <a href="https://github.com/python/cpython/blob/3.7/Lib/heapq.py#L210" rel="noreferrer">here</a>) but I couldn't see the difference in timing from this change alone.</p>
+<p>Then I removed the call to <code>_get_parent</code> and made the appropriate change (kind of inlining it because function call are not cheap in Python) and the new time is</p>
+<pre><code>7762306 function calls (6333638 primitive calls) in 3.147 seconds
+</code></pre>
+<p>Function calls went down obviously but time only dropped around 70-80 millisecond. Not a great victory (a bit less than a 3% speedup). And readability was not improved so up to you if it is worth it.</p>
+<p><strong>Speeding up _siftdown</strong></p>
+<p>The first change was to improve readability.</p>
+<p>Original version:</p>
+<pre><code>def __siftdown(self, index):
+    current_value = self.__array[index]
+    left_child_index, left_child_value = self.__get_left_child(index)
+    right_child_index, right_child_value = self.__get_right_child(index)
+    # the following works because if the right_child_index is not None, then the left_child
+    # is also not None =&gt; property of a complete binary tree, else left will be returned.
+    best_child_index, best_child_value = (right_child_index, right_child_value) if right_child_index\
+    is not None and self.comparer(right_child_value, left_child_value) else (left_child_index, left_child_value)
+    if best_child_index is not None and self.comparer(best_child_value, current_value):
+        self.__array[index], self.__array[best_child_index] =\
+            best_child_value, current_value
+        self.__siftdown(best_child_index)
+    return
+</code></pre>
+<p>V2:</p>
+<pre><code>def __siftdown(self, index): #v2
+    current_value = self.__array[index]
+    left_child_index, left_child_value = self.__get_left_child(index)
+    right_child_index, right_child_value = self.__get_right_child(index)
+    # the following works because if the right_child_index is not None, then the left_child
+    # is also not None =&gt; property of a complete binary tree, else left will be returned.
+    best_child_index, best_child_value = (left_child_index, left_child_value)
+    if right_child_index is not None and self.comparer(right_child_value, left_child_value):
+        best_child_index, best_child_value = (right_child_index, right_child_value)
+    if best_child_index is not None and self.comparer(best_child_value, current_value):
+        self.__array[index], self.__array[best_child_index] =\
+            best_child_value, current_value
+        self.__siftdown(best_child_index)
+    return
+</code></pre>
+<p>I transformed the ternary assignment</p>
+<pre><code>best_child_index, best_child_value = (right_child_index, right_child_value) if right_child_index\
+        is not None and self.comparer(right_child_value, left_child_value) else (left_child_index, left_child_value)
+</code></pre>
+<p>into</p>
+<pre><code>best_child_index, best_child_value = (left_child_index, left_child_value)
+if right_child_index is not None and self.comparer(right_child_value, left_child_value):
+    best_child_index, best_child_value = (right_child_index, right_child_value)
+</code></pre>
+<p>I find it a lot more readable but it's probably a matter of taste. And to my surprise, when I profiled the code again, the result was:</p>
+<pre><code>7762306 function calls (6333638 primitive calls) in 3.079 seconds
+</code></pre>
+<p>(I ran it 10times and I always had gained around 80-100 milliseconds). I don't really understand why, if anybody could explain to me?</p>
+<p>V3:</p>
+<pre><code>def __siftdown(self, index): #v3
+    current_value = self.__array[index]
+    
+    left_child_index = 2 * index + 1
+    if left_child_index &gt; self.__last_index:
+        left_child_index, left_child_value = None, None
+    else:
+        left_child_value = self.__array[left_child_index]
+    
+    right_child_index = 2 * index + 2
+    if right_child_index &gt; self.__last_index:
+         right_child_index, right_child_value = None, None
+    else:
+        right_child_value = self.__array[right_child_index]
+    # the following works because if the right_child_index is not None, then the left_child
+    # is also not None =&gt; property of a complete binary tree, else left will be returned.
+    best_child_index, best_child_value = (left_child_index, left_child_value)
+    if right_child_index is not None and self.comparer(right_child_value, left_child_value):
+        best_child_index, best_child_value = (right_child_index, right_child_value)
+    if best_child_index is not None and self.comparer(best_child_value, current_value):
+        self.__array[index], self.__array[best_child_index] =\
+            best_child_value, current_value
+        self.__siftdown(best_child_index)
+    return
+</code></pre>
+<p>Like in <code>_siftup</code> I inlined 2 calls from helper function <code>_get_left_child</code> and <code>_get_right_child</code> and that payed off!</p>
+<pre><code>4960546 function calls (3531878 primitive calls) in 2.206 seconds
+</code></pre>
+<p>That's a 30% speedup from the baseline.</p>
+<p>(What follow is a further optimization that I try to explain but I lost the code I wrote for it, I'll try to right down again later. It might gives you an idea of the gain)</p>
+<p>Then using the <code>heapq</code> trick of specializing comparison for max and min (using a <code>_siftdown_max</code> and <code>_siftup_max</code> version replacing <code>comparer</code> by <code>&gt;</code> and doing the same for min) gives us to:</p>
+<pre><code>2243576 function calls (809253 primitive calls) in 1.780 seconds
+</code></pre>
+<p>I did not get further in optimizations but the <code>_siftdown</code> is still a big fish so maybe there is room for more optimizations? And <code>pop</code> and <code>push</code> maybe could be reworked a bit but I don't know how.</p>
+<p><strong>Comparing my code to the one in the heapq module, it seems that they do not provide a heapq class, but just provide a set of operations that work on lists? Is this better?</strong></p>
+<p>I'd like to know as well!</p>
+<p><strong>Many implementations I saw iterate over the elements using a while loop in the siftdown method to see if it reaches the end. I instead call siftdown again on the chosen child. Is this approach better or worse?</strong></p>
+<p>Seeing as function call are expensive, looping instead of recursing might be faster. But I find it better expressed as a recursion.</p>
+<p><strong>Is my code clean and readable?</strong></p>
+<p>For the most part yes! Nice code, you got docstrings for your public methods, you respect PEP8 it's all good. Maybe you could add documentation for the private method as well? Especially for hard stuff like <code>_siftdown</code> and <code>_siftup</code>.</p>
+<p>Just a few things:</p>
+<ul>
+<li><p>the ternary I changed in <code>_siftdown</code> I consider personally really hard to read.</p>
+</li>
+<li><p><code>comparer</code> seems like a French name, why not <code>compare</code>? Either I missed something or you mixed language and you shouldn't.</p>
+</li>
+</ul>
+<p><strong>Do my test suffice (for say an interview)?</strong></p>
+<p>I'd say no. Use a module to do unit testing. I personally like <a href="https://docs.pytest.org/en/latest/getting-started.html" rel="noreferrer">pytest</a>.</p>
+<p>You prefix the name of your testing file by <code>test_</code> and then your tests methods are prefixed/suffixed by <code>test_</code>/<code>_test</code>. Then you just run <code>pytest</code> on the command line and it discovers tests automatically, run them and gives you a report. I highly recommend you try it.</p>
+<p>Another great tool you could have used is <a href="https://hypothesis.readthedocs.io/en/latest/index.html" rel="noreferrer">hypothesis</a> which does property-based testing. It works well with pytest.</p>
+<p>An example for your case:</p>
+<pre><code>from hypothesis import given, assume
+import hypothesis.strategies as st
+
+@given(st.lists(st.integers()))
+def test_minheap(l):
+    h = MinHeap.createHeap(l)
+    s = sorted(l)
+    for i in range(len(s)):
+        assert(h.pop() == s[i])
+        
+@given(st.lists(st.integers()))
+def test_maxheap(l):
+    h = MaxHeap.createHeap(l)
+    s = sorted(l, reverse=True)
+    for i in range(len(s)):
+        assert(h.pop() == s[i])
+</code></pre>
+<p>It pretty much gives the same kind of testing you did in your <code>automatic_test</code> but gets a bunch of cool feature added, and is shorter to write.</p>
+<p>Raymond Hettinger did a really <a href="https://www.youtube.com/watch?v=ARKbfWk4Xyw" rel="noreferrer">cool talk</a> about tools to use when testing on a short time-budget, he mention both pytest and hypothesis, go check it out :)</p>
+<p><strong>Is the usage of subclasses MinHeap and MaxHeap &amp; their comparer method that distincts them, a good approach to provide both type of heaps?</strong></p>
+<p>I believe it is! But speed wise, you should instead redeclare <code>siftdown</code> and <code>siftup</code> in the subclasses and replace instance of <code>compare(a,b)</code> by <code>a &lt; b</code> or <code>a &gt; b</code> in the code.</p>
+<p><strong>End note</strong></p>
+<p>Last thing is a remark, on <a href="https://en.wikipedia.org/wiki/Heap_(data_structure)#Operations" rel="noreferrer">wikipedia</a>, the article say:</p>
+<blockquote>
+<p>sift-up: move a node up in the tree, as long as needed; used to restore heap  condition after insertion. Called "sift" because node moves up the tree until it reaches the correct level, as in a sieve.</p>
+<p>sift-down: move a node down in the tree, similar to sift-up; used to restore heap condition after deletion or replacement.</p>
+</blockquote>
+<p>And I think you used it in this context but on the <a href="https://github.com/python/cpython/blob/3.7/Lib/heapq.py#L141" rel="noreferrer">heapq module implementation</a> it seems to have the name backward?</p>
+<p>They use <code>siftup</code> in <code>pop</code> and <code>siftdown</code> in <code>push</code> while wikipedia tells us to do the inverse. Somebody can explain please?</p>
+<p>(I asked this <a href="https://stackoverflow.com/q/53546052/3729797">question on StackOverflow</a>, hopefully I'll get a response)</p>
+    </div>

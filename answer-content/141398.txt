@@ -1,0 +1,101 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You have at least a couple bugs.  <a href="http://www.davespace.co.uk/arm/introduction-to-arm/conditional.html" rel="nofollow noreferrer">The LT condition is <em>signed</em> less-than</a>.  You need BLO to branch on the unsigned Lower-Than condition (branch if Carry is unset).  See also <a href="http://teaching.idallen.com/dat2343/10f/notes/040_overflow.txt" rel="nofollow noreferrer">this article about carry vs. overflow</a>.</p>
+<p>Also, I think you forgot to put the remainder into R1.</p>
+<hr>
+<p>Your custom calling convention makes life difficult.  Flag return values appear to be cumbersome in Thumb mode, because many instructions are only available in flag-setting form.  (Cortex-M0 only supports Thumb mode, <a href="http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.ddi0432c/CHDCICDF.html" rel="nofollow noreferrer">with these instructions</a>.)  It's also strange to not let your function clobber R2 and R3 like the standard calling convention allows.  This would reduce code-size for the function, although it would increase overall code size if there are many call sites.</p>
+<p>It's normal to arrange a loop so the conditional branch is at the end. That reduces the instruction-count by one (removing the unconditional branch). Sometimes you need to test if the loop should even run once before falling into it, or jump to the test at the end, if you can't guarantee that it should always run at least once (<code>do{}while()</code> style).</p>
+<p>You can combine the exit code-paths around AnsZero.  You have <code>MOV R0, #0</code> / <code>BX  LR</code> twice, so you should just put AnsZero pointing at the first one and leave out the second.  You also have two consecutive <code>BX  LR</code> instructions, where you previously had a <code>B</code> to the next line at the end of the function.  Never branch to the instruction that normal fall-through execution would take you to anyway.</p>
+<hr>
+<p><a href="https://community.arm.com/groups/processors/blog/2010/02/11/hello-world-in-assembly" rel="nofollow noreferrer">The comment character in ARM asm is <code>@</code></a>.  <code>;</code> is used in x86 NASM / MASM, but the GNU assembler uses it to separate multiple instructions on the same line.  Maybe there are ARM assemblers that use <code>;</code> as a comment character, but making your code assemble with GAS seems like a good idea.  Note that <code>mov r3, #0</code> won't assemble with <code>-mcpu=cortex-m0</code>, <a href="https://stackoverflow.com/a/30980781/224132">because <code>movs</code> is the only immediate-mov instruction it supports</a>.  Cortex-M0 has <a href="http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.ddi0432c/CHDCICDF.html" rel="nofollow noreferrer">very limited instruction choices</a>.</p>
+<p>Further style points: use <code>:</code> after label names, even if your assembler syntax doesn't technically require it.  Some people may like to omit it when assembling data sections, but I don't think anyone likes it for code sections.</p>
+<p>All-upper-case for asm instructions and register names is a valid choice.  I don't like it, but I guess it doesn't hurt.  Using it for symbol names is a bad idea, because you don't want to have to use all-caps names to call it from C.</p>
+<p>Avoid useless comments like <code>CMP   R0,#0       ;compares R0 to 0</code>.  asm mnemonics are not <em>that</em> hard to decipher (except PowerPC).  Comment space is limited, don't waste it saying the same thing the reader learned from reading the code itself.</p>
+<p>Leave blank spaces between logically-separate blocks of code, even when there aren't branches.  This improves human-readability.</p>
+<p>I like to leave a space between operands in the operand list, like <code>cmp  r0, #0</code> instead of <code>cmp r0,#0</code>.</p>
+<h3>My version:</h3>
+<p>Always comment the top of your function with some high level description of input/output register usage.  Just like in a higher-level language, describe the contract the function makes with its caller.</p>
+<p>My asm code usually ends up littered with comments about alternatives I decided against.  It's not an ideal example of good style.</p>
+<pre class="lang-none prettyprint-override"><code>.syntax unified     @ allow 2 or 3 operand forms of instructions.
+.cpu cortex-m0
+.thumb              @ this is probably implied already by the .cpu
+
+@@ input:  R0=divisor,  R1=dividend
+@@ calculate R1/R0 by repeated subtraction
+@@ output: R0=quotient, R1=remainder, C flag unset.
+@@    or on division by zero: R0,R1 unchanged, C flag set.
+@@ Other regs unmodified (even r2 and r3, which the normal calling convention allows functions to use as scratch regs)
+.globl divu
+divu:
+      CMP   R1, #0         @ return 0,0 instead of divide error for the 0/0 corner case.
+      BEQ   zero_dividend @ label names that describe why you go there are usually good.  Comments at the label can describe what happens there.
+
+      CMP   R0, #0
+      BEQ   div_by_zero
+
+      @CMP   R0, R1        @ let this case fall through the loop once, instead of slowing down the common case to speed up this special case.
+      @BLO   QuotientZero
+
+      PUSH  {R3, LR}         @ LR doesn't make a good scratch reg, since many insns can only use low regs (R0-R7).  Push/popping it saves a BX LR
+      MOVS  R3, #0           @ R3 = quotient = repeated-subtraction counter
+@      LDR   R3, =#-1        @ account for the loop overshoot up-front.  But don't do this because cortex-m0 can't encode it in one insn other than a PC-relative load
+
+sub_loop:                  @do{
+      ADDS  R3, #1         @ quotient += 1.  (init is zero, so 0+1=1 if one successful loop)
+      SUBS  R1, R0         @ dividend -= divisor and set flags,
+      @ CMP   R0, R1       @ ...avoiding this cmp instruction.  Potentially a significant speedup for a tight loop.
+      BLO   sub_loop       @} while(that didn't carry)@ i.e. while divisor was lower (unsigned) than the old value of dividend.
+
+@EndWhile:
+      @@ now we've subtracted one too many times.  Detecting that carry is the loop exit condition.
+      @@ It's worth extra instructions outside the loop to save one inside the loop.
+      @@ BUGFIX: original forgot to put the remainder in R1
+      ADD   R1, R0         @ remainder, undoing the overshoot
+      SUBS  R0, R3, #1     @  quotient, undoing the overshoot and clearing the C flag.
+      @  Except that this will carry for 0xFFFFFFFF / 1.
+      CMP   R0, R0         @ clear C flag.  TODO: avoid this otherwise-redundant instruction
+
+
+      POP   {R3, PC}           @ return by popping straight into the PC
+
+div_by_zero:      @@ We only get here with r0 == 0
+      SUBS  R0, #1         @ Set the C flag and fall through to a mov the restores R0 to its original value
+
+zero_dividend:    @@ CMP cleared the C flag
+      MOVS  R0, #0         @ doesn't affect the C flag.   MOV Rd, #imm isn't available for Cortex-M0
+      BX    LR
+</code></pre>
+<p>I'm not an ARM expert, and there may be a slight difference between popping into PC vs. running <code>BX LR</code>.  <a href="https://stackoverflow.com/questions/27084857/what-does-bx-lr-do-in-arm-assembly-language"><code>BX LR</code> can return from Thumb code to ARM code, or vice versa</a>, but popping into PC can't.  AFAIK, either is fine for Thumb -&gt; Thumb returns which are your only option <a href="http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.ddi0432c/CHDCICDF.html" rel="nofollow noreferrer">on a Cortex-M0</a>.</p>
+<p>This really does assemble.  I didn't test it, but the disassembly looks like we'd expect (which is a useful sanity check):</p>
+<pre><code>$ arm-linux-gnueabi-objdump -d arm-divu.o 
+
+arm-divu.o:     file format elf32-littlearm
+
+
+Disassembly of section .text:
+
+00000000 &lt;divu&gt;:
+   0:   2900            cmp     r1, #0
+   2:   d00a            beq.n   1a &lt;zero_dividend&gt;
+   4:   2800            cmp     r0, #0
+   6:   d007            beq.n   18 &lt;div_by_zero&gt;
+   8:   b508            push    {r3, lr}
+   a:   2300            movs    r3, #0
+
+0000000c &lt;sub_loop&gt;:
+   c:   3301            adds    r3, #1
+   e:   1a09            subs    r1, r1, r0
+  10:   d3fc            bcc.n   c &lt;sub_loop&gt;
+  12:   4401            add     r1, r0
+  14:   1e58            subs    r0, r3, #1
+  16:   4280            cmp     r0, r0
+  18:   bd08            pop     {r3, pc}
+
+0000001a &lt;div_by_zero&gt;:
+  1a:   3801            subs    r0, #1
+
+0000001c &lt;zero_dividend&gt;:
+  1c:   2000            movs    r0, #0
+  1e:   4770            bx      lr
+</code></pre>
+<p>I don't know much at all about tuning for Cortex-M0, but perhaps aligning the top of <code>sub_loop</code> would be good.  Maybe to a 16-byte boundary, or at least so all three instructions are in the same 16-byte block.  (Currently the branch is in the next block after the ADDS/SUBS.)</p>
+    </div>

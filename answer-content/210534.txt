@@ -1,0 +1,368 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>Always return errors</h3>
+
+<p>Don't use <code>log.Fatal()</code> everywhere ! Instead, return the error with some context: </p>
+
+<pre><code>checksum, fileChecksum, err := computeChecksum(fileByte, options.BlockSize, weakChecksumLength, strongChecksumLength)
+if err != nil {
+    return fmt.Errorf("fail to compute checksum: %v", err)
+}
+</code></pre>
+
+<h3>Write to the <code>bufio.Writer</code> directly</h3>
+
+<p>You are right, creating the header by appending strings is not the best way. We could instead write 
+the header content directly to the <code>bufio.writer</code>: </p>
+
+<pre><code>buf := bufio.NewWriter(zsyncFile)
+buf.WriteString("zsync: ")
+buf.WriteString(version)
+buf.WriteByte('\n')
+
+buf.WriteString("Filename: ")
+</code></pre>
+
+<p>...</p>
+
+<p>it also possible to do it in a single call with <code>fmt.Fprintf()</code></p>
+
+<pre><code>    fmt.Fprintf(buf, `zsync: %s
+Filename: %s
+MTime: %s
+Blocksize: %d
+Length: %d
+Hash-Lengths: %d,%d,%d
+URL: %s
+SHA-1: %s
+
+%s`,
+        version,
+        fileInfo.Name(),
+        fileInfo.ModTime().Format(time.RFC1123Z),
+        options.BlockSize,
+        fileLength,
+        sequenceMatches, weakChecksumLength, strongChecksumLength,
+        options.Url,
+        hex.EncodeToString(fileChecksum),
+        checksum,
+    )
+</code></pre>
+
+<h3>Read the file once</h3>
+
+<p>Reading a file is expensive, it should be done only once. It is possible to read the content of a file 
+in a slice of bytes with the <code>io/ioutil</code> package</p>
+
+<pre><code>fileByte, err := ioutil.ReadFile(options.Filename)
+</code></pre>
+
+<p>you can then compute it's <strong>SHA1 checksum</strong> in one line: </p>
+
+<pre><code>fileChecksum := sha1.Sum(fileByte)
+</code></pre>
+
+<p>and then create a <code>*Reader</code> from it: </p>
+
+<pre><code>reader := bytes.NewReader(fileByte)
+for {
+        read, err := reader.Read(block)
+        ...
+}
+</code></pre>
+
+<p>This also allow us to get the <strong>file length</strong> as an int like this: </p>
+
+<pre><code>fileLength := len(fileByte)
+</code></pre>
+
+<h3>Method parameters</h3>
+
+<p>Some params are unused or redundant, for example <code>path</code> and <code>options.Filename</code>, they should be removed. 
+You can group params with same type for more readability: </p>
+
+<pre><code>func computeChecksum(fileByte []byte, blockSize int, weakLen int, strongLen int) ([]byte, []byte, error) {
+</code></pre>
+
+<p>can be written like this: </p>
+
+<pre><code>func computeChecksum(fileByte []byte, blockSize, weakLen, strongLen int) ([]byte, []byte, error) {
+</code></pre>
+
+<p>Go also allows <strong>named return</strong> for more clarity. It's usefull when a method returns two values of the same type like here. Method 
+signature could be: </p>
+
+<pre><code>func computeChecksum(fileByte []byte, blockSize, weakLen, strongLen int) (checksum []byte, fileChecksum []byte, err error) {
+</code></pre>
+
+<h3>Keep things simple</h3>
+
+<p>There is no need for <strong>channels</strong> and <strong>goroutines</strong> in this code, it just make the code harder to read. Try to keep the code clean and simple. If you face performance issues, profile the code and optimize the hotspot. </p>
+
+<p>The <code>computeRsum</code> method could be simplified a bit to return an <code>int32</code> directly: </p>
+
+<pre><code>func computeRsum(block []byte) uint32 {
+
+    a, b, l := 0, 0, len(block)
+
+    for _, v := range block {
+        if v &lt; 0 {
+            v = v &amp; 0xFF
+        }
+        a += int(v)
+        b += l * int(v)
+        l--
+    }
+    return uint32(a&lt;&lt;16) | uint32(b&amp;0xffff)
+}
+</code></pre>
+
+<h3>Use <strong>const</strong> block for constant</h3>
+
+<p>this block </p>
+
+<pre><code>var ZSYNC_VERSION = "0.6.2"
+var BLOCK_SIZE_SMALL = 2048
+var BLOCK_SIZE_LARGE = 4096
+</code></pre>
+
+<p>should be rewritten like this: </p>
+
+<pre><code>const (
+    version        = "0.6.2"
+    blockSizeSmall = 2048
+    blockSizeLarge = 4096
+)
+</code></pre>
+
+<p><strong>const</strong> are immutable, and that's what we want here. Also note that CamelCase is preferred for naming constant in go</p>
+
+<h3>final version</h3>
+
+<pre><code>package zsync
+
+import (
+    "bufio"
+    "bytes"
+    "crypto/md5"
+    "crypto/sha1"
+    "encoding/binary"
+    "encoding/hex"
+    "fmt"
+    "io"
+    "io/ioutil"
+    "log"
+    "math"
+    "os"
+    "strconv"
+    "time"
+)
+
+type Options struct {
+    BlockSize int
+    Filename  string
+    Url       string
+}
+
+const (
+    version        = "0.6.2"
+    blockSizeSmall = 2048
+    blockSizeLarge = 4096
+)
+
+func ZsyncMake(options *Options) {
+
+    err := writeToFile(options)
+    if err != nil {
+        log.Fatal(err)
+    }
+}
+
+func writeToFile(options *Options) error {
+    file, err := os.Open(options.Filename)
+    if err != nil {
+        return err
+    }
+
+    fileInfo, err := file.Stat()
+    if err != nil {
+        return err
+    }
+
+    fileByte, err := ioutil.ReadFile(options.Filename)
+    if err != nil {
+        return err
+    }
+    fileLength := len(fileByte)
+
+    if options.Url == "" {
+        options.Url = options.Filename
+    }
+
+    if options.BlockSize == 0 {
+        if fileLength &lt; 100*1&lt;&lt;20 {
+            options.BlockSize = blockSizeSmall
+        } else {
+            options.BlockSize = blockSizeLarge
+        }
+    }
+
+    sequenceMatches := 1
+    if fileLength &gt; options.BlockSize {
+        sequenceMatches = 2
+    }
+    weakChecksumLength := weakChecksumLength(fileLength, options.BlockSize, sequenceMatches)
+    strongChecksumLength := strongChecksumLength(fileLength, options.BlockSize, sequenceMatches)
+
+    checksum, fileChecksum, err := computeChecksum(fileByte, options.BlockSize, weakChecksumLength, strongChecksumLength)
+    if err != nil {
+        return fmt.Errorf("fail to compute checksum: %v", err)
+    }
+
+    zsyncFile, err := os.Create(file.Name() + ".zsync")
+    if err != nil {
+        return err
+    }
+    defer zsyncFile.Close()
+
+    buf := bufio.NewWriter(zsyncFile)
+    buf.WriteString("zsync: ")
+    buf.WriteString(version)
+    buf.WriteByte('\n')
+
+    buf.WriteString("Filename: ")
+    buf.WriteString(fileInfo.Name())
+    buf.WriteByte('\n')
+
+    buf.WriteString("MTime: ")
+    buf.WriteString(fileInfo.ModTime().Format(time.RFC1123Z))
+    buf.WriteByte('\n')
+
+    buf.WriteString("Blocksize: ")
+    buf.WriteString(strconv.Itoa(options.BlockSize))
+    buf.WriteByte('\n')
+
+    buf.WriteString("Length: ")
+    buf.WriteString(strconv.Itoa(int(fileLength)))
+    buf.WriteByte('\n')
+
+    buf.WriteString("Hash-Lengths: ")
+    buf.WriteString(strconv.Itoa(sequenceMatches))
+    buf.WriteByte(',')
+    buf.WriteString(strconv.Itoa(weakChecksumLength))
+    buf.WriteByte(',')
+    buf.WriteString(strconv.Itoa(strongChecksumLength))
+    buf.WriteByte('\n')
+
+    buf.WriteString("URL: ")
+    buf.WriteString(options.Url)
+    buf.WriteByte('\n')
+
+    buf.WriteString("SHA-1: ")
+    buf.WriteString(hex.EncodeToString(fileChecksum))
+    buf.WriteByte('\n')
+    buf.WriteByte('\n')
+
+    buf.Write(checksum)
+
+    return buf.Flush()
+}
+
+func computeChecksum(fileByte []byte, blockSize, weakLen, strongLen int) ([]byte, []byte, error) {
+
+    reader := bytes.NewReader(fileByte)
+
+    checksumBytes := bytes.NewBuffer(nil)
+    block := make([]byte, blockSize)
+    unsignedWeakByte := make([]byte, 4)
+
+    for {
+        read, err := reader.Read(block)
+        if err != nil {
+            if err == io.EOF {
+                break
+            }
+            return nil, nil, fmt.Errorf("fail to read block: %v", err)
+        }
+
+        if read &lt; blockSize {
+
+            blockSlice := block[read:blockSize]
+            for i := range blockSlice {
+                blockSlice[i] = byte(0)
+            }
+        }
+
+        rsum := computeRsum(block)
+        binary.BigEndian.PutUint32(unsignedWeakByte, rsum)
+
+        checksumBytes.Write(unsignedWeakByte[len(unsignedWeakByte)-weakLen:])
+
+        strongBytes := md5.Sum(block)
+        checksumBytes.Write(strongBytes[:strongLen])
+    }
+
+    fileChecksum := sha1.Sum(fileByte)
+    checksumBytes.Write(fileChecksum[:])
+
+    return checksumBytes.Bytes(), fileChecksum[:], nil
+}
+
+func computeRsum(block []byte) uint32 {
+
+    a, b, l := 0, 0, len(block)
+
+    for _, v := range block {
+        if v &lt; 0 {
+            v = v &amp; 0xFF
+        }
+        a += int(v)
+        b += l * int(v)
+        l--
+    }
+    return uint32(a&lt;&lt;16) | uint32(b&amp;0xffff)
+}
+
+func strongChecksumLength(fileLength, blocksize, sequenceMatches int) int {
+    // estimated number of bytes to allocate for strong checksum
+    d := (math.Log(float64(fileLength))+math.Log(float64(1+fileLength/blocksize)))/math.Log(2) + 20
+
+    // reduced number of bits by sequence matches
+    lFirst := float64(math.Ceil(d / float64(sequenceMatches) / 8))
+
+    // second checksum - not reduced by sequence matches
+    lSecond := float64((math.Log(float64(1+fileLength/blocksize))/math.Log(2) + 20 + 7.9) / 8)
+
+    // return max of two: return no more than 16 bytes (MD4 max)
+    return int(math.Min(float64(16), math.Max(lFirst, lSecond)))
+}
+
+func weakChecksumLength(fileLength, blocksize, sequenceMatches int) int {
+    // estimated number of bytes to allocate for the rolling checksum per formula in
+    // Weak Checksum section of http://zsync.moria.org.uk/paper/ch02s03.html
+    d := (math.Log(float64(fileLength))+math.Log(float64(blocksize)))/math.Log(2) - 8.6
+
+    // reduced number of bits by sequence matches per http://zsync.moria.org.uk/paper/ch02s04.html
+    rdc := d / float64(sequenceMatches) / 8
+    lrdc := int(math.Ceil(rdc))
+
+    // enforce max and min values
+    if lrdc &gt; 4 {
+        return 4
+    }
+    if lrdc &lt; 2 {
+        return 2
+    }
+    return lrdc
+}
+</code></pre>
+
+<h3>performance</h3>
+
+<p>New code is slightly faster: </p>
+
+<pre><code>goos: linux
+goarch: amd64
+BenchmarkWriteOld-4        10000        200830 ns/op       40815 B/op         43 allocs/op
+BenchmarkWriteNew-4        10000        164985 ns/op       29272 B/op         27 allocs/op
+</code></pre>
+    </div>

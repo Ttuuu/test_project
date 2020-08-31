@@ -1,0 +1,113 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>One thing that stands out to me is the database itself. It's somewhat ugly for something that sounds like it only really <em>needs</em> to keep track of one thing: a unique identifier for each truck viewed so far (such as its page URL), if the client wants to be alerted on <em>new</em> postings, and not on edits to <em>old</em> postings. If it were me, I'd set the script up on my <em>own</em> server, which does have a persistent file system, and then it'd be trivial to save and retrieve the URLs seen so far with <code>JSON.stringify</code>/<code>JSON.parse</code> with a tiny local file. If that's not possible, you can still make things simpler by saving <em>just</em> the URLs of each truck into the database, then checking whether the URL of a truck found on the page exists in the database yet or not.</p>
+
+<p>It's pretty much never a good idea to directly concatenate input to construct the SQL query string:</p>
+
+<pre><code>sql = "INSERT INTO  " + tblName +
+      "SET (title, price, location, miles, imgUrl, itemURL, status, is_deleted)" +
+      "VALUES (" +
+      "'${title}', '${element.price}', '${location}', '${miles}', '${imgUrl}', '${itemURL}', 1, 0" +
+      ")";
+</code></pre>
+
+<p>It's not only inelegant, when done wrong, it can lead to (inadvertent) SQL injection and other troubles. Consider using <a href="https://node-postgres.com/features/queries#Parameterized%20query" rel="nofollow noreferrer">parameterized queries</a> instead.</p>
+
+<p>You might also consider using <a href="https://www.sitepoint.com/using-redis-node-js/" rel="nofollow noreferrer">Redis</a> instead of a database, I think it might be a slightly better choice, especially if you just need to store an array of URLS. I believe you could do something like:</p>
+
+<pre><code>// Retrieve all elements in "truckUrls" list
+// lrange: retrieves all elements of list
+// Use a Set for less computational complexity
+const existingUrls = new Set(await lrange('truckUrls', 0, -1));
+
+const currentlyDisplayedItems = await getItems();
+
+const newItems = currentlyDisplayedItems.filter(({ itemURL }) =&gt; !existingUrls.has(itemURL));
+if (newItems.length &gt; 0) {
+  // Save new URLs:
+  // rpush: pushes elements to a list
+  await rpush('truckUrls', ...newItems.map(({ itemURL }) =&gt; itemURL));
+  // Then notify user with items from the newItems object here
+}
+// Done
+</code></pre>
+
+<p>where <code>lrange</code> and <code>push</code>, Redis methods have been promisified. (By default, they use callbacks, just like your existing <code>pool.query</code>.) To convert a callback API to a Promise, either use <a href="https://nodejs.org/dist/latest-v8.x/docs/api/util.html" rel="nofollow noreferrer">util.promisify</a> (recommended) or <a href="https://stackoverflow.com/q/22519784">do it manually</a>. (Your current <code>getPreviousItems</code> and <code>saveToDatabase</code> are not promisified, so they resolve immediately, rather than when the action is complete, and don't resolve to anything.)</p>
+
+<p>In your <code>initScraper</code> function, there's no need to assign to a variable that isn't going to be read before it's reassigned:</p>
+
+<pre><code>var currentItems  = [];
+// ...
+
+
+// Scrape Page - Get New Items
+currentItems = await getItems('Jeep Wrangler');
+</code></pre>
+
+<p>Better to declare the variable only after the value to assign to it is retrieved:</p>
+
+<pre><code>const currentItems = await getItems('Jeep Wrangler');
+</code></pre>
+
+<p>Note the use of <code>const</code>. You're sometimes declaring variables with <code>var</code>, and sometimes with <code>const</code>. If you're writing in ES2015+ syntax (which you are, and should be), you should always use <code>const</code> to declare variables: <code>var</code> has <a href="https://stackoverflow.com/questions/762011/whats-the-difference-between-using-let-and-var">too many gotchas</a> to be worth using, and is less readable than <code>const</code> (since with <code>const</code>, you know that a variable is never going to be reassigned). If a variable must be reassigned, declare it with <code>let</code>.</p>
+
+<p>Make sure to handle errors - unhandled Promise rejections are deprecated and in the future will cause the Node process to terminate. Best place to handle them would probably be at the entry point, the <code>initScraper</code> call:</p>
+
+<pre><code>initScraper()
+  .catch((err) =&gt; {
+    // handle errors
+    // add to a logfile?
+  });
+</code></pre>
+
+<p>I think the only thing left to look at is the <code>getItems</code> function.</p>
+
+<p>The reassignment of the global <code>browser</code> variable used both in <code>getItems</code> and <code>initScraper</code> is somewhat smelly:</p>
+
+<pre><code>browser = await puppeteer.launch({
+  headless: true,
+  timeout: 0,
+  args: ["--no-sandbox"]
+});
+</code></pre>
+
+<p>Consider constructing the browser in <code>initScraper</code> instead, and then <em>pass</em> it to <code>getItems</code> - that'll let you declare it with <code>const</code>, and avoid an unnecessary global variable. <code>page</code> doesn't need to be global either - it's only used inside <code>getItems</code>, so feel free to declare it with <code>const</code> inside.</p>
+
+<p>Since you don't need to use the <code>page.waitForSelector</code> result directly, and since you're using <code>await</code> already (which is good!), you might use <code>await page.waitForSelector</code> and <em>separately</em> do <code>const itemList = await page.evaluate</code>. This also less you get rid of a layer of bracket nesting.</p>
+
+<p>You have a couple of <em>very specific</em> selectors. If they <em>work</em>, that's fine, but the slightest tweak to Facebook's HTML will cause your script to break. You might consider using the descendant selector instead when possible, and with something more specific than tag names. For example, it would be great if you could replace <code>div &gt; div &gt; span &gt; div &gt; a[tabindex="0"]</code> with a selector similar to <code>.listContainer a[tabindex="0"]</code> where <code>listContainer</code> is a class on an ancestor element - look through the DOM to see if something like that is possible. (Rather than repeating this selector twice, save it in a variable first, then reference that variable.) Same thing for <code>itemImg</code>'s selector - you might be able to replace</p>
+
+<pre><code>item.querySelector('div &gt; div &gt; span &gt; div &gt; a &gt; div &gt; div &gt; div &gt; div &gt; div &gt; div &gt; img')
+</code></pre>
+
+<p>with</p>
+
+<pre><code>item.querySelector('img[src]')
+</code></pre>
+
+<p>It's best to <a href="http://perfectionkills.com/the-poor-misunderstood-innerText/" rel="nofollow noreferrer">avoid <code>.innerText</code></a> unless you're <em>deliberately</em> looking to invoke its strange text styling rules. See if you can use <code>textContent</code> instead, which is the standard method.</p>
+
+<p>If you're iterating over all elements of an array to construct a new one, it's more appropriate to use <code>Array.prototype.map</code> (from which you can return the item for the new array) than to use <code>forEach</code> and <code>push</code>. (See below for example.)</p>
+
+<p>The <code>reduce</code> there is really weird. If you have an array of values that you want to put into an object with particular key names, using a plain object literal by destructuring the <code>split</code> call would make more sense (see below for example).</p>
+
+<p>In full, <code>getItems</code> can be made to look something like the following:</p>
+
+<pre><code>const getItems = async (searchTerm, browser) =&gt; {
+  const page = await browser.newPage();
+  await page.goto(`https://facebook.com/marketplace/tampa/search/?query=${encodeURI(searchTerm)}&amp;sort=created_date_descending&amp;exact=true`);
+  await autoScroll(page);
+  const itemSelector = 'div &gt; div &gt; span &gt; div &gt; a[tabindex="0"]';
+  await page.waitForSelector(itemSelector);
+  return page.evaluate(() =&gt; {
+    return [...document.querySelectorAll(itemSelector)]
+      .map((item) =&gt; {
+        const itemTitle = item.textContent;
+        const itemURL = item.href;
+        const imgUrl = item.querySelector('img[src]').src;
+        const [price, title, location, miles] = itemTitle.split(/\n/);
+        return { price, title, location, miles, imgUrl, itemURL };
+      });
+  });
+};
+</code></pre>
+    </div>

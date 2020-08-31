@@ -1,0 +1,156 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I have seen many answers that suggest counting the number of distinct characters. <strong>But beware that this only works for 16-bit characters!</strong></p>
+
+<p>A character in C# is a <a href="https://stackoverflow.com/questions/10572902/encoding-char-in-c-sharp">UTF-16 code unit</a>. Extended unicode characters are stored in multiple C# characters. <a href="https://docs.microsoft.com/en-us/dotnet/api/system.globalization.charunicodeinfo.getunicodecategory?view=netframework-4.8" rel="nofollow noreferrer">CharUnicodeInfo.GetUnicodeCategory</a> allows us to detect whether a C# character represents a real character or whether it is part of an extended unicode character or combined character (UnicodeCategory.Surrogate).</p>
+
+<p><strong>Test (fake) entropy:</strong></p>
+
+<pre><code> public static void Main()
+ {
+     var value = "\U00020B20";
+
+     // yields 2, even though \U00020B20 represents a single unicode-character '𠬠'
+     var entropyTest = value.Distinct().Count(); 
+ }
+</code></pre>
+
+<p>In order to count the characters (not the C# characters), we need to augment our algorithm. I am using a class called <a href="https://en.wikipedia.org/wiki/Grapheme" rel="nofollow noreferrer">Grapheme</a> to do the trick. This class is able to detect <em>extended unicode characters</em> and <a href="https://en.wikipedia.org/wiki/Diacritic" rel="nofollow noreferrer">diacritics</a>.</p>
+
+<p><strong>Test entropy:</strong></p>
+
+<pre><code> public static void Main()
+ { 
+     var grapheme = Grapheme.Parse("\U00020B20");
+
+     // yields 1, as \U00020B20 represents a single unicode-character '𠬠'.
+     var entropyTest = grapheme.Select(x =&gt; x.Glyph).Distinct().Count();
+
+     // yields 2, as \U00020B20 is stored in 2 C# characters.
+     var codeUnits = grapheme.Single().CodeUnits.Length;
+ }
+</code></pre>
+
+<p><strong>Final note:</strong></p>
+
+<p>Testing entropy on a string is <strong>not</strong> <em>context-free</em>. Some characters or combined characters result in the same glyph, depending on the <a href="https://en.wikipedia.org/wiki/Font" rel="nofollow noreferrer">Font</a> used. So entropy can only be calculated in the context of a font. The Grapheme class does not take this into account, since different fonts would render different entropies. The Grapheme class is said to be <em>context-free</em>.</p>
+
+<ul>
+<li>(A) two different characters might have the exact same glyph (homoglyph)</li>
+<li>(B) combined characters might have the same glyph as another character</li>
+</ul>
+
+<p>Examples:</p>
+
+<ul>
+<li>A: \u0061 and \u0430 represent both the letter 'a' in certain fonts</li>
+<li>B:  Å is both the character \u00C5 and the combined character <code>A</code> with an <a href="https://en.wikipedia.org/wiki/Dot_(diacritic)" rel="nofollow noreferrer">overdot</a> character</li>
+</ul>
+
+<p><strong>Appendix: Grapheme</strong></p>
+
+<pre><code>public class Grapheme
+{
+    private char[] _codeUnits;
+    private Grapheme[] _diacritics;
+    private string _glyph;
+
+    public Grapheme(string glyph) {
+
+        Guard.NotNull(glyph, "glyph");
+        _glyph = StringInfo.GetNextTextElement(glyph);
+        Guard.Condition(_glyph.Length != glyph.Length, "glyph", "Invalid glyph specified");
+
+        var codeUnits = new List&lt;char&gt;();
+        var diacritics = new List&lt;Grapheme&gt;();
+        var buffer = _glyph;
+
+        if (buffer.Length &gt; 0) {
+            var cu0 = CharUnicodeInfo.GetUnicodeCategory(buffer[0]);
+            switch (cu0) {
+                case UnicodeCategory.Surrogate:
+                    codeUnits.AddRange(buffer.Take(2));
+                    buffer = buffer.Substring(2);
+                    break;
+                default:
+                    codeUnits.Add(buffer[0]);
+                    buffer = buffer.Substring(1);
+                    break;
+            }
+            diacritics.AddRange(Parse(buffer));
+        }
+
+        _codeUnits = codeUnits.ToArray();
+        _diacritics = diacritics.ToArray();
+
+        if (_codeUnits.Length == 2) {
+            Guard.Condition(!char.IsSurrogatePair(new string(_codeUnits), 0),
+                "glyph", "Invalid surrogate pair specified");
+        }
+    }
+
+    public static Grapheme[] Parse(string value) {
+        Guard.NotNull(value, "value");
+        return StringInfo.ParseCombiningCharacters(value).Select(i 
+                        =&gt; new Grapheme(StringInfo.GetNextTextElement(value, i))).ToArray();
+    }
+
+    public static int[] ParseIndices(string value) {
+        Guard.NotNull(value, "value");
+        return StringInfo.ParseCombiningCharacters(value).ToArray();
+    }
+
+    public static Grapheme ParseNext(string value, int index) {
+        return new Grapheme(StringInfo.GetNextTextElement(value, index));
+    }
+
+    public static Grapheme ParseNext(string value) {
+        return ParseNext(value, 0);
+    }
+
+    public char[] CodeUnits { 
+        get { 
+            return _codeUnits; 
+        }
+    }
+
+    public Grapheme[] Diacritics {
+        get { 
+            return _diacritics; 
+        }
+    }
+
+    public string Glyph {
+        get { 
+            return _glyph;
+        }
+    }
+
+    public Grapheme[] Flatten() {
+        return new[] { this }.Concat(_diacritics.SelectMany(x =&gt; x.Flatten())).ToArray();
+    }
+
+    public Grapheme Normalize() {
+        return new Grapheme(_glyph.Normalize());
+    }
+
+    public Grapheme Normalize(NormalizationForm form) {
+        return new Grapheme(_glyph.Normalize(form));
+    }
+
+    public override bool Equals(object obj) {
+        if (obj is Grapheme) {
+            return string.Equals(((Grapheme)obj)._glyph, _glyph);
+        }
+        return false;
+    }
+
+    public override int GetHashCode() {
+        return _glyph.GetHashCode();
+    }
+
+    public override string ToString() {
+        return _glyph;
+    }
+}
+</code></pre>
+    </div>

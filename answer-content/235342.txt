@@ -1,0 +1,183 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Extension methods</h1>
+
+<p>Notice that I add <code>this</code> to the first arguments of all the functions to allow calling them like <code>points.Area()</code> instead of <code>Area(points)</code>.</p>
+
+<h1>Polygon Vertices vs. Edges</h1>
+
+<p>The biggest problem I see is that you represent the polygon as a list/array (generaly an enumerable) of points. Well that's not bad on it's own. But the fact that all your functions need to treat the polygon as a list of edges rather than vertices makes you repeat the complexity of "converting the representations" in every function again. </p>
+
+<p>And so the first thing I would do, would be to generalize to IEnumerable and create a function that converts the vertices representation into an edges representation. And use yielding to avoid triplication of memory.</p>
+
+<p>Maybe you could do this with linq but it is not necessary. There is a low level interface called IEnumerator. Thats how every IEnumerable achieve the "foreachability", they simply provide an enumerator through the <code>GetEnumerator()</code> method. It is useful whenever you need different code for some items and different for other items. Only when all items are processed the same you fall back to standard foreach (which uses the enumerator for you). The enumerator is probably used directly by linq as well. But true is, sometimes, if you use it directly yourself, you can get the best fit for your case.</p>
+
+<p>And because such function no longer depends on the "point type" it can be made generic.</p>
+
+<pre><code>public static IEnumerable&lt;Tuple&lt;T, T&gt;&gt; GetCircularPairs&lt;T&gt;(this IEnumerable&lt;T&gt; items)
+{
+    var enumerator = items.GetEnumerator();
+    if (enumerator.MoveNext())
+    {
+        T first = enumerator.Current;
+        if (enumerator.MoveNext())
+        {
+            T previous = first;
+            do
+            {
+                T current = enumerator.Current;
+                yield return new Tuple&lt;T, T&gt;(previous, current);
+                previous = current;
+            } while (enumerator.MoveNext());
+            yield return new Tuple&lt;T, T&gt;(previous, first);
+        }
+    }
+}
+</code></pre>
+
+<p>All your functions could then rely on the edges representation simplifying them a lot. And because we generalized to IEnumerable, you dont need any overloads for lists, arrays, etc...</p>
+
+<pre><code>public static float Area(this IEnumerable&lt;Vector2&gt; points)
+{
+  float area = 0.0;
+  foreach (var (p1, p2) in points.GetCircularPairs()) {
+    area += p1.x * p2.y - p2.x * p1.y;
+  }
+  return area;
+}
+
+public static bool IsClockwise(this IEnumerable&lt;Vector2&gt; points)
+{
+  float sum = 0.0;
+  foreach (var (p1, p2) in points.GetCircularPairs()) {
+    sum += (p2.x - p1.x) * (p2.y + p1.y);
+  }
+  return sum &gt; 0;
+}
+</code></pre>
+
+<p>The same in linq:</p>
+
+<pre><code>public static float Area(this IEnumerable&lt;Vector2&gt; points)
+{
+  return points.GetCircularPairs().Aggregate(0.0, (a, x) =&gt; a + x.Item1.x * x.Item2.y - x.Item2.x * x.Item1.y);
+}
+
+public static bool IsClockwise(this IEnumerable&lt;Vector2&gt; points)
+{
+  return 0 &lt; points.GetCircularPairs().Aggregate(0.0, (a, x) =&gt; a +(x.Item2.x - x.Item1.x) * (x.Item2.y + x.Item1.y));
+}
+</code></pre>
+
+<h1>3D Wrappers may not be necessary</h1>
+
+<p>Similarly to @tinstaafl linq solution for Vector3, but extract the select to separate function because that also repeats:</p>
+
+<pre><code>public static IEnumerable&lt;Vector2&gt; OmitY(this IEnumerable&lt;Vector3&gt; points)
+{
+  return points.Select(p =&gt; new Vector2(p.x,p.z));
+}
+
+public static float Area(this IEnumerable&lt;Vector3&gt; points)
+{
+    return points.OmitY().Area();
+}
+
+public static bool IsClockwise(this IEnumerable&lt;Vector3&gt; points)
+{
+    return points.OmitY().IsClockwise();
+}
+</code></pre>
+
+<p>you can solve without linq this way:</p>
+
+<pre><code>public static IEnumerable&lt;Vector2&gt; OmitY(this IEnumerable&lt;Vector3&gt; points)
+{
+  foreach (var p in points) {
+    yield return new Vector2(p.x,p.z);
+  }
+}
+</code></pre>
+
+<p>You see that maybe you will want to also define <code>OmitX</code> and <code>OmitZ</code>, and then maybe the 3D wrappers would need variants for that too (ie <code>AreaXOmitted</code>, etc.), so it becomes disuptable whether they are needed at all or rather let the consumer choose which axis to omit by calling <code>OmitX|Y|Z</code> himself before calling <code>Area</code> and/or <code>IsClockwise</code> on it. But by all means, if you feel that omitting y is the best fit for most cases, go for it and add this y-omitting overload :)</p>
+
+<h1>Linq or No Linq?</h1>
+
+<p>As you can see with Linq the code gets a bit shorter in height and longer in width :). Also depends on you if you wanna make it dependent on Linq. I wouldn't see any problem with it as Linq is commonly used anyway. On other hand, in the code you needed Select and Aggregate functions from linq. And these actually encapsulate a very trivial using such wrappers may cause some performance drop. To show how trivial they are here is a possible implementation:</p>
+
+<pre><code>public static IEnumerable&lt;R&gt; Select&lt;R,T&gt;(this IEnumerable&lt;T&gt; items, Func&lt;T,R&gt; f)
+{
+    foreach (var item in items)
+    {
+        yield return f(item);
+    }
+}
+
+public static R Aggregate&lt;R,T&gt;(this IEnumerable&lt;T&gt; items, R acc, Func&lt;R,T,R&gt; f)
+{
+    foreach (var item in items)
+    {
+        acc = f(acc, item);
+    }
+    return acc;
+}
+</code></pre>
+
+<h1>Some More Abstraction?</h1>
+
+<p>If the expression <code>p1.x * p2.y - p2.x * p1.y</code> make any "Sense" separately you can also create a function for it (depends how far you wanna go :)):</p>
+
+<pre><code>public static float AreaSense(this Tuple&lt;Vector2, Vector2&gt; edge)
+{
+  return edge.Item1.x * edge.Item2.y - edge.Item2.x * edge.Item1.y
+}
+
+public static float ClockwiseSense(this Tuple&lt;Vector2, Vector2&gt; edge)
+{
+  return (edge.Item2.x - edge.Item1.x) * (edge.Item2.y + edge.Item1.y);
+}
+
+public static float Area(this IEnumerable&lt;Vector2&gt; points)
+{
+  return points.GetCircularPairs().Select(p =&gt; p.AreaSense()).Sum();
+  // supposing Sum() is the obvious Aggregate(0.0, (a,x) =&gt; a+x)
+}
+
+// or aggregate directly
+public static float IsClockwise(this IEnumerable&lt;Vector2&gt; points)
+{
+  return points.GetCircularPairs().Aggregate(0.0, (a,p) =&gt; a + p.ClockwiseSense());
+}
+</code></pre>
+
+<h1>Increased performance without linq</h1>
+
+<p>You can increase performance by bypassing linq and merging everything possible together, and you get something similar to what @Holger suggests in his answer, but it is generalized for anything enumerable, not just read only collections.</p>
+
+<pre><code>public static float SumCircluarPairs&lt;T&gt;(this IEnumerable&lt;T&gt; points, Func&lt;T, T, float&gt; f)
+{
+    float sum = 0.0;
+    var enumerator = items.GetEnumerator();
+    if (enumerator.MoveNext())
+    {
+        T first = enumerator.Current;
+        if (enumerator.MoveNext())
+        {
+            T previous = first;
+            do
+            {
+                T current = enumerator.Current;
+                sum += f(previous, current);
+                previous = current;
+            } while (enumerator.MoveNext());
+            sum += f(previous, first);
+        }
+    }
+    return sum;
+} 
+
+public static float Area(this IEnumerable&lt;Vector2&gt; points)
+{
+  return points.SumCircularPairs((p1, p2) =&gt; p1.x * p2.y - p2.x * p1.y);
+}
+</code></pre>
+    </div>

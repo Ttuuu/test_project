@@ -1,0 +1,169 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First note that your code does not detect invalid input data.
+For example, the string <code>"XX"</code> is just converted to a zero byte.
+Detecting invalid input with <code>strtoul()</code> is a bit tricky, there is an
+alternative suggestion below.</p>
+
+<hr>
+
+<pre><code>let data = NSMutableData(capacity: length/2)
+</code></pre>
+
+<p>creates an optional <code>NSData</code>. If that fails then the optional chaining</p>
+
+<pre><code>data?.appendBytes(&amp;wholeByte, length: 1)
+</code></pre>
+
+<p>simply does nothing, i.e. the error is ignored. Better check the 
+success immediately:</p>
+
+<pre><code>guard let data = NSMutableData(capacity: length/2) else { return nil }
+</code></pre>
+
+<hr>
+
+<blockquote>
+  <p>How can I optimize the ugly <code>i+=1</code> lines?</p>
+</blockquote>
+
+<p>By using <code>stride</code>:</p>
+
+<pre><code>func dataFromHexString() -&gt; NSData? {
+    guard let chars = cStringUsingEncoding(NSUTF8StringEncoding) else { return nil}
+    let length = characters.count
+
+    guard let data = NSMutableData(capacity: length/2) else { return nil }
+    var byteChars: [CChar] = [0, 0, 0]
+    var wholeByte: CUnsignedLong = 0
+
+    for i in 0.stride(to: length, by: 2) {
+        byteChars[0] = chars[i]
+        byteChars[1] = chars[i + 1]
+        wholeByte = strtoul(byteChars, nil, 16)
+        data.appendBytes(&amp;wholeByte, length: 1)
+    }
+
+    return data
+}
+</code></pre>
+
+<p>This does not change the performance. The time to convert a 512,000
+character string is 0.0140 sec on my computer (test code at the end).</p>
+
+<hr>
+
+<blockquote>
+  <p>Is <code>cStringUsingEncoding(NSUTF8StringEncoding)</code> the correct way to get the <code>[CChar]</code> from the string?</p>
+</blockquote>
+
+<p>That is fine as far as I can see. There is also </p>
+
+<pre><code>self.withCString {
+    // $0 is a pointer to the NUL-terminated UTF-8 string
+}
+</code></pre>
+
+<p>which I personally prefer, but I could not detect a difference in
+the performance.</p>
+
+<hr>
+
+<blockquote>
+  <p>Since this is almost a direct translation from Objective-C, is there any way to make this more "Swifty," say by using <code>map</code> or <code>stride</code>, without sacrificing speed?</p>
+</blockquote>
+
+<p><code>stride()</code> is already used for the iteration. I do not see an use-case
+for <code>map()</code> here.</p>
+
+<p>But the performance can be improved considerably.
+As observed <a href="https://stackoverflow.com/q/38478888/1187415">here</a>
+and <a href="https://stackoverflow.com/q/26990394/1187415">here</a>, accessing the <em>UTF-16 view</em>
+of a Swift string is very fast. This leads to the following implementation:</p>
+
+<pre><code>func dataFromHexString() -&gt; NSData? {
+
+    let utf16 = self.utf16
+    guard let data = NSMutableData(capacity: utf16.count/2) else { return nil }
+
+    var byteChars: [CChar] = [0, 0, 0]
+    var wholeByte: CUnsignedLong = 0
+    var i = utf16.startIndex
+    while i != utf16.endIndex {
+        byteChars[0] = CChar(truncatingBitPattern: utf16[i])
+        byteChars[1] = CChar(truncatingBitPattern: utf16[i.advancedBy(1, limit: utf16.endIndex)])
+        wholeByte = strtoul(byteChars, nil, 16)
+        data.appendBytes(&amp;wholeByte, length: 1)
+        i = i.advancedBy(2, limit: utf16.endIndex)
+    }
+    return data
+}
+</code></pre>
+
+<p>which converts the 512,000 character string in 0.00185 sec.
+Note that invalid input is still not detected.</p>
+
+<p>We can still make it faster by converting the UTF-16 code points
+"manually" instead of using <code>strtoul()</code>. This is more code,
+but again faster, and also detects all kinds of invalid input:</p>
+
+<pre><code>func dataFromHexString() -&gt; NSData? {
+
+    // Convert 0 ... 9, a ... f, A ...F to their decimal value,
+    // return nil for all other input characters
+    func decodeNibble(u: UInt16) -&gt; UInt8? {
+        switch(u) {
+        case 0x30 ... 0x39:
+            return UInt8(u - 0x30)
+        case 0x41 ... 0x46:
+            return UInt8(u - 0x41 + 10)
+        case 0x61 ... 0x66:
+            return UInt8(u - 0x61 + 10)
+        default:
+            return nil
+        }
+    }
+
+    let utf16 = self.utf16
+    guard let data = NSMutableData(capacity: utf16.count/2) else {
+        return nil
+    }
+
+    var i = utf16.startIndex
+    while i != utf16.endIndex {
+        guard let
+            hi = decodeNibble(utf16[i]),
+            lo = decodeNibble(utf16[i.advancedBy(1, limit: utf16.endIndex)])
+        else {
+                return nil
+        }
+        var value = hi &lt;&lt; 4 + lo
+        data.appendBytes(&amp;value, length: 1)
+        i = i.advancedBy(2, limit: utf16.endIndex)
+    }
+    return data
+}
+</code></pre>
+
+<p>The time to convert the 512,000 character string is now
+0.0008 seconds. This is more than 17 times faster than the original code.</p>
+
+<hr>
+
+<p><strong>Test code:</strong></p>
+
+<pre><code>let s1 = (0 ... 255).map { String(format:"%02x", $0) }.joinWithSeparator("")
+let str = Repeat(count: 100, repeatedValue: s1).joinWithSeparator("")
+print(str.characters.count) // 51200
+
+let start = NSDate()
+if let data = str.dataFromHexString() {
+    let duration = NSDate().timeIntervalSinceDate(start)
+    print(duration)
+} else {
+    print("failed")
+}
+</code></pre>
+
+<p>The tests were done on a MacBook, with the program compiled in
+Release mode.</p>
+    </div>

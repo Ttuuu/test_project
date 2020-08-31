@@ -1,0 +1,220 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>To quote Mark Seemann from the following article <a href="https://blog.ploeh.dk/2019/11/18/small-methods-are-easy-to-troubleshoot/" rel="nofollow noreferrer">Small methods are easy to troubleshoot</a></p>
+
+<blockquote>
+  <p>Write small methods. How small? Small enough that any unhandled exception is easy to troubleshoot.</p>
+</blockquote>
+
+<p>Break the function up into smaller more manageable chunks that focus on a single concern as much as possible. </p>
+
+<p>Yes, the net effect of this is a lot of additional functions. They are however easier to read and maintain.</p>
+
+<p>Another benefit of the many small methods it that it would help identify areas that can be generalized into reusable services that help reduce repeated code, allowing it <em>(the code)</em> to be more DRY (Don't Repeat Yourself)</p>
+
+<p>Lets start with getting the connection</p>
+
+<pre><code>private SqlConnection createConnection() {
+    var connection = (SqlConnection) sqlHelper.CreateConnection(); //sqlHelper is a nugget and not in my
+    connection.Open();
+    return connection;
+}
+</code></pre>
+
+<p>This can now be wrapped in a <code>using</code> block that will dispose of the connection once out of scope</p>
+
+<pre><code>using(SqlConnection connection = createConnection()) {
+
+    //...
+}
+</code></pre>
+
+<p>While there is nothing wrong with creating the command manually, I personal prefer to let the connection do it rather than newing one. Again wrapping in a <code>using</code> block, and populating.</p>
+
+<pre><code>//...
+
+using(SqlCommand command = connection.CreateCommand()) {
+    command.CommandText = Constants.GetAllParkingSlips;
+    command.CommandType = System.Data.CommandType.StoredProcedure;
+    command.Parameters.Add("@CreatedBy", SqlDbType.NVarChar).Value = gepservice.GetUserContext().UserId;
+    command.Parameters.Add("@OffsetRows", SqlDbType.NVarChar).Value = offset;
+    command.Parameters.Add("@FetchRows", SqlDbType.NVarChar).Value = fetch;
+
+    //...
+}
+</code></pre>
+
+<p>That could have also been refactored into its own method, but in my opinion it would have ended up with too many arguments. </p>
+
+<p>This could be fixed with an aggregated value object.</p>
+
+<pre><code>public class ParkingSlipQuery {
+    public int FetchRows { get; set; }
+    public int OffsetRows  { get; set; }
+    public string CreatedBy { get; set; }
+}
+</code></pre>
+
+<p>for example</p>
+
+<pre><code>private SqlCommand createCommand(SqlConnection connection, ParkingSlipQuery query) {
+    SqlCommand command = connection.CreateCommand();
+    command.CommandText = Constants.GetAllParkingSlips;
+    command.CommandType = System.Data.CommandType.StoredProcedure;
+    command.Parameters.Add("@CreatedBy", SqlDbType.NVarChar).Value = query.CreatedBy;
+    command.Parameters.Add("@OffsetRows", SqlDbType.NVarChar).Value = query.OffsetRows;
+    command.Parameters.Add("@FetchRows", SqlDbType.NVarChar).Value = query.FetchRows;
+    return command;
+}
+</code></pre>
+
+<p>and implemented</p>
+
+<pre><code>var query = new ParkingSlipQuery {
+    CreatedBy = gepservice.GetUserContext().UserId,
+    OffsetRows = offset,
+    FetchRows = fetch
+};
+using(SqlCommand command = createCommand(connection, query)) {
+    //...
+}
+</code></pre>
+
+<p>The execution of the command and subsequent reader result however can be moved</p>
+
+<pre><code>private SqlDataReader executeReader(SqlCommand command) {
+    var refCountdr = (RefCountingDataReader) sqlHelper.ExecuteReader(cmd);
+    return (SqlDataReader) refCountdr.InnerReader;
+}
+</code></pre>
+
+<p>As you have realized by now, you should know what is coming next about building the model to populate the collection.</p>
+
+<pre><code>private ParkingSlipDetails getDetails(SqlDataReader reader) {
+    ParkingSlipDetails details = new ParkingSlipDetails();
+    details.Id = Convert.ToInt32(reader[FileUploadConstants.Id]);
+    details.FileName = Convert.ToString(reader[FileUploadConstants.FileName]);
+    details.FileUri = Convert.ToString(reader[FileUploadConstants.FileURI]);
+    details.PONumber = Convert.ToString(reader[FileUploadConstants.DocumentNumber]);
+    details.UploadDate = Convert.IsDBNull(reader[FileUploadConstants.UploadDate]) ? DateTime.UtcNow: Convert.ToDateTime(reader[FileUploadConstants.UploadDate]);
+    details.FileStatus = (Status)(Convert.ToInt16(reader[FileUploadConstants.FileStatus]));
+    details.ReceiptNumber = Convert.ToString(reader[FileUploadConstants.RecieptNumber].ToString());
+    details.TotalRows = Convert.ToInt32(reader[FileUploadConstants.TotalRows]);
+    details.CreatedBy = gepservice.GetUserContext().UserId;
+
+    return details;
+}
+
+private List&lt;ParkingSlipDetails&gt; getDetailsList(SqlDataReader reader, string userId) {
+    List&lt;ParkingSlipDetails&gt; detailsList = new List&lt;ParkingSlipDetails&gt;();
+    if (reader != null) {
+        while (reader.Read()) {
+            ParkingSlipDetails details = getDetails(reader);
+            details.CreatedBy = userId;
+            detailsList.Add(details);
+        }
+    }
+    return detailsList;
+}
+</code></pre>
+
+<p>Finally, to avoid null reference errors, the method should try to avoid return <code>null</code>. An empty collection is safer to check than a null collection.</p>
+
+<p>This results in refactor looking like</p>
+
+<pre><code>public CustomReturn&lt;List&lt;ParkingSlipDetails&gt;&gt; GetAllParkingSlips(int offset, int fetch) {
+    List&lt;ParkingSlipDetails&gt; detailsList = new List&lt;ParkingSlipDetails&gt;();
+    try {
+        using(SqlConnection connection = createConnection()) {
+            string userId = gepservice.GetUserContext().UserId;
+            var query = new ParkingSlipQuery {
+                CreatedBy = userId,
+                OffsetRows = offset,
+                FetchRows = fetch
+            };
+            using(SqlCommand command = createCommand(collection, query)) {
+                using(SqlDataReader reader = executeReader(command)) {
+                    detailsList = getDetailsList(reader, userId);
+                }
+            }
+        }
+    } catch(Exception ex) {
+        LogError("ManageParkingSlipDataAccess", "GetAllParkingSlips", "Error", ex);
+        detailsList = new List&lt;ParkingSlipDetails&gt;();
+    }
+    return new CustomReturn&lt;List&lt;ParkingSlipDetails&gt;&gt;(detailsList);
+}
+</code></pre>
+
+<p>The <code>using</code> block will handle the closing and disposal of the connect and the other disposable members.</p>
+
+<p>If following explicit dependency principle, it could be refactored further down by delegating the argument values to the caller.</p>
+
+<pre><code>public CustomReturn&lt;List&lt;ParkingSlipDetails&gt;&gt; GetAllParkingSlips(ParkingSlipQuery query) {
+    List&lt;ParkingSlipDetails&gt; detailsList = new List&lt;ParkingSlipDetails&gt;();
+    try {
+        using(SqlConnection connection = createConnection()) {                
+            using(SqlCommand command = createCommand(collection, query)) {
+                using(SqlDataReader reader = executeReader(command)) {
+                    detailsList = getDetailsList(reader, query.CreatedBy);
+                }
+            }
+        }
+    } catch(Exception ex) {
+        LogError("ManageParkingSlipDataAccess", "GetAllParkingSlips", "Error", ex);
+        detailsList = new List&lt;ParkingSlipDetails&gt;();
+    }
+    return new CustomReturn&lt;List&lt;ParkingSlipDetails&gt;&gt;(detailsList);
+}
+</code></pre>
+
+<p>with the following support methods</p>
+
+<pre><code>private SqlConnection createConnection() {
+    var connection = (SqlConnection) sqlHelper.CreateConnection(); //sqlHelper is a nugget and not in my
+    connection.Open();
+    return connection;
+}
+
+private SqlCommand createCommand(SqlConnection connection, ParkingSlipQuery query) {
+    SqlCommand command = connection.CreateCommand();
+    command.CommandText = Constants.GetAllParkingSlips;
+    command.CommandType = System.Data.CommandType.StoredProcedure;
+    command.Parameters.Add("@CreatedBy", SqlDbType.NVarChar).Value = query.CreatedBy;
+    command.Parameters.Add("@OffsetRows", SqlDbType.NVarChar).Value = query.OffsetRows;
+    command.Parameters.Add("@FetchRows", SqlDbType.NVarChar).Value = query.FetchRows;
+    return command;
+}
+
+private SqlDataReader executeReader(SqlCommand command) {
+    var refCountdr = (RefCountingDataReader) sqlHelper.ExecuteReader(cmd);
+    return (SqlDataReader) refCountdr.InnerReader;
+}
+
+private List&lt;ParkingSlipDetails&gt; getDetailsList(SqlDataReader reader, string userId) {
+    List&lt;ParkingSlipDetails&gt; detailsList = new List&lt;ParkingSlipDetails&gt;();
+    if (reader != null) {
+        while (reader.Read()) {
+            ParkingSlipDetails details = getDetails(reader);
+            details.CreatedBy = userId;
+            detailsList.Add(details);
+        }
+    }
+    return detailsList;
+}
+
+private ParkingSlipDetails getDetails(SqlDataReader reader) {
+    ParkingSlipDetails details = new ParkingSlipDetails();
+
+    details.Id = Convert.ToInt32(reader[FileUploadConstants.Id]);
+    details.FileName = Convert.ToString(reader[FileUploadConstants.FileName]);
+    details.FileUri = Convert.ToString(reader[FileUploadConstants.FileURI]);
+    details.PONumber = Convert.ToString(reader[FileUploadConstants.DocumentNumber]);
+    details.UploadDate = Convert.IsDBNull(reader[FileUploadConstants.UploadDate]) ? DateTime.UtcNow: Convert.ToDateTime(reader[FileUploadConstants.UploadDate]);
+    details.FileStatus = (Status)(Convert.ToInt16(reader[FileUploadConstants.FileStatus]));
+    details.ReceiptNumber = Convert.ToString(reader[FileUploadConstants.RecieptNumber].ToString());
+    details.TotalRows = Convert.ToInt32(reader[FileUploadConstants.TotalRows]);
+
+    return details;
+}
+</code></pre>
+    </div>

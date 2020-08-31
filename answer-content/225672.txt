@@ -1,0 +1,181 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><em>(self-answer)</em></p>
+
+<hr>
+
+<p>This pattern has proven itself in practice so I'll keep it for my logging layer. I extended the POC in many places. The middleware has gotten an interface and each middleware I now call <code>Node</code>s. I have implemented also many ideas from other related questions (like <code>IsActive</code> or queues). Thanks a lot! ;-)</p>
+
+<pre><code>public interface ILinkedListNode&lt;T&gt;
+{
+    T Previous { get; }
+
+    T Next { get; }
+
+    T InsertNext(T next);
+
+    /// &lt;summary&gt;
+    /// Removes this node from the chain an returns the Previous item or Next if Previous is null.
+    /// &lt;/summary&gt;
+    /// &lt;returns&gt;&lt;/returns&gt;
+    T Remove();
+}
+</code></pre>
+
+<p>Thre is also a default implementation with linked-list operations that I need for this framework only so some of them are missing.</p>
+
+<pre><code>public abstract class LoggerNode : ILinkedListNode&lt;LoggerNode&gt;, IDisposable
+{
+    public LoggerNode(bool isActive)
+    {
+        IsActive = isActive;
+    }
+
+    public virtual bool IsActive { get; set; } = true;
+
+    #region ILinkeListNode
+
+    [JsonIgnore]
+    public LoggerNode Previous { get; private set; }
+
+    [JsonIgnore]
+    public LoggerNode Next { get; private set; }
+
+    #endregion
+
+    // Inserts a new middleware after this one and returns the new one.
+    public LoggerNode InsertNext(LoggerNode next)
+    {
+        (next.Previous, next.Next, Next) = (this, Next, next);
+        return next;
+    }
+
+    public LoggerNode Remove()
+    {
+        var result = default(LoggerNode);
+
+        if (!(Previous is null))
+        {
+            result = Previous;
+            (Previous.Next, Previous) = (Next, null);
+        }
+
+        if (!(Next is null))
+        {
+            result = result ?? Next;
+            (Next.Previous, Next) = (Previous, null);
+        }
+
+        return result;
+    }
+
+    public void Invoke(LogEntry request)
+    {
+        if (IsActive)
+        {
+            InvokeCore(request);
+        }
+        else
+        {
+            Next?.Invoke(request);
+        }
+    }
+
+    protected abstract void InvokeCore(LogEntry request);
+
+    // Removes itself from the middleware chain.
+    public virtual void Dispose()
+    {
+        Remove();
+    }
+}
+</code></pre>
+
+<hr>
+
+<p><code>TransactionNode</code> was a little bit challenging. It now uses a <code>LoggerScope&lt;T&gt;</code> helper that is borrowed from the asp.net-core console logger and made reusable because I need it for other nodes too. It maintains a <code>State</code> in an async context which allows to open many independent scopes:</p>
+
+<pre><code>public class LoggerScope&lt;T&gt;
+{
+    private static readonly AsyncLocal&lt;LoggerScope&lt;T&gt;&gt; State = new AsyncLocal&lt;LoggerScope&lt;T&gt;&gt;();
+
+    private LoggerScope(T value)
+    {
+        Value = value;
+    }
+
+    public T Value { get; }
+
+    private LoggerScope&lt;T&gt; Parent { get; set; }
+
+    public static LoggerScope&lt;T&gt; Current
+    {
+        get =&gt; State.Value;
+        private set =&gt; State.Value = value;
+    }
+
+    public static bool IsEmpty =&gt; Current is null;
+
+    public static LoggerScope&lt;T&gt; Push(T value)
+    {
+        return Current = new LoggerScope&lt;T&gt;(value) { Parent = Current };
+    }
+
+    public void Dispose()
+    {
+        Current = Current?.Parent;
+    }
+}
+</code></pre>
+
+<p>Here, I use it for keeping <code>Queue</code> buffers fol log-entries.</p>
+
+<pre><code>public class TransactionNode : LoggerNode, ILoggerScope&lt;TransactionNode.Scope, object&gt;
+{
+    public TransactionNode() : base(false) { }
+
+    public override bool IsActive =&gt; !LoggerScope&lt;Scope&gt;.IsEmpty;
+
+    protected override void InvokeCore(LogEntry request)
+    {
+        LoggerScope&lt;Scope&gt;.Current.Value.Buffer.Enqueue(request);
+        // Don't call Next until Commit.
+    }
+
+    public Scope Push(object parameter)
+    {
+        return LoggerScope&lt;Scope&gt;.Push(new Scope { Next = Next }).Value;
+    }
+
+    public class Scope : IDisposable
+    {
+        internal Queue&lt;LogEntry&gt; Buffer { get; } = new Queue&lt;LogEntry&gt;();
+
+        internal LoggerNode Next { get; set; }
+
+        public void Commit()
+        {
+            while (Buffer.Any())
+            {
+                Next?.Invoke(Buffer.Dequeue());
+            }
+        }
+
+        public void Rollback()
+        {
+            Buffer.Clear();
+        }
+
+
+        public void Dispose()
+        {
+            Buffer.Clear();
+            LoggerScope&lt;Scope&gt;.Current.Dispose();
+        }
+    }
+}
+</code></pre>
+
+<hr>
+
+<p>The entire framework has grown a lot. If anyone would like to take a look at the API, it's in my repo <a href="https://github.com/he-dev/reusable/blob/feature/console-models/Reusable.app.Console/src/Examples/OmniLog/Example.cs" rel="nofollow noreferrer">here</a>.</p>
+    </div>

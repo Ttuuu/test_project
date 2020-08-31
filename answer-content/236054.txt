@@ -1,0 +1,130 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Consider portable shell</h1>
+<p>The only Bash feature we're using is <code>[[ ]]</code>  for testing file properties.  It's easy to replace <code>[[ -d $1 ]]</code> with <code>[ -d "$1" ]</code> and that allows us to stick with standard shell, which is more portable and lower overhead:</p>
+<pre><code>#!/bin/sh
+</code></pre>
+<h1>Careful with quoting</h1>
+<p>Most of shellcheck's output is due to failure to quote parameter expansions:</p>
+<pre class="lang-none prettyprint-override"><code>236052.sh:9:31: note: Double quote to prevent globbing and word splitting. [SC2086]
+236052.sh:9:50: error: Delete trailing spaces after \ to break line (or use quotes for literal space). [SC1101]
+236052.sh:10:5: warning: This flag is used as a command name. Bad line break or missing [ .. ]? [SC2215]
+236052.sh:11:15: note: Double quote to prevent globbing and word splitting. [SC2086]
+236052.sh:12:28: note: Double quote to prevent globbing and word splitting. [SC2086]
+236052.sh:12:74: note: Double quote to prevent globbing and word splitting. [SC2086]
+236052.sh:18:14: note: Double quote to prevent globbing and word splitting. [SC2086]
+236052.sh:18:27: note: Expressions don't expand in single quotes, use double quotes for that. [SC2016]
+236052.sh:18:53: note: Expressions don't expand in single quotes, use double quotes for that. [SC2016]
+236052.sh:18:75: note: Double quote to prevent globbing and word splitting. [SC2086]
+236052.sh:22:16: note: Double quote to prevent globbing and word splitting. [SC2086]
+236052.sh:23:20: note: Double quote to prevent globbing and word splitting. [SC2086]
+236052.sh:24:16: note: Double quote to prevent globbing and word splitting. [SC2086]
+236052.sh:26:12: note: Double quote to prevent globbing and word splitting. [SC2086]
+</code></pre>
+<p>Ironically, you do have quotes in some places they aren't strictly necessary, so it's unclear why you missed all these.</p>
+<h1>Errors go to standard output</h1>
+<blockquote>
+<pre><code>echo "Argument missing"
+exit 1
+</code></pre>
+</blockquote>
+<p>That should be:</p>
+<blockquote>
+<pre><code>echo &gt;&amp;2 "Argument missing"
+exit 1
+</code></pre>
+</blockquote>
+<p>The test here is slightly wrong: the argument may be present, but not the name of a plain file or directory.  So I'd replace that with:</p>
+<pre><code>elif [ -e "$1" ]
+    echo "$1: not a plain file or directory" &gt;&amp;2
+    exit 1
+elif [ "$1" ]
+    echo "$1: file not found" &gt;&amp;2
+    exit 1
+else
+    echo "Argument missing" &gt;&amp;2
+    exit 1
+fi
+</code></pre>
+<p>It may be worthwhile to move that testing into the <code>resize</code> function, because at present we assume that the contents found in directory arguments are plain files (that said, we're covering a tiny corner case with that, so I wouldn't sweat it - just let the commands there fail).</p>
+<h1>Don't assume previous commands succeeded</h1>
+<p>In <code>resize</code>, if <code>ffmpeg</code> fails, there's little point running <code>exiftool</code>, so connect them with <code>&amp;&amp;</code>.  Also consider removing the file if it was created with errors (so we're not fooled by a partly-written output into thinking this file doesn't need conversion).</p>
+<h1>Avoid temporary files</h1>
+<p>There's no need for the file <code>/tmp/fl_$timestamp</code>: we could simply use a pipeline there.</p>
+<h1>Consider accepting more arguments</h1>
+<p>Instead of only allowing a single argument (and ignoring all but the first), let the user specify as many files as needed; it's easy to loop over them using <code>for</code>.</p>
+<h1>Handle directories using recursion</h1>
+<p>Instead of the <code>while</code> loop, we could invoke our script recursively using <code>xargs</code>.  I'll make it a separate function for clarity:</p>
+<pre><code>resize_dir() {
+    exiftool "$1"/*.mp4 -if '$ImageHeight &gt;= 1080' -p '$Filename' |
+        xargs -r -d '\n' -- "$0" || status=false
+}
+</code></pre>
+<p>(<code>xargs -r</code> is a GNU extension to avoid running the command with no arguments.  If this option isn't available, we'll need to modify the script so that passing no arguments isn't an error.)</p>
+<hr>
+<h1>Modified code</h1>
+<p>This is Shellcheck-clean, but I'm not able to test it (lacking the requisite directory of MPEG files).</p>
+<pre><code>#!/bin/sh
+
+set -eu
+
+
+status=true
+fail() {
+    echo "$@" &gt;&amp;2
+    status=false
+}
+
+# Resize a single file
+resize() {
+    echo "Filename $1"
+    filename=$(basename -- "$1")
+    extension=${filename##*.}
+    filename=${filename%.*}
+    new_filename=${filename}.${timestamp}.${extension}
+    if 
+        ffmpeg -v quiet -stats -i "$1" -map_metadata 0 \
+               -vf scale=-1:720 -c:v libx264 -crf 23 \
+               -c:a copy "$new_filename" &lt; /dev/null &amp;&amp;
+            exiftool -TagsFromFile "$1" '-all:all&gt;all:all' \
+                     -overwrite_original "$new_filename"
+    then
+        # success
+        true
+    else
+        # failed; destroy the evidence
+        rm -f "$new_filename" 2&gt;/dev/null
+        fail "Failed to convert $1"
+    fi
+}
+
+# Resize all *.mp4 files in a single directory
+# N.B. only immediate contents; not recursive
+resize_dir() {
+    # shellcheck disable=SC2016
+    exiftool "$1"/*.mp4 -if '$ImageHeight &gt;= 1080' -p '$Filename' |
+        xargs -r -d '\n' -- "$0" || status=false
+}
+
+[ $# -gt 0 ] || fail "Usage: $0 FILE FILE..."
+
+timestamp=$(date +%s)
+
+for arg
+do
+    if [ -d "$arg" ]
+    then
+        resize_dir "$arg"
+    elif [ -f "$arg" ]
+    then
+        resize "$arg"
+    elif [ -e "$arg" ]
+    then
+        fail "$arg: not a plain file or directory"
+    else
+        fail "$arg: file not found"
+    fi
+done
+
+exec $status # true or false
+</code></pre>
+    </div>

@@ -1,0 +1,205 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Something that jumps out immediately is the <code>is_folder</code> member.  It's a bad sign if a base class needs to know what subclass it is.  Even more concerning, the subclass constructors allow one to create a <code>File</code> with <code>is_folder</code> set, or a <code>Folder</code> with <code>is_folder</code> reset.  Thankfully, this member seems never to be used, so it can be omitted altogether.</p>
+<hr>
+<p>I think that <code>BaseComponent</code> ought to be an abstract class.  A simple way to do so is to make <code>size()</code> a <em>pure</em> virtual method:</p>
+<pre><code>virtual std::size_t size() const = 0;
+</code></pre>
+<p>(I've used a more appropriate return type, too - though some platforms support files larger than addressable memory, so be careful).</p>
+<hr>
+<p>Similarly, the destructor that's declared just to make it virtual (well done for remembering) can be defined <code>=default</code>:</p>
+<pre><code>virtual ~BaseComponent() = default;
+</code></pre>
+<p>The subclass destructors can be omitted, as the compiler-generated ones will be exactly equivalent.</p>
+<hr>
+<p>We can save the two-step construct-then-add by having the constructor also add to the parent entry:</p>
+<pre><code>BaseComponent::BaseComponent(std::string name, Folder* parent)
+    : name_v{std::move(name)},
+      parent_v{parent}
+{
+    if (parent) {
+        parent-&gt;add_component(this);
+    }
+}
+</code></pre>
+<p>It also makes sense for a destructor to remove the object from its parent (otherwise we could end up with dangling references), and for a deleted <code>Folder</code> to null out its children's parent pointers.</p>
+<hr>
+<p>We can help avoid mistakes by using the <code>override</code> keyword when we reimplement <code>size()</code> in the subclasses:</p>
+<pre><code>std::size_t size() const override
+{
+    return sizeof this;
+}
+</code></pre>
+<p>BTW, I hope that <code>sizeof this</code> is just a placeholder for something more useful later (all pointers to <code>File</code> objects will have the same size on any given system).  You probably meant <code>return contents_v.size();</code> there.</p>
+<hr>
+<p>Minor points:</p>
+<ul>
+<li><code>num_ff()</code> should be <code>const</code></li>
+<li>Constructor arguments passed by value should be <code>std::move()</code>d to their new homes.</li>
+<li><code>BaseComponent</code> constructor and destructor can be <code>protected</code>.  Consider suppressing copy construction and copy assignment.</li>
+<li><code>BaseComponent</code> isn't a very informative name.</li>
+</ul>
+<hr>
+<h1>Modified code</h1>
+<pre><code>#include &lt;numeric&gt;
+#include &lt;string&gt;
+#include &lt;set&gt;
+
+class Folder;
+class File;
+
+class FileSystemObject
+{
+    std::string name_v;
+    Folder* parent_v;
+
+protected:
+    FileSystemObject(std::string name, Folder* parent);
+
+    FileSystemObject(const FileSystemObject&amp;) = delete;
+    FileSystemObject&amp; operator=(const FileSystemObject&amp;) = delete;
+
+    virtual ~FileSystemObject();
+
+public:
+    void change_name(std::string&amp; name)
+    {
+        name_v = name;
+    }
+
+    std::string name() const
+    {
+        return name_v;
+    }
+
+    Folder* parent() const
+    {
+        return parent_v;
+    }
+
+    virtual std::size_t size() const = 0;
+
+    void set_parent(Folder* parent);
+};
+
+
+class Folder : public FileSystemObject
+{
+    std::set&lt;FileSystemObject*&gt; children = {};
+public:
+    Folder(std::string name, Folder* parent = nullptr)
+        : FileSystemObject{std::move(name), parent}
+    {
+    }
+
+    ~Folder()
+    {
+        for (auto c: children) {
+            c-&gt;set_parent(nullptr);
+        }
+    }
+
+    std::size_t size() const override
+    {
+        return std::accumulate(children.begin(), children.end(), 0,
+                               [](auto sum, auto child){ return sum + child-&gt;size(); });
+    }
+
+    int num_ff() const
+    {
+        return children.size();
+    }
+
+    void add_component(FileSystemObject* b)
+    {
+        children.insert(b);
+    }
+
+    void delete_component(FileSystemObject* b)
+    {
+        children.erase(b);
+    }
+};
+
+
+class File : public FileSystemObject
+{
+    std::string contents_v;
+public:
+    File(std::string contents, std::string name, Folder* parent)
+        : FileSystemObject{name, parent},
+          contents_v{contents}
+    {
+    }
+
+    std::size_t size() const override
+    {
+        return contents_v.size();
+    }
+
+    void write(std::string content)
+    {
+        contents_v = std::move(content);
+    }
+
+    std::string read() const
+    {
+        return contents_v;
+    }
+
+};
+
+FileSystemObject::FileSystemObject(std::string name, Folder* parent)
+    : name_v{std::move(name)},
+      parent_v{parent}
+{
+    if (parent) {
+        parent-&gt;add_component(this);
+    }
+}
+
+
+FileSystemObject::~FileSystemObject()
+{
+    if (parent_v) {
+        parent_v-&gt;delete_component(this);
+    }
+}
+
+void FileSystemObject::set_parent(Folder* parent)
+{
+    if (parent_v) {
+        parent_v-&gt;delete_component(this);
+    }
+    if ((parent_v = parent)) {    // assignment!
+        parent_v-&gt;add_component(this);
+    }
+}
+
+
+#include &lt;iostream&gt;
+
+int main()
+{
+    Folder root{"/"};
+    Folder home{"home", &amp;root};
+    Folder lib{"lib", &amp;root};
+    Folder dev{"dev", &amp;root};
+    std::cout &lt;&lt; "No. of components in root: " &lt;&lt; root.num_ff() &lt;&lt; '\n';
+    std::cout &lt;&lt; "No. of components in home: " &lt;&lt; home.num_ff() &lt;&lt; '\n';
+    File test{"x = 0, y = 0", "Configuration.txt", &amp;root};
+    Folder ws{"ws", &amp;home};
+    File fs{"fs file", "fs.cpp", &amp;ws};
+    File git{"user: dummy", "git_config", &amp;home};
+    std::cout &lt;&lt; "Contents of git: " &lt;&lt; git.read() &lt;&lt; '\n';
+    git.write("user: new\n email:new@new.com");
+    std::cout &lt;&lt; "Contents of git: " &lt;&lt; git.read() &lt;&lt; '\n';
+    std::cout &lt;&lt; "No. of components in root: " &lt;&lt; root.num_ff() &lt;&lt; '\n';
+    std::cout &lt;&lt; "No. of components in home: " &lt;&lt; home.num_ff() &lt;&lt; '\n';
+    std::cout &lt;&lt; "No. of components in ws: " &lt;&lt; ws.num_ff() &lt;&lt; '\n';
+    dev.set_parent(nullptr);
+    std::cout &lt;&lt; "No. of components in root: " &lt;&lt; root.num_ff() &lt;&lt; '\n';
+    std::cout &lt;&lt; "Size of git: " &lt;&lt; git.size() &lt;&lt; '\n';
+    std::cout &lt;&lt; "Size of root: " &lt;&lt; root.size() &lt;&lt; '\n';
+}
+</code></pre>
+    </div>

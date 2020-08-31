@@ -1,0 +1,100 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>As it happens, there is already an implementation of Karatsuba multiplication in the implementation of BigInteger. Of course that's integer multiplication instead of polynomial multiplication, but they're very similar, apart from how they handle carries. You can read the source <a href="https://hg.openjdk.java.net/jdk8/jdk8/jdk/file/tip/src/share/classes/java/math/BigInteger.java" rel="nofollow noreferrer">here</a>, look for <code>multiplyKaratsuba</code>. It's more of a high-level implementation, delegating the details of extracting the high/low halves and addition and the base-case multiplication. There are some things to learn from it, for example:</p>
+<ul>
+<li>It uses <code>int[]</code>, not <code>ArrayList&lt;Long&gt;</code>. <code>int[]</code> instead of <code>long[]</code> is used because multiplying two <code>long</code>s is actually difficult, the lowest 64 bits of the result are easy enough to get, but what about the upper 64 bits? That detail is not important for polynomial multiplication, as there is no carry propagation to worry about. You could use <code>long[]</code>, which is a flat array of data, whereas <code>ArrayList&lt;Long&gt;</code> is an array of pointers to individually allocated <code>Long</code>s, that's a significant amount of size overhead (2x to 3x) and is also associated with hard-to-profile time overhead (the cost of loading more data and following more pointers and allocating/GC-ing more objects is <em>diffuse</em>, it does not show up as a hot spot during profiling).</li>
+<li>The base case is not "a single element". Karatsuba multiplication is asymptotically faster than standard quadratic-time multiplication, but also has more overhead. For small inputs Karatsuba is slower, so it should only be used above some size threshold (which can be found experimentally).</li>
+</ul>
+<h1>Bugs</h1>
+<p>The current implementation does not deal with different-sized <code>a</code> and <code>b</code>. If <code>b</code> is longer, the extra part is cut off. If <code>a</code> is longer, well, that's a problem.</p>
+<p>Even if the original input <code>a</code> and <code>b</code> were the same size, the algorithm would normally be able to create different sized inputs to its recursive calls: when the size is uneven that would naturally happen, unless you add padding. That does not happen here, if the size of <code>a</code> is uneven one element is <em>dropped</em>.</p>
+<h1>Unusual ordering</h1>
+<p>It seems that the name <code>high</code> is given to the start of the array/list. Normally the low part would be there, so that <code>polynomial[i]</code> corresponds to the coefficient of x<sup>i</sup>. That way it is for example easier to add two polynomials, because the coefficients at the same index in the array have the same index in the polynomials - that would not be true in the flipped order and all sorts of offset-arithmetic needs to happen, it's confusing and easy to get wrong. Also, "leading zero coefficients" appear at the end of the array where it would be easier to drop/ignore them. It's not necessarily <em>wrong</em> to flip it around, but normally less convenient.</p>
+<p>I expect there are bugs due to this, but it's hard to tell.</p>
+<p>Using the usual ordering, naive (quadratic time) polynomial multiplication would look like this:</p>
+<pre><code>static long[] multiplyPolynomials(long[] a, long[] b) {
+    long[] c = new long[a.length + b.length - 1];
+    for (int i = 0; i &lt; a.length; i++)
+        for (int j = 0; j &lt; b.length; j++)
+            c[i + j] += a[i] * b[j];
+    return c;
+}
+</code></pre>
+<p>Which you can also use to test the more advanced implementations against.</p>
+<h1>Repeated in-line operations</h1>
+<p>Extracting the low and high parts, as well as creating the "low + high" polyomial, could be put in their own functions, to clean up the main function.</p>
+<p>Some of the loops can be written as <code>System.arrayCopy</code>.</p>
+<h1>Suggested implementation</h1>
+<p>Putting those things together, the code might end up like this:</p>
+<pre><code>static long[] getLow(long[] a, int half)
+{
+    long[] low = new long[half];
+    System.arraycopy(a, 0, low, 0, low.length);
+    return low;
+}
+
+static long[] getHigh(long[] a, int half)
+{
+    long[] high = new long[a.length - half];
+    System.arraycopy(a, half, high, 0, high.length);
+    return high;
+}
+
+static long[] addPolynomials(long[] a, long[] b) {
+    if (a.length &lt; b.length) {
+        long[] t = a;
+        a = b;
+        b = t;
+    }
+    long[] result = new long[a.length];
+    for (int i = 0; i &lt; b.length; i++)
+        result[i] = a[i] + b[i];
+    System.arraycopy(a, b.length, result, b.length, a.length - b.length);
+    return result;
+}
+
+public static long[] multiplyPolynomialsKaratsuba(long[] a, long[] b) {
+    
+    long[] c = new long[a.length + b.length - 1];
+    if (a.length * b.length &lt; 1000) {
+        
+        for (int i = 0; i &lt; a.length; i++)
+            for (int j = 0; j &lt; b.length; j++)
+                c[i + j] += a[i] * b[j];
+        return c;
+    }
+
+    int half = (Math.max(a.length, b.length) + 1) / 2;
+    long[] alow = getLow(a, half);
+    long[] blow = getLow(b, half);
+    long[] ahigh = getHigh(a, half);
+    long[] bhigh = getHigh(b, half);
+    long[] amed = addPolynomials(alow, ahigh);
+    long[] bmed = addPolynomials(blow, bhigh);
+
+    long[] clow = multiplyPolynomialsKaratsuba(alow, blow);
+    System.arraycopy(clow, 0, c, 0, clow.length);
+            
+    long[] chigh = multiplyPolynomialsKaratsuba(ahigh, bhigh);
+    System.arraycopy(chigh, 0, c, 2 * half, chigh.length);
+    
+    long[] cmed = multiplyPolynomialsKaratsuba(amed, bmed);
+    for (int j = 0; j &lt; cmed.length; j++)
+        c[j + half] += cmed[j] - (j &lt; chigh.length ? chigh[j] : 0) - (j &lt; clow.length ? clow[j] : 0);
+
+    return c;
+}
+</code></pre>
+<p>I did some minor benchmarking, choosing both polynomials to be the same size, and a power of two size, which is the only case in which the old implementation does the right thing (or the right amount of work at least). The new code was tested with a threshold of 2 and with a threshold of 1000 (which looked like a good value to choose).</p>
+<pre><code>         Old  Thr2 Thr1000
+  256    2ms 0.7ms  0.1ms
+  512    5ms   1ms  0.5ms
+ 1024   14ms   4ms    1ms
+ 2048   40ms  11ms    3ms
+ 4096  125ms  32ms   10ms
+ 8192  360ms 100ms   29ms
+16384 1100ms 270ms   85ms
+</code></pre>
+<p>So I think we safely conclude that about a factor of 3 is thanks to not applying Karatsuba all the way down single elements, and about an other factor of 4 is thanks to everything else.</p>
+<p>The times are plotted below on a log-log plot so you can see the scaling is about right.</p>
+<p><a href="https://i.stack.imgur.com/R0cPs.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/R0cPs.png" alt="time plot"></a></p>
+    </div>

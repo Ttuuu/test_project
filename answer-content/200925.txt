@@ -1,0 +1,252 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Here's the most performant version I've got so far based on suggestions by  @chux, @PieterWitvoet and @202_accepted. (From both this and the <a href="https://codereview.stackexchange.com/questions/200935/custom-integer-parser-optimized-for-performance">Custom integer parser optimized for performance</a> question.)</p>
+
+<pre class="lang-c# prettyprint-override"><code>/// &lt;summary&gt;High performance double parser with rudimentary flexibility.&lt;/summary&gt;
+/// &lt;returns&gt;Returns true only if we can be certain we parsed the string correctly.&lt;/returns&gt;
+/// &lt;remarks&gt;Does not support thousand separators or whitespace.&lt;/remarks&gt;
+/// &lt;remarks&gt;Supports all culture-specific symbols specified by the NumberFormatInfo of the
+/// &lt;see cref="CultureInfo.CurrentCulture"/&gt; at the time this static class is instantiated.
+/// So long as all culture symbols are a single character in length.
+/// TODO: In theory, this class could be made instantiable, take the culture as an argument,
+///       and support changing the culture at runtime in case the file the user is uploading
+///       was generated on a machine with different culture settings.&lt;/remarks&gt;
+/// &lt;remarks&gt;Supports leading negative signs and positive signs, scientific notation,
+/// as well as Infinity, Negative Infinity, and NaN, string representations.&lt;/remarks&gt;
+/// &lt;remarks&gt;A string containing only a negative sign (usually "-") intentionally returns a
+/// value of zero. This is because it's a common representation of 0 in accounting.&lt;/remarks&gt;
+public static unsafe bool FastTryParseDouble(string input, out double result)
+{
+    // We never expect null, but enforcing this may enable some JIT optimizations.
+    if (input == null)
+    {
+        result = default(double);
+        return false;
+    }
+    fixed (char* cInput = input)
+    {
+        double localValue;
+        double sign = 1d;
+        char* nextChar = cInput;
+
+        /************** Sign (+/-) and Special Case String Representations ***************/
+        // Handle all cases where the string does not start with a numeric character
+        if (*nextChar &lt; '0' || *nextChar &gt; '9')
+        {
+            // The first character may be a sign character (-/+). Take note of a negative.
+            if (*nextChar == CharNegative)
+                sign = -1d;
+            // The very first character may also be the decimal separator.
+            else if (*nextChar == CharDecimalSeparator)
+            {
+                // In this case, we treat the integer part as 0 and skip to the fractional part.
+                localValue = 0;
+                goto SkipIntegerPart;
+            }
+            // Finally, unless it was a '+' sign, we cannot parse this double.
+            // Return true only if the input matches one of a set of special cases.
+            else if (*nextChar != CharPositive)
+                return CheckForSpecialCaseDoubleStrings(input, out result);
+
+            // Once the sign is consumed, advance to the next character for further parsing
+            // We must once more check whether the character is numeric before proceeding.
+            if (*++nextChar &lt; '0' || *nextChar &gt; '9')
+            {
+                // If not numeric, at this point, the character can only be a decimal separator
+                // (as in "-.123" or "+.123"), or else it must be part of a special case string
+                // (as in "-∞"). So check for those.
+                if (*nextChar != CharDecimalSeparator)
+                    return CheckForSpecialCaseDoubleStrings(input, out result);
+                localValue = 0;
+                goto SkipIntegerPart;
+            }
+        }
+
+        /******************************** "Integer Part" *********************************/
+        // Treat all subsequent numeric characters as the "integer part" of the result.
+        // Since we've already checked that the next character is numeric,
+        // We can save 2 ops by initializing the localValue directly.
+        localValue = *nextChar++ - '0';
+        while (*nextChar &gt;= '0' &amp;&amp; *nextChar &lt;= '9')
+            localValue = localValue * 10L + (*nextChar++ - '0');
+
+        // This label and corresponding goto statements is a performance optimization to
+        // allow us to efficiently skip "integer part" parsing in cases like ".123456"
+        // Please don't be mad.
+        SkipIntegerPart:
+
+        // The expected case is that the next character is a decimal separator, however
+        // this section might be skipped in normal use cases (e.g. as in "1e18")
+        // TODO: If we broke out of the while loop above due to reaching the end of the
+        //       string, this operation is superfluous. Is there a way to skip it?
+        //       Also, if we used goto `SkipIntegerPart`, this test for '.' is redundant.
+        int fractionLen;
+        if (*nextChar == CharDecimalSeparator)
+        {
+            /***************************** "Fractional Part" *****************************/
+            // Track the index at the start of the fraction part.
+            char* fractionStart = ++nextChar;
+            // Continue shifting and adding to the localValue as before
+            // Note that we flip the OR here, because it's now more likely that
+            // nextChar &gt; '9' ('e' or 'E'), leading to an early exit condition.
+            while (*nextChar &lt;= '9' &amp;&amp; *nextChar &gt;= '0')
+                localValue = localValue * 10L + (*nextChar++ - '0');
+
+            // Keep track of the digits in the fraction for the final magnitude adjustment.
+            fractionLen = unchecked((int)(nextChar - fractionStart));
+        }
+        else
+            fractionLen = 0;
+
+        // If we have consumed every character in the string, return now (successfully)
+        if (*nextChar == Char.MinValue)
+        {
+            // Produce the final result and return
+            result = sign * localValue * Pow10[unchecked(MaxDoubleExponent - fractionLen)];
+            return true;
+        }
+
+        /**************************** "Scientific Notation Part" *****************************/
+        // The next character encountered must be an exponent character ('e' or 'E').
+        // Any other character appears, or if there's nothing afterwards, that's an error
+        if (*nextChar != 'e' &amp;&amp; *nextChar != 'E' || *++nextChar == Char.MinValue)
+        {
+            result = default(double);
+            return false;
+        }
+        // Otherwise, begin parsing the exponent
+        bool exponentIsNegative = false;
+        // The next character can only be a +/- sign, or a numeric character
+        if (*nextChar &lt; '0' || *nextChar &gt; '9')
+        {
+            if (*nextChar == CharNegative)
+                exponentIsNegative = true;
+            // Fail if the non-digit character was not one of these two signs
+            else if (*nextChar != CharPositive)
+            {
+                result = default(double);
+                return false;
+            }
+            // Advance, and fail if the sign is not followed by a numeric character
+            if (*++nextChar &lt; '0' || *nextChar &gt; '9')
+            {
+                result = default(double);
+                return false;
+            }
+        }
+
+        unchecked
+        {
+            // Since we know the next character is a digit, we can initialize the exponent
+            // int directly and avoid 2 wasted ops (multiplying by and adding to zero).
+            int exponent = *nextChar++ - '0';
+            // Shift and add any additional digit characters
+            while (*nextChar &lt;= '9' &amp;&amp; *nextChar &gt;= '0')
+                exponent = exponent * 10 + (*nextChar++ - '0');
+            // If we broke for anything other than the end of string, it's an error
+            if (*nextChar != Char.MinValue)
+            {
+                result = default(double);
+                return false;
+            }
+            // Account for the negative sign and any parsed fractional digits
+            int powerIndex;
+            if (exponentIsNegative)
+                powerIndex = MaxDoubleExponent - fractionLen - exponent;
+            else
+                powerIndex = MaxDoubleExponent - fractionLen + exponent;
+            // Apply the exponent using our array, falling to Math.Pow it's out of range.
+            if (powerIndex &gt;= 0 &amp;&amp; powerIndex &lt; Pow10Length)
+                result = sign * localValue * Pow10[powerIndex];
+            else
+                result = sign * localValue * Math.Pow(10, powerIndex - MaxDoubleExponent);
+        }
+
+        // Doubles that underwent scientific notation parsing should be checked for overflow
+        // (This isn't really a risk before now as we don't expect strings of &gt;308 characters).
+        // This trick tests whether the value evaluates to negative or positive infinity:
+        return !Double.IsInfinity(result);
+    }
+}
+
+/// &lt;summary&gt;Checks if the string matches one of a few supported special case
+/// double strings. If so, assigns the result and returns true.&lt;/summary&gt;
+public static bool CheckForSpecialCaseDoubleStrings(string input, out double result)
+{
+    if (input == NumberFormat.PositiveInfinitySymbol)
+        result = Double.PositiveInfinity;
+    else if (input == NumberFormat.NegativeInfinitySymbol)
+        result = Double.NegativeInfinity;
+    else if (input == NumberFormat.NaNSymbol)
+        result = Double.NaN;
+    // Special Case: Excel has been known to format zero as "-".
+    // We intentionally support it by returning zero now (most parsers would not)
+    else if (input == NumberFormat.NegativeSign)
+        result = 0d;
+    // Special Case: Our organization treats the term "Unlimited" as referring
+    // to Double.MaxValue (most parsers would not)
+    else if (input.Equals("unlimited", StringComparison.OrdinalIgnoreCase))
+        result = Double.MaxValue;
+    // Anything else is not a valid input
+    else
+    {
+        result = Double.NaN;
+        return false;
+    }
+    return true;
+}
+
+/// &lt;summary&gt;The largest exponent (or smallest when negative) that can be given to a Double.&lt;/summary&gt;
+private const int MaxDoubleExponent = 308;
+
+/// &lt;summary&gt;The number of elements that will be generated in the Pow10 array.&lt;/summary&gt;
+private const int Pow10Length = MaxDoubleExponent * 2 + 1;
+
+/// &lt;summary&gt;A cache of all possible positive powers of 10 that might be required to
+/// apply an exponent to a double (Indices 308-616), as well as the first 308 negative
+/// exponents. (Indices 0-301)&lt;/summary&gt;
+private static readonly double[] Pow10 =
+    Enumerable.Range(1, MaxDoubleExponent).Select(i =&gt; Math.Pow(10, -i)).Reverse()
+    .Concat(Enumerable.Range(0, MaxDoubleExponent + 1).Select(i =&gt; Math.Pow(10, i)))
+        .ToArray();
+</code></pre>
+
+<p><strong>Benchmarks</strong></p>
+
+<p>I was seeing a lot of variability in my benchmark runs when I looped over a billion strings at once, so to mange noise, I changed my test code to run several smaller test in succession. Here are the results for the above code:</p>
+
+<blockquote>
+  <p>Native parser took 1976 ms. Custom parser took 452 ms. Performance
+  gain was 337.17% Native parser took 1967 ms. Custom parser took 457
+  ms. Performance gain was 330.42% Native parser took 1957 ms. Custom
+  parser took 449 ms. Performance gain was 335.86% Native parser took
+  2009 ms. Custom parser took 452 ms. Performance gain was 344.47%
+  Native parser took 1958 ms. Custom parser took 451 ms. Performance
+  gain was 334.15% Native parser took 1981 ms. Custom parser took 485
+  ms. Performance gain was 308.45% Native parser took 2028 ms. Custom
+  parser took 458 ms. Performance gain was 342.79% Native parser took
+  2018 ms. Custom parser took 462 ms. Performance gain was 336.80%
+  Native parser took 1987 ms. Custom parser took 472 ms. Performance
+  gain was 320.97% Native parser took 1958 ms. Custom parser took 455
+  ms. Performance gain was 330.33%</p>
+</blockquote>
+
+<p>The average is about <strong>330%</strong> faster than native parse.</p>
+
+<p><strong>Performance Improvements</strong></p>
+
+<ul>
+<li><p>Uses <code>unsafe</code> and <code>fixed</code> to treat the string as a null-terminated character array, avoiding the need to monitor or pre-compute the length of the string as we traverse it.</p></li>
+<li><p>Uses a local double value for accumulation during parsing, and only assigns <code>out result</code> once - since manipulating <code>out</code> variables directly is more expensive.</p></li>
+<li><p>Initializes the local value directly using the first numeric digit, avoiding a superfluous multiplication and addition with zero in the first loop.</p></li>
+<li><p>A null check at the beginning may enable some JIT optimizations.</p></li>
+<li><p>Merged the magnitude adjustment made after parsing the fraction with the one made after parsing the scientific notation.</p></li>
+<li><p>Simplified the power lookup by using a single array, and always falling back to Math.Pow - allowing it to overflow if applicable and checking for overflow in the final return statement.</p></li>
+<li><p>Tried to reduce the amount of condition checking / branching in the "expected case" (all numeric digits) by grouping special case handling beneath the initial check for a numeric digit.</p></li>
+</ul>
+
+<p><strong>Omissions</strong></p>
+
+<ul>
+<li>Still does not allow white-space or thousand separators. Note that in all above 'unhandled' cases, we're very careful to return <code>false</code> - we will never return <code>true</code> with an incorrect result. You could (in theory) replace any instances of <code>return false</code> with <code>return Double.TryParse(input, out result)</code> if you wanted to "fall-back" to the native parser in these rare cases and add back its flexibility. In our case, something similar is done further up the chain, so I haven't included it in this code.</li>
+</ul>
+    </div>

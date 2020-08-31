@@ -1,0 +1,161 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Since you want to go for performance and your environment is tightly constrained in terms of which nodes are neighbors, you should not use a generic graph structure. E.g. you can use a grid to store the costs of each of the nodes you have computed, as well as a similar grid to store a reference or whatever to the parent of each node. </p>
+
+<p>Also, don't use a normal list for the openlist since you will have to sort it repeatedly if you follow the naive approach as you do at the moment. Python has the <a href="https://docs.python.org/3/library/heapq.html" rel="nofollow noreferrer"><code>heapq</code></a> module or <a href="https://docs.python.org/3/library/queue.html#queue.PriorityQueue" rel="nofollow noreferrer"><code>queue.PriorityQueue</code></a> exactly for that purpose. You would then use the node's cost + its estimated heuristic cost as priority value - Python does: the lower the value, the higher up. Furthermore, it's also possible to implement A* without using a closelist, which would eliminate another lump of data you would have to care for.</p>
+
+<p>There is also no need to look at all the elements of the openlist once you have found a path to the goal. IIRC you can terminate early once the goal is part of the openlist (under the assumption of an admissible heuristic).</p>
+
+<hr>
+
+<p>I still stand by what I said about the heuristic function in a comment under your code. You will usually always want to use the Euclidean distance for grid worlds as yours. Python will also happily support you in computing this distance with <a href="https://docs.python.org/3/library/math.html#math.hypot" rel="nofollow noreferrer"><code>hypot</code></a> from the math module. Using <code>hypot(dx, dy)</code> will likely be at least little bit faster than <code>sqrt(dx*dx + dy*dy)</code> and also numerically more stable. The comments also describe heuristics that might even be more suitable for this case.</p>
+
+<hr>
+
+<h3>Addendum</h3>
+
+<p>I cobbled together some code that still ignores some of the recommendations above and reuses some of the structural ideas (like a modified version of the <code>Node</code> class), but is considerably faster while producing the same result. Also note that this in an implementation that does not use a closelist.</p>
+
+<p>Your original implementation took about 12s here on my machine. The version runs in less than 1ms.</p>
+
+<pre class="lang-py prettyprint-override"><code>from heapq import heappush, heappop
+from math import hypot, sqrt
+
+
+SQRT2 = sqrt(2.0)
+
+
+DIRECTIONS = ((1, 0, 1.0), (0, 1, 1.0), (-1, 0, 1.0), (0, -1, 1.0),
+              (1, 1, SQRT2), (-1, -1, SQRT2), (1, -1, SQRT2), (-1, 1, SQRT2))
+
+
+class Node:
+
+    def __init__(self, x, y, cost=float("inf"), h=0, parent=None):
+        self.x = x
+        self.y = y
+        self.cost = cost
+        self.h = h
+        self.parent = parent
+
+    def update(self, new_parent, new_cost):
+        self.parent = new_parent
+        self.cost = new_cost
+
+    def __repr__(self):
+        return "Node(x={x}, y={y}, cost={cost}, h={h}, parent={parent})".format(**self.__dict__)
+
+    @property
+    def priority(self):
+        return self.cost + self.h
+
+    @property
+    def pos(self):
+        return self.x, self.y
+
+    def __eq__(self, other):
+        return self.x == other.x and self.y == other.y
+
+    def __lt__(self, other):
+        """This allows Node to be used in the priority queue directly"""
+        return self.priority &lt; other.priority
+
+
+def make_grid(n_rows, n_cols, value):
+    """Make a n_rows x n_cols grid filled with an initial value"""
+    return [[value for _ in range(n_cols)] for _ in range(n_rows)]
+
+
+def euclidean_distance(node1, node2):
+    """Compute the Euclidean/L2 distance between two nodes"""
+    return hypot(node1[0] - node2[0], node1[1] - node2[1])
+
+
+def is_valid(x, y, grid, x_max, y_max):
+    """Check the bounds and free space in the map"""
+    if 0 &lt;= x &lt; x_max and 0 &lt;= y &lt; y_max:
+        return grid[x][y] == 0
+    return False
+
+
+def pfind_new(grid, start, goal):
+    x_max, y_max = len(grid), len(grid[0])
+
+    # None will later be used as sentinel for "no node here (yet)"
+    nodes = make_grid(x_max, y_max, None)
+
+    start_node = Node(*start, cost=0, h=euclidean_distance(start, goal))
+    nodes[start_node.x][start_node.y] = start_node
+    goal_node = Node(*goal)
+    nodes[goal_node.x][goal_node.y] = goal_node
+
+    # openlist will be used a priority queue and has to be accessed using
+    # heappush and heappop from the heapq module. The Node class was modified
+    # to work well with this kind of datastructure.
+    openlist = []
+    heappush(openlist, start_node)
+
+    found = False
+    while not found:
+        # get the node with the least overall cost (actual + heuristic)
+        current = heappop(openlist)
+        for direction in DIRECTIONS:
+            # compute new coordinates
+            x_n, y_n = current.x + direction[0], current.y + direction[1]
+            if not is_valid(x_n, y_n, grid, x_max, y_max):
+                continue
+            # we have valid coordinates
+            if nodes[x_n][y_n] is None:
+                nodes[x_n][y_n] = Node(
+                    x_n, y_n, h=euclidean_distance((x_n, y_n), goal)
+                )
+            # the new cost is made up if the current cost + transition
+            new_cost = nodes[current.x][current.y].cost + direction[2]
+            if new_cost &lt; nodes[x_n][y_n].cost:
+                # cool, we have found a faster path to this node, let's update
+                # it's predecessor
+                nodes[x_n][y_n].update(current.pos, new_cost)
+                heappush(openlist, nodes[x_n][y_n])
+                if nodes[x_n][y_n] == goal_node:
+                    # we're done, get out of here
+                    found = True
+                    break
+        # openlist is empty and we have not bailed out with found. seems like
+        # there is nothing we can do here
+        if not openlist:
+            return []
+
+    # backtracking
+    path = []
+    current = goal_node
+    # this is a little bit weird because I decided to store only the
+    # coordinates instead of the parent itself. Why? Because repr(node) is way
+    #  more readable that way ;-)
+    while True:
+        path.append(current.pos)
+        if current.parent is not None:
+            current = nodes[current.parent[0]][current.parent[1]]
+        else:
+            break
+    # the path is built by backtracking from the goal, so we have to reverse it
+    return path[::-1]
+
+
+if __name__ == "__main__":
+    import timeit
+    grid = [[0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 1, 1, 1, 0],
+            [0, 0, 1, 0, 0, 0, 1, 0],
+            [0, 0, 1, 0, 0, 0, 1, 0],
+            [0, 0, 1, 1, 1, 1, 1, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 0]]
+
+    start = (0, 0)
+    goal = (4, 3)
+    t_start = timeit.default_timer()
+    path = pfind_new(grid, start, goal)
+    print(f"took: {timeit.default_timer() - t_start}")
+    assert path == [(0, 0), (1, 1), (2, 2), (3, 3), (4, 3)]
+</code></pre>
+    </div>

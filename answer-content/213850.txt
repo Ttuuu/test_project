@@ -1,0 +1,154 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>It seems to me that a whole lot of this is duplicating things that are already in the standard library (and many other libraries).</p>
+
+<p>It also seems to me like it does a lot of work to handle things that are more easily dealt with via a simple text editor. Just for example, if you want to add command aliases for bash, you don't feed some special command to bash to have it modify your <code>~/.bashrc</code>. Instead, you use a text editor of your choice to edit <code>~/.bashrc</code>, and then (most likely) re-source it to get bash to use it. I'd tend to do pretty much the same here--have the utility stick to expanding tags to directory names, and let the user edit tags with their normal text editor.</p>
+
+<p>Handling things that way, the code can be reduced to something on this general order:</p>
+
+<pre><code>#include &lt;map&gt;
+#include &lt;iomanip&gt;
+#include &lt;fstream&gt;
+#include &lt;unistd.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;iostream&gt;
+#include &lt;pwd.h&gt;
+
+static std::string get_home_dir() {
+    struct passwd* pw = getpwuid(getuid());
+    std::string name{pw-&gt;pw_dir}; 
+    return name;
+}
+
+// expand tilde, if needed. To be more thorough, consider using
+// wordexp(3) instead.
+std::string expand(std::string in) { 
+    std::string home = get_home_dir();
+
+    auto pos = in.find("~");
+    if (pos != std::string::npos) {
+        in.replace(pos, 1, home);
+    }
+    return in;
+}
+
+// Read tags from file. A tag must not contain white-space, and a "#" at the
+// beginning of a line signifies a comment.
+std::map&lt;std::string, std::string&gt; read_tags(std::string const &amp;filename) { 
+    std::ifstream in{expand(filename)};
+
+    std::string tag;
+    std::string path;
+    std::map&lt;std::string, std::string&gt; ret;
+
+    while (in &gt;&gt; tag) {
+        // I'm not sure if you supported comments in the tags file, but it 
+        // seems like a useful thing, and it's easy, so why not?
+        if (tag[0] == '#')
+            continue;
+        std::getline(in, path);
+        ret[tag] = path;
+    }
+    return ret;
+}
+
+void write_tags(std::map&lt;std::string, std::string&gt; const &amp;tags, std::string const &amp;filename) {     
+    std::ofstream out{expand(filename)};
+    for (auto const &amp;p : tags)
+        out &lt;&lt; p.first &lt;&lt; "\t" &lt;&lt; p.second &lt;&lt; "\n";
+}
+
+void chdir(std::string const &amp;s) {
+    // Here we write the shell script fragment to change directory
+    // For now I'm going to cheat and just print the command on standard output
+    std::cout &lt;&lt; "cd " &lt;&lt; expand(s) &lt;&lt; "\n";
+}
+
+int main(int argc, char **argv) { 
+    std::string config_path = "~/.path_tags";    
+
+    auto tags = read_tags(config_path);
+
+    std::string prev;
+    if (tags.find("prev") != tags.end()) 
+        prev = tags["prev"];
+
+    tags["prev"] = get_current_dir_name();
+
+    write_tags(tags, config_path);
+
+    if (argc == 1) {
+        if (!prev.empty())
+            chdir(prev);
+        else
+            std::cerr &lt;&lt; "No previous directory to switch to.";
+    }
+    else {
+        auto pos = tags.find(argv[1]);
+        if (pos != tags.end())
+            chdir(pos-&gt;second);
+    }
+}
+</code></pre>
+
+<h3>File Reading</h3>
+
+<p>This code:</p>
+
+<pre><code>while (!inputFileStream.eof() &amp;&amp; !inputFileStream.bad() &amp;&amp; !inputFileStream.fail()) {
+    inputFileStream.getline(lineBuffer, LINE_BUFFER_CAPACITY);
+</code></pre>
+
+<p>...is pretty much broken. In fact, nearly any loop of the form <code>while (!foo.eof())</code> is broken. You want to test the result of attempting to read the line instead:</p>
+
+<pre><code>while (inputFileStream.getline(lineBuffer, LINE_BUFFER_CAPACITY)) {
+    // process the data we just read        
+}
+</code></pre>
+
+<p>It's also generally easier to read the data into an <code>std::string</code> instead:</p>
+
+<pre><code>std::string lineBuffer;
+while (std::getline(lineBuffer)) {
+    // process the line
+}
+</code></pre>
+
+<h3>File I/O</h3>
+
+<p>Right now, you use not only iostreams, but (for no particularly obvious reason) in places use posix <code>creat</code>/<code>open</code> level functions as well. At least offhand, I don't see much reason for using both.</p>
+
+<h3>Tag File</h3>
+
+<p>Right now, you store the tags in a single global file that's shared across all users of the system. This doesn't seem like a great idea. I'd (strongly) prefer a per-user tag file (as in the code I've posted above).</p>
+
+<h3>default ctor</h3>
+
+<p>Right now, you've explicitly defined a default constructor for your <code>TagEntry</code> type:</p>
+
+<pre><code>TagEntry::TagEntry()
+    :
+    m_tag(""),
+    m_directory("") {
+
+}
+</code></pre>
+
+<p>When (as in this case) the compiler can generate an adequate ctor, it's generally preferable to let it do so, with a declaration like this:</p>
+
+<pre><code>TagEntry() = default;
+</code></pre>
+
+<p>In fact, at least at first glance, it looks like all of <code>TagEntry</code>'s ctors are doing pretty much what the compiler-generated ones would do if you didn't define any, so it's probably better to just not declare or define any at all (but as in the code above, I'd tend to just use a <code>map</code> or <code>unordered_map</code>, and skip creating a <code>TagEntry</code> class at all). Right now, <code>TagEntry</code> is pretty much a Quasi-class, that would work about as well as a struct:</p>
+
+<pre><code>struct TagEntry { 
+    std::string tag;
+    std::string directory;
+};
+</code></pre>
+
+<p>I'd say if you decide to keep it, at least keep it simple.</p>
+
+<p><strong>Reference</strong></p>
+
+<p><a href="https://www.idinews.com/quasiClass.pdf" rel="nofollow noreferrer">Pseudo-classes and Quasi-Classes</a></p>
+    </div>

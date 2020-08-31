@@ -1,0 +1,89 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Whether it makes sense to break this up is somewhat contextually dependent on whether you anticipate reusing this pattern elsewhere, IMO.  If it's a one-off it might be cleaner to simply do it in-place as in your first example; I don't think the second example is particularly easier to follow, since your <code>execute</code> method still contains a lot of logging-related code either way, and it has the undesirable side effect of adding more state to your object that could otherwise be locally scoped.</p>
+
+<p>However, if you do plan on reusing this logging logic, a neat way to separate its implementation details from the function that you're trying to log is putting it in a decorator:</p>
+
+<pre><code>import functools
+
+
+def logged(logger_name):
+    logger = logging.getLogger(logger_name)
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapped_func(self, *args, **kwargs):
+            start_time = time.time()
+            logger.debug("%s starting execution" % self)
+            ret = func(self, *args, **kwargs)
+            exec_time = time.time() - start_time
+            logger.debug(
+                "%s returned %s after %.4f seconds" % (self, ret, exec_time)
+            )
+            return ret
+        return wrapped_func
+    return decorator
+
+
+class HTTPRequest(object):
+    def __init__(self, url, method, **kwds):
+        self.logger = logging.getLogger(__name__)
+        self.url = url
+        self.method = method
+        self.request_kwds = kwds
+        self.logger.debug("Created instance %s" % self)
+
+    @logged(__name__)
+    def execute(self):
+        response = HTTPResponse(
+            request=self,
+            request_response=requests.request(
+                url=self.url,
+                method=self.method,
+                **self.request_kwds
+            )
+        )
+        response.raise_for_status()
+        return response
+</code></pre>
+
+<p>Now all of the logging logic is completely removed from the body of <code>execute</code>, and it lives in that one little <code>@logged</code> decoration, which you can reuse with any other method on any other object (note that the decorator is written to assume it's being applied to an instance method, because it uses a <code>self</code> parameter in its logging).  Note that it always measures the overall execution time of the decorated function starting before it's called and ending after it returns (I'm not sure if <code>raise_for_status()</code> blocks long enough for it to make a meaningful difference that the stopwatch ends after you return the response rather than after you create it).</p>
+
+<p>There are a lot of potential further directions to take this -- for example, you could create a logging superclass/mixin that also encapsulates the logging in <code>__init__</code>, or that handles logging-related state that needs to persist in between method calls (e.g. if you want to do any sort of aggregation), and thereby have the ability to make your logging significantly more sophisticated without exposing any of that complexity in the rest of your code.  So this approach scales in lots of interesting ways, but again, whether it's worthwhile depends on whether you actually need that scaling.</p>
+
+<p>Making all these things work in a thoroughly typesafe way is also doable but adds a decent amount of complexity that I won't even go into here.</p>
+
+<p>A simpler approach that's less extensible but sticks a lot closer to your original implementation while still getting most of the code out of <code>execute</code> would be to use a higher order function within the class (similar to the decorator approach but with less magic):</p>
+
+<pre><code>class HTTPRequest(object):
+    def __init__(self, url, method, **kwds):
+        self.logger = logging.getLogger(__name__)
+        self.url = url
+        self.method = method
+        self.request_kwds = kwds
+        self.logger.debug("Created instance %s" % self)
+
+    def measure_request_time(self, func, *args, **kwargs):
+        self.logger.debug("%s starting request" % self)
+        start_time = time.time()
+        ret = func(*args, **kwargs)
+        self.execution_time_seconds = time.time() - start_time
+        self.logger.debug(
+            "%s received response %s after %.4f seconds"
+            % (self, ret, self.execution_time_seconds)
+        )
+        return ret
+
+    def execute(self):
+        self.response = measure_request_time(
+            HTTPResponse,
+            request=self,
+            request_response=requests.request(
+                url=self.url,
+                method=self.method,
+                **self.request_kwds
+            )
+        )
+        self.response.raise_for_status()
+        return self.response
+</code></pre>
+    </div>

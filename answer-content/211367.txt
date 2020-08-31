@@ -1,0 +1,167 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>static_vector(const static_vector&amp; rhs)
+{
+    clear(); // Sets m_size to zero for safety
+    for (std::size_t pos = 0; pos &lt; rhs.m_size; ++pos)
+        m_data[pos] = rhs.m_data[pos];
+    m_size = rhs.m_size;
+}
+</code></pre>
+
+<p><code>clear()</code> is not needed (<code>m_size</code> is already zero because of the default member initializer). </p>
+
+<p><strong>bug:</strong> We are assigning to elements that haven't been constructed yet! We need to use placement new (either through the <code>emplace</code> function, or <code>std::uninitialized_copy_n</code>) to construct each element in place. The move constructor has the same issue.</p>
+
+<hr>
+
+<pre><code>static_vector(static_vector&amp;&amp; rhs)
+{
+    // Start by clearing sizes to avoid bad data
+    // access in the case of an exception
+    std::size_t count_self = m_size;
+    std::size_t count_rhs = rhs.m_size;
+    m_size = 0;
+    rhs.m_size = 0;
+
+    // Can't swap because the destination may be uninitialized
+    destroy_n(count_self);
+    for (std::size_t pos = 0; pos &lt; count_rhs; ++pos)
+        m_data[pos] = std::move(rhs.m_data[pos]);
+    m_size = count_rhs;
+}
+</code></pre>
+
+<p>Same issue as above (assignment to non-constructed elements).</p>
+
+<p>We could call <code>clear()</code> to set the size to zero and destroy the elements in <code>this</code>.</p>
+
+<p><strong>bug:</strong> It's incorrect to alter the size of <code>rhs</code> like this. Although we have moved from the <code>rhs</code> elements, they still "exist", and we need to call their destructors. (Note that unlike <code>std::vector</code>, <code>std::array</code> isn't empty after a "move").</p>
+
+<p>If we want <code>rhs</code> to be empty afterwards, we can call <code>rhs.clear()</code> after moving the elements.</p>
+
+<hr>
+
+<p>The copy / move construction / assignment can be simplified quite a bit:</p>
+
+<pre><code>static_vector(const static_vector&amp; rhs)
+{
+    std::uninitialized_copy(rhs.begin(), rhs.end(), begin());
+    m_size = rhs.m_size;
+}
+
+static_vector&amp; operator=(const static_vector&amp; rhs)
+{
+    clear();
+    std::uninitialized_copy(rhs.begin(), rhs.end(), begin());
+    m_size = rhs.m_size;
+    return *this;
+}
+
+static_vector(static_vector&amp;&amp; rhs)
+{
+    std::uninitialized_move(rhs.begin(), rhs.end(), begin());
+    m_size = rhs.m_size;
+}
+
+static_vector&amp; operator=(static_vector&amp;&amp; rhs)
+{
+    clear();
+    std::uninitialized_move(rhs.begin(), rhs.end(), begin());
+    m_size = rhs.m_size;
+    return *this;
+}
+</code></pre>
+
+<hr>
+
+<p>Swapping is never going to be fast because we're storing the elements on the stack, and have to swap them all in turn. We could write something with <code>std::swap_ranges</code>, and then <code>std::uninitialized_move</code> any extra elements if there's a size mismatch, but I'd probably just do this:</p>
+
+<pre><code>    // member function
+    void swap(static_vector&amp; rhs)
+    {
+        auto temp = std::move(*this);
+        *this = std::move(rhs);
+        rhs = std::move(temp);
+    }
+
+...
+
+// free function in the nonstd namespace
+template&lt;class T, std::size_t N&gt;
+void swap(static_vector&lt;T, N&gt;&amp; a, static_vector&lt;T, N&gt;&amp; b)
+{
+    a.swap(b);
+}
+</code></pre>
+
+<hr>
+
+<p>I think preventing copy and move (and not defining swap) on <code>aligned_storage_array</code> is fine.</p>
+
+<hr>
+
+<pre><code>inline T&amp; at(std::size_t pos)
+{
+    if ((pos &lt; 0) || (pos &gt;= m_size))
+    ...
+}
+</code></pre>
+
+<p><code>pos</code> is (correctly) unsigned, so <code>(pos &lt; 0)</code> isn't needed.</p>
+
+<p>Use the <code>size_type</code> typedef for the function argument (same with the other element access functions).</p>
+
+<p>There's no need to use the <code>inline</code> keyword for functions defined in a class body.</p>
+
+<hr>
+
+<pre><code>    inline iterator begin()                 { return &amp;m_data[0]; }
+    inline const_iterator begin()     const { return &amp;m_data[0]; }
+    inline iterator end()                   { return &amp;m_data[m_size]; }
+    inline const_iterator end()       const { return &amp;m_data[m_size]; }
+</code></pre>
+
+<p><strong>bug:</strong> This is undefined behaviour. The array elements at <code>[m_size]</code> or even <code>[0]</code> may not exist. (So the <code>std::array</code> implementation may sensibly throw or crash if we try to access them).</p>
+
+<p>We can fix this with:</p>
+
+<pre><code>    // in aligned_storage_array:
+    T* data()
+    {
+        return std::launder(
+            reinterpret_cast&lt;T*&gt;(m_data.data()));
+    }
+
+    T const* data() const
+    {
+        return std::launder(
+            reinterpret_cast&lt;T const*&gt;(m_data.data()));
+    }
+
+    ...
+
+    // in static_vector:
+    iterator begin()                 { return m_data.data(); }
+    const_iterator begin()     const { return m_data.data(); }
+    iterator end()                   { return m_data.data() + m_size; }
+    const_iterator end()       const { return m_data.data() + m_size; }
+</code></pre>
+
+<p>This gives us pointer access, which is what we need for iterators. As long as we only dereference pointers to valid elements, we avoid undefined behaviour (i.e. don't dereference <code>end()</code>, and only use <code>begin()</code> if <code>size()</code> isn't zero).</p>
+
+<hr>
+
+<pre><code>    template&lt;typename ...Args&gt;
+    inline T&amp; emplace_back(Args&amp;&amp;... args)
+    {
+        T&amp; result = m_data.bounded_emplace(m_size, args...);
+        ...
+    }
+</code></pre>
+
+<p>We should use <code>std::forward</code> here (it's correctly used in the <code>aligned_storage_array::emplace</code> functions).</p>
+
+<hr>
+
+<p>I'm really not very familiar with <code>std::launder</code>, so hopefully someone else can comment on that.</p>
+    </div>

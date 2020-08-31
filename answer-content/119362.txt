@@ -1,0 +1,133 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This is an interesting approach. I would have used a queue by default since it seems to express the semantics a bit clearer (the queuing is slightly more obvious). Also <code>ContinueWith</code> creates a <code>Task</code> wrapping the original task which I'm not sure if that has any form of performance downsides (it probably shouldn't). I hacked a quick benchmark together with the alternative being implemented using the <a href="https://msdn.microsoft.com/en-us/library/dd267312%28v=vs.110%29.aspx" rel="nofollow"><code>BlockingCollection</code></a>:</p>
+
+<pre><code>using System;
+using System.Diagnostics;
+using System.Threading.Tasks;
+using System.Threading;
+using System.Collections.Concurrent;
+
+public interface IAppendable
+{
+    void Append(Action action);
+}
+
+public class TaskGroup : IAppendable
+{
+    public int CurrentlyQueuedTasks { get { return _currentlyQueued; } }
+
+    private readonly object _previousTaskMonitor;
+    private Task _previousTask;
+    private int _currentlyQueued;
+
+    public TaskGroup()
+    {
+        _previousTaskMonitor = new object();
+        _previousTask = Task.FromResult(false);
+    }
+
+    public void Append(Action action)
+    {
+        lock(_previousTaskMonitor)
+        {
+            Interlocked.Increment(ref _currentlyQueued);
+            _previousTask = _previousTask.ContinueWith(task =&gt;
+            {
+                try
+                {
+                    action();
+                }catch(Exception)
+                {
+                    //TODO
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref _currentlyQueued);
+                }
+            });
+        }
+    }
+}
+
+public class QueueAppendable : IAppendable, IDisposable
+{
+    public int CurrentlyQueuedTasks { get { return _Queue.Count; } }
+
+    BlockingCollection&lt;Action&gt; _Queue = new BlockingCollection&lt;Action&gt;();
+
+    public QueueAppendable()
+    {
+        Task.Factory.StartNew(() =&gt;
+        {
+            while (true)
+            {
+                try 
+                {
+                    var action = _Queue.Take();
+                    action();
+                }
+                catch (InvalidOperationException)
+                {
+                    break;
+                }
+                catch
+                {
+                    // TODO log me
+                }
+            }
+        });
+    }
+
+    public void Append(Action action)
+    {
+        _Queue.Add(action);
+    }
+
+    public void Dispose()
+    {
+        _Queue.CompleteAdding();
+    }
+}
+
+public class Test
+{
+    public static void TimeIt(string name, IAppendable appendable)
+    {
+        var finishEvent = new ManualResetEvent(false);
+        var sw = new Stopwatch();
+        sw.Start();
+        for (int i = 0; i &lt; 2000; ++i)
+        {
+            appendable.Append(() =&gt; { Thread.Sleep(1); });
+        }
+        appendable.Append(() =&gt; { finishEvent.Set(); });
+        finishEvent.WaitOne();
+        sw.Stop();
+        Console.WriteLine("{0} elapsed time: {1}ms", name, sw.ElapsedMilliseconds);
+        (appendable as IDisposable)?.Dispose();
+    }
+
+    public static void Main()
+    {
+        TimeIt("TaskGroup", new TaskGroup());
+        TimeIt("Queue", new QueueAppendable());
+    }
+}
+</code></pre>
+
+<p>Output:</p>
+
+<pre><code>TaskGroup elapsed time: 2135ms
+Queue elapsed time: 2121ms
+</code></pre>
+
+<p>So there is pretty much no performance difference between the two however I think the <code>BlockingCollection</code> approach has a few advantages:</p>
+
+<ol>
+<li>Easier to debug. You can simply set a break point and peek the queue. This is quite difficult to do with the wrapped task approach.</li>
+<li>No use use of lower level synchronization primitives. The first time I read your code I instinctively thought "Hang he's got a <code>lock</code> why the <code>Interlocked</code> calls" until I realized that the decrement happen in the async task outside of the lock. With the <code>BlockingQueue</code> you program against a slightly higher level of abstraction which is often a good thing.</li>
+<li>Fewer class members which reduce the state complexity of the object (the queue is the only member).</li>
+</ol>
+
+<p>Apart from that I think your approach should be fine. You may want to consider adding support for cancellation via <a href="https://msdn.microsoft.com/en-us/library/system.threading.cancellationtoken%28v=vs.110%29.aspx" rel="nofollow"><code>CancellationToken</code></a></p>
+    </div>

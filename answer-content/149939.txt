@@ -1,0 +1,102 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>Comments</h3>
+
+<p>Let's consider one of your constructors, and its accompanying comment:</p>
+
+<pre><code>string(const char * p, size_t size) : m_size(size) { //default constructor
+</code></pre>
+
+<p>At least in my opinion, this has at least two obvious problems. This first problem is that the comment is just wrong. A default constructor is one that can be invoked without supplying any arguments. In this case, two arguments must be supplied, so it's not a default ctor.</p>
+
+<p>The second problem is almost simpler. As it stands right now, the comment is pointless. If the comment were corrected (or the code changed so it really was a default constructor), it would still wouldn't give any useful information. It's just telling me what's already obvious from the function's parameter list--it's a default ctor if and only if it can be invoked without supplying any arguments.</p>
+
+<p>Comments should convey information that's <em>not</em> immediately obvious from the code itself. Most often, this is things like <em>why</em> you wrote the code the way it is.</p>
+
+<p>The same applies to most of the other comments as well--everything they try to convey is either wrong or obvious (or, as above, both).</p>
+
+<h3>Non-templated string type</h3>
+
+<p>The days of strings supporting only <code>char</code> as the data type are (IMO) long past. Whether you like Unicode or not, it's better to support it (and for a string, it's much cleaner to manipulate UTF-32 than UTF-8).</p>
+
+<h3>Array <code>new</code></h3>
+
+<p>The array form of <code>new</code> should generally be avoided. In the <em>specific</em> case of <code>char</code> (or <code>unsigned char</code>) it's marginally less evil than usual, but I'd advise avoiding it in general. For containers (and IMO, <code>string</code> is a container) you want to use <code>operator new</code> to allocate "raw" memory, then use placement new to construct objects in that raw memory. It's kind of overkill in the specific case of <code>char</code>, but at worst it's harmless, and at best it's a drastic improvement (it leaves the unused part of the memory as raw memory, where <code>new []</code> always creates objects in all the memory you allocate).</p>
+
+<h3><code>operator+</code></h3>
+
+<p>I'm not particularly fond of your current implementation of <code>operator+</code>. It works, but (IMO) is fairly easy for somebody to misinterpret in subtle ways that could lead to problems down the road.</p>
+
+<p>I'd do pretty much the same things, but split it into smaller pieces that made the intent a little more obvious:</p>
+
+<pre><code>string operator+(const string &amp; str) const {
+    string r(*this);
+    r += str;
+    return r;
+}
+</code></pre>
+
+<p>I'd have to think things through in detail to be sure, there's at least a reasonable chance that this is actually more efficient. In particular, it allows copy elision of the return value, where casting to an rvalue (whether done explicitly or in the form of <code>std::move</code>) can inhibit that.</p>
+
+<h3>Alternative Rule</h3>
+
+<p>In most case, you want to follow the <a href="https://rmf.io/cxx11/rule-of-zero" rel="nofollow noreferrer">rule of zero</a> rather than the rule of five. In simple form, this says you should delegate essentially all the resource management to a class (most often <code>unique_ptr</code> or <code>shared_ptr</code>) devoted solely to that purpose, so your class only needs to deal with whatever it's really supposed to do. In the case of a (non-COW) string, each string representation has only a single owner, so this should be <code>std::unique_ptr</code>.</p>
+
+<h3>Copy assignment</h3>
+
+<p>Your current copy assignment operator isn't safe in the face of exceptions. Right now you have a sequence of deleting the existing data, <em>then</em> allocating new space, and then copying the new data into the new space. If (for example) that <code>new</code> throws an exception, your string won't contain either the old data or the new data. Since it's a constructed string, its destructor will execute when that scope is exited. That will attempt to delete the buffer pointed to by its <code>data</code>--which you just deleted, so you get a double delete, giving undefined behavior.</p>
+
+<p>One easy way to get defined behavior is the copy and swap idiom, which could look something like this:</p>
+
+<pre><code>string&amp; operator=(string str) {
+    std::cout &lt;&lt; "Copy assignment\n";
+    using std::swap;
+    swap(data, str.data);
+    swap(m_size, str.m_size);
+    return *this;
+}
+</code></pre>
+
+<p>Since we pass the parameter by value, the copy constructor is invoked to create a string for the parameter. We then essentially do a move from there to the target. To keep things as simple as possible, we swap the guts of the two strings, so when the function returns, the parameter goes out of scope, and gets destroyed automatically.</p>
+
+<p>In this case, the allocation happens in the ctor, so if it throws, this function is never invoked at all. The function itself contains only operations that we know can't throw, so we don't have to worry about what would happen if an exception were thrown in the middle of it.</p>
+
+<p>This isn't the only possible way, of course, but it's one way that's pretty easy to get right. More important, perhaps, is establishing the basic pattern:</p>
+
+<p>Phase 1: carry out things that might throw, but don't affect any existing data if they do.
+Phase 2: carry out operation that affect existing data, but can't throw.</p>
+
+<p>This way, if anything throws, Phase 2 never happens at all, so existing data can never be affected. If phase 2 starts, it always executes completely. Therefore, we always get either the state from before we started this operation at all, or else the state after it finished completely. The outside world will never see an intermediate state.</p>
+
+<p>Of course, move assignment can be handled much the same way, except taking an rvalue reference as the parameter. We can still swap the "guts" of the current string with those of the parameter, and then let the dtor take care of destroying the parameter when it goes out of scope:</p>
+
+<pre><code>string&amp; operator=(string &amp;&amp; str) {
+    std::cout &lt;&lt; "Move assignment\n";
+    using std::swap;
+    swap(data, str.data);
+    swap(m_size, str.m_size);
+    return *this;
+}
+</code></pre>
+
+<h3>Use of <code>strcat</code></h3>
+
+<p>As it stands right now, I'd call your use of <code>strcat</code> (e.g., in <code>operator+=</code>) basically a bug. To use <code>strcat</code>, you'd need to guarantee that every string contains exactly one NUL character at its very end.</p>
+
+<p>As it stands now, a string can be created that contains NUL characters in its middle. A string can also be created that doesn't contain any NUL character at its end.</p>
+
+<p>To work correctly, you could use <code>memcpy</code> for both operations:</p>
+
+<pre><code>string&amp; operator+=(const string &amp; str) {
+    size_t new_size = m_size + str.m_size;
+    char * new_data = new char[new_size];
+    mempy(new_data, data, m_size); 
+    memcpy(new_data+m_size, str.data, str.m_size); 
+    delete[] data;
+    m_size = new_size;
+    data = new_data;
+    return *this;
+}
+</code></pre>
+
+<p>Note that your use of <code>memmove</code> would work correctly, but was overkill. <code>memmove</code> guarantees correct behavior even if the old and new locations might overlap. To do that, it has to check for overlap, and copy from beginning to end for overlap in one direction, and end to beginning for overlap in the other direction. In this case, we know there will never be any overlap, so we can use <code>memcpy</code> which only supports non-overlapping buffers (so it avoids checking for overlap).</p>
+    </div>

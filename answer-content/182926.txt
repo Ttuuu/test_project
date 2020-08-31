@@ -1,0 +1,249 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'd highly recommend you use <a href="https://docs.python.org/3/library/collections.html#collections.namedtuple" rel="nofollow noreferrer"><code>collections.namedtuple</code></a>. Or since you're using <code>typing</code>, <a href="https://docs.python.org/3/library/typing.html#typing.NamedTuple" rel="nofollow noreferrer"><code>typing.NamedTuple</code></a>. If we change <code>TioFile</code> to use this, then we'll get:</p>
+
+<pre><code>_TioFile = NamedTuple(
+    '_TioFile',
+    [
+        ('name', AnyStr),
+        ('content', bytes)
+    ]
+)
+
+
+class TioFile(_TioFile):
+    def get_name(self):
+        # type: () -&gt; AnyStr
+        return self.name
+
+    def get_content(self):
+        # type: () -&gt; bytes
+        return self.content
+</code></pre>
+
+<p>From this, we know that <code>get_name</code> and <code>get_content</code> are actual not needed, and promote WET. Write it once for the property, once again for the method. And goes against <a href="https://www.python.org/dev/peps/pep-0020/" rel="nofollow noreferrer">PEP 20</a>:</p>
+
+<blockquote>
+  <p>There should be one-- and preferably only one --obvious way to do it.</p>
+</blockquote>
+
+<p>And so I'd also change the following classes to use <code>NamedTuple</code>.</p>
+
+<ul>
+<li><code>TioVariable</code> can easily be changed to use <code>NamedTuple</code>, I would also remove the <code>get_*</code> parts as highlighted above.</li>
+<li><code>TioResult</code> requires an <code>EMPTY</code> variable bound to the class. It should also have <code>output</code> and <code>debug</code> set to <code>EMPTY</code> by default. If we were 3.6.1 this would be super simple, as it allows setting default values. However as we have to support Python 2.7, it's simpler to just add a static method <code>new</code> that does this for you.</li>
+<li><code>TioResponse</code> requires a static method say <code>from_raw</code>, that contains the old <code>__init__</code> and should convert <code>result</code> and <code>error</code> to be decoded. This is as wrapping <code>__new__</code> is a little messy, and PyCharm complains a lot.</li>
+</ul>
+
+<hr>
+
+<p>As I don't really want to look at <code>Tio</code>, this leaves <code>TioRequest</code>. Which I'd change:</p>
+
+<ul>
+<li>You can use <code>self.set_code</code> rather than <code>self.add_file_bytes('.code.tio', code)</code>.</li>
+<li>I wouldn't use <code>self._bytes</code> as that means it will duplicate the state of <code>TioRequest</code> if you ever call <code>as_bytes</code> twice. Instead just make it a local variable in <code>as_bytes</code>.</li>
+<li>I would move <code>write_variable</code> and <code>write_file</code> onto <code>TioVariable</code> and <code>TioFile</code> respectively, as <code>as_byte</code>.</li>
+<li>I would add a function <code>bytes_</code> that in Python 3 is <code>functools.partial(bytes, encoding='utf-8')</code>, and in Python 2 is <code>bytes</code>. This can greatly simplify <code>write_variable</code> and <code>write_file</code>.</li>
+<li>I would move the <code>if content</code> out of <code>write_variable</code> into <code>as_bytes</code>.</li>
+<li>I would change <code>platform.python_version() &lt; '3.0'</code> to be inverted, as then you can group all the <code>len(content)</code>s together.</li>
+<li>I would use <code>str.format</code>, rather than string concatenation in both <code>write_variable</code> and <code>write_file</code>.</li>
+</ul>
+
+<p>And so I'd change your code to:</p>
+
+<p><code>pytio/_TioObjects.py</code>:</p>
+
+<pre><code># coding=utf-8
+
+from typing import NamedTuple, AnyStr, Union, List, Optional, Any
+import platform
+import functools
+
+if platform.python_version() &gt;= '3.0':
+    bytes_ = functools.partial(bytes, encoding='utf-8')
+else:
+    bytes_ = bytes
+
+
+_TioFile = NamedTuple(
+    '_TioFile',
+    [
+        ('name', AnyStr),
+        ('content', bytes)
+    ]
+)
+_TioVariable = NamedTuple(
+    '_TioVariable',
+    [
+        ('name', AnyStr),
+        ('content', Union[List[AnyStr], AnyStr])
+    ]
+)
+_TioResult = NamedTuple(
+    '_TioResult',
+    [
+        ('output', Union[AnyStr, object]),
+        ('debug', Union[AnyStr, object])
+    ]
+)
+_TioResponse = NamedTuple(
+    '_TioResponse',
+    [
+        ('code', Union[AnyStr, int]),
+        ('result', Union[AnyStr, None]),
+        ('error', Union[AnyStr, None]),
+        ('raw', Any)
+    ]
+)
+
+
+class TioFile(_TioFile):
+    def as_bytes(self):
+        # type: () -&gt; bytes
+        content = self.content
+        if platform.python_version() &gt;= '3.0' and isinstance(content, str):
+            length = len(content.encode('utf-8'))
+        elif isinstance(content, (str, bytes, bytearray)):
+            length = len(content)
+        else:
+            raise ValueError("Can only pass UTF-8 strings or bytes at this time.")
+
+        return bytes_(
+            'F{name}\x00{length}\x00{content}\x00'
+                .format(
+                    name=self.name,
+                    length=length,
+                    content=self.content
+                )
+            )
+
+
+class TioVariable(_TioVariable):
+    def as_bytes(self):
+        # type: () -&gt; bytes
+        return bytes_(
+            'V{name}\x00{length}\x00{content}\x00'
+                .format(
+                    name=self.name,
+                    length=len(self.content.split(' ')),
+                    content=self.content
+                )
+            )
+
+
+class TioResult(_TioResult):
+    EMPTY = object()
+
+    @staticmethod
+    def new(output=EMPTY, debug=EMPTY):
+        # type: (Optional[Union[AnyStr, object]], Optional[Union[AnyStr, object]]) -&gt; TioResult
+        return TioResult(output, debug)
+
+
+class TioResponse(_TioResponse):
+    @staticmethod
+    def from_raw(code, data=None, error=None):
+        # type: (Union[int, AnyStr], Optional[Any], Optional[Any]) -&gt; TioResponse
+        if data is None:
+            splitdata = [None, error]
+        else:
+            splitdata = data.split(data[:16])
+
+        if not splitdata[1] or splitdata[1] == b'':
+            error = b''.join(splitdata[2:])
+            result = None
+        else:
+            error = None
+            result = splitdata[1]
+
+        if result is not None:
+            result = result.decode('utf-8')
+
+        if error is not None:
+            error = error.decode('utf-8')
+        return TioResponse(code, result, error, data)
+</code></pre>
+
+<p><code>pytio/_TioRequest.py</code>:</p>
+
+<pre><code># coding=utf-8
+
+import zlib
+from typing import List, AnyStr, Union
+from ._TioObjects import TioFile, TioVariable
+
+
+class TioRequest:
+    def __init__(self, lang=None, code=None):
+        # type: (AnyStr, Union[AnyStr, bytes]) -&gt; None
+        self._files = []
+        self._variables = []
+
+        if lang:
+            self.set_lang(lang)
+
+        if code:
+            self.set_code(code)
+
+    def add_file(self, file):
+        # type: (TioFile) -&gt; None
+        if file in self._files:
+            self._files.remove(file)
+        self._files.append(file)
+
+    def add_file_bytes(self, name, content):
+        # type: (AnyStr, bytes) -&gt; None
+        self._files.append(TioFile(name, content))
+
+    def set_code(self, code):
+        # type: (AnyStr) -&gt; None
+        self.add_file_bytes('.code.tio', code)
+
+    def set_input(self, input_data):
+        # type: (AnyStr) -&gt; None
+        self.add_file_bytes('.input.tio', input_data.encode('utf-8'))
+
+    def add_variable(self, variable):
+        # type: (TioVariable) -&gt; None
+        self._variables.append(variable)
+
+    def add_variable_string(self, name, value):
+        # type: (AnyStr, Union[List[AnyStr], AnyStr]) -&gt; None
+        self._variables.append(TioVariable(name, value))
+
+    def set_lang(self, lang):
+        # type: (AnyStr) -&gt; None
+        self.add_variable_string('lang', lang)
+
+    def set_compiler_flags(self, flags):
+        # type: (AnyStr) -&gt; None
+        self.add_variable_string('TIO_CFLAGS', flags)
+
+    def set_commandline_flags(self, flags):
+        # type: (AnyStr) -&gt; None
+        self.add_variable_string('TIO_OPTIONS', flags)
+
+    def set_arguments(self, args):
+        # type: (AnyStr) -&gt; None
+        self.add_variable_string('args', args)
+
+    def as_bytes(self):
+        # type: () -&gt; bytes
+        bytes_ = bytes()
+        try:
+            for var in self._variables:
+                if var.content:
+                    bytes_ += var.as_bytes()
+            for file in self._files:
+                bytes_ += file.as_bytes()
+            bytes_ += b'R'
+        except IOError:
+            raise RuntimeError("IOError generated during bytes conversion.")
+        return bytes_
+
+    def as_deflated_bytes(self):
+        # type: () -&gt; bytes
+        # This returns a DEFLATE-compressed bytestring, which is what TIO.run's API requires for the request
+        # to be proccessed properly.
+        return zlib.compress(self.as_bytes(), 9)[2:-4]
+</code></pre>
+    </div>

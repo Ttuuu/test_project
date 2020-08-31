@@ -1,0 +1,112 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2><code>Monitor.IsEntered</code></h2>
+
+<p>This call basically makes no sense. <a href="https://docs.microsoft.com/en-us/dotnet/api/system.threading.monitor.isentered?view=netframework-4.7.2" rel="noreferrer"><code>Monitor.IsEntered</code></a> is used for coordination/mutual exclusion between threads. There are no threads here, and even if there were, there is no reason to lock on <code>i</code>: it is a counter. It isn't even a meaningful target for <code>Monitor.IsEntered</code> because it isn't an object.</p>
+
+<p>There is no apparently threading going on here, so you can confidently remove <em>all</em> the locking stuff (including <code>Interlocked.Increment</code>). This may noticeably improve performance, since <code>Monitor.IsEntered</code> is non-trivial, and the call will incur boxing (so at worse this will improve the memory characteristics of your code).</p>
+
+<p>If, for some reason, you are reading <code>i</code> from a different thread while the flood-fill is running, then you <em>might</em> want to use <code>Interlocked</code> methods to provide some notion of up-to-dateness.... but unless you are using that low-latency synchronisation (in which case it is a bad choice for doing so) you won't in practice need any manual memory barriers here. If it is not the case that you want to access <code>i</code> before this has finished then keep track of it as a 'normal' variable, and then set it as <code>out</code> at the end (if it is needed at all). <code>out</code> parameters can be abused, and may interfere with the compilers ability to perform optimisations.</p>
+
+<h2><code>100000</code></h2>
+
+<p>What is this?</p>
+
+
+
+<pre class="lang-cs prettyprint-override"><code>if (i &gt; 100000)
+    break;
+</code></pre>
+
+<p>This is a magic number threshold. This says "if I happen to look at some mysterious number of entries, then I will give up and provide a mangled result". This is <em>terrible</em>, especially so because it isn't documented. If you want a cut-out, then have the threshold passed as a parameter, and document it in the inline documentation. It's good that you <em>have</em> inline documentation, but it isn't very helpful at the moment, failing to explain what any of the parameters are beyond suggesting that <code>target</code> will be 'replaced' (what does that mean?).</p>
+
+<p>Furthermore, if it <em>does</em> cut out, then the consumer should be informed. You could throw a <code>FloodfillCutoffException</code>, or return a <code>bool</code> indicating that it did not complete, or something else.</p>
+
+<h2><code>HashSet</code>/<code>Stack</code></h2>
+
+<p>You should probably be using a <code>Stack</code>. <code>HashSet.Contain</code> is efficient (for what it does), but you don't need it. <em>(This is assuming that <code>target.Equals(replacement)</code> is always <code>false</code>, but if that isn't the case then your code is broken anyway, because it doesn't keep track of pixels it has dequeued)</em></p>
+
+<p>Excepting the first pixel, if you set <code>source[targetIndex] = replacement</code> when you queue it then you don't need to check if it is already in the <code>HashSet</code>: you only need to check that <code>source[targetIndex].Equals(target)</code>, which you have to do anyway. The probably with your non-<code>HashSet</code> code wasn't the <code>Stack</code>, it was how you were using it.</p>
+
+<p>With a stack, the code will look mostly the same, only you'll be <code>Pop</code>ing from the stack (instead of using <code>First()</code> and <code>Remove(T)</code>. It should be much faster, because it doesn't lean on <code>HashSet</code>, which while being 'kind of <code>O(1)</code>' isn't going to outperform a single array lookup which probably needs to be done anyway.</p>
+
+<h2>Indexing</h2>
+
+<p>I'm guessing <code>Pn</code> is static, and looks something like this:</p>
+
+<pre class="lang-cs prettyprint-override"><code>static int Pn(int x, int y, int width =&gt; x + y * width;
+</code></pre>
+
+<h2><code>IEquatable&lt;T&gt;</code></h2>
+
+<p>It's good that you are using this.</p>
+
+<h2>Naming</h2>
+
+<p>Most of the names are cryptic. This is not ideal. It isn't clear why you use <code>P</code> rather than <code>Pn</code>. <code>i</code> and <code>_i</code> are completely unrelated (and both poor names). <code>target</code> and <code>targetIndex</code> are mostly unrelated.</p>
+
+<h2>Code</h2>
+
+<p>Here is a (completely untested) rework of your code I threw together in a hurry incorporating some of the points above, with some added comments.</p>
+
+<pre class="lang-cs prettyprint-override"><code>public static void FloodFill&lt;T&gt;(this T[] source, int x, int y, int width, int height, T target, T replacement, int cutoff, out int explored)
+    where T : IEquatable&lt;T&gt;
+{
+    // code can't handle this, so throw
+    if (target.Equals(replacement))
+    {
+        throw new ArgumentException("Target and Replacement cannot equate");
+    }
+
+    // do start manually, and exit quickly if appropriate
+    int start = P(x, y, width, height);
+    if (!source[start].Equals(target))
+    {
+        explored = 0;
+        return;
+    }
+
+    // stack is not a great name, but I'm in a hurry right now...
+    Stack&lt;int&gt; stack = new Stack&lt;int&gt;();
+    stack.Push(start);
+
+    int count = 1;
+    while (queue.Count &gt; 0)
+    {
+        int _i = stack.Pop(),
+            _x = _i % width,
+            _y = _i / width;
+
+        for (int offsetX = -1; offsetX &lt; 2; offsetX++)
+            for (int offsetY = -1; offsetY &lt; 2; offsetY++)
+            {
+                // do not check origin or diagonal neighbours
+                if (offsetX == 0 &amp;&amp; offsetY == 0 || offsetX == offsetY || offsetX == -offsetY || -offsetX == offsetY)
+                    continue;
+
+                int targetIndex = Pn(_x + offsetX, _y + offsetY, width); // This is already inverted that's why we don't use F.P(...)
+                int _tx = targetIndex % width,
+                    _ty = targetIndex / width;
+
+                // skip out of bounds point
+                if (_tx &lt; 0 || _ty &lt; 0 || _tx &gt;= width || _ty &gt;= height)
+                    continue;
+
+                // if pixel matched target, reset it and queue
+                if (source[targetIndex].Equals(target))
+                {
+                    source[targetIndex] = replacement;
+
+                    stack.Push(targetIndex);
+                    count++;
+                }
+            }
+
+        if (i &gt; cutoff)
+            throw new Exception("FloodFill passed cutoff");
+    }
+
+    // report the number of cells explored
+    explored = count;
+}
+</code></pre>
+    </div>

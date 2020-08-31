@@ -1,0 +1,192 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>Reply to self: an improved version</h3>
+
+<p>Here's an improved version for anyone who's interested. I managed to simplify it in lots of ways. Many suggestions from the answer were implemented, but I decided to keep the class form. Most notably I decided to ditch the assertion that the first axis should have length 1, allowing for a more general encoding scheme (still only the last axis encoded though).</p>
+
+<pre><code>class OneHotEncoder:
+    """
+    Simple one-hot encoder.
+
+    Does not handle unseen categories: will default to the first category.
+    Does not invert all-zero arrays: will default to the first category.
+    Does not handle nan data.
+    """
+    def __init__(self):
+        self._categories = None
+
+    @property
+    def categories(self) -&gt; np.ndarray:
+        if self._categories is None:
+            raise ValueError('Encoder not fitted!')
+        return self._categories
+
+    @categories.setter
+    def categories(self, categories) -&gt; None:
+        self._categories = categories
+
+    @property
+    def n_features(self) -&gt; int:
+        return len(self.categories)
+
+    def fit(self, categories: np.ndarray) -&gt; None:
+        self.categories = np.unique(categories)
+
+    def transform(self, samples: np.ndarray) -&gt; np.ndarray:
+        return self.transform_from_labels(self.transform_to_labels(samples))
+
+    def transform_to_labels(self, samples: np.ndarray) -&gt; np.ndarray:
+        arr = np.argwhere(self.categories == samples.reshape(-1, 1))
+        labels = np.zeros((samples.size,), dtype=int)
+        labels[arr[:, 0]] = arr[:, 1]
+        return labels.reshape(samples.shape)
+
+    def transform_from_labels(self, labels: np.ndarray) -&gt; np.ndarray:
+        return np.eye(self.n_features)[labels]
+
+    def inverse_from_labels(self, labels: np.ndarray) -&gt; np.ndarray:
+        return self.categories[labels]
+
+    @staticmethod
+    def inverse_to_labels(encoded: np.ndarray) -&gt; np.ndarray:
+        return np.argmax(encoded, axis=-1)
+
+    def inverse(self, encoded: np.ndarray) -&gt; np.ndarray:
+        return self.inverse_from_labels(self.inverse_to_labels(encoded))
+</code></pre>
+
+<p>Next I made a subclass for some more demanding tasks.</p>
+
+<pre><code>class NanHotEncoder(OneHotEncoder):
+    """
+    Extension to the simple OneHotEncoder.
+
+    Does handle NaN data, ignores unseen categories (all zero) and inverts all zero rows.
+    Only accepts and returns 1-dimensional data (pd.Series) as samples (categories).
+    """
+    def __init__(self):
+        super().__init__()
+
+    @staticmethod
+    def _mask_assign(shape: tuple, mask: np.ndarray, values: np.ndarray, init: float=np.nan) -&gt; np.ndarray:
+        array = np.full(shape, init)
+        array[mask] = values
+        return array
+
+    def transform_from_labels(self, labels: np.ndarray) -&gt; np.ndarray:
+        nans = np.isnan(labels)
+        encoded = super(NanHotEncoder, self).transform_from_labels(labels[~nans].astype(int))
+        return self._mask_assign(labels.shape + (self.n_features,), ~nans, encoded, init=0)
+
+    def inverse_to_lables(self, encoded: np.ndarray) -&gt; np.ndarray:
+        nans = np.sum(encoded, axis=-1) == 0
+        inverted = super(NanHotEncoder, self).inverse_to_labels(encoded[~nans].astype(int))
+        return self._mask_assign(encoded.shape[:-1], ~nans, inverted)
+
+    def transform_to_labels(self, samples: pd.Series) -&gt; np.ndarray:
+        mask = samples.isnull() | ~samples.isin(self.categories)
+        labels = super(NanHotEncoder, self).transform_to_labels(samples[~mask].values)
+        return self._mask_assign(samples.values.shape, ~mask.values, labels)
+
+    def inverse_from_labels(self, labels: np.ndarray) -&gt; pd.Series:
+        series = pd.Series(labels.ravel())
+        inverted = super(NanHotEncoder, self).inverse_from_labels(series.dropna().values.astype(int))
+        series[~series.isnull()] = inverted
+        return series
+
+    def transform(self, samples: pd.Series) -&gt; np.ndarray:
+        return self.transform_from_labels(self.transform_to_labels(samples))
+
+    def inverse(self, encoded: np.ndarray) -&gt; pd.Series:
+        return self.inverse_from_labels(self.inverse_to_labels(encoded))
+</code></pre>
+
+<p>Here's also a basic test suite to validate the functionality.</p>
+
+<pre><code>import unittest
+from encoders import OneHotEncoder, NanHotEncoder
+
+import numpy as np
+import pandas as pd
+
+
+def array_equal(a: np.ndarray, b: np.ndarray) -&gt; np.ndarray:
+    return (a == b) | ((a != a) &amp; (b != b))
+
+
+class TestOneHotEncoder(unittest.TestCase):
+    str_categories = np.array(['a', 'b', 'c', 'd'])
+
+    def setUp(self):
+        self.oh = OneHotEncoder()
+        self.oh.fit(self.str_categories)
+
+    def test_fit(self):
+        self.assertTrue(np.all(self.str_categories == self.oh.categories))
+
+    def test_transform_to_labels(self):
+        samples = np.array([[['a', 'c'], ['b', 'c']], [['d', 'd'], ['a', 'd']]])
+        result = np.array([[[0, 2], [1, 2]], [[3, 3], [0, 3]]])
+        self.assertTrue(np.all(self.oh.transform_to_labels(samples) == result))
+
+    def test_transform_from_labels(self):
+        labels = np.array([[0, 2], [1, 3]])
+        result = np.array([[[1, 0, 0, 0], [0, 0, 1, 0]], [[0, 1, 0, 0], [0, 0, 0, 1]]])
+        self.assertTrue(np.all(self.oh.transform_from_labels(labels) == result))
+
+    def test_inverse_from_labels(self):
+        labels = np.array([[[0, 2], [1, 2]], [[3, 3], [0, 3]]])
+        result = np.array([[['a', 'c'], ['b', 'c']], [['d', 'd'], ['a', 'd']]])
+        self.assertTrue(np.all(self.oh.inverse_from_labels(labels) == result))
+
+    def test_inverse_to_labels(self):
+        encoded = np.array([[[1, 0, 0, 0], [0, 0, 1, 0]], [[0, 1, 0, 0], [0, 0, 0, 1]]])
+        result = np.array([[0, 2], [1, 3]])
+        self.assertTrue(np.all(self.oh.inverse_to_labels(encoded) == result))
+
+
+class TestNanHotEncoder(unittest.TestCase):
+    categories = np.array(['a', 'b', 'c', 'd'])
+
+    def setUp(self):
+        self.nh = NanHotEncoder()
+        self.nh.fit(self.categories)
+
+    def test_transform_to_labels(self):
+        samples = pd.Series(['a', 'c', np.nan, 'c', 'd', np.nan, 'a', 'd'])
+        result = np.array([0, 2, np.nan, 2, 3, np.nan, 0, 3])
+        self.assertTrue(np.all(array_equal(self.nh.transform_to_labels(samples), result)))
+
+    def test_transform_from_labels(self):
+        labels = np.array([[0, np.nan], [np.nan, 3]])
+        result = np.array([[[1, 0, 0, 0], [0, 0, 0, 0]], [[0, 0, 0, 0], [0, 0, 0, 1]]])
+        self.assertTrue(np.all(array_equal(self.nh.transform_from_labels(labels), result)))
+
+    def test_inverse_from_labels(self):
+        labels = np.array([0, 2, np.nan, 2, 3, np.nan, 0, 3])
+        result = pd.Series(['a', 'c', np.nan, 'c', 'd', np.nan, 'a', 'd'])
+        self.assertTrue(self.nh.inverse_from_labels(labels).equals(result))
+
+    def test_inverse_to_labels(self):
+        encoded = np.array([[[1, 0, 0, 0], [0, 0, 0, 0]], [[0, 0, 0, 0], [0, 0, 0, 1]]])
+        result = np.array([[0, np.nan], [np.nan, 3]])
+        self.assertTrue(np.all(array_equal(self.nh.inverse_to_lables(encoded), result)))
+
+    def test_novel_classes(self):
+        samples = pd.Series(['a', 'f', np.nan, 'd'])
+        result = np.array([[1, 0, 0, 0], [0, 0, 0, 0],  [0, 0, 0, 0], [0, 0, 0, 1]])
+        self.assertTrue(np.all(array_equal(self.nh.transform(samples), result)))
+
+
+if __name__ == '__main__':
+    oh_test = TestOneHotEncoder()
+    nh_test = TestNanHotEncoder()
+    test = unittest.TestSuite()
+    test.addTests([oh_test, nh_test])
+    res = unittest.TestResult()
+    test.run(res)
+</code></pre>
+
+<p>This was a great learning experience. It's still not finished though. It'd be nice to be able to handle the general n-dimensional or at least the common 2D case with the NanHotEncoder as well. But time will tell, perhaps I'll edit this answer.</p>
+
+<p>Cheers!</p>
+    </div>

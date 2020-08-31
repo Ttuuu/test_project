@@ -1,0 +1,125 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>Review</h3>
+
+<ul>
+<li>re-organize your code to avoid redundant code segments <code>underlyingNullableType ?? type</code> or <code>DBNull.Value</code> checks</li>
+<li>I just found out you have a <a href="https://codereview.stackexchange.com/questions/74637/conversion-helper-with-support-for-enumerations-and-nullablet-the-remix">follow-up question</a>: pitty I didn't notice it before :) That one is also review-worthy / can be improved</li>
+</ul>
+
+<h3>Bugs</h3>
+
+<ul>
+<li><code>if (!Enum.IsDefined(..</code> should not be called. <a href="https://social.msdn.microsoft.com/Forums/vstudio/en-US/66ac3c72-6af1-4967-afd3-734980adde9a/why-is-a-non-defined-enum-value-allowed?forum=netfxbcl" rel="nofollow noreferrer">Microsoft Policy: Why is a non defined enum value allowed</a></li>
+<li>Your method throws an <code>ArgumentException</code> when dealing with enums with different underlying types</li>
+</ul>
+
+<p>Additional reason why you can't use <code>Enum.IsDefined</code>: suppose we have the following enum..</p>
+
+<pre><code>[Flags]
+enum A : uint
+{
+    None = 0,
+    X = 1,
+    Y = 2
+}
+</code></pre>
+
+<p>Conversion fails because of not defined, even though <code>A.X | A.Y</code> is perfectly valid.</p>
+
+<h3>Refactored code</h3>
+
+<p>To be honest, I had to completely rewrite the flow to get rid of the redundant code blocks. First check the edge case when <code>value</code> is <code>null</code>. Then extract a <code>nonNullableType</code> to continue to work with. Process the other edge case with <code>Enum</code> and its underlying type. Use the exiting API <code>Convert.ChangeType</code> to map the normal cases. I have made some inline comments to explain what I'm doing. </p>
+
+<pre><code>public static T ChangeType&lt;T&gt;(object value)
+{
+    var isNull = IsNull(value);
+    var type = typeof(T);
+
+    if (isNull)
+    {
+        if (!type.IsNullAssignable())
+        {
+            throw new InvalidCastException($"Cannot cast null to {type}");
+        }
+
+        // null-assignable types (reference types and nullable types) can deal with null
+        return default;
+    }
+
+    // use this type from here on to avoid the redundant 'if nullable .. else ..'
+    var nonNullableType = type.AsNonNullable();
+
+    if (nonNullableType.IsEnum)
+    {
+        // convert the value to the underlying type of the enum and
+        // convert that result to the enum
+        var enumUnderlyingType = Enum.GetUnderlyingType(nonNullableType);
+        var enumUnderlyingValue = Convert.ChangeType(value, enumUnderlyingType);
+        return (T)Enum.ToObject(nonNullableType, enumUnderlyingValue);
+    }
+
+    // let .NET handle remaining convertions
+    return (T)Convert.ChangeType(value, nonNullableType);
+}
+
+public static bool IsNull(object value)
+{
+    // - value == null uses the type's equality operator (usefull for Nullable)
+    // - ReferenceEquals checks for actual null references
+    // - DBNull is a special null value
+
+    return value == null 
+        || ReferenceEquals(null, value)
+        || value is DBNull;
+}
+</code></pre>
+
+<p>Helper class</p>
+
+<p><em>argument checks are left out for brevity</em></p>
+
+<pre><code>public static class TypeExtension
+{
+    public static bool IsNullable(this Type type)
+    {
+        return type.IsGenericType &amp;&amp; type.GetGenericTypeDefinition().Equals(typeof(Nullable&lt;&gt;));
+    }
+
+    public static bool IsNullAssignable(this Type type)
+    {
+        return IsNullable(type) || !type.IsValueType;
+    }
+
+    public static Type AsNonNullable(this Type type)
+    {
+        return type.IsNullable() ? Nullable.GetUnderlyingType(type) : type;
+    }
+}
+</code></pre>
+
+<h3>Use Cases / Tests</h3>
+
+<pre><code>[TestMethod]
+public void TestConversions()
+{
+    // Positive tests
+
+    var enumFlags = ChangeType&lt;A&gt;(A.X | A.Y);
+    var enumFlagsUnderlying = ChangeType&lt;A&gt;(4);
+    var enumFlagsUnderlyingDifferentType = ChangeType&lt;A&gt;(4d);
+    var enumFlagsNullable = ChangeType&lt;A?&gt;(A.X | A.Y);
+    var enumFlagsNullableNull = ChangeType&lt;A?&gt;(null);
+    var enumFlagsNullableDBNull = ChangeType&lt;A?&gt;(DBNull.Value);
+    var referenceType = ChangeType&lt;RefType&gt;(null);
+    var valueType = ChangeType&lt;ValType&gt;(default(ValType));
+    var valueTypeNullable = ChangeType&lt;ValType?&gt;(default(ValType));
+    var valueTypeNullableNull = ChangeType&lt;ValType?&gt;(null);
+    var enumTypeWithDifferentUnderlyingTypes = ChangeType&lt;A&gt;(B.Z);
+    var enumTypeWithDifferentUnderlyingTypesWithoutConstant = ChangeType&lt;A&gt;(B.ZZ);
+
+    // Negative tests
+
+    Assert.ThrowsException&lt;InvalidCastException&gt;(() =&gt; ChangeType&lt;ValType&gt;(null));
+}
+</code></pre>
+    </div>

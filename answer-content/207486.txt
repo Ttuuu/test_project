@@ -1,0 +1,151 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Because the <code>LIKE</code> clause has a defined syntax, to do this right (meaning no clause will be incorrectly converted), you will need to use (or create) a simple lexer to parse the <code>LIKE</code> clause.  A sample grammar could look like:</p>
+
+<pre><code>expr := wild-card + expr
+      | wild-char + expr
+      | escape + expr
+      | string + expr
+      | ""
+
+wild-card := %  
+wild-char := _  
+escape := [%|_]  
+string := [^%_]+ (One or &gt; more characters that are not wild-card or wild-char)
+</code></pre>
+
+<p>NOTE: Although the above grammar will work by default, note that SQL allows the user to specify a user-defined <code>ESCAPE</code> character (see <a href="https://docs.microsoft.com/en-us/sql/t-sql/language-elements/like-transact-sql?view=sql-server-2017#pattern-matching-with-the-escape-clause" rel="nofollow noreferrer">T-SQL</a>)</p>
+
+<p>The steps to accomplish the <code>LIKE</code> syntax conversion are as follows:</p>
+
+
+
+<ol>
+<li><p>Define your Token classes:</p>
+
+<pre class="lang-java prettyprint-override"><code>public abstract class Token {
+    private final String value;
+
+    public Token(String value) {
+        this.value = value;
+    }
+
+    public abstract String convert();
+
+    public String getValue() {
+        return value;
+    }
+}
+
+public class EscapeToken extends Token {
+    public EscapeToken(String value) {
+        super(value);
+    }
+
+    @Override
+    public String convert() {
+        return getValue();
+    }
+}
+
+public class WildcardToken extends Token {
+    public WildcardToken(String value) {
+        super(value);
+    }
+
+    @Override
+    public String convert() {
+        return ".*";
+    }
+}
+
+public class WildcharToken extends Token {
+    public WildcharToken(String value) {
+        super(value);
+    }
+
+    @Override
+    public String convert() {
+        return ".";
+    }
+}
+
+public class StringToken extends Token {
+    public StringToken(String value) {
+        super(value);
+    }
+
+    @Override
+    public String convert() {
+        return Pattern.quote(getValue());
+    }
+}
+</code></pre></li>
+<li><p>Create a Lexer (or Tokenizer):</p>
+
+<pre class="lang-java prettyprint-override"><code>public class Tokenizer {
+
+   private Collection&lt;Tuple&gt; patterns = new LinkedList&lt;&gt;();
+
+   public &lt;T extends Token&gt; Tokenizer add(String regex, Function&lt;String, Token&gt; creator) {
+       this.patterns.add(Tuple.of(Pattern.compile(regex), creator));
+       return this;
+    }
+
+    public Collection&lt;Token&gt; tokenize(String clause) throws ParseException {
+        Collection&lt;Token&gt; tokens = new ArrayList&lt;&gt;();
+        String copy = String.copyValueOf(clause.toCharArray());
+
+        int position = 0;
+        while (!copy.equals("")) {
+            boolean found = false;
+            for (Tuple tuple : this.patterns) {
+                Pattern pattern = tuple.get(0, Pattern.class);
+                Matcher m = pattern.matcher(copy);
+                if (m.find()) {
+                    found = true;
+                    String token = m.group(1);
+                    Function&lt;String, Token&gt; fn = (Function&lt;String, Token&gt;) tuple.get(1);
+                    tokens.add(fn.apply(token));
+                    copy = m.replaceFirst("");
+                    position += token.length();
+                    break;
+                }
+            }
+
+            if (!found) {
+                throw new ParseException("Unexpected sequence found in input string.", ++position);
+            }
+        }
+
+        return tokens;
+
+    }
+}
+</code></pre></li>
+<li><p>Create SQL <code>LIKE</code> to RegEx Transpiler:</p>
+
+<pre class="lang-java prettyprint-override"><code>public class SqlLikeTranspiler {
+    private static Tokenizer TOKENIZER = new Tokenizer()
+            .add("^(\\[[^]]*])", ConstantToken::new)
+            .add("^(%)", WildcardToken::new)
+            .add("^(_)", WildcharToken::new)
+            .add("^([^\\[\\]%_]+)", StringToken::new);
+
+    public static String toRegEx(String pattern) throws ParseException {
+        StringBuilder sb = new StringBuilder().append("^");
+        for (Token token : TOKENIZER.tokenize(pattern)) {
+            sb.append(token.convert());
+        }
+
+        return sb.append("$").toString();
+    }
+}
+</code></pre></li>
+</ol>
+
+<p>NOTE: We ensure the match is not too generous by indicating the resulting regular expression has start and end tags (<code>^</code> and <code>$</code> respectively).</p>
+
+<p>By creating a lexer and converting using this methodology, we can prevent <code>LIKE</code> clauses like <code>%abc[%]%</code>, which should match any string with the sub-string <code>abc%</code> in it, from being converted to a regular expression like <code>.*abc[.*].*</code> which will match any string with either the sub-string <code>abc.</code> or <code>abc*</code>.</p>
+
+<p>The provided code is Java.</p>
+    </div>

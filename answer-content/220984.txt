@@ -1,0 +1,113 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I think the original API is really not as intuitive as I thought. I simplified it by replacing this</p>
+
+<blockquote>
+<pre><code>public static FeatureService Configure&lt;TScope, T&gt;
+(
+    this FeatureService features,
+    INamespace&lt;TScope&gt; scope,
+    Expression&lt;Func&lt;TScope, T&gt;&gt; feature,
+    Func&lt;FeatureOptions, FeatureOptions&gt; configure
+) where TScope : INamespace
+{
+    return features.Configure(FeatureKey&lt;TScope&gt;.Create(feature), configure);
+}
+</code></pre>
+</blockquote>
+
+<p>with</p>
+
+<pre><code>public static FeatureService Configure
+(
+    this FeatureService features,
+    string name,
+    Func&lt;FeatureOptions, FeatureOptions&gt; configure
+)
+{
+    return features.Configure(name, configure);
+}
+</code></pre>
+
+<p>where I'm using just the <code>string</code>. The creation of the <code>name</code> is entirely up to the caller. I extracted the previous logic into a new helper:</p>
+
+<pre><code>public static class From&lt;T&gt; where T : INamespace
+{
+    [NotNull]
+    public static string Select&lt;TMember&gt;([NotNull] Expression&lt;Func&lt;T, TMember&gt;&gt; selector)
+    {
+        if (selector == null) throw new ArgumentNullException(nameof(selector));
+        var member = selector.ToMemberExpression().Member;
+        return
+            GetKeyFactory(member)
+                .FirstOrDefault(Conditional.IsNotNull)
+                ?.CreateKey(selector)
+            ?? throw DynamicException.Create("KeyFactoryNotFound", $"Could not find key-factory on '{selector}'.");
+    }
+
+    [NotNull, ItemCanBeNull]
+    private static IEnumerable&lt;IKeyFactory&gt; GetKeyFactory(MemberInfo member)
+    {
+        // Member's attribute has a higher priority and can override type's default factory.
+        yield return member.GetCustomAttribute&lt;KeyFactoryAttribute&gt;();
+        yield return member.DeclaringType?.GetCustomAttribute&lt;KeyFactoryAttribute&gt;();
+    }
+}
+</code></pre>
+
+<p>that I use like this:</p>
+
+<pre><code>_features.Configure(From&lt;IDemo&gt;.Select(x =&gt; x.Greeting), o =&gt; o ^ Enabled);
+</code></pre>
+
+<p>It gets all information about how to create the name <code>Demo.Greeting</code> from an interface that needs to be properly decorated with.</p>
+
+<pre><code>namespace Features
+{
+    [TypeMemberKeyFactory]
+    [RemoveInterfacePrefix]
+    public interface IDemo : INamespace
+    {
+        object Greeting { get; }
+    }
+}
+</code></pre>
+
+<p>This unhides the default key-factory and also extracts the strategy of cleaning-type names into other attributes that can be chained and the user can provide his own logic anytime.</p>
+
+<pre><code>public class TypeMemberKeyFactoryAttribute : KeyFactoryAttribute
+{
+    public override string CreateKey(LambdaExpression keyExpression)
+    {
+        var memberExpression = keyExpression.ToMemberExpression();
+        var typeName = memberExpression.Member.DeclaringType.ToPrettyString();
+        typeName = memberExpression.Member.DeclaringType.GetCustomAttributes&lt;TypeNameCleanerAttribute&gt;().Aggregate(typeName, (name, cleaner) =&gt; cleaner.Clean(name));
+        return $"{typeName}.{memberExpression.Member.Name}";
+    }
+}
+</code></pre>
+
+<p>The new set of attributes are of the type <code>ITypeNameCleaner</code>:</p>
+
+<pre><code>public interface ITypeNameCleaner
+{
+    [NotNull]
+    string Clean(string name);
+}
+
+[AttributeUsage(AttributeTargets.Interface | AttributeTargets.Class)]
+public abstract class TypeNameCleanerAttribute : Attribute, ITypeNameCleaner
+{
+    public abstract string Clean(string name);
+}
+
+public class RemoveInterfacePrefixAttribute : TypeNameCleanerAttribute
+{
+    public override string Clean(string name)
+    {
+        return Regex.Replace(name, "^I", string.Empty);
+    }
+}
+</code></pre>
+
+<p>So, there are no more unsued parameters now and it looks like every part of it can be now customized.</p>
+    </div>

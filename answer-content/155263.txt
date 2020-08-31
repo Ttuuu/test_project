@@ -1,0 +1,97 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Calculating ranges</h1>
+
+<blockquote>
+  <p>I need split the list I get from the select into multiple list so I can use Parallel.For() to generate the next query in different threads.</p>
+</blockquote>
+
+<p>Nope. You don't need it. Use <code>Parallel.ForEach</code> that automatically can distribute the load on multiple threads if necessary or use the <code>Partitioner</code> to calculate the ranges e.g.:</p>
+
+<pre><code>var partitions = Partitioner
+    .Create(fromInclusive: 0, toExclusive: 100, rangeSize: 30)
+    .GetDynamicPartitions();
+</code></pre>
+
+<p>the result</p>
+
+<blockquote>
+<pre><code>Item1  Item2
+
+    0     30 
+   30     60 
+   60     90 
+   90    100
+</code></pre>
+</blockquote>
+
+<hr>
+
+<h1>Example</h1>
+
+<p>Here's an example of how it could be implemented:</p>
+
+<ul>
+<li><p>The first change is that you don't split the list but pass all ids to this method. It'll partition it and will use these partitions for reading from the id-list.</p></li>
+<li><p>The second change is that <code>Parallel.ForEach</code> doesn't run over the ids but over the partitions. Each partition (index range) is passed to the <em>body</em>.</p></li>
+<li><p>The third change is that you initialize the connection and the command once per thread via the <code>localInit</code>. It'll be disposed/closed by <code>localFinally</code>.</p></li>
+<li><p>The fourth change is that you don't have to recreate the command each time. All you have to do is to set the new parameter value and call <code>ExecuteNonQuery</code>.</p></li>
+</ul>
+
+<p>Code:</p>
+
+<pre><code>public void routeParallelGeneration(List&lt;long&gt; route_pending)
+{
+    var parallelOptions = new ParallelOptions
+    {
+        MaxDegreeOfParallelism = Environment.ProcessorCount
+    };
+
+    var partitions =
+        Partitioner
+            .Create(
+                fromInclusive: 0,
+                toExclusive: route_pending.Count,
+                rangeSize: 100
+            )
+            .GetDynamicPartitions();
+
+    Parallel.ForEach(
+        source: partitions,
+        parallelOptions: parallelOptions,
+        localInit: () =&gt; 
+        {
+            var conn = new NpgsqlConnection(strConnection);
+            conn.Open();
+
+            var cmd = new NpgsqlCommand();
+            cmd.Connection = conn;
+            cmd.CommandText = "SELECT avl_db.process_route(@route_source)";
+            cmd.CommandType = CommandType.Text;
+
+            NpgsqlParameter p = new NpgsqlParameter("@route_source", NpgsqlDbType.Array | NpgsqlDbType.Bigint);
+            cmd.Parameters.Add(p);
+
+            return new { Connection = conn, Command = cmd };
+        },
+        body: (source, state, local) =&gt;
+        {
+            local.Command.Parameters["@route_source"].Value = route_pending.GetRange(
+                index: source.Item1, 
+                count: source.Item2 - source.Item1 - 1
+            );
+            local.Command.ExecuteNonQuery();
+            return local;
+        },
+        localFinally: local =&gt;
+        {
+            local.Connection?.Dispose();
+            local.Command?.Dispose();
+        }
+    );
+}
+</code></pre>
+
+<h1>Improvable</h1>
+
+<p>Don't do everything in a single method. Write one method to get the data from the server and another one to process it and/or calculate the partitions. You need to pay more attentions to the separation of concerns. Mixing all features in a single method makes it super hard to maintain and to test.</p>
+    </div>

@@ -1,0 +1,174 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<ul>
+<li>Naming guidelines are in: For returning named tuples use PascalCased identifiers: <a href="https://github.com/dotnet/corefx/issues/33553#issuecomment-531420515" rel="nofollow noreferrer">https://github.com/dotnet/corefx/issues/33553#issuecomment-531420515</a></li>
+<li>Usage guidelines are in: Unless you're named something like GetOffsetAndLength, don't use tuples (<code>Tuple&lt;T1, T2, ...&gt;</code>, <code>ValueTuple&lt;T1, T2, ...&gt;</code> or <code>(T1 T1, T2 T2, ...)</code> as a return type. (Same link)</li>
+</ul>
+
+<pre><code>    public static byte[] Decrypt(ECDiffieHellman recipient, byte[] rBar, byte[] em, byte[] d)
+    {
+        // Convert R̄ to an elliptic curve point R=(xR, yR)
+        var r = new ECParameters
+        {
+            Curve = recipient.ExportParameters(false).Curve,
+            Q =
+            {
+                X = rBar.Skip(1).Take(32).ToArray(),
+                Y = rBar.Skip(33).Take(32).ToArray(),
+            }
+        };
+</code></pre>
+
+<ul>
+<li>You should really validate the inputs. Too short of <code>rBar</code> throws a weird exception unrelated to the parameter names. Too long of <code>rBar</code> has the trailing bytes ignored.  You also didn't check it was type 0x04 (uncompressed point).</li>
+</ul>
+
+<pre><code>if (recipient == null)
+    throw new ArgumentNullException(nameof(recipient));
+if (rBar == null)
+    throw new ArgumentNullException(nameof(rBar));
+if (rBar.Length != 65)
+    throw new ArgumentOutOfRangeException(nameof(rBar), ...);
+if (em == null)
+    throw new ArgumentNullException(nameof(em));
+if (d == null)
+    throw new ArgumentNullException(nameof(d));
+</code></pre>
+
+<ul>
+<li>Also, rather than naming them from the forumlae, you should give the parameters more standard identifier names.</li>
+</ul>
+
+<pre><code>public static byte[] Decrypt(
+    ECDiffieHellman recipient,
+    byte[] encodedPoint,
+    byte[] ciphertext,
+    byte[] mac)
+</code></pre>
+
+<p>In decrypt you read the senderEcdh.PublicKey parameter twice, you should save it once as a local.  Since a) looking at the implementation shows that it returns a new object every time (and thus shouldn't have been a property, but oh, well) and b) you've created the parent object; you should also have it in a <code>using</code> (Dispose) statement.</p>
+
+<pre><code>using (var senderEcdh = ECDiffieHellman.Create(r))
+using (var senderPublicKey = senderEcdh.PublicKey))
+{
+    ...
+}
+</code></pre>
+
+<p>(Note: I continued using <code>var</code> here, since you did, but the only <code>var</code> that would be permitted in the BCL is <code>r</code>, since it's the only variable declaration with an enforced expression type)</p>
+
+<ul>
+<li>The <code>{ 0x00, 0x00, 0x00, 0x01 }</code> and <code>{ 0x00, 0x00, 0x00, 0x02 }</code> arrays are being created every time in encrypt and decrypt.  They could both be <code>static readonly</code>.</li>
+</ul>
+
+<blockquote>
+  <p>Also, how might the API change if different KDF functions</p>
+</blockquote>
+
+<p>Two answers appear off the top of my head:</p>
+
+<p>1) make a class structure for ECIES KDFs. Using a Span-writing one (so destination and length are the same parameter) it'd be something like <code>protected abstract void DeriveKey(ECDiffieHellman privateEcdh, ECDiffieHellmanPublicKey publicEcdh, Span&lt;byte&gt; destination)</code>.  This lets the SharedInfo stuff be ctor parameters / state.</p>
+
+<p>2) Add a bunch of parameters.</p>
+
+<blockquote>
+  <p>... and HMAC functions </p>
+</blockquote>
+
+<p>Presumably accepting a <code>HashAlgorithmName</code> value for the MAC algorithm, then using <code>IncrementalHash.CreateForHMAC</code> to later build the HMAC calculator from the identifier.</p>
+
+<blockquote>
+  <p>, cipher functions [and key sizes]</p>
+</blockquote>
+
+<p>There's not a strong precedent in .NET for this. <code>PbeEncryptionAlgorithm</code> exists for password-based encryption (used for <code>ExportEncryptedPkcs8PrivateKey</code>).  The answer is probably a custom enum... or passing in a SymmetricAlgorithm instance whose key will get updated, but KeySize, padding, and mode are respected.  Taking a SymmetricAlgorithm instance to modify isn't really common, either, though.</p>
+
+<ul>
+<li>Oh, and the class name is something that would get debated for a long time in API Review.  In general, initialisms, abbreviations, and acronyms are frowned upon.</li>
+</ul>
+
+<hr>
+
+<pre><code>public readonly struct EciesResults
+{
+    public byte[] EncodedEphemeralPoint { get; }
+    public byte[] Tag { get; }
+    public byte[] Ciphertext { get; }
+
+    public EciesResult(byte[] encodedEphemeralPoint, byte[] tag, byte[] ciphertext)
+    {
+        if (encodedEphemeralPoint == null)
+            throw new ArgumentNullException(nameof(encodedEphemeralPoint));
+        if (tag == null)
+            throw new ArgumentNullException(nameof(tag));
+        if (ciphertext == null)
+            throw new ArgumentNullException(nameof(ciphertext));
+
+        EncodedEphemeralPoint = encodedEphemeralPoint;
+        Tag = tag;
+        Ciphertext = ciphertext;
+    }
+}
+
+public static class Ecies
+{
+    public static EciesResult Encrypt(
+        ECDiffieHellmanPublicKey recipient,
+        byte[] plaintext)
+    {
+        if (recipient == null)
+            throw new ArgumentNullException(nameof(recipient));
+        if (plaintext == null)
+            throw new ArgumentNullException(nameof(plaintext));
+
+        ...
+
+        return new EciesResult(rBar, d, em);
+    }
+
+    public static byte[] Decrypt(ECDiffieHellman recipient, EciesResult encryptionResult)
+    {
+        if (recipient == null)
+            throw new ArgumentNullException(nameof(recipient));
+        if (encryptionResult.Tag == null)
+            throw new ArgumentException("EciesResult must have values", nameof(encryptionResult));
+
+        ECParameters ecParameters = recipient.ExportParameters(false);
+        int curveSize = ecParameters.G.X.Length;
+
+        if (encryptionResult.EncodedEphemeralPoint.Length != curveSize * 2 + 1)
+        {
+            throw new ArgumentException(
+                "The EciesResult encoded point length is not appropriate for the recipient curve.",
+                nameof(encryptionResult));
+        }
+
+        if (encryptionResult.EncodedEphemeralPoint[0] != 0x04)
+        {
+            throw new ArgumentException(
+                "The EciesResult encoded point is not in the correct format.",
+                nameof(encryptionResult));
+        }
+
+        var r = new ECParameters
+        {
+            Curve = recipient.ExportParameters(false).Curve,
+            Q =
+            {
+                X = rBar.Skip(1).Take(curveSize).ToArray(),
+                Y = rBar.Skip(1 + curveSize).ToArray(),
+            }
+        };
+        r.Validate();
+
+        using (ECDiffieHellman senderEcdh = ECDiffieHellman.Create(r))
+        using (ECDiffieHellmanPublickey sender = senderEcdh.PublicKey)
+        {
+            ...
+
+            return decryptor.TransformFinalBlock(em, 0, em.Length);
+        }
+    }
+}
+<span class="math-container">```</span>
+</code></pre>
+    </div>

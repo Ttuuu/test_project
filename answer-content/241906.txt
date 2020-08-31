@@ -1,0 +1,68 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>"Correct" is nebulous. If it were to mean here something like "the semantics of any wrapped generator through the public API is the same as if it were not wrapped, apart from a print statement before the generator is created", then, no, the code isn't correct since it doesn't preserve the effects of raising an exception or closing the generator. For example,</p>
+
+<pre><code>import asyncio
+
+class StopItNow( Exception ): 
+    pass
+
+async def f():
+    try:
+        yield 0
+    except StopItNow:
+        yield 1
+
+async def g( f ): 
+    x = f()
+    print( await x.asend( None ) )
+    print( await x.athrow( StopItNow ) )
+
+asyncio.run( g( f ) )
+asyncio.run( g( asyncgen_wrapper( f ) ) )
+</code></pre>
+
+<p>. I think it would be a non-trivial undertaking to "correctly" implement a wrapper. Interestingly, in the same PEP (525) that you've linked in your question,</p>
+
+<blockquote>
+  <p>While it is theoretically possible to implement yield from support for asynchronous generators, it would require a serious redesign of the generators implementation.</p>
+</blockquote>
+
+<p><a href="https://www.python.org/dev/peps/pep-0525/#asynchronous-yield-from" rel="nofollow noreferrer">https://www.python.org/dev/peps/pep-0525/#asynchronous-yield-from</a></p>
+
+<p>. You might find that it's a whole lot easier to implement some sort of injection or parameterise the generator itself to accept callables.</p>
+
+<p>Otherwise, from my experimentation and taking hints from <a href="https://www.python.org/dev/peps/pep-0380/#formal-semantics" rel="nofollow noreferrer">PEP 380</a>, there are implementation details that are omitted from PEP 525 that would be necessary to emulate the behaviour of an unwrapped generator.</p>
+
+<p>This is the result of some toying around:</p>
+
+<pre><code>import functools
+import sys
+
+def updated_asyncgen_wrapper( generator ): 
+
+    @functools.wraps( generator )
+    async def wrapped( *args, **kwargs ): 
+        print( "iterating wrapped generator" )
+
+        gen = generator( *args, **kwargs )
+        to_send, is_exc = ( None, ), False
+
+        while True:
+            try:
+                do = gen.athrow if is_exc else gen.asend
+                value = await do( *to_send )
+            except StopAsyncIteration:
+                return
+            try:
+                to_send, is_exc = ( (yield value), ), False
+            except GeneratorExit:
+                await gen.aclose()
+                raise
+            except:
+                to_send, is_exc = sys.exc_info(), True
+
+    return wrapped
+</code></pre>
+
+<p>. This isn't "correct" either, since it doesn't disambiguate between an attempt to close the generator and an explicit throw of an instance of <code>GeneratorExit</code>, which is, though, marked distinctly for usage by the <a href="https://docs.python.org/3/library/exceptions.html#GeneratorExit" rel="nofollow noreferrer">former case</a>. This <em>might</em> be <em>good enough</em> for internal use.</p>
+    </div>

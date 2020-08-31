@@ -1,0 +1,144 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p>Due to obvious restrictions, it is imperative that log calls below the global log level get optimized away at compile time.</p>
+</blockquote>
+
+<p>If such restrictions exist, they are not obvious at all. It sounds like you're designing a piece of software to run <em>exactly once</em> in a <em>completely understood environment</em> — namely a cubesat. ("Completely understood" doesn't mean "completely controlled" — things can still go wrong at runtime — but at least you don't have to worry about different customers with different installation-specific requirements.)</p>
+
+<ul>
+<li><p>Why does it need the "global log level" to be configurable at all? Surely for each given log message in your current codebase, you can just look at it and ask, "Will this message be helpful during the mission?" If it is, then it should be logged during the mission. If it is not, then it should not be logged during the mission (and since that's the only time this code will run, the message can be entirely removed from the codebase).</p></li>
+<li><p>OTOH, if it's <em>not</em> intuitively obvious which messages will be useful during the mission, then what you need is a <em>runtime</em>-configurable log level.  "Oh shoot, something's going wrong. Quick, bump up the log level and let's see if the debug messages can give us a clue!" If the compiler has completely removed all the code that was involved with printing those debug messages, then you're screwed.</p></li>
+</ul>
+
+<hr>
+
+<pre><code>enum LogLevel : LogLevelType {
+    trace = 32,
+    debug = 64,
+    info = 96,
+    notice = 128,
+    warning = 160,
+    error = 192,
+    emergency = 254,
+    disabled = 255, 
+};
+</code></pre>
+
+<p>You've placed <code>disabled</code> in the wrong place (assuming it means "a message which is never ever printed"). Emergency messages should <em>always</em> be printed; error messages usually printed; warnings and notices less often; info and trace messages least often; and then disabled messages <em>never</em>. So in your current scheme, <code>disabled</code> should be <code>0</code>, and if you have a name for <code>255</code>, it should be something like <code>always</code>.</p>
+
+<p>Except that in practice I'd actually flip the ordering around, so that <code>0</code> messages were always printed (emergency) and <code>255</code> messages were hardly ever printed (debug). That way, when someone said "I'm turning the log level <em>down</em>," it would be clear which way they meant — lower integer number, fewer messages logged.</p>
+
+<p><a href="https://tools.ietf.org/html/rfc5424#page-11" rel="nofollow noreferrer">POSIX <code>syslog</code> severity levels work exactly the way I just described: <code>0</code> for emergencies, <code>7</code> for debug traces.</a></p>
+
+<hr>
+
+<pre><code>    template &lt;class T&gt;
+    Logger::LogEntry&amp; operator&lt;&lt;(const T value) noexcept {
+        message.append(value);
+
+        return *this;
+    }
+
+    Logger::LogEntry&amp; operator&lt;&lt;(const std::string&amp; value);
+</code></pre>
+
+<p>Why do you have a separate overload of <code>&lt;&lt;</code> for strings? Surely the definition of that overload (not shown in your post) would just be <code>message.append(value)</code> anyway.</p>
+
+<p>Also, consider using move semantics. Personally, I would write the entire overload set as</p>
+
+<pre><code>    template&lt;class T&gt;
+    Logger::LogEntry&amp; operator&lt;&lt;(T value) {
+        message.append(std::move(value));
+        return *this;
+    }
+</code></pre>
+
+<p>I've removed the incorrect <code>noexcept</code> specifier — <code>std::string::append</code> is totally capable of throwing exceptions. Now, <em>maybe</em> you've decided that you want "out-of-memory during a logging operation" to call <code>std::terminate</code> and crash the whole process, but that really seems like something you should think carefully about. "Best practices for heap-allocation in space" is a whole rabbit hole you might not want to go down, but leaving that aside, just thinking about the behavior <em>with</em> <code>noexcept</code> and <em>without</em> <code>noexcept</code>, I'm pretty sure I'd prefer the behavior <em>without</em> <code>noexcept</code>.</p>
+
+<p>(Removing <code>noexcept</code> will also decrease your code size, because it won't have to generate code to catch exceptions and call <code>terminate</code>. Rule of thumb: <code>noexcept</code> should go on move-constructors to avoid the vector pessimization; and maybe move-assignment and swap; and nowhere else.)</p>
+
+<hr>
+
+<pre><code>template &lt;typename T&gt;
+[[maybe_unused]] constexpr Logger::NoLogEntry operator&lt;&lt;(const Logger::NoLogEntry noLogEntry, T value) {
+    return noLogEntry;
+}
+</code></pre>
+
+<p>It seems silly to use a different idiom here than you already used for the <code>LogEntry</code> case, especially when it means you have to cruft up your code with <code>[[maybe_unused]]</code> to suppress warnings. (Would any compiler actually warn on this code, though?) I would write this as a cut-and-paste of the <code>LogEntry</code> case:</p>
+
+<pre><code>    template&lt;class T&gt;
+    Logger::NoLogEntry&amp; operator&lt;&lt;(const T&amp;) {
+        // do not log it
+        return *this;
+    }
+</code></pre>
+
+<p>I guess for bonus metaprogramming points you could implement the entire thing as</p>
+
+<pre><code>template&lt;LogLevelType Lvl&gt;
+struct LogEntry {
+    std::string message;
+    explicit LogEntry() = default;
+    LogEntry(LogEntry const&amp;) = delete;
+    ~LogEntry();
+
+    template&lt;class T&gt;
+    LogEntry&amp; operator&lt;&lt;(T value) {
+        if (Lvl &lt;= GLOBAL_LOG_LEVEL) {
+             message.append(std::move(value));
+        }
+        return *this;
+    }
+};
+
+#define LOG_ALWAYS LogEntry&lt;0&gt;()
+#define LOG_ERROR LogEntry&lt;10&gt;()
+#define LOG_NOTICE LogEntry&lt;100&gt;()
+#define LOG_INFO LogEntry&lt;200&gt;()
+#define LOG_DEBUG LogEntry&lt;255&gt;()
+</code></pre>
+
+<p>Notice that I'm not using <code>if constexpr</code> on my compile-time-constant condition there. The compiler will constant-fold it away without my help, and if I do use <code>if constexpr</code> then I don't get the extra compile-time sanity-checking to make sure that the body of the <code>if</code> is well-formed. <code>if constexpr</code> is a tool for template metaprogramming; if you're not doing template metaprogramming then you probably shouldn't be using it.</p>
+
+<pre><code>LOG_TRACE &lt;&lt; 42.0;
+    // If I never build your code with GLOBAL_LOG_LEVEL==TRACE,
+    // I'll never see any indication that appending a double to a string
+    // is ill-formed! This could lead me to write a lot of wrong code
+    // that will cost me a lot of fixup time when I eventually do try
+    // to build it in TRACE mode.
+</code></pre>
+
+<hr>
+
+<p>Watch out! You aren't using the tried-and-true <code>assert</code> idiom here — unwanted calls to <code>LOG_DEBUG</code> don't get macro'ed away. So for example</p>
+
+<pre><code>#include &lt;assert.h&gt;
+assert(some_expensive_sanity_check());  // produces no code
+
+#include &lt;glog/logging.h&gt;
+LOG(INFO) &lt;&lt; (some_expensive_sanity_check() ? "Yes" : "No");  // produces no code
+
+#include &lt;your-thing.h&gt;
+LOG_INFO &lt;&lt; (some_expensive_sanity_check() ? "Yes" : "No");  // produces very much code
+</code></pre>
+
+<p>If you anticipate logging expensive things, then either:</p>
+
+<ul>
+<li><p>Use the macro tricks from <code>assert</code> or <code>LOG(INFO)</code> to ensure that <code>some_expensive_sanity_check()</code> is macro'ed away when unwanted, or</p></li>
+<li><p>Provide a "getter" for the log level, so that you can explicitly guard expensive log messages:</p>
+
+<pre><code>#include &lt;your-thing.h&gt;
+if (INFO_IS_LOGGED) {
+    LOG_INFO &lt;&lt; (some_expensive_sanity_check() ? "Yes" : "No");
+        // produces very much code, but the code
+        // won't be executed unless INFO_IS_LOGGED
+}
+</code></pre></li>
+</ul>
+
+<hr>
+
+<p>TLDR: if you're going to Not-Invented-Here a piece of code, then you owe it to yourself to make your replacement <em>as simple as possible.</em> The more "tricks" you use, the more places you have to screw up and thus end up <em>worse</em> than the established code you could have used for free in the first place.</p>
+    </div>

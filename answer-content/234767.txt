@@ -1,0 +1,226 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Pokémon error handling "Catch them all"</h2>
+
+<p>Never (ever!) write code like this:</p>
+
+<pre><code>try {
+    ...
+} catch (Exception e) {
+    ...
+}
+</code></pre>
+
+<p>It allows the program to continue executing even if fatal errors are
+encountered which is very bad. Only catch errors that you can
+handle. In practice, that means that you almost never catch anything.</p>
+
+<h2>File handling</h2>
+
+<p>Saving and loading the key to the process' current working directory
+is not nice. Better to let the user pass a <code>Path</code> specifying the
+directory to use in the <code>GCM</code> constructor:</p>
+
+<pre><code>public GCM(Path path) {
+    this.path = path;
+}
+</code></pre>
+
+<p>It is also a good idea to store the filenames in constants because it
+guards against spelling errors:</p>
+
+<pre><code>private final String PUBLIC_KEY = "public.key";
+private final String PRIVATE_KEY = "private.key";
+</code></pre>
+
+<p>So to get the path to "public.key", you write <code>path.resolve(PUBLIC_KEY)</code>.</p>
+
+<p>Mixing Java NIO with old style IO is not nice. Your code for writing
+the keypair to file can be replaced with Java NIO calls:</p>
+
+<pre><code>byte[] encodedPrivateKey = keyPair.getPrivate().getEncoded();
+byte[] privateKeyBytes = encrypt(encodedPrivateKey, password);
+Files.write(path.resolve(PRIVATE_KEY), privateKeyBytes);
+byte[] publicKeyBytes = keyPair.getPublic().getEncoded();
+Files.write(path.resolve(PUBLIC_KEY), publicKeyBytes);
+</code></pre>
+
+<h2>Code organization</h2>
+
+<p>While reviewing your class I realized that it does two things; it
+handles key pairs and it encrypts/decrypts data. Ideally, each class
+should only do one job. Therefore I think a better way to organize the
+code is to have one class for the key pair handling and one for
+encryption/decryption.</p>
+
+<p>Furthermore, the only state in your class is the <code>keyPair</code> variable
+which is not referenced in many of the methods. As a rule of thumb, if
+a method doesn't access any state then it should be made into a static
+method (a function). While refactoring that, I realized that your
+whole API can be better expressed as two static classes without any
+state.</p>
+
+<h2>Comments</h2>
+
+<p>If I were reviewing your code for a real project, I'd definitely
+complain about the lack of comments. There's a lot of things in there
+that is not obvious when reading the code. For example, what is an IV?
+Where does the number 4096 come from? What is <code>GCM_TAG_LENGTH</code>? And so
+on.</p>
+
+<h2>Result</h2>
+
+<p>With comments removed:</p>
+
+<pre><code>import javax.crypto.*;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.PBEKeySpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.IOException;
+import java.nio.file.*;
+import java.security.*;
+import java.security.spec.*;
+import java.util.Arrays;
+
+class GCM {
+    private final static int SALT_LENGTH = 256/8;
+    private final static int IV_LENGTH = 12;
+    private final static int KEY_LENGTH = 256;
+    private final static int GCM_TAG_LENGTH = 16;
+
+    private static SecretKeySpec generateKey(char[] password, byte[] salt)
+        throws InvalidKeySpecException, NoSuchAlgorithmException {
+        SecretKeyFactory factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+        KeySpec spec = new PBEKeySpec(password, salt, 65536, KEY_LENGTH);
+        SecretKey tmp = factory.generateSecret(spec);
+        SecretKeySpec secretKeySpec =
+            new SecretKeySpec(tmp.getEncoded(), "AES");
+        return secretKeySpec;
+    }
+    public static byte[] decrypt(byte[] data, KeyPair keyPair)
+        throws GeneralSecurityException {
+        byte[] symmetricKey = Arrays.copyOfRange(data, 0, 4096/8);
+        byte[] iv = Arrays.copyOfRange(data, 4096/8, 4096/8 + IV_LENGTH);
+        byte[] encryptedData = Arrays.copyOfRange(data, 4096/8 + IV_LENGTH,
+                                                  data.length);
+        Cipher cipher = Cipher.getInstance(
+            "RSA/NONE/OAEPWithSHA3-512AndMGF1Padding");
+        cipher.init(Cipher.DECRYPT_MODE, keyPair.getPrivate());
+        byte[] decryptedSymmetricKey = cipher.doFinal(symmetricKey);
+
+        SecretKeySpec secretKeySpec =
+            new SecretKeySpec(decryptedSymmetricKey, "AES");
+        return decrypt(encryptedData, secretKeySpec, iv);
+    }
+    private static byte[] decrypt(byte[] data,
+                                  SecretKeySpec secretKeySpec,
+                                  byte[] iv)
+        throws GeneralSecurityException {
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        GCMParameterSpec gcmParameterSpec =
+            new GCMParameterSpec(GCM_TAG_LENGTH * 8, iv);
+        cipher.init(Cipher.DECRYPT_MODE, secretKeySpec, gcmParameterSpec);
+
+        return cipher.doFinal(data);
+    }
+    public static byte[] decrypt(byte[] data, char[] password)
+        throws GeneralSecurityException {
+        byte[] salt = Arrays.copyOfRange(data, 0, SALT_LENGTH);
+        byte[] iv =
+            Arrays.copyOfRange(data, SALT_LENGTH, SALT_LENGTH + IV_LENGTH);
+        byte[] encryptedData =
+            Arrays.copyOfRange(data, SALT_LENGTH + IV_LENGTH, data.length);
+
+        SecretKeySpec secretKeySpec = generateKey(password, salt);
+        return decrypt(encryptedData, secretKeySpec, iv);
+    }
+    public static byte[] encrypt(byte[] data, byte[] publicKey)
+        throws GeneralSecurityException {
+        byte[] iv = new byte[IV_LENGTH];
+        new SecureRandom().nextBytes(iv);
+
+        KeyGenerator keyGen = KeyGenerator.getInstance("AES");
+        keyGen.init(256, new SecureRandom());
+        SecretKey secretKey = keyGen.generateKey();
+        SecretKeySpec secretKeySpec =
+            new SecretKeySpec(secretKey.getEncoded(), "AES");
+        byte[] encrypted = encrypt(data, secretKeySpec, iv);
+
+        Cipher cipher =
+            Cipher.getInstance("RSA/NONE/OAEPWithSHA3-512AndMGF1Padding");
+        X509EncodedKeySpec keySpec = new X509EncodedKeySpec(publicKey);
+        KeyFactory keyFactory = KeyFactory.getInstance("RSA");
+        cipher.init(Cipher.ENCRYPT_MODE, keyFactory.generatePublic(keySpec));
+        byte[] symmetricKey = cipher.doFinal(secretKeySpec.getEncoded());
+
+        byte[] result = new byte[encrypted.length + iv.length
+                                 + symmetricKey.length];
+        System.arraycopy(symmetricKey, 0, result, 0, symmetricKey.length);
+        System.arraycopy(iv, 0, result, symmetricKey.length, iv.length);
+        System.arraycopy(encrypted,0, result, iv.length + symmetricKey.length, encrypted.length);
+        return result;
+    }
+    public static byte[] encrypt(byte[] data, char[] password)
+        throws GeneralSecurityException {
+        byte[] salt = new byte[SALT_LENGTH];
+        byte[] iv = new byte[IV_LENGTH];
+        new SecureRandom().nextBytes(salt);
+        new SecureRandom().nextBytes(iv);
+
+        SecretKeySpec secretKeySpec = generateKey(password, salt);
+        byte[] encrypted = encrypt(data, secretKeySpec, iv);
+        byte[] result = new byte[encrypted.length + salt.length + iv.length];
+        System.arraycopy(salt, 0, result, 0, salt.length);
+        System.arraycopy(iv, 0, result, salt.length, iv.length);
+        System.arraycopy(encrypted, 0, result, salt.length + iv.length, encrypted.length);
+        return result;
+    }
+    private static byte[] encrypt(byte[] data,
+                           SecretKeySpec secretKeySpec,
+                           byte[] iv)
+        throws GeneralSecurityException {
+        Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+        GCMParameterSpec gcmParameterSpec = new GCMParameterSpec(GCM_TAG_LENGTH * 8, iv);
+        cipher.init(Cipher.ENCRYPT_MODE, secretKeySpec, gcmParameterSpec);
+        return cipher.doFinal(data);
+    }
+}
+class KeyPairs {
+    private final static String PUBLIC_KEY = "public.key";
+    private final static String PRIVATE_KEY = "private.key";
+
+    public static KeyPair generate() throws NoSuchAlgorithmException {
+        KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA");
+        kpg.initialize(4096, new SecureRandom());
+        return kpg.genKeyPair();
+    }
+    public static KeyPair load(Path path, char[] password)
+        throws IOException, GeneralSecurityException {
+        Path publicKeyPath = path.resolve(PUBLIC_KEY);
+        byte[] publicKeyBytes = Files.readAllBytes(publicKeyPath);
+        Path privateKeyPath = path.resolve(PRIVATE_KEY);
+        byte[] privateKeyBytes = GCM.decrypt(
+            Files.readAllBytes(privateKeyPath),
+            password);
+        X509EncodedKeySpec x509EncodedKeySpec =
+            new X509EncodedKeySpec(publicKeyBytes);
+        KeyFactory keyFactory = KeyFactory.getInstance("RSA");
+        PublicKey publicKey = keyFactory.generatePublic(x509EncodedKeySpec);
+        PKCS8EncodedKeySpec pkcs8EncodedKeySpec =
+            new PKCS8EncodedKeySpec(privateKeyBytes);
+        PrivateKey privateKey = keyFactory.generatePrivate(pkcs8EncodedKeySpec);
+        return new KeyPair(publicKey, privateKey);
+    }
+    public static void save(Path path, KeyPair keyPair, char[] password)
+        throws IOException, GeneralSecurityException {
+        byte[] encodedPrivateKey = keyPair.getPrivate().getEncoded();
+        byte[] privateKeyBytes = GCM.encrypt(encodedPrivateKey, password);
+        Files.write(path.resolve(PRIVATE_KEY), privateKeyBytes);
+        byte[] publicKeyBytes = keyPair.getPublic().getEncoded();
+        Files.write(path.resolve(PUBLIC_KEY), publicKeyBytes);
+    }
+}
+</code></pre>
+
+<p>I think your usage of the Java Crypto API is correct, but I'm no
+expert.</p>
+    </div>

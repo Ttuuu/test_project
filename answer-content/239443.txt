@@ -1,0 +1,319 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1><code>zip</code></h1>
+
+<p>Right now, your <code>zip</code> uses the tuple protocol.  It probably makes more sense to use the range protocol instead, to support cases like this:</p>
+
+<pre><code>std::vector a{1, 2, 3, 4};
+std::vector b{5, 6, 7, 8};
+for (auto [x, y] : zip(a, b)) {
+    std::cout &lt;&lt; x &lt;&lt; ' ' &lt;&lt; y &lt;&lt; '\n';
+}
+</code></pre>
+
+<p>These constructors:</p>
+
+<pre><code>zip(T&amp; t, Ts&amp;... ts) : zip&lt;Ts...&gt;(ts...), t_(t) {}
+zip(T&amp; t, Ts&amp;&amp;... ts) : zip&lt;Ts...&gt;(ts...), t_(t) {}
+zip(T&amp;&amp; t, Ts&amp;... ts) : zip&lt;Ts...&gt;(ts...), t_(t) {}
+zip(T&amp;&amp; t, Ts&amp;&amp;... ts) : zip&lt;Ts...&gt;(ts...), t_(t) {}
+</code></pre>
+
+<p>mandate that all arguments other than the first have the same.  You also convert everything to lvalues, because an id-expression that refer to an rvalue reference is an lvalue (!) — this is because the original purpose of rvalue references were to capture rvalues and treat them like normal objects, not to forward rvalues.</p>
+
+<p>The <code>iterator</code> class is also some required operations: associated types (<code>iterator_category</code>, <code>difference_type</code>, etc.), <code>==</code>, postfix <code>++</code>, etc.  Also consider supporting random access iterator functionalities if the zipped ranges support them.  We'll come back to this later.</p>
+
+<p>I would also probably implement the <code>zip</code> without recursion, to reduce the compile-time overhead of nested template class instantiations.  So the end result roughly looks like this: (not comprehensively tested, may have bugs; for simplicity, only random access ranges are supported)</p>
+
+<pre><code>#include &lt;exception&gt;
+#include &lt;iterator&gt;
+#include &lt;tuple&gt;
+
+namespace detail {
+    using std::begin, std::end;
+
+    template &lt;typename Range&gt;
+    struct range_traits {
+        using iterator = decltype(begin(std::declval&lt;Range&gt;()));
+        using value_type = typename std::iterator_traits&lt;iterator&gt;::value_type;
+        using reference = typename std::iterator_traits&lt;iterator&gt;::reference;
+    };
+
+    template &lt;typename... Its&gt;
+    class zip_iterator {
+    public:
+        // technically lying
+        using iterator_category = std::common_type_t&lt;
+            typename std::iterator_traits&lt;Its&gt;::iterator_category...
+        &gt;;
+        using difference_type = std::common_type_t&lt;
+            typename std::iterator_traits&lt;Its&gt;::difference_type...
+        &gt;;
+        using value_type = std::tuple&lt;
+            typename std::iterator_traits&lt;Its&gt;::value_type...
+        &gt;;
+        using reference = std::tuple&lt;
+            typename std::iterator_traits&lt;Its&gt;::reference...
+        &gt;;
+        using pointer = std::tuple&lt;
+            typename std::iterator_traits&lt;Its&gt;::pointer...
+        &gt;;
+
+        constexpr zip_iterator() = default;
+        explicit constexpr zip_iterator(Its... its)
+            : base_its{its...}
+        {
+        }
+
+        constexpr reference operator*() const
+        {
+            return std::apply([](auto&amp;... its) {
+                return reference(*its...);
+            }, base_its);
+        }
+        constexpr zip_iterator&amp; operator++()
+        {
+            std::apply([](auto&amp;... its) {
+                (++its, ...);
+            }, base_its);
+            return *this;
+        }
+        constexpr zip_iterator operator++(int)
+        {
+            return std::apply([](auto&amp;... its) {
+                return zip_iterator(its++...);
+            }, base_its);
+        }
+        constexpr zip_iterator&amp; operator--()
+        {
+            std::apply([](auto&amp;... its) {
+                (--its, ...);
+            }, base_its);
+            return *this;
+        }
+        constexpr zip_iterator operator--(int)
+        {
+            return std::apply([](auto&amp;... its) {
+                return zip_iterator(its--...);
+            }, base_its);
+        }
+        constexpr zip_iterator&amp; operator+=(difference_type n)
+        {
+            std::apply([=](auto&amp;... its) {
+                ((its += n), ...);
+            }, base_its);
+            return *this;
+        }
+        constexpr zip_iterator&amp; operator-=(difference_type n)
+        {
+            std::apply([=](auto&amp;... its) {
+                ((its -= n), ...);
+            }, base_its);
+            return *this;
+        }
+        friend constexpr zip_iterator operator+(const zip_iterator&amp; it, difference_type n)
+        {
+            return std::apply([=](auto&amp;... its) {
+                return zip_iterator(its + n...);
+            }, it.base_its);
+        }
+        friend constexpr zip_iterator operator+(difference_type n, const zip_iterator&amp; it)
+        {
+            return std::apply([=](auto&amp;... its) {
+                return zip_iterator(n + its...);
+            }, it.base_its);
+        }
+        friend constexpr zip_iterator operator-(const zip_iterator&amp; it, difference_type n)
+        {
+            return std::apply([=](auto&amp;... its) {
+                return zip_iterator(its - n...);
+            }, it.base_its);
+        }
+        constexpr reference operator[](difference_type n) const
+        {
+            return std::apply([=](auto&amp;... its) {
+                return reference(its[n]...);
+            }, base_its);
+        }
+
+        // the following functions assume usual random access iterator semantics
+        friend constexpr bool operator==(const zip_iterator&amp; lhs, const zip_iterator&amp; rhs)
+        {
+            return std::get&lt;0&gt;(lhs.base_its) == std::get&lt;0&gt;(rhs.base_its);
+        }
+        friend constexpr bool operator!=(const zip_iterator&amp; lhs, const zip_iterator&amp; rhs)
+        {
+            return !(lhs == rhs);
+        }
+        friend constexpr bool operator&lt;(const zip_iterator&amp; lhs, const zip_iterator&amp; rhs)
+        {
+            return std::get&lt;0&gt;(lhs.base_its) &lt; std::get&lt;0&gt;(rhs.base_its);
+        }
+        friend constexpr bool operator&gt;(const zip_iterator&amp; lhs, const zip_iterator&amp; rhs)
+        {
+            return rhs &lt; lhs;
+        }
+        friend constexpr bool operator&lt;=(const zip_iterator&amp; lhs, const zip_iterator&amp; rhs)
+        {
+            return !(rhs &lt; lhs);
+        }
+        friend constexpr bool operator&gt;=(const zip_iterator&amp; lhs, const zip_iterator&amp; rhs)
+        {
+            return !(lhs &lt; rhs);
+        }
+     private:
+        std::tuple&lt;Its...&gt; base_its;
+    };
+}
+
+template &lt;typename... Ranges&gt;
+class zip {
+    static_assert(sizeof...(Ranges) &gt; 0, "Cannot zip zero ranges");
+public:
+    using iterator = detail::zip_iterator&lt;
+        typename detail::range_traits&lt;Ranges&gt;::iterator...
+    &gt;;
+    using value_type = typename iterator::value_type;
+    using reference = typename iterator::reference;
+
+    explicit constexpr zip(Ranges&amp;&amp;... rs)
+        : ranges{std::forward&lt;Ranges&gt;(rs)...}
+    {
+    }
+    constexpr iterator begin()
+    {
+        return std::apply([](auto&amp;... rs) {
+            return iterator(rs.begin()...);
+        }, ranges);
+    }
+    constexpr iterator end()
+    {
+        return std::apply([](auto&amp;... rs) {
+            return iterator(rs.end()...);
+        }, ranges);
+    }
+private:
+    std::tuple&lt;Ranges...&gt; ranges;
+};
+
+// by default, rvalue arguments are moved to prevent dangling references
+template &lt;typename... Ranges&gt;
+explicit zip(Ranges&amp;&amp;...) -&gt; zip&lt;Ranges...&gt;;
+</code></pre>
+
+<p>Let's hope that <a href="https://wg21.link/P1858" rel="nofollow noreferrer">P1858 Generalized pack declaration and usage</a> gets accepted so that we can eliminate the tons of invocations of <code>std::apply</code> ...</p>
+
+<h1><code>range</code></h1>
+
+<p>Similar to <code>zip</code>, <code>range</code> operates on a tuple basis — the parameters are passed as template arguments, and <code>tuple_size</code> is provided.  This would limit the usefulness of it, because runtime ranges (e.g., <code>range(vector.size())</code>) are not possible.</p>
+
+<p>You choose to make <code>range</code> its own iterator type, which is not without <a href="https://en.cppreference.com/w/cpp/filesystem/directory_iterator/begin" rel="nofollow noreferrer">precedent</a> in the standard library.  However, this will cause confusion once you add more functionality to <code>range</code>.</p>
+
+<p>A more sophisticated comparison operator that treats sentinel (end) values specially takes the sign of <code>step</code> into account allows for commutative comparison and negative steps.</p>
+
+<p>So the end result may look like this: (concept verification, overflow checking, etc. are omitted for simplicity)</p>
+
+<pre><code>namespace detail {
+    template &lt;typename T&gt;
+    class range_iterator {
+        T value{0};
+        T step{1};
+        bool sentinel{false};
+    public:
+        // lying again
+        using iterator_category = std::forward_iterator_tag;
+        using difference_type = std::intmax_t;
+        using value_type = T;
+        using reference = T;
+        using pointer = T*;
+
+        constexpr range_iterator() = default;
+        // sentinel
+        explicit constexpr range_iterator(T v)
+            : value{v}, sentinel{true}
+        {
+        }
+        explicit constexpr range_iterator(T v, T s)
+            : value{v}, step{s}
+        {
+        }
+
+        constexpr reference operator*() const
+        {
+            return value;
+        }
+        constexpr range_iterator&amp; operator++()
+        {
+            value += step;
+            return *this;
+        }
+        constexpr range_iterator operator++(int)
+        {
+            auto copy{*this};
+            ++*this;
+            return copy;
+        }
+        friend constexpr bool operator==(const range_iterator&amp; lhs, const range_iterator&amp; rhs)
+        {
+            if (lhs.sentinel &amp;&amp; rhs.sentinel) {
+                return true;
+            } else if (lhs.sentinel) {
+                return rhs == lhs;
+            } else if (lhs.step &gt; 0) {
+                return lhs.value &gt;= rhs.value;
+            } else if (lhs.step &lt; 0) {
+                return lhs.value &lt;= rhs.value;
+            } else {
+                return lhs.value == rhs.value;
+            }
+            // C++20: return (lhs.value &lt;=&gt; rhs.value) == (step &lt;=&gt; 0); from third branch
+        }
+        friend constexpr bool operator!=(const range_iterator&amp; lhs, const range_iterator&amp; rhs)
+        {
+            return !(lhs == rhs);
+        }
+    };
+}
+
+template &lt;typename T&gt;
+class range {
+    T first{0};
+    T last{};
+    T step{1};
+public:
+    using value_type = T;
+    using iterator = detail::range_iterator&lt;T&gt;;
+
+    explicit constexpr range(T e)
+        : last{e}
+    {
+    }
+    explicit constexpr range(T b, T e, T s = T{1})
+        : first{b}, last{e}, step{s}
+    {
+    }
+    constexpr iterator begin() const
+    {
+        return iterator{first, step};
+    }
+    constexpr iterator end() const
+    {
+        return iterator{last};
+    }
+    constexpr T size() const
+    {
+        return (last - first) / step;
+    }
+};
+</code></pre>
+
+<p>You may also consider implementing <code>enumerate</code> based on <a href="https://docs.python.org/3.8/library/functions.html?highlight=enumerate#enumerate" rel="nofollow noreferrer">Python's</a>, which comes in handy when accessing sequences by index:</p>
+
+<pre><code>// again, rvalue arguments are copied by default
+template &lt;typename Sequence&gt;
+auto enumerate(Sequence&amp;&amp; seq)
+{
+    using std::begin, std::end;
+    return zip(range(end(seq) - begin(seq)), std::forward&lt;Sequence&gt;(seq));
+}
+</code></pre>
+    </div>

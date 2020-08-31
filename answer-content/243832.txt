@@ -1,0 +1,179 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>About the <code>Vec</code> class: Every function in this class could be <code>constexpr</code>. (Especially <code>size()</code>.) At least <code>operator==</code> and <code>size()</code> could also be <code>noexcept</code>. <code>constexpr</code> and <code>noexcept</code> could <em>vastly</em> improve code generation in most cases.</p>
+<p>(Not all of the functions should really be <code>noexcept</code>, though. <code>operator[]</code> probably shouldn’t be, for example, because it might fail for out-of-range indexes. That doesn’t mean you should literally throw an exception! A non-<code>noexcept</code> function doesn’t <em>have</em> to throw. You’re just leaving it as an option, maybe just for in debug mode (and in release mode, remove all exceptions for max performance). You should read <code>noexcept</code> as “this function can’t possibly fail” and anything else as “this function can fail, and <em>might</em> throw when it does (or it might not)”.)</p>
+<pre><code>Vec&lt;sz&gt;(const std::array&lt;double, sz&gt;&amp; storage) : storage_{storage} {}
+Vec&lt;sz&gt;(std::array&lt;double, sz&gt;&amp;&amp; storage) : storage_{move(storage)} {}
+</code></pre>
+<p>There’s really no point in the second constructor. Arrays are not moveable. The <em>contents</em> of an array might be moveable, but in this case the contents are <code>double</code>s, and those are also not moveable. So you have a copy-only container of copy-only stuff… the moving constructor above ends up doing exactly the same thing as the copying constructor, making it pointless.</p>
+<pre><code>Vec&lt;sz&gt; operator-(const Vec&lt;sz&gt;&amp; other) const {
+</code></pre>
+<p>It’s generally a good idea to make your binary operations non-member functions—it’s generally a good idea to make as many things as possible non-member functions, for the sake of encapsulation.</p>
+<p>The usual way to do this is to define the assignment versions of binary ops in-class, and then write the regular binary ops in terms of the assignment versions. Or in plain C++lish:</p>
+<pre><code>class Type
+{
+public:
+    auto operator+=(Type const&amp; t) -&gt; Type&amp;
+    {
+        // define += operation...
+        return *this;
+    }
+
+    // rest of class...
+};
+
+auto operator+(Type a, Type const&amp; b) -&gt; Type
+{
+    return a += b;
+}
+</code></pre>
+<p>So you should probably write an <code>operator-=</code> for <code>Vec&lt;sz&gt;</code>, and then define <code>operator-</code> outside of the class in terms of <code>operator-=</code>. (You probably want an <code>operator-=</code> <em>anyway</em>, for reasons I’ll explain later.)</p>
+<pre><code>Vec&lt;sz&gt; operator-(const Vec&lt;sz&gt;&amp; other) const {
+  std::array&lt;double, sz&gt; result;
+  for (size_t i = 0; i &lt; storage_.size(); ++i) {
+    result[i] = storage_[i] - other.storage_[i];
+  }
+  return Vec&lt;sz&gt;{result};
+}
+</code></pre>
+<p><code>result</code> seems to be completely superfluous here. You store the calculation results in <code>result</code>, and then copy them into the <code>Vec&lt;sz&gt;</code>’s internal <code>storage_</code>… why not skip that step, and store the calculation results directly into the <code>storage_</code>? Like so:</p>
+<pre><code>Vec&lt;sz&gt; operator-(const Vec&lt;sz&gt;&amp; other) const {
+  auto result = Vec&lt;sz&gt;{};
+  for (size_t i = 0; i &lt; storage_.size(); ++i) {
+    result.storage_[i] = storage_[i] - other.storage_[i];
+  }
+  return result;
+}
+</code></pre>
+<p>With C++17’s guaranteed return value elision, you can end up with no copying at all.</p>
+<pre><code>Vec&lt;sz&gt; operator*(const double scalar) const {
+</code></pre>
+<p>This is another function that would be better as a non-member. In this case, you also have symmetry going on:</p>
+<pre><code>template &lt;int sz&gt;
+auto operator*(Vec&lt;sz&gt; const&amp; v, double scalar) -&gt; Vec&lt;sz&gt; { ... }
+template &lt;int sz&gt;
+auto operator*(double scalar, Vec&lt;sz&gt; const&amp; v) -&gt; Vec&lt;sz&gt; { ... }
+</code></pre>
+<p>You could make one or both of those a friend of the class, or define both in terms of a member function (perhaps named <code>scale()</code>).</p>
+<p><code>operator==</code> should also be a non-member, and it should come along with <code>operator!=</code>. (<code>operator[]</code> has to be a member, of course.)</p>
+<pre><code>double sigmoid(const double x, double* dx=nullptr) {
+</code></pre>
+<p>I’m not a fan of default arguments. They make <em>writing</em> functions easier, but <em>using</em> them harder… which is the worst kind of feature, because you only write a function once, but you use them many times.</p>
+<p>Even worse, in this case you’re actually ruining the function by making it less efficient <em>for every possibly usage</em>. If I don’t want the the derivative, I still have to pay for the extra function parameter and the check. If I do, I’m paying for a mostly unnecessary check (branching is slow!).</p>
+<p>And on top of all that, if you <em>don’t</em> try to cram all possible usage scenarios into a single function, you avoid the entire question of whether to use <code>nullptr</code> or <code>std::optional</code>, and make the function easier to use because you can return the derivative directly:</p>
+<pre><code>double sigmoid(const double x) {
+  return 1 / (1 + std::exp(-x));
+}
+
+std::tuple&lt;double, double&gt; sigmoid_with_derivative(const double x) {
+  const double ret = 1 / (1 + std::exp(-x));
+  return {ret, ret * (1 - ret)};
+}
+
+// usage:
+auto a = sigmoid(x); // when I don't want the derivative
+auto [a, dx] = sigmoid_with_derivative(x); // when I do want it
+</code></pre>
+<p>The same idea applies to <code>cross_entropy()</code> and <code>dot_product()</code>.</p>
+<pre><code>double cross_entropy(const int y, const double&amp; y_hat, double* dy_hat=nullptr) {
+</code></pre>
+<p>I’m guessing the <code>&amp;</code> here is a typo, but just in case not: there’s (usually!) nothing to be gained by passing built-in types like <code>double</code> by reference.</p>
+<pre><code>template&lt;int size&gt;
+double logistic_regression(Vec&lt;size&gt;&amp; w,
+                           double&amp; b,
+                           const Vec&lt;size&gt;&amp; x,
+                           const int y,
+                           const int num_epochs=100,
+                           const double learning_rate=0.001) {
+</code></pre>
+<p>Hm… okay, the last two arguments here are probably legitimate use case for default arguments.</p>
+<p>As for the <em>first</em> two arguments… I’m really not a fan of “out” arguments, if that’s what <code>w</code> and <code>b</code> are intended to be. But I don’t know what the intended usage of this function looks like, so I don’t know if maybe this is one of the very, very rare cases where they make sense.</p>
+<p>Assuming that isn’t the case, a better form for this function might be something like:</p>
+<pre><code>template&lt;int size&gt;
+std::tuple&lt;double, Vec&lt;size&gt;, double&gt;
+logistic_regression(Vec&lt;size&gt; w,
+                           double b,
+                           const Vec&lt;size&gt;&amp; x,
+                           const int y,
+                           const int num_epochs=100,
+                           const double learning_rate=0.001) {
+
+  // ... everything else in the function is the same except the last line...
+
+  return {final_loss, w, b};
+}
+</code></pre>
+<p>or:</p>
+<pre><code>template&lt;int size&gt;
+std::tuple&lt;double, Vec&lt;size&gt;, double&gt;
+logistic_regression(Vec&lt;size&gt; const w_,
+                           double const b_,
+                           const Vec&lt;size&gt;&amp; x,
+                           const int y,
+                           const int num_epochs=100,
+                           const double learning_rate=0.001) {
+  auto ret = std::tuple{0.0, w_, b_};
+  auto&amp;&amp; final_loss = std::get&lt;0&gt;(ret);
+  auto&amp;&amp; w = std::get&lt;1&gt;(ret);
+  auto&amp;&amp; b = std::get&lt;2&gt;(ret);
+
+  // ... everything else in the function is the same except the last line...
+
+  return ret;
+}
+</code></pre>
+<p>Just a few final comments:</p>
+<p>It’s good that you’re not fussing over vectorization, because, really, compilers are smart enough to already vectorize your loops. Even in the case that you’re working with a compiler that’s not, it’s pretty trivial to signal you want a loop vectorized with intrinsics or OMP or other means.</p>
+<p>You are correct worry that your biggest performance drain will probably be poor algorithms and/or unnecessary copying. I don’t see any obvious signs of redundant or unnecessary calculations, so you might be okay on that front. That leaves unnecessary copying.</p>
+<p>You’re using arrays for your data types, rather than, say, vectors. That can actually be a performance pessimization, especially if <code>sz</code> is large. Arrays are non-moveable; they can only be copied. Vectors can be copied or moved, and moves are so fast they’re basically free. On the other hand, when vectors <em>do</em> need to be copied, the cost can be many times more than the cost of copying an array, due to the overhead of allocation.</p>
+<p>Note that I’m not suggesting you should use vectors instead! I’m just saying that when using arrays, you can’t count on moves. Every move is actually a copy. So if you <em>are</em> going to use arrays—which is a perfectly sensible thing to do for reasonably small <code>sz</code>—you need to be very careful to avoid <em>both</em> copies <em>and</em> moves.</p>
+<p>You note (via a tag) that you’re using C++17. That’s good! That works out a <em>lot</em> in your favour, because C++17 brought in guaranteed elision. What does that mean?</p>
+<p>It means that for a function like this:</p>
+<pre><code>template &lt;int size&gt;
+auto dot_product_with_derivative(
+        Vec&lt;size&gt; const&amp; w,
+        Vec&lt;size&gt; const&amp; x)
+    -&gt; std::tuple&lt;double, Vec&lt;size&gt;&gt;
+{
+    auto ret = std::tuple{0.0, x};
+
+    for (std::size_t i = 0; i &lt; size; ++i)
+        ret += w[i] * x[i];
+
+    return ret;
+}
+</code></pre>
+<p>used like this:</p>
+<pre><code>auto [z, dw] = dot_product_with_derivative(w, x);
+</code></pre>
+<p>there is only a single array copy done (when the array in <code>x</code> is copied into what will eventually be <code>dw</code>). All other temporary/intermediate values are elided away. This is guaranteed by the standard starting C++17.</p>
+<p>The only place I can see where you (might!) have a superfluous copy is in the line:</p>
+<pre><code>w = w - learning_rate * (dw * dz * da);
+</code></pre>
+<p>That’s because <code>(dw * dz * da)</code> has to create a temporary <code>Vec&lt;size&gt;</code> (let’s call it <code>tmp1</code>)…</p>
+<p>… and then <code>learning_rate * tmp1</code> has to create <em>another</em> temporary <code>Vec&lt;size&gt;</code> (let’s call it <code>tmp2</code>)…</p>
+<p>… and then <code>w - tmp2</code> has to create <em>ANOTHER</em> temporary…</p>
+<p>… when then gets assigned into <code>w</code>.</p>
+<p>That’s <em>THREE</em> temporary <code>Vec&lt;size&gt;</code> objects, each of which requires copying an array of <code>doubles</code>.</p>
+<p>A smart compiler might be able to elide away that third temporary… but why risk it? Why not write <code>operator-=</code> and do:</p>
+<pre><code>w -= learning_rate * (dw * dz * da);
+</code></pre>
+<p>But that still leaves 2 temporaries.</p>
+<p>Is there any reason you want to force <code>(dw * dz * da)</code> to be calculated first? That creates a temporary <code>Vec&lt;size&gt;</code> that you then multiply with <code>learning_rate</code>.</p>
+<p>Why not reorder your calculation as: <code>(learning_rate * dz * da) * dz</code>?</p>
+<pre><code>w -= (learning_rate * dz * da) * dz;
+</code></pre>
+<p>Now <code>(learning_rate * dz * da)</code> only creates a temporary <code>double</code>… not a temporary <code>Vec&lt;size&gt;</code>. A temporary <code>double</code> is basically free.</p>
+<p>Then <code>(learning_rate * dz * da) * dz</code> creates a temporary <code>Vec&lt;size&gt;</code>. That’s unavoidable. Let’s call that <code>tmp1</code>.</p>
+<p>And then <code>w -= tmp1</code> creates no temporaries.</p>
+<p>So you’ve gone from:</p>
+<pre><code>// Up to 3 temporaries created:
+w = w - learning_rate * (dw * dz * da);
+</code></pre>
+<p>to:</p>
+<pre><code>// Only 1 temporary created at maximum, guaranteed:
+w -= (learning_rate * dz * da) * dz;
+</code></pre>
+<p>without changing the actual calculation.</p>
+<p>Now, I’m not sure if a smart compiler could do that optimization on its own. I’m not sure how blasé optimizers these days are about ignoring your parentheses, or reordering built-in operations around user-defined operations. Your original line of code <em>might</em> be compiled without all those temporaries. (Probably will, to be honest.) But why risk it? Rewriting <code>x = x - y</code> as <code>x -= y</code> is an optimization as old as time—it’s why <code>operator-=</code> exists in the first place. And reordering your computation so all the <code>double</code> calculations get done first and then only a single <code>Vec&lt;size&gt;</code> calculation has to be done is also a trivial thing to do. Even if it ultimately makes no difference (because optimizing compilers are so smart these days), it doesn’t really cost anything.</p>
+<p>Without knowing the expected values for the <code>sz</code> parameter of <code>Vec&lt;sz&gt;</code>, I can’t comment on whether using arrays is a good idea. If <code>sz</code> is fairly small, then sure. Even if <code>sz</code> ranges into a hundred or so, maybe, if you’re not making a ton of these objects. But past a certain point, trucking the arrays around will get so unwieldy that it might make more sense to use vectors. With vectors, you would pay a lot more at construction time, and if copying… but you get super-fast moves. Might be worth it, especially if the rest of the code is written to take advantage of moving.</p>
+    </div>

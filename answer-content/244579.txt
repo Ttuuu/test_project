@@ -1,0 +1,433 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'll narrate this in the order I "discover" your code. Then I'll present some tweaks which I think mattered the most in the end.</p>
+<p>I'm liking a lot of what you've done.</p>
+<ol>
+<li><p>A few names could (should?) be improved. E.g. <code>ast::operators</code> does nothing to suggest its purpose. It's a lazy factory for binary operator expressions.</p>
+<p>So, name it <code>make_binary</code> or similar.</p>
+<p>Same with the <code>phoenix::function&lt;&gt;</code> wrapper that wraps it. <code>op</code> in the semantic action doesn't express what happens there very well.</p>
+</li>
+<li><p>Instead of having the <code>op</code> (alias <code>make_binary</code>) actor be side-effectful on the _val argument, consider making it return a different value. Then everything can become immutable and the semantic action better expresses intent:</p>
+<pre><code>rule = expr [ _val = foo(_val, _1, _2, _3) ];
+</code></pre>
+<p>Expresses that _val is updated to something created from the given parameters.</p>
+</li>
+<li><p>At the level of the grammar, things don't look "tidy". A lot of it could be improved by simply <code>using namespace qi::labels</code>, and getting rid of redundant <code>qi::lit()</code> wrappers, which changes e.g.</p>
+<pre><code>logical = equality[qi::_val = qi::_1]
+  &gt;&gt; *(
+    ((qi::lit("&amp;&amp;") &gt; equality[op(qi::_val, qi::_1, ast::operators::and_{})]) |
+     (qi::lit("||") &gt; equality[op(qi::_val, qi::_1, ast::operators::or_{})]))
+  );
+</code></pre>
+<p>into</p>
+<pre><code>using ast::operators;
+using namespace qi::labels;
+
+logical = equality[_val = _1]
+  &gt;&gt; *(
+    (("&amp;&amp;" &gt; equality[op(_val, _1, operators::and_{})]) |
+     ("||" &gt; equality[op(_val, _1, operators::or_{})]))
+  );
+</code></pre>
+</li>
+<li><p>You check for <code>eoi</code> in your grammar (Good for you!). However, it's put inside a recursed rule:</p>
+<pre><code>expression = logical.alias() &gt; qi::eoi;
+</code></pre>
+<p>This means that <code>(a+b)*3</code> would never parse, because <code>)</code> is found where <code>eoi</code> is required. Fix it by putting <code>eoi</code> on the top level.</p>
+</li>
+<li><p>You have a skipper at the grammar level, which means people have to pass in the correct skipper. If they don't, they can wreck the grammar. Instead, make the skipper internal so you control it, and the interface is easier to use (correctly):</p>
+<pre><code>start = qi::skip(qi::ascii::space) [ expression ];
+</code></pre>
+<p>Usage:</p>
+<pre><code>if (qi::parse(it_begin, it_end, parser, expression)) {
+</code></pre>
+<p>Or perhaps:</p>
+<pre><code>if (qi::parse(it_begin, it_end, parser &gt; qi::eoi, expression)) {
+</code></pre>
+</li>
+<li><p>I realize that the driver code (<code>main</code>) might be out of scope for your review, but I'll show you the missing error-handling, because it can be pretty subtle w.r.t. partial parses:</p>
+<pre><code>int main() {
+    ast::printer printer;
+    grammar&lt;std::string::const_iterator&gt; parser;
+
+    for (std::string const input : {
+            "2 + 5 + t.a",
+            "(2 + 5) + t.a", // note the removed eoi constraint
+            "2 + 5 * t.a",
+            "2 * 5 - t.a",
+            "partial match",
+            "uhoh *",
+        })
+    try {
+        std::cout &lt;&lt; "----- " &lt;&lt; std::quoted(input) &lt;&lt; " ---- \n";
+        auto it_begin(input.begin()), it_end(input.end());
+
+        ast::expression expression;
+        if (qi::parse(it_begin, it_end, parser, expression)) {
+            printer(expression);
+            std::cout &lt;&lt; std::endl;
+        } else {
+            std::cout &lt;&lt; "Not matched\n";
+        }
+
+        if (it_begin != it_end) {
+            std::string tail(it_begin, it_end);
+            std::cout &lt;&lt; "Remaining unparsed input: " &lt;&lt; std::quoted(tail) &lt;&lt; "\n";
+        }
+    } catch(std::exception const&amp; e) {
+        std::cout &lt;&lt; "Exception: " &lt;&lt; std::quoted(e.what()) &lt;&lt; "\n";
+    }
+}
+</code></pre>
+</li>
+<li><p>Note that the expectations will not give useful messages unless you named your rules.</p>
+<pre><code>Exception: Expected &lt;unnamed-rule&gt; at ""
+</code></pre>
+<p>The idiomatic way to name them is to use the DEBUG macros:</p>
+<pre><code>BOOST_SPIRIT_DEBUG_NODES(
+        (start)
+        (expression)(logical)(equality)
+        (relational)(additive)(multiplicative)
+        (factor)(unary)(binary)(primary)
+        (variable)
+    )
+</code></pre>
+<p>Now:</p>
+<pre><code>Exception: Expected &lt;factor&gt; at ""
+</code></pre>
+<blockquote>
+<p>Intermission: superficial changes to here: <strong><a href="http://coliru.stacked-crooked.com/a/be341801f70758e1" rel="nofollow noreferrer">Live On Coliru</a></strong></p>
+</blockquote>
+</li>
+<li><p>In the printer there's a lot of repetition (<code>apply_visitor(*this</code>...) and it's slightly less than readable due to <code>operator()</code>. My preference is to relay to a <code>call</code> or <code>apply</code> function</p>
+</li>
+<li><p>Also in the printer, don't hardcode the output stream. One day(TM) you will want to format to a string. Or <code>std::cerr</code>, or a file</p>
+<blockquote>
+<p>Combining these notes on the printer: <strong><a href="http://coliru.stacked-crooked.com/a/3d0a027e41d2a8b8" rel="nofollow noreferrer">Live On Coliru</a></strong></p>
+<pre><code>struct printer {
+    std::ostream&amp; _os;
+
+    template &lt;typename T&gt; std::ostream&amp; operator()(T const&amp; v) const
+        { return call(v); }
+
+  private:
+    std::ostream&amp; call(expression const&amp; ast) const {
+        return boost::apply_visitor(*this, ast.expr);
+    }
+
+    std::ostream&amp; call(binary_operator const&amp; expr) const {
+        _os &lt;&lt; "op:" &lt;&lt; expr.op &lt;&lt; "(";
+        call(expr.lhs) &lt;&lt; ", ";
+        return call(expr.rhs) &lt;&lt; ')';
+    }
+
+    std::ostream&amp; call(unary_operator const&amp; expr) const {
+        _os &lt;&lt; "op:" &lt;&lt; expr.op &lt;&lt; "(";
+        return call(expr.rhs) &lt;&lt; ')';
+    }
+
+    template &lt;typename Lit&gt;
+    std::ostream&amp; call(Lit const&amp; v) const { return _os &lt;&lt; v; }
+};
+</code></pre>
+</blockquote>
+</li>
+<li><p>The logical extension of this is to make it an actual <a href="https://en.cppreference.com/w/cpp/io/manip" rel="nofollow noreferrer">output manipulator</a>:</p>
+<pre><code>    std::cout &lt;&lt; "Parsed: " &lt;&lt; fmt_expr{expression} &lt;&lt; std::endl;
+</code></pre>
+<blockquote>
+<p>Again, <strong><a href="http://coliru.stacked-crooked.com/a/6fa6027d9de65693" rel="nofollow noreferrer">Live On Coliru</a></strong>, also simplified the <code>printer</code> visitor again:</p>
+<pre><code>std::ostream&amp; call(binary_operator const&amp; expr) const {
+    return _os
+        &lt;&lt; "op:" &lt;&lt; expr.op
+        &lt;&lt; "("   &lt;&lt; fmt_expr{expr.lhs}
+        &lt;&lt; ", "  &lt;&lt; fmt_expr{expr.rhs} &lt;&lt; ')';
+}
+</code></pre>
+</blockquote>
+</li>
+<li><p>In the AST you store the actual operator dynamically, as a string. It seems to me that there is not a lot of value to encode the operator statically just for all the ast-building overloads (<code>ast::operator::operator()</code> as well as all the delegated members of <code>ast::expr</code>). Instead, just pass a string everytime?</p>
+<p>Now the builder namespace can vanish, the asymmetrical factory members, and the whole phoenix function is grammar-local:</p>
+<pre><code>struct make_binary_f {
+    ast::binary_operator operator()(ast::expression lhs, ast::expression rhs, std::string op) const {
+        return { op, lhs, rhs };
+    }
+};
+boost::phoenix::function&lt;make_binary_f&gt; make;
+</code></pre>
+<blockquote>
+<p>Another in-between station <strong><a href="http://coliru.stacked-crooked.com/a/21fd38b724e13fc1" rel="nofollow noreferrer">Live On Coliru</a></strong></p>
+<h3>ACHIEVEMENT UNLOCKED</h3>
+<p>Code down 113 lines of code (now 218 instead of 331 lines of code)</p>
+</blockquote>
+</li>
+<li><p>Random spot:</p>
+<pre><code>variable = qi::lexeme[qi::alpha &gt;&gt; *(qi::alnum | '_')];
+</code></pre>
+<p><code>'_'</code> is equivalent to <code>qi::lit('_')</code>, not <code>qi::char_('_')</code> so this would remove all underscores. Either use the char_, or use <code>raw[]</code> to directly construct the argument from source iterators.</p>
+</li>
+<li><p>Now we're getting into details: instead of <code>[_val=_1]</code> we can use automatic attribute propagation (see <a href="https://stackoverflow.com/questions/8259440/boost-spirit-semantic-actions-are-evil">https://stackoverflow.com/questions/8259440/boost-spirit-semantic-actions-are-evil</a> and <a href="https://www.boost.org/doc/libs/1_73_0/libs/spirit/doc/html/spirit/qi/reference/nonterminal/rule.html#spirit.qi.reference.nonterminal.rule.expression_semantics" rel="nofollow noreferrer"><code>operator %=</code> rule init</a>).</p>
+</li>
+<li><p>Factor out more common subexpressions. Together with previous bullet:</p>
+<pre><code>primary
+    = qi::double_[_val = _1]
+    | ('(' &gt; expression[_val = _1] &gt; ')')
+      &gt;&gt; *("." &gt; variable[_val = make(_val, _1, ".")])
+    | variable[_val = _1]
+      &gt;&gt; *("." &gt; variable[_val = make(_val, _1, ".")]);
+</code></pre>
+<p>Becomes:</p>
+<pre><code>primary %= qi::double_
+    | (('(' &gt; expression &gt; ')') | variable)
+        &gt;&gt; *("." &gt; variable[_val = make(_val, _1, ".")])
+    ;
+</code></pre>
+</li>
+<li><p>Lift variant type outside <code>expression</code> so you can implement the recursive types before <code>expression</code>. Also, consider <code>expression</code> deriving from the variant (<a href="https://en.wikipedia.org/wiki/Liskov_substitution_principle" rel="nofollow noreferrer">LSK</a>). In your case, there is no real need for nested expressions because the unary/binary nodes impose order already. So your entire AST can be:</p>
+<pre><code>struct unary_operator;
+struct binary_operator;
+
+typedef boost::variant&lt;
+    double,
+    std::string,
+    boost::recursive_wrapper&lt;unary_operator&gt;,
+    boost::recursive_wrapper&lt;binary_operator&gt;
+&gt; expr_variant;
+
+struct expression : expr_variant {
+    using expr_variant::expr_variant;
+    using expr_variant::operator=;
+};
+
+struct unary_operator  { expression rhs;                 std::string op; } ;
+struct binary_operator { expression lhs; expression rhs; std::string op; } ;
+</code></pre>
+</li>
+<li><p>Move <code>expectation_handler</code> inside the grammar class (it's of no use to anything else), and optionally modernize it with phoenix::function? Regardless, since the functor is stateless, no need to <code>ref</code> (and certainly not <code>ref</code> instead of <code>cref</code>):</p>
+<pre><code>qi::on_error&lt;qi::fail&gt;(
+    expression,
+    boost::phoenix::bind(expectation_handler{}, _3, _2, _4));
+</code></pre>
+<p>Actually, just make it</p>
+<pre><code>auto handler = [](Iterator first, Iterator last, const boost::spirit::info &amp;info) {
+    std::stringstream msg;
+    msg &lt;&lt; "Expected " &lt;&lt; info &lt;&lt; " at \"" &lt;&lt; std::string(first, last) &lt;&lt; "\"";
+    throw std::runtime_error(msg.str());
+};
+
+qi::on_error&lt;qi::fail&gt;(
+    expression,
+    boost::phoenix::bind(handler, _3, _2, _4));
+</code></pre>
+</li>
+<li><p>Minor nit: use <a href="https://en.cppreference.com/w/cpp/io/manip/quoted" rel="nofollow noreferrer"><code>std::quoted</code></a> instead of "fake" quoting :)</p>
+</li>
+<li><p>Late brainwave, you can extract the bulk of that semantic action:</p>
+<pre><code>auto make_bin =
+    _val = px::bind(make_&lt;ast::binary_expr&gt;{}, _val, _2, _1);
+</code></pre>
+<p>As long as all the limbs are stateless/by value, that's not a problem (contrast with <a href="https://stackoverflow.com/questions/22023779/assigning-parsers-to-auto-variables/22027181#22027181">https://stackoverflow.com/questions/22023779/assigning-parsers-to-auto-variables/22027181#22027181</a> though!). Now just make the operators expose attributes:</p>
+<pre><code>expression %= equality
+  &gt;&gt; *(
+      (qi::string("&amp;&amp;") &gt; equality)[make_bin] |
+      (qi::string("||") &gt; equality)[make_bin]
+  );
+
+equality %= relational
+  &gt;&gt; *(
+      (qi::string("==") &gt; relational)[make_bin] |
+      (qi::string("!=") &gt; relational)[make_bin]
+  );
+
+relational %= additive
+  &gt;&gt; *(
+      (qi::string("&lt;")  &gt; relational)[make_bin]  |
+      (qi::string("&lt;=") &gt; relational)[make_bin] |
+      (qi::string("&gt;")  &gt; relational)[make_bin]  |
+      (qi::string("&gt;=") &gt; relational)[make_bin]
+  );
+
+additive %= multiplicative
+  &gt;&gt; *(
+      (qi::string("+") &gt; multiplicative)[make_bin] |
+      (qi::string("-") &gt; multiplicative)[make_bin]
+  );
+
+multiplicative %= factor
+  &gt;&gt; *(
+      (qi::string("*") &gt; factor)[make_bin] |
+      (qi::string("/") &gt; factor)[make_bin]
+  );
+
+factor %= primary
+  &gt;&gt; *(
+      (qi::string("**") &gt; primary)[make_bin]
+  );
+
+primary %= qi::double_
+    | (('(' &gt; expression &gt; ')') | variable)
+        &gt;&gt; *(qi::string(".") &gt; variable)[make_bin]
+    ;
+</code></pre>
+</li>
+<li><p>Actually, just checked and <code>phoenix::construct</code> can do aggregates:</p>
+<pre><code>auto make_bin =
+    _val = boost::phoenix::construct&lt;ast::binary_expr&gt;(_1, _val, _2);
+</code></pre>
+</li>
+<li><p>Also dropped the unused <code>unary_*</code> machinery, moved the IO manipulator into <code>io</code> namespace (instead of <code>ast</code>) and reintroduced <code>eoi</code> checking in the <code>main</code> driver...</p>
+</li>
+<li><p>Heck, with some c++17 you can combine the branches of each production:</p>
+<pre><code>auto op = [](auto... sym) { return qi::copy((qi::string(sym) | ...)); };
+
+expression     %= equality       &gt;&gt; *(op("&amp;&amp;","||") &gt; equality)[make_bin];
+equality       %= relational     &gt;&gt; *(op("==","!=") &gt; relational)[make_bin];
+relational     %= additive       &gt;&gt; *(op("&lt;","&lt;=","&gt;","&gt;=") &gt; relational)[make_bin];
+additive       %= multiplicative &gt;&gt; *(op("+","-")   &gt; multiplicative)[make_bin];
+multiplicative %= factor         &gt;&gt; *(op("*","/")   &gt; factor)[make_bin];
+factor         %= primary        &gt;&gt; *(op("**")      &gt; primary)[make_bin];
+</code></pre>
+</li>
+</ol>
+<h2>Full Demo, 103 Lines Of Code</h2>
+<p>Only just didn't manage to bring it under 100 LoC, but I added more test cases in the process.</p>
+<ul>
+<li><p><strong><a href="https://wandbox.org/permlink/n6Sd1a0JCnzRo5Hr" rel="nofollow noreferrer">Live Demo On Wandbox</a></strong></p>
+</li>
+<li><p><strong><a href="https://godbolt.org/z/RCs8MU" rel="nofollow noreferrer">Live Demo On Compiler Explorer</a></strong></p>
+</li>
+<li><p><strong><a href="http://coliru.stacked-crooked.com/a/3f9afaad41463243" rel="nofollow noreferrer">Live Demo On Coliru</a></strong> (<em>where I found out that <code>phoenix::construct&lt;&gt;</code> for aggregates requires either GCC or recent boost or both, so added a constructor</em>)</p>
+</li>
+</ul>
+<pre class="lang-cpp prettyprint-override"><code>#include &lt;boost/spirit/include/qi.hpp&gt;
+#include &lt;boost/spirit/include/phoenix.hpp&gt;
+#include &lt;iostream&gt;
+#include &lt;iomanip&gt;
+namespace qi = boost::spirit::qi;
+
+namespace ast {
+    struct binary_expr;
+
+    typedef boost::variant&lt;
+        double,
+        std::string,
+        boost::recursive_wrapper&lt;binary_expr&gt;
+    &gt; expr_variant;
+
+    struct expression : expr_variant {
+        using expr_variant::expr_variant;
+        using expr_variant::operator=;
+    };
+
+    struct binary_expr {
+        binary_expr(std::string op, expression lhs, expression rhs)
+            : op(std::move(op)), lhs(std::move(lhs)), rhs(std::move(rhs)) {}
+        std::string op; expression lhs; expression rhs;
+    };
+}
+
+namespace io {
+    struct fmt_expr { // io manipulator
+        ast::expression const&amp; _ref;
+        friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; os, fmt_expr manip);
+    };
+
+    struct formatter_visitor {
+        std::ostream&amp; _os;
+        template &lt;typename T&gt; std::ostream&amp; operator()(T const&amp; v) const
+            { return call(v); }
+
+      private:
+        std::ostream&amp; call(ast::expression const&amp; v) const {
+            return boost::apply_visitor(*this, v);
+        }
+
+        std::ostream&amp; call(ast::binary_expr const&amp; expr) const {
+            return _os &lt;&lt; "op:" &lt;&lt; expr.op
+                &lt;&lt; "("   &lt;&lt; fmt_expr{expr.lhs} &lt;&lt; ", "  &lt;&lt; fmt_expr{expr.rhs} &lt;&lt; ')';
+        }
+
+        template &lt;typename Lit&gt;
+        std::ostream&amp; call(Lit const&amp; v) const { return _os &lt;&lt; v; }
+    };
+
+    std::ostream&amp; operator&lt;&lt;(std::ostream&amp; os, fmt_expr manip) {
+        return formatter_visitor{os}(manip._ref);
+    }
+}
+
+template&lt;typename Iterator&gt;
+struct grammar : qi::grammar&lt;Iterator, ast::expression()&gt; {
+    grammar() : grammar::base_type(start) {
+        using namespace qi::labels;
+
+        auto make_bin = _val = boost::phoenix::construct&lt;ast::binary_expr&gt;(_1, _val, _2);
+        auto op = [](auto... sym) { return qi::copy((qi::string(sym) | ...)); };
+
+        expression     %= equality       &gt;&gt; *(op("&amp;&amp;","||") &gt; equality)[make_bin];
+        equality       %= relational     &gt;&gt; *(op("==","!=") &gt; relational)[make_bin];
+        relational     %= additive       &gt;&gt; *(op("&lt;","&lt;=","&gt;","&gt;=") &gt; relational)[make_bin];
+        additive       %= multiplicative &gt;&gt; *(op("+","-")   &gt; multiplicative)[make_bin];
+        multiplicative %= factor         &gt;&gt; *(op("*","/")   &gt; factor)[make_bin];
+        factor         %= primary        &gt;&gt; *(op("**")      &gt; primary)[make_bin];
+    
+        variable = qi::lexeme[qi::alpha &gt;&gt; *(qi::alnum | qi::char_('_'))];
+        primary %= qi::double_ | (('(' &gt; expression &gt; ')') | variable)
+                &gt;&gt; *(op(".") &gt; variable)[make_bin];
+    
+        start = qi::skip(qi::ascii::space) [ qi::eps &gt; expression ] &gt; qi::eoi;
+
+        qi::on_error&lt;qi::fail&gt;(start, boost::phoenix::bind([](auto first, auto last, auto const&amp; info) {
+            std::stringstream msg;
+            msg &lt;&lt; "Expected " &lt;&lt; info &lt;&lt; " at " &lt;&lt; std::quoted(std::string(first, last));
+            throw std::runtime_error(msg.str());
+        }, _3, _2, _4));
+
+        BOOST_SPIRIT_DEBUG_NODES((expression)(equality)(relational)(additive)
+                (multiplicative)(factor)(unary)(binary)(primary)(variable))
+    }
+  private:
+    qi::rule&lt;Iterator, ast::expression()&gt; start;
+    qi::rule&lt;Iterator, ast::expression(), qi::ascii::space_type&gt; expression, equality, relational, additive, multiplicative, factor, unary, binary, primary;
+    qi::rule&lt;Iterator, std::string()&gt; variable; // lexeme
+};
+
+int main() {
+    using io::fmt_expr;
+    grammar&lt;std::string::const_iterator&gt; parser;
+
+    for (std::string const s : { "2 + 5 + t.a", "(2 + 5) + t.a", "2 + 5 * t.a",
+            "2 * 5 - t.a", "partial match", "uhoh *", "under_scores", "" })
+    try {
+        ast::expression expression;
+        qi::parse(s.begin(), s.end(), parser, expression);
+        std::cout &lt;&lt; std::quoted(s) &lt;&lt; " -&gt; " &lt;&lt; fmt_expr{expression} &lt;&lt; "\n";
+    } catch(std::exception const&amp; e) {
+        std::cout &lt;&lt; "Exception: " &lt;&lt; e.what() &lt;&lt; "\n";
+    }
+}
+</code></pre>
+<p>Prints</p>
+<pre><code>"2 + 5 + t.a" -&gt; op:+(op:+(2, 5), op:.(t, a))
+"(2 + 5) + t.a" -&gt; op:+(op:+(2, 5), op:.(t, a))
+"2 + 5 * t.a" -&gt; op:+(2, op:*(5, op:.(t, a)))
+"2 * 5 - t.a" -&gt; op:-(op:*(2, 5), op:.(t, a))
+Exception: Expected &lt;eoi&gt; at " match"
+Exception: Expected &lt;factor&gt; at ""
+"under_scores" -&gt; under_scores
+</code></pre>
+<h2>Beyond Scope</h2>
+<p>The things I'll consider beyond the scope are related to your grammar/ast semantics.</p>
+<ol>
+<li><p>Operator precedence is a bit noisy. What you'd like to have is some meta data that allows you to "just combine" the binary operands and have the correct precedence emerge, like so:</p>
+<pre><code>expression %= primary
+  &gt;&gt; *(
+      (binop &gt; expression) [_val = make_bin(_1, _val, _2)]
+  );
+</code></pre>
+<p>I've applied this strategy on an <a href="https://chat.stackoverflow.com/transcript/210289?m=49164574#49164574">extended chat</a> at <a href="https://stackoverflow.com/a/60846101/85371">this answer</a> and the resulting code is on github: <a href="https://github.com/sehe/qi-extended-parser-evaluator" rel="nofollow noreferrer">https://github.com/sehe/qi-extended-parser-evaluator</a></p>
+</li>
+<li><p>Consider using X3 if you have C++14 support. The compile times will be much lower.</p>
+</li>
+</ol>
+
+    </div>

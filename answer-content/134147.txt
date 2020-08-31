@@ -1,0 +1,137 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Like @Gareth mentioned in his comment it would be perfect to use the <code>ConcurrentQueue&lt;T&gt;</code>. </p>
+
+<p>You answered <code>@Gareth the queue needs to be bounded in size</code> but where is the problem. We can just add a check to the <code>Add()</code> method and if the queue's size is equal to the bounded size we will just dequeue one item.  </p>
+
+<p>If the passed in <code>size</code> parameter of the constructor is <code>0</code> you will get a <code>DivideByZeroException</code> at <code>_i = (_i + 1)%_size;</code> and it doesn't really make sense to have a <code>CircularBuffer</code> with <code>size == 0</code>, does it ?</p>
+
+<p>As you will notice in the adjusted code, I have placed the <code>_lock.EnterWriteLock();</code> outside of the <code>try..finally</code> <a href="https://stackoverflow.com/q/7071103/2655508">because what happens if the call to <code>EnterWriteLock()</code> fails ?</a> </p>
+
+<pre><code>public class CircularBuffer&lt;T&gt;
+{
+    private readonly ConcurrentQueue&lt;T&gt; _data;
+    private readonly ReaderWriterLockSlim _lock = new ReaderWriterLockSlim();
+    private readonly int _size;
+
+    public CircularBuffer(int size)
+    {
+        if (size &lt; 1)
+        {
+            throw new ArgumentException($"{nameof(size)} cannot be negative or zero");
+        }
+        _data = new ConcurrentQueue&lt;T&gt;();
+        _size = size;
+    }
+
+    public IEnumerable&lt;T&gt; Latest()
+    {
+        return _data.ToArray();
+    }
+
+    public void Add(T t)
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            if (_data.Count == _size)
+            {
+                T value;
+                _data.TryDequeue(out value);
+            }
+
+            _data.Enqueue(t);
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
+        }
+    }
+}
+</code></pre>
+
+<p>although using a <code>ConcurrentQueue</code> is IMO the cleaner way I will post a solution using a generic array as well like so  </p>
+
+<pre><code>public class CircularBuffer&lt;T&gt;
+{
+    private readonly ReaderWriterLockSlim slimLock = new ReaderWriterLockSlim();
+    private readonly int capacity;
+    private readonly T[] buffer;
+    private readonly int upperBound;
+
+    private int currentIndex = -1;
+    private int currentStart = 0;
+
+    public CircularBuffer(int size)
+    {
+        if (size &lt; 1)
+        {
+            throw new ArgumentException($"{nameof(size)} cannot be negative nor zero");
+        }
+
+        buffer = new T[size];
+        capacity = size;
+        upperBound = size - 1;
+    }
+
+    public void Add(T value)
+    {
+        slimLock.EnterWriteLock();
+        try
+        {
+
+            if (IsFull || currentIndex == upperBound)
+            {
+                currentStart = FetchNextSlot(currentStart);
+                IsFull = true;
+            }
+
+            currentIndex = FetchNextSlot(currentIndex);
+            buffer[currentIndex] = value;
+
+        }
+        finally
+        {
+            slimLock.ExitWriteLock();
+        }
+
+    }
+
+    public bool IsFull { get; private set; }
+
+    private int FetchNextSlot(int value)
+    {
+        return (value + 1) % capacity;
+    }
+
+    public IEnumerable&lt;T&gt; Latest()
+    {
+        slimLock.EnterReadLock();
+        try
+        {
+            return FetchItems().ToArray();
+        }
+        finally
+        {
+            slimLock.ExitReadLock();
+        }
+    }
+
+    private IEnumerable&lt;T&gt; FetchItems()
+    {
+        IEnumerable&lt;T&gt; fetchedItems = Enumerable.Empty&lt;T&gt;();
+        if (IsFull)
+        {
+            return FetchItems(currentStart, upperBound);
+        }
+        return fetchedItems.Concat(FetchItems(0, currentIndex));
+    }
+    private IEnumerable&lt;T&gt; FetchItems(int start, int end)
+    {
+        for (int i = start; i &lt;= end; i++)
+        {
+            yield return buffer[i];
+        }
+    }
+}  
+</code></pre>
+    </div>

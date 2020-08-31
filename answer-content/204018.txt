@@ -1,0 +1,108 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2><code>GenericNode&lt;T&gt;</code></h2>
+
+<p>I'll adopt the name <code>Node&lt;T&gt;</code>, as Henrik Hansen has done.</p>
+
+<ul>
+<li>This class is completely publically mutable, which is probably not ideal. Does it make any sense to change the <code>NodeInformation</code> once you've created the node? Maybe it does, but if not, then you should work to enforce the idea by making it immutable. I'd also wager it makes no sense to have a node without this information, so I'd add a constructor to this effect:</li>
+</ul>
+
+
+
+<pre><code>    public T NodeInformation { get; }
+
+    public Node(T nodeInformation)
+    {
+        NodeInformation = nodeInformation;
+    }
+</code></pre>
+
+<ul>
+<li><p>The children and parent properties are more tricky, as (without some effort), you can't know who who the children are upfront, and it's even more effort to make both the <code>Children</code> list and <code>Parent</code> immutable. Instead, let's make them privatelly mutable, and add an <code>AddChild</code> method, so that it's more difficult for an external entity to produce an invalid tree:</p>
+
+<pre><code>public Node&lt;T&gt; Parent { get; private set; }
+
+private readonly List&lt;Node&lt;T&gt;&gt; _children = new List&lt;Node&lt;T&gt;&gt;();
+public IReadOnlyList&lt;Node&lt;T&gt;&gt; Children =&gt; _children;
+
+public void AddChild(Node&lt;T&gt; childNode)
+{
+    if (childNode.Parent != null)
+        throw new ArgumentException(nameof(childNode), "Child node already has a parent");
+
+    _children.Add(childNode);
+    childNode.Parent = this;
+}
+</code></pre>
+
+<p>Note that we have a <code>List&lt;Node&lt;T&gt;&gt;</code> so we can add children, but we only expose an <code>IReadOnlyList&lt;Node&lt;T&gt;&gt;</code>, so they can only be added (without dodgy casts) by means of the <code>AddChild</code> method.</p></li>
+</ul>
+
+<h2><code>IDbEntityNode</code></h2>
+
+<ul>
+<li><p>Again, everything here is publically mutable: I do not think it makes much sense to change the Id of something! As a general rule, immutable is good if you can have it. It's very easy to add a public setter back in, but it's potentially nightmarish to take it out.</p></li>
+<li><p>You mentioned wanted more generic IDs: I'd be inclined to make this type generic, with both generic Ids and generic <code>Data</code>. You can always provide a 'convenience' concrete version which has <code>int</code> and <code>string</code> baked in. If you have generic Ids, you either need to make the type comparable, or you'll want to pass <code>CreateGenericTree</code> an <code>IEqualityComparer&lt;TId&gt;</code> to handle it (or you could assume the default comparer, but that's much less fun, and you can again provide a 'convenience' overload which uses it by default).</p></li>
+</ul>
+
+<h2><code>CreateGenericTree</code></h2>
+
+<ul>
+<li><p>Conceptually, this appears to create multiple trees, as oppose to one tree (as there can be many roots); should it be called <code>CreateTrees</code>?</p></li>
+<li><p>You are repeatedly indexing into <code>flatDataObject</code>: much better to loop over something like <code>i</code>, which everyone knows is an index, and set <code>element = flatDataObject[i]</code> (or use a <code>foreach</code> as Henrik Hansen has said).</p></li>
+<li><p>I think I'm in a minority, but I'd be strongly inclined to use a dedicated delegate type rather than <code>Func&lt;T, bool&gt;</code>. What question does <code>Func&lt;T, bool&gt;</code> answer? It is a horse? Is it lazily loaded? I don't know. You might consider then something like, but a lot of people dislike nominal delegates, for various reasons.</p>
+
+<pre><code>public delegate bool RootDetector&lt;in T&gt;(T node) where T : IDbEntityNode
+</code></pre></li>
+<li><p>You are returning a <code>List&lt;T&gt;</code>, and there is a good chance that you could just as well return a more abstract type, such as <code>IList&lt;T&gt;</code> or <code>IReadOnlyList&lt;T&gt;</code>. This give you freedom to change the <em>actual</em> returned type later (e.g. if you change the implementation) without having to change the return type, and if it turns out later that you need some members of a less abstract type, then you can more easily change an abstract return type to less abstract return type than you can the other way round.</p></li>
+<li><p>You are also taking <code>List&lt;T&gt;</code> as a parameter. As someone consuming your API, this would concern me, as <code>List&lt;T&gt;</code> is openly mutable, and I would unsure whether your code is going to modify what I pass it. Much better to use an abstract type like <code>IReadOnlyList&lt;T&gt;</code>, which gives the caller more freedom, and communicates immediately that you are not going to modify the parameter.</p></li>
+<li><p>Your code will currently heave oddly if the <code>flatDataObject</code> contains nodes with the same <code>Id</code>. Unfortunately, checking for this would be ugly.</p></li>
+</ul>
+
+<p>Below is my take (you'll note it's pretty similar to Henrik Hansen's code).</p>
+
+<pre><code>public static IReadOnlyList&lt;Node&lt;T&gt;&gt; CreateTrees&lt;T&gt;(IEnumerable&lt;T&gt; flatDataObjects, RootDetector&lt;T&gt; isRoot) where T : IDbEntityNode            
+{
+    if (flatDataObjects == null)
+        throw new ArgumentNullException(nameof(flatDataObjects));
+    if (isRoot == null)
+        throw new ArgumentNullException(nameof(isRoot));
+
+    var nodes = flatDataObjects.ToDictionary(fdo =&gt; fdo.Id, fdo =&gt; new Node&lt;T&gt;(fdo));
+
+    List&lt;Node&lt;T&gt;&gt; roots = new List&lt;Node&lt;T&gt;&gt;();
+
+    foreach (var node in nodes.Values)
+    {
+        if (isRoot(node.NodeInformation))
+        {
+            roots.Add(node);
+        }
+        else
+        {
+            if (nodes.TryGetValue(node.NodeInformation.ParentId, out var parentNode))
+            {
+                parentNode.AddChild(node);
+            }
+            else
+            {
+                throw new InvalidOperationException($"Non-root node {node.NodeInformation.Id} has ParentId {node.NodeInformation.ParentId}, but no node exists with that id");
+            }
+        }
+    }
+
+    return roots;
+}
+</code></pre>
+
+<p>Note that I've added dedicated checks for <code>null</code> parameters, and that upon detecting an invalid input (a node with no parent) I throw a helpful error message. Note also that <code>ToDictionary</code> will throw if two elements have the same key (Which is good), though the message will be less helpful: you could actively trap this exception and throw your own explanation, or otherwise you could manually detected duplicates and throw first/write your own version of <code>ToDictionary</code> to achieve the same.</p>
+
+<p>I would argue that these LINQy versions are <em>much</em> more readable, because each bit of logic is mostly self contained. Even clearer would be to select the roots only at the very end, but there is a good case to be made that calling <code>isRoot</code> as few times as possible is desirable, as we don't know what it does, and partitioning the dictionary would introduce complexity.</p>
+
+<h2>Boring things</h2>
+
+<ul>
+<li><p><code>IsRootNode</code> is a method parameter, and usually these are in <code>lowerCamelCase</code> (e.g. <code>isRootNode</code>). Note that it has the same name currently as the method you are passing to it, which means if you change it to <code>isRootNode</code> you might forget to change the usage if the method is in scope, and then you have a problem (C# warns about unused variables, but not unused parameters).</p></li>
+<li><p>Pay attention to your white-space: inconsistent white-space can make perfectly good code terribly untidy-looking, and a few more line-breaks here-and-there really help to break up the logic and make the code easier to scan.</p></li>
+</ul>
+    </div>

@@ -1,0 +1,224 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Reinderien's comments definitely improve the result overall, but since my original question was about performance, I thought I should provide the answer I came up with. The main performance issue was excessive use of SelectSingleNode, when looping through all the existing files and looking to see if it was in the XML. By building two arrays, one for indexed files and one for indexed folders, I could dramatically improve the search speed. This due to <code>.Contains()</code> being much faster than <code>.SelectSingleNode()</code> and splitting folders and files into independent arrays. I have as many as 1000 folders indexed, and 8000 files, in a typical data set, and searching all 9000 items 9000 times is a lot slower than searching 1000 folders 1000 times and 8000 files 8000 times. Both of those indexes are also unsorted as there is no value in sorting them, but a slight performance penalty when creating them sorted.
+The last refinements where only sorting and saving the final XML if changes where actually made.
+With all those changes, I got total performance down to 10 seconds, when also checking all existing files to see if they have changed and need rehashed, and adding a few new files which would also need hashing. 10 seconds per library is quite manageable.</p>
+<p>So, final code</p>
+<pre><code>$oldIndex = 'C:\Assets\Revit\oldIndex.xml'
+$newIndex = 'C:\Assets\Revit\newIndex.xml'
+$path = 'C:\Assets\Revit\2020'
+
+function Get-FileInfo {
+    param (
+        [String]$path,
+        [switch]$hash
+    )
+
+    $file = Get-Item $path
+    $fileInfo = @{
+        size = $file.Length
+        date = (([System.IO.FileInfo]::new($path)).LastWriteTime).ToString('O')
+        hash = $null
+    }
+    if ($hash) {
+        $fileInfo.hash = (Get-FileHash -Path:$path -Algorithm:SHA1).Hash
+    }
+
+    $fileInfo
+}
+
+CLS
+(Measure-Command {
+$logAdd = [System.Collections.Generic.List[string]]::new()
+$logMove = [System.Collections.Generic.List[string]]::new()
+$logDelete = [System.Collections.Generic.List[string]]::new()
+$logUpdate = [System.Collections.Generic.List[string]]::new()
+
+$currentFolders = Get-ChildItem $path -Directory -recurse | Select -ExpandProperty FullName
+$currentFiles = Get-ChildItem $path -File -recurse | Select -ExpandProperty FullName
+
+[xml]$xml = Get-Content $oldIndex
+$rootNode = $xml.SelectSingleNode('/*')
+$rootPath = $rootNode.path
+
+# Array to search for indexed items
+$indexedFolders = [System.Collections.Generic.List[string]]::new()
+$indexedFiles = [System.Collections.Generic.List[string]]::new()
+foreach ($item in $rootNode.ChildNodes) {
+    $indexedItems.Add($item.path)
+    if ($item.hash) {
+        $indexedFiles.Add($item.path)
+    } else {
+        $indexedFolders.Add($item.path)
+    }
+}
+
+
+foreach ($item in $xml.SelectNodes('//item')) {
+    $fullPath = "$rootPath\$($item.path)"
+    $status = $null
+    if (Test-Path $fullPath) {
+        # Test for need to update
+        if ($item.hash) { # for files only
+            $fileInfo = Get-FileInfo $fullPath
+            if (($item.size -ne $fileInfo.size) -or ($item.date -ne $fileInfo.date)) {
+                $fileInfo = Get-FileInfo $fullPath -hash
+                $item.SetAttribute('size', $fileInfo.size)
+                $item.SetAttribute('date', $fileInfo.date)
+                $item.SetAttribute('hash', $fileInfo.hash)
+                $logUpdate.Add($fullPath.TrimStart($rootPath))
+            }
+        }
+    } else {
+        if ($item.hash) { # files
+            $status = 'deleted' # assume deleted
+            :current foreach ($currentFile in $currentFiles) {
+                if ($currentFile.EndsWith((Split-Path $item.path -leaf))) {
+                    # Only consider something moved if size and date have not changed, otherwise delete and consider it new
+                    $newItemPath = $currentFile.TrimStart($rootPath)
+                    $index = [array]::IndexOf($indexedFiles, $item.path)
+                    $fileInfo = Get-FileInfo $currentFile
+                    if (($item.size -eq $fileInfo.size) -and ($item.date -eq $fileInfo.date)) {
+                        $status = 'moved'
+                    }
+                    Break :current
+                }
+            }
+        } else { # folders
+            $index = [array]::IndexOf($indexedFolders, $item.path)
+            $status = 'deleted' # assume deleted, since a folder with the same name could exist in another sub folder and falsely indicate a move
+        }
+
+        switch ($status) {
+            'deleted' {
+                if ($item.hash) {
+                    $indexedFiles.RemoveAt($index)
+                } else {
+                    $indexedFolders.RemoveAt($index)
+                }
+                [void]$rootNode.RemoveChild($item)
+                $logDelete.Add($item.path)
+            }
+            'moved' {
+                $item.path = $newItemPath
+                if ($item.hash) {
+                    $indexedFiles[$index] = $newItemPath
+                } else {
+                    $indexedFolders[$index] = $newItemPath
+                }
+                $logMove.Add($newItemPath)
+            }
+            default {
+            }
+        }
+    }
+}
+
+foreach ($folder in $currentFolders) {
+    $itemPath = $folder.TrimStart($rootPath)
+    if (-not $indexedFolders.Contains($itemPath)) {
+        $itemNode = $xml.CreateElement('item')
+        $itemNode.SetAttribute('path', $itemPath)
+        $rootNode.AppendChild($itemNode)
+        
+        $logAdd.Add($itemPath)
+    }
+}
+
+foreach ($file in $currentFiles) {
+    $itemPath = $file.TrimStart($rootPath)
+    if (-not $indexedFiles.Contains($itemPath)) {
+        $fileInfo = Get-FileInfo $file -hash
+        $itemNode = $xml.CreateElement('item')
+        $itemNode.SetAttribute('path', $itemPath)
+        $itemNode.SetAttribute('size', $fileInfo.size)
+        $itemNode.SetAttribute('date', $fileInfo.date )
+        $itemNode.SetAttribute('hash', $fileInfo.hash)
+        $rootNode.AppendChild($itemNode)
+        $logAdd.Add($itemPath)
+    }
+}
+
+if (($logDelete.Count -gt 0) -or ($logMove.Count -gt 0) -or ($logAdd.Count -gt 0) -or ($logUpdate.Count -gt 0)) {
+    $sortedNodes = $rootNode.ChildNodes | Sort-Object {$_.path}
+    $rootNode.RemoveAll()
+    $rootNode.SetAttribute('path', $path)
+
+    foreach ($sortedNode in $sortedNodes) {
+        $rootNode.AppendChild($sortedNode)
+    }
+
+    $rootNode.SetAttribute('date', (Get-Date).ToUniversalTime().ToString('O'))
+
+    $xml.Save($newIndex)
+}
+
+}).TotalSeconds
+
+
+
+Write-Host "moved:$($logMove.Count) deleted:$($logDelete.Count) updated:$($logUpdate.Count) added:$($logAdd.Count)"
+
+
+if ($logDelete) {
+    Write-Host "Deleted:"
+    foreach ($item in $logDelete) {
+        Write-Host "  $item"
+    }
+}
+if ($logMove) {
+    Write-Host "Moved:"
+    foreach ($item in $logMove) {
+        Write-Host "  $item"
+    }
+}
+if ($logAdd) {
+    Write-Host "Added:"
+    foreach ($item in $logAdd) {
+        Write-Host "  $item"
+    }
+}
+if ($logUpdate) {
+    Write-Host "Updated:"
+    foreach ($item in $logUpdate) {
+        Write-Host "  $item"
+    }
+}
+</code></pre>
+<p>And the XML looks like this now.</p>
+<pre><code>&lt;?xml version="1.0"?&gt;
+&lt;rootDirectory path="C:\Assets\Revit\2020" date="2020-06-23T08:02:20.3126654Z"&gt;
+  &lt;item path="OOTB" /&gt;
+  &lt;item path="OOTB\Data" /&gt;
+  &lt;item path="OOTB\Data\IES" /&gt;
+  &lt;item path="OOTB\Data\IES\1x4 3Lamp.ies" size="583" date="2019-03-22T22:09:40.0000000+01:00" hash="B4A02121565CCADAA601C7092BD598F5BA0A9DED" /&gt;
+  &lt;item path="OOTB\Data\IES\1x41T12.ies" size="1207" date="2019-03-22T22:09:40.0000000+01:00" hash="D36BFBA468A66DD21775D0B9797479F4DBE40A19" /&gt;
+  &lt;item path="OOTB\Data\Lookup Tables" /&gt;
+  &lt;item path="OOTB\Data\Lookup Tables\Conduit" /&gt;
+  &lt;item path="OOTB\Data\Lookup Tables\Conduit\Conduit Body - Type C - Aluminum.csv" size="441" date="2019-03-22T22:09:42.0000000+01:00" hash="4E63184FEBADD10007012C94E816979B044BEF36" /&gt;
+  &lt;item path="OOTB\Data\Lookup Tables\Conduit\Conduit Body - Type C - Aluminum.csv" size="441" date="2019-03-22T22:09:42.0000000+01:00" hash="4E63184FEBADD10007012C94E816979B044BEF36" /&gt;
+  &lt;item path="OOTB\Data\Lookup Tables\Pipe" /&gt;
+  &lt;item path="OOTB\Data\Lookup Tables\Pipe\Bend Double - PVC - Sch 40 - DWV.csv" size="224" date="2019-03-22T22:09:44.0000000+01:00" hash="30C7DCD5BFC70E67CD79861CC508D72BC987F158" /&gt;
+  &lt;item path="OOTB\Data\Lookup Tables\Pipe\Bend Long Sweep - PVC - Sch 40 - DWV.csv" size="290" date="2019-03-22T22:09:44.0000000+01:00" hash="E6A8D01A99082E443744EBDE16E55612AE47611A" /&gt;
+  &lt;item path="OOTB\Libraries" /&gt;
+  &lt;item path="OOTB\Libraries\Generic" /&gt;
+  &lt;item path="OOTB\Libraries\Generic\place_holder.txt" size="0" date="2019-03-22T22:42:14.0000000+01:00" hash="DA39A3EE5E6B4B0D3255BFEF95601890AFD80709" /&gt;
+  &lt;item path="OOTB\Libraries\US Imperial" /&gt;
+  &lt;item path="OOTB\Libraries\US Imperial\Annotations" /&gt;
+  &lt;item path="OOTB\Libraries\US Imperial\Annotations\Architectural" /&gt;
+  &lt;item path="OOTB\Libraries\US Imperial\Annotations\Architectural\Casework Tag.rfa" size="274432" date="2019-03-22T22:20:42.0000000+01:00" hash="D31C94C25A2C333AAA03A122036303C6AAE0D994" /&gt;
+  &lt;item path="OOTB\Libraries\US Imperial\Annotations\Architectural\Ceiling Tag w Height.rfa" size="274432" date="2019-03-22T22:20:42.0000000+01:00" hash="8DA9958E3A746D22429175E819D620ECB78AE93E" /&gt;
+  &lt;item path="OOTB\Templates" /&gt;
+  &lt;item path="OOTB\Templates\Families" /&gt;
+  &lt;item path="OOTB\Templates\Families\English Imperial" /&gt;
+  &lt;item path="OOTB\Templates\Families\English Imperial\Annotations" /&gt;
+  &lt;item path="OOTB\Templates\Families\English Imperial\Annotations\Callout Head.rft" size="311296" date="2019-03-22T22:20:40.0000000+01:00" hash="F248371D4A9179147E6CEA0D63CF27B5D862A979" /&gt;
+  &lt;item path="OOTB\Templates\Families\English Imperial\Annotations\Data Device Tag.rft" size="307200" date="2019-03-22T22:20:22.0000000+01:00" hash="BA9421D1B4741AF773CCE716CEB81BBD4F9CA856" /&gt;
+  &lt;item path="OOTB\Templates\Families\English Imperial\Annotations\Door Tag.rft" size="307200" date="2019-03-22T22:20:40.0000000+01:00" hash="684E61A81D70BC73D0F2B62E55072D00A717A6D8" /&gt;
+  &lt;item path="OOTB\Templates\Projects" /&gt;
+  &lt;item path="OOTB\Templates\Projects\Generic" /&gt;
+  &lt;item path="OOTB\Templates\Projects\Generic\Default_I_ENU.rte" size="3248128" date="2019-03-22T22:42:14.0000000+01:00" hash="1527A4C4F7181A32F04F42233D968E4935139B90" /&gt;
+  &lt;item path="OOTB\Templates\Projects\US Imperial" /&gt;
+  &lt;item path="OOTB\Templates\Projects\US Imperial\Commercial-Default.rte" size="6410240" date="2019-03-22T22:20:30.0000000+01:00" hash="CEF8BEB4CBEF05DD9D02EAF98BC8F3E1E7657224" /&gt;
+&lt;/rootDirectory&gt;
+</code></pre>
+    </div>

@@ -1,0 +1,125 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Order of <code>public</code>, <code>protected</code>, <code>private</code></h1>
+
+<p>This is a personal preference but one that I find makes code easier to read. I always order my fields as: <code>public</code> then <code>protected</code> then <code>private</code> with the motivation that the person using the class is interested in seeing the <code>public</code> API and this should thus be the first thing you see so that you don't have to search for it. </p>
+
+<h1>Misuse of <code>volatile</code></h1>
+
+<p>C++ (and C) has a thing called the <a href="http://en.cppreference.com/w/cpp/language/as_if" rel="nofollow noreferrer">"as-if rule"</a>. Which in essence says:</p>
+
+<blockquote>
+  <p>The compiler is allowed to generate ANY code as long as all reads and writes to <code>volatile</code> memory happens in the same order and with the same values <strong>as if</strong> the program was execute according to the language specification.</p>
+</blockquote>
+
+<p>This is the only use <code>volatile</code> has in C++, it means that writes and writes to <code>volatile</code> memory will always happen and will happen in the order specified. For example the compiler can, and frequently does re-order stores and writes. The compiler can remove memory writes and reads if it can determine that they will not affect any <code>volatile</code> memory read or write. The compiler can even remove memory allocations if it so pleases (clang does this some times). </p>
+
+<p>For completeness, all inputs and outputs (files, <code>std::cout</code>, <code>std::cin</code>, <code>std::cerr</code>, <code>std::clog</code>, keyboard drivers, graphics display, sound buffers, networks packets) are volatile either directly or transitively. So the compiler cannot remove inputs or outputs of the program, but anything in-between basically.</p>
+
+<h3>When should I use <code>volatile</code> then?</h3>
+
+<p>Volatile should be used when you must be certain that a certain write or read is not removed by the compiler as dead. For example when you are writing a hardware driver, you would set control variables that must be written to some bus as volatile. </p>
+
+<h3>But <code>volatile</code> works for synchronising my threads just fine!</h3>
+
+<p>That is pure luck that it is working on your compiler. The compiler is allowed to change the order of reads and writes AROUND your volatile accesses as long as they don't affect the values of the volatile accesses. Also the CPU may or may not re-order some stores or loads depending on the CPU (x86 has a conveniently strict memory model which only has one case where memory accesses may complete out of order). </p>
+
+<p>What you need is a <a href="https://en.wikipedia.org/wiki/Memory_barrier" rel="nofollow noreferrer">memory barrier</a>. A memory barrier forces both the compiler to generate code in such a way that all writes before the barrier happens before the barrier and tells the CPU to make sure all writes before the barrier has happened before the barrier completes. The above is a bit simplified, there are different memory types of barriers which say what must be completed before the barrier completes. If you're interested, see <a href="http://en.cppreference.com/w/cpp/atomic/memory_order" rel="nofollow noreferrer"><code>std::memory_order</code></a>.</p>
+
+<h3>Does <code>volatile</code> affect my performance?</h3>
+
+<p>Yes, the compiler can do quite some fancy optimisations with re-ordering stores and loads and instructions so that they will effectively use the CPU's registers and to make sure that multiple issue kicks in on some CPUs. By using <code>volatile</code> you are prohibiting the compiler from doing some of these optimisations as you are forcing it to emit a read or write in a specific order.</p>
+
+<p>In summary, don't use <code>volatile</code> unless you're absolutely sure that you need it.</p>
+
+<h1>Over-aligning basic types</h1>
+
+<p>You specify:</p>
+
+<pre><code>alignas(64) volatile unsigned       mHead = 0;
+volatile bool                       mRuning = false;
+Event                               mWaitEvent;
+alignas(64) volatile unsigned       mTail = 0;
+ThreadID                            mConsumerThreadID = 0;
+alignas(64) CMDBase                 mElements[MaxCommand];
+</code></pre>
+
+<p>The compiler is required to store members of a struct or class in the order they are specified in the definition. And it is also required to respect the requested alignment. So the above code will form a structure in memory that looks something like this (depending on platform, unsigned is at least 16 bits but most often 32 bits):</p>
+
+<pre><code>Byte offset  Value
+0-3         mHead
+4           mRunning
+Padding to respect basic alignment of mWaitEvent which believe is 4
+8-?         mWaitEvent (I don't know how big it is)
+Padding to make sure mTail starts on 64 byte boundary.
+64-67       mTail
+68-71       mConsumerThreadID (should be 32 bits)
+72-127 Padding to make sure mElements start on a 64 byte boundary.
+128 - 64127  mElements (assuming 64 bit binary)
+
+Note that as CMDBase has `alignas(16)` and the structure is `MaxLamdaSize = 8*7 = 56 bytes` it has to be rounded up to the nearest multiple of 16 which is 64, so each CMDBase will occupy 64 bytes in that array.
+</code></pre>
+
+<p>Compare the above to the following:</p>
+
+<pre><code>unsigned       mHead = 0;
+unsigned       mTail = 0;
+ThreadID       mConsumerThreadID = 0;
+Event          mWaitEvent;
+bool           mRuning = false;
+CMDBase        mElements[MaxCommand];
+
+Byte offset  Value
+0-3         mHead
+4-7         mTail
+8-13        mConsumerThreadID 
+14-21(?)    mWaitEvent (I don't know how big it is, assuming 8 bytes now)
+22          mRuning 
+32 - 6431   mElements (assuming 64 bit binary)
+</code></pre>
+
+<p>Notice how the struct is 90 bytes shorter just by re-arranging the order of the members and removing the useless padding. Looking at it from a relative point of view 90 bytes out of 64127 is less than 0.2% storage reduction but that is not the point. Typically CPUs have a cache line that is 64 bytes long, i.e. the CPU can cache data in batches of 64 bytes. In this later variation all of the control variables fit in one cache line, where in your original code you needed two cache lines to hold the control variables, leaving less cache lines for the rest of the data.</p>
+
+<p>Further more the alignment of data doesn't affect performance in any way as long as the data is aligned so that the CPU doesn't have to do an unaligned load (as long as you don't get an unaligned load but standard alignment requirements in C++ prevent this automatically).</p>
+
+<p>Alignment is only useful to guarantee that hardware which requires a certain alignment can function and when you want to avoid <a href="https://en.wikipedia.org/wiki/False_sharing" rel="nofollow noreferrer">false sharing</a>. For example SSE instructions require 16 byte alignment on their loads. Don't just go randomly sprinkling <code>alignas</code> in your code. It will HURT your performance.</p>
+
+<h1>Enough about conceptual misunderstandings and on to the code</h1>
+
+<p>So it looks like you have implemented a <a href="https://en.wikipedia.org/wiki/Circular_buffer" rel="nofollow noreferrer">circular buffer</a>.  I recommend that you break out the circular buffer into it's own class and then use that in implementing your command queue. This will make your code clearer and easier to read. It will also make it possible to re-use the circular buffer.</p>
+
+<p>Don't use the destructor to run the code like you do here:</p>
+
+<pre><code>       ~NewCMD()
+        {
+            mProc();
+        }
+</code></pre>
+
+<p>If the lamda throws then you might have problems on your hands as destructors throwing exceptions is kind of a bad situation <a href="https://stackoverflow.com/questions/130117/throwing-exceptions-out-of-a-destructor">throwing from destructor</a>. Not to mention that destructors are only for destroying the object, releasing any resources held and cleaning up.</p>
+
+<p>Further since you're not removing the commands from the queue, when your application shuts down the <code>mElements</code> array will be destructed and each of the destructors on the elements will be executed again. Do I need to say this is bad? Not to mention that you never remove the objects from the queue when you're done with them.</p>
+
+<p>I feel that you are overworking this in an effort to make it fast but in practice you're introducing problems and not actually improving speed. If you want your lamda to be 16 byte aligned so that your captures will work then just say so. </p>
+
+<pre><code>alignas(16) struct AlignedFunction{
+    std::function&lt;void(void)&gt; function;
+};
+
+std::queue&lt;AlignedFunction&gt; mElements;
+
+template&lt;typename Callable&gt;
+void enqueue(Callable&amp;&amp; callable){
+    mElements.emplace_back([](){callable();});
+}
+</code></pre>
+
+<h1>Don't preemptively optimise</h1>
+
+<p>Have you measured your application and have hard evidence that this command queue is the bottleneck of your application? If not you're just wasting time and creating bugs trying to write this complex class. I recommend that you take a simpler approach using standard library algorithms and functions and model the behaviour you want. If at a later point you get profiling data that points out this class as a bottle neck, then you can optimise. </p>
+
+<h1>In summary</h1>
+
+<p>I see that you are trying a lot of tricks that you think will improve performance. In reality these do no improve your performance, in fact I'd be willing to wager that you are in fact hurting your performance instead. Not only that but they are making the code hard to read and hard to work with.</p>
+
+<p>Stop trying to be clever, you are hurting yourself. Write clean, maintainable code instead. The compilers today are pretty darn good when it comes to generating good code. Most likely they are way better than you are.</p>
+    </div>

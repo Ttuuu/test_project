@@ -1,0 +1,201 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>We can learn a lot about what code is supposed to do by giving our functions explicit type signatures. Starting at the top, what are we working with?</p>
+
+<ul>
+<li><code>team_id</code> is some kind of Team ID. It's probably a string, or maybe an int, but for now I'll assume it's a <code>TeamID</code>. We know it's exactly what we need because it's passed as-is to the Django filters an <code>SlackUser.retrieve</code>. </li>
+<li><code>user_id</code> we can similarly assume is a <code>UserID</code>. However, look at how it's used: All we do with it is retrieve the <code>SlackUser</code>.
+
+<ul>
+<li>We shouldn't be calling this function unless we know the <code>team_id</code> and the <code>user_id</code>. <strong>What if we just had one argument <code>user:SlackUser</code>?</strong> Then we wouldn't need to read those DB tables from inside this function.</li>
+</ul></li>
+<li><code>msg_state</code> is supposed to be a dict, but we're letting the user pass in None. Possibly this argument might be a bigger dict with lots of other stuff in it, but for the purpose at hand it really just bundles up two shadow arguments.
+
+<ul>
+<li><code>resource_type</code>, which itself is just a bundle of <code>web_pages:bool=True</code> and <code>async_tasks:bool=True</code>.</li>
+<li><code>availability</code>, which likewise breaks out into <code>available:bool=True</code> and <code>unavailable:bool=True</code>. Those aren't great names; we can improve on them later.</li>
+</ul></li>
+<li><code>chl_state</code> is just masking our real parameter: <code>channel_id:Optional[ChannelID]=None</code>.</li>
+<li>We're returning a dict, but most of it's static. The part that we're actually computing is a list of dicts. 
+
+<ul>
+<li>Those dicts clearly have a structure that's needed elsewhere. You have a few options for how to explain and enforce that structure; a small inheritance tree is probably advisable. I'll just assume you've got a class <code>UIMessageItem</code>.</li>
+<li>So the <em>interesting</em> functionality will return an <code>Iterable[UIMessageItem]</code>, and that will get wrapped by the outer dict structure you've got.</li>
+</ul></li>
+</ul>
+
+<h1>Round 1:</h1>
+
+<p>I've included <code>old_build_list_message</code>, as a wrapper to the new function, just to show how you would use the new version in place of the new one.</p>
+
+<h3>helpers:</h3>
+
+<pre class="lang-py prettyprint-override"><code>def _build_filters(*,
+                   include_web_pages: bool = True,
+                   include_async_tasks: bool = True,
+                   include_available: bool = True,
+                   include_unavailable: bool = True)
+                   -&gt; UIMessageItem:
+    ...
+
+
+def _build_page_item(page: Page, user: SlackUser) -&gt; UIMessageItem:
+    ...
+
+
+def _build_async_task_item(task: AsyncTask, user: SlackUser) -&gt; UIMessageItem:
+    ...
+
+def old_build_list_message(team_id, user_id, msg_state, chl_state):
+    return {
+        'text': "Here's the list of all monitoring resources",
+        'attachments': build_list_message(
+            SlackUser.retrieve(team_id, user_id),
+            include_web_pages: msg_state['resource_type'] in ['web_pages', 'all'],
+            include_async_tasks: msg_state['resource_type'] in ['async_tasks', 'all'],
+            include_available: msg_state['resource_availability'] in ['available', 'all'],
+            include_unavailable: msg_state['resource_availability'] in ['unavailable', 'all'],
+            channel_id: chl_state.get('channel_id')
+        )
+    }
+</code></pre>
+
+<h3>heart:</h3>
+
+<pre class="lang-py prettyprint-override"><code>def build_list_message(user: SlackUser,
+                       *,
+                       include_web_pages: bool = True,
+                       include_async_tasks: bool = True,
+                       include_available: bool = True,
+                       include_unavailable: bool = True,
+                       channel_id: Optional[ChannelID] = None)
+                       -&gt; Iterable[UIMessageItem]:
+
+    pages = Page.objects.none()
+    async_tasks = AsyncTask.objects.none()
+
+    if include_web_pages:
+        pages = Page.objects.filter(
+            user__team__team_id=user.team_id).order_by('title')
+
+    if include_async_tasks:
+        async_tasks = AsyncTask.objects.filter(
+            user__team__team_id=user.team_id).order_by('title')
+
+    if not include_unavailable:
+        pages = pages.filter(available=True)
+        async_tasks = async_tasks.filter(available=True)
+
+    if not include_available:
+        pages = pages.filter(available=False)
+        async_tasks = async_tasks.filter(available=False)
+
+    if channel_id:
+        pages = pages.filter(alert_channel=channel_id)
+        async_tasks = async_tasks.filter(alert_channel=channel_id)
+
+    return [
+        _build_filters(include_web_pages = include_web_pages,
+                       include_async_tasks = include_async_tasks,
+                       include_available = include_available,
+                       include_unavailable = include_unavailable),
+        *[_build_page_item(p, user) for p in pages],
+        *[_build_async_task_item(at, user) for at in async_tasks]
+    ]
+
+</code></pre>
+
+<h1>Round 2:</h1>
+
+<ul>
+<li>The call to <code>_build_filters</code> seems out of place. It <em>doesn't</em> need the external state that our business logic needs.</li>
+<li>The business logic seems to be doing two very  similar things at once. We'd like the parts that are the same to happen once, separately from the parts that are different.</li>
+<li>We could probably break the "display" logic out from the "find" logic.</li>
+</ul>
+
+<h3>helpers:</h3>
+
+<pre class="lang-py prettyprint-override"><code>def _build_filters(whatever):
+    '''At this point this is the problem of whoever's higher in the stack.'''
+    ...
+
+
+def _build_UI_message_item(item: Union[Page, AsyncTask],
+                           user: SlackUser)
+                           -&gt; UIMessageItem:
+    ...
+
+def old_build_list_message(team_id, user_id, msg_state, chl_state):
+    items = build_list_message(
+        SlackUser.retrieve(team_id, user_id),
+        django_filter = django_filters(
+            include_available = msg_state['resource_availability'] in ['available', 'all'],
+            include_unavailable = msg_state['resource_availability'] in ['unavailable', 'all'],
+            channel_id = chl_state.get('channel_id')
+        ),
+        include_web_pages = msg_state['resource_type'] in ['web_pages', 'all'],
+        include_async_tasks = msg_state['resource_type'] in ['async_tasks', 'all']
+    )
+    filters_message = _build_filters(msg_state)
+
+    return {
+        'text': "Here's the list of all monitoring resources",
+        'attachments': itertools.chain((filters_message, ),
+                                       map(_build_UI_message_item, items)
+                       )
+    }
+</code></pre>
+
+<h3>heart:</h3>
+
+<pre class="lang-py prettyprint-override"><code>def django_filters(include_available: bool = True,
+                   include_unavailable: bool = True,
+                   channel_id: Optional[ChannelID] = None)
+                   -&gt; Callable[[QuerySet], QuerySet]:
+    filters = {}
+
+    if not include_unavailable:
+        filters['available' = True)
+
+    if not include_available:
+        filters['available' = False)
+
+    if channel_id:
+        filters['alert_channel' = channel_id)
+
+    return functools.partial(QuerySet.filter, **filters)
+
+def build_list_message(user: SlackUser,
+                        *,
+                        django_filter: Callable[[QuerySet], QuerySet] = lambda qs: qs,
+                        include_web_pages: bool = True,
+                        include_async_tasks: bool = True)
+                        -&gt; Iterable[Union[Page, AsyncTask]]:
+    pages = django_filter(
+        Page.objects.all() if include_web_pages else Page.objects.none()
+    )
+    tasks = django_filter(
+        AsyncTask.objects.all() if include_async_tasks else AsyncTask.objects.none()
+    )
+
+    return itertools.chain(pages, async_tasks)
+
+</code></pre>
+
+<h1>Where does that leave us?</h1>
+
+<ul>
+<li>There are some situational details you'll have to decide for yourself, like whether <code>map(_build_UI_message_item,...)</code> goes inside <code>build_list_message</code>.</li>
+<li><code>django_filters()</code> could maybe be made easier to read somehow.</li>
+<li>Obviously I've introduced the <a href="https://docs.python.org/3/library/itertools.html" rel="noreferrer">itertools</a>, <a href="https://docs.python.org/3/library/functools.html" rel="noreferrer">functools</a>, and <a href="https://docs.python.org/3/library/typing.html" rel="noreferrer">typing</a> libraries. They're part of the standard package, so hopefully that's ok.</li>
+<li>Is stuff testable?
+
+<ul>
+<li><code>_build_filters()</code> is pure and easy to test, if you feel it's necessary.</li>
+<li><code>_build_UI_message_item()</code> is pure and easy to test.</li>
+<li><code>old_build_list_message()</code>, <em>if</em> any such method is still needed, is a thin wrapper for the deeper methods. Give it its own type-signature, and you can probably get away without writing unit tests for it.</li>
+<li><code>django_filters()</code> is pure. It's not super easy to test, but if your test suite has a supply of QuerySet objects then you should be ok.</li>
+<li><code>build_list_message()</code> <strong>is impure!</strong> We've consolidated all our impure code down, almost to a one-liner. In order to have tests for it we'll need to have some kind of test database, or some other way of spoofing the Django Manager classes. That's probably do-able. </li>
+</ul></li>
+<li>Speaking of test: I haven't tested any of this, so it probably doesn't work as written.</li>
+</ul>
+    </div>

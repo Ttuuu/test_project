@@ -1,0 +1,210 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+<p>When the function has finished it's logic, these registers should have their previous values</p>
+</blockquote>
+<p>The normal <a href="https://github.com/hjl-tools/x86-psABI/wiki/x86-64-psABI-r252.pdf" rel="nofollow noreferrer">x86-64 System V</a> calling convention allows functions to clobber RAX, RCX, RDX, RSI, RDI, and R8-R11.  Most of these registers are also used for passing args to functions, or returning them (RAX and sometimes RDX).</p>
+<p>For a more readable guide to calling conventions, see <a href="http://agner.org/optimize/" rel="nofollow noreferrer">Agner Fog's calling conventions PDF</a> which covers the differences between calling conventions on Windows/non-Windows and how to deal with it.  (His optimization manuals are essential reading, too if you want to write efficient asm.)</p>
+<p>Also, the standard calling convention passes the first arg in <code>rdi</code>.  You seem to be using <code>rsi</code>.  This needs to be documented with a comment.  (Your whole code is under-commented, even though most of it is straightforward).</p>
+<p>All libc functions like <code>strlen</code> follow the normal calling convention, so writing code that takes advantage of the fact that your functions don't clobber some registers requires remembering the non-standard calling convention they use.</p>
+<p>Using a non-standard calling convention that doesn't clobber any registers might be good for some obscure use-cases like optimizing for code-size in a function with <em>many</em> callers, or for a debug-print function.  You're making your functions bloated by forcing them to save/restore <em>all</em> registers.  Also, <strong>restoring even <code>rax</code> stops you from returning an error code</strong> (possible if <code>stdout</code> is closed).  I think your function is intended for use in toy programs that don't check for errors, though.  But still, allowing your functions to clobber <code>rax</code> is pretty sensible.</p>
+<p>BTW, in most stack-args calling conventions (including args that don't fit in registers in the x86-64 System V convention used on Linux), functions are allowed to modify their args on the stack.  So it's not weird that functions are allowed to clobber the registers their args are in.</p>
+<p>Also beware that inserting a debug-print function call isn't necessarily safe even if it restores all registers.  x86-64 System V defines <a href="https://stackoverflow.com/questions/38042188/where-exactly-is-the-red-zone-on-x86-64">a red zone of 128B below <code>rsp</code></a> that a function can assume isn't clobbered asynchronously (by signal handlers if you have any), so a function might have valuable data stored at <code>[rsp - 8]</code> or something.  Inserting a debug-print function call into a function that was previously a leaf function might break it (because <code>call</code> pushes a return address, overwriting memory below the old <code>rsp</code>).  This is why you should just use a debugger instead of writing debug-print functions.</p>
+<p>Anyway, if you insist on save/restoring all registers, don't forget that <code>syscall</code> itself clobbers <code>rcx</code> and <code>r11</code>.  See <a href="https://stackoverflow.com/questions/2535989/what-are-the-calling-conventions-for-unix-linux-system-calls-on-i386-and-x86-6">What are the calling conventions for UNIX &amp; Linux system calls on i386 and x86-64?</a>.  Or maybe you're intentionally not saving r8-r11?  <code>read_input</code> writes <code>r8</code> without saving it first.  That's fine, <strong>you can use whatever non-standard calling convention you want, but document it with comments</strong>.</p>
+<p>Also, implement it efficiently: in <code>sprint</code>, you push / pop RSI around a <code>mov rax, rsi</code>.  You're only reading it, which doesn't modify <code>rsi</code>.
+Also, you should wait until the end of the function to restore RSI.  If you're going to eventually save/restore registers inside your function, you might as well do it early.</p>
+<hr>
+<h3>Keep read-only string constants in <code>section .rodata</code></h3>
+<p><code>section .data</code> is for modifiable strings that go in read-write memory.  Use <code>section .rodata</code> for your <code>inputTemplate</code>.</p>
+<hr>
+<h3>Indentation / formatting style:</h3>
+<p>It's nice to indent the operands to a consistent column, so different length mnemonics don't make your code as ragged.  I've been doing this in code blocks in this answer.</p>
+<p>Also don't forget to use <code>:</code> after labels even in .data / .rodata sections.</p>
+<hr>
+<h3>Make function definitions contiguous and use local labels for function internals.</h3>
+<p><code>next_char</code> is not a usable entry-point to your code.  It's part of <code>sprint</code>.  So what you've done is put the first part of <code>sprint</code> early in memory, then code for another function, then the rest of <code>sprint</code>.  This is not efficient for hardware to run (I-cache locality and a <code>jmp</code> instruction to reach the 2nd half of the function), or easy for anyone to read.</p>
+<p>Putting a <code>ret</code> after a <code>jmp</code> is particularly silly:</p>
+<pre><code>jmp  next_char
+ret
+</code></pre>
+<p>because nothing jumps back to execute the <code>ret</code> instruction.  Anyway, much better to just put the <code>next_char</code> code right below the first part of <code>sprint</code> so execution falls into it.</p>
+<p>Similarly, <code>sys_exit</code> is guaranteed not to return, so there's no point putting some <code>pop</code> and <code>ret</code> instructions after it.  Or <code>push</code> instructions before it.</p>
+<p>If some of the blocks were helper functions, it could make some sense, but they're not.  (Although <code>sprint_linefeed</code> should use <code>kernel_fn_print_string</code>, see below.  Except that you can't really use it because it pops more than it pushes.  Having the save/restore built-in to blocks of code makes it hard to reuse them.)</p>
+<p>For labels internal to a function, <a href="https://www.tortall.net/projects/yasm/manual/html/nasm-local-label.html" rel="nofollow noreferrer"><strong>use <code>.name</code> instead of <code>name</code></strong> to give it local scope</a>.</p>
+<h3>You don't need to <code>jmp</code> over blank lines in the source</h3>
+<p>Execution continues to the next instruction on its own.  This is an example:</p>
+<pre><code>count_length:
+    sub rax, rsi
+    mov rdx, rax
+    jmp kernel_fn_print_string
+
+kernel_fn_print_string:
+    mov rax, 1
+    ....
+</code></pre>
+<p>The jmp instruction is completely useless and a waste of space.  You should have done this:</p>
+<pre><code>.count_length:
+    sub    rax, rsi
+    mov    rdx, rax          ; should have used rdx as the loop counter in the first place to save this mov
+.kernel_fn_print_string:
+    mov    eax, 1
+    ....
+</code></pre>
+<hr>
+<h3>Use more efficient instructions</h3>
+<p><code>mov eax,1</code> is smaller than <code>mov rax,1</code>, <a href="https://stackoverflow.com/questions/11177137/why-do-most-x64-instructions-zero-the-upper-part-of-a-32-bit-register">but exactly equivalent</a>.  NASM will actually optimize it to <code>mov eax,1</code>, but the other NASM-syntax assembler (YASM) won't, and will emit the 7-byte <code>mov r/m64, imm32</code> form of the instruction (with a REX prefix) instead of 5-byte <code>mov eax, imm32</code>.</p>
+<p><a href="https://stackoverflow.com/questions/33666617/what-is-the-best-way-to-set-a-register-to-zero-in-x86-assembly-xor-mov-or-and"><code>xor eax,eax</code> is the most efficient way to zero <code>eax</code></a>.  Use that instead of <code>mov eax, 0</code>.</p>
+<p>Use <code>push imm8</code> for small constants.  <code>mov  rsi, 0Ah</code> / <code>push rsi</code> can be just <code>push 0xa</code>.  (I prefer C-style <code>0xDEADBEEF</code> hex constants, not MASM-style trailing-<code>h</code>).  <code>sprint_linefeed</code> is a good example of how bloated your calling convention forces your code to be.</p>
+<pre><code>sprint_linefeed:
+    call   sprint
+
+    push    rsi          ; this and the 2nd pop aren't needed if you can clobber caller's RSI
+    push    0Ah
+    mov     rsi, rsp
+    call   sprint
+    pop     rsi          ; clear the newline from the stack
+    pop     rsi          ; restore RSI
+    ret
+</code></pre>
+<p>Of course, you know you want to <code>sys_write</code> exactly one byte, so could just do that with a few instructions instead of calling <code>sprint</code> on a known-length string.  Or you could <code>push</code> the right registers and <code>jmp</code> to <code>kernel_fn_print_string</code> directly.  But that doesn't work because you need it to return to your code to <code>pop rsi</code>, and you can't <code>call</code> it because it pops more than it pushes before running a <code>ret</code>.</p>
+<p>I guess you could make <code>sprint</code> do extra work (like save/restore <code>rsi</code>) so you could use it from other functions that use just the tail of the function to restore <code>rsi</code> and return.  This whole thing is a mess, and without knowing what you're aiming for (simple code, small code-size, fast?) I have no idea what to recommend.</p>
+<h3>Use <code>do{}while()</code> loop structure in asm whenever possible.</h3>
+<p>A normal idiomatic asm loop has one taken conditional branch at the bottom instead of a not-taken branch at the top and a <code>jmp</code> at the bottom.  <a href="https://stackoverflow.com/questions/47783926/why-are-loops-always-compiled-into-do-while-style-tail-jump">Why are loops always compiled into “do…while” style (tail jump)?</a>.  (Also, prefer calling <code>strlen</code> because it's a lot faster than a naive byte-at-a-time loop for strings more than a few bytes long.  <a href="https://stackoverflow.com/questions/37800739/is-it-safe-to-read-past-the-end-of-a-buffer-within-the-same-page-on-x86-and-x64/37801080">glibc's <code>strlen</code> uses SSE2 <code>pcmpeqb</code> to look for the zero byte</a>, and <a href="https://stackoverflow.com/questions/55563598/why-is-this-code-6-5x-slower-with-optimizations-enabled/55589634#55589634">this</a>)</p>
+<pre><code>.next_char:
+    inc     rdx
+    cmp     byte [rdx], 0
+    jnz     .next_char
+   dec     rdx       ; un-count the last byte.  Happens once outside the loop.  Or init rdx to -1 instead of 0 to avoid this.
+</code></pre>
+<p>When a loop might need to run zero times, you can put a test/branch <em>outside</em> the loop.  But strlen always looks at at least one byte.</p>
+<hr>
+<h3>Use <code>global</code> to export functions in the symbol table</h3>
+<p><code>global sprint</code> makes it possible to use <code>extern sprint</code> and <code>call sprint</code> from a separately-assembled file.</p>
+<h3>Align your function entry-points for performance</h3>
+<p>If you're really going for code-size, then sure leave everything packed.  But normally you want to <code>align 16</code> before a function so there's a full fetch-block of code to decode.  Some CPUs may do a 16B-aligned fetch that contains the target address when jumping, and if the branch target is near the end of that 16B then there are only a couple bytes to decode in the first cycle.</p>
+<hr>
+<h3>Comment your code, especially any magic numbers.</h3>
+<pre><code>mov  eax, 1       ; __NR_write
+mov  edi, 1       ; stdout
+syscall           ; sys_write(1, buf, len)
+</code></pre>
+<p>You can optimize by using <code>mov edi, eax</code> instead of another mov-immediate for a constant that happens to be the same.</p>
+<h3><code>read_input</code> requires a fixed-size 255 byte buffer instead of having the caller pass a size?!?</h3>
+<p>This is just weird.  Write a function with 2 args: pointer + length, like a normal person.</p>
+<h3><code>read_input</code> assumes that it can <code>strlen()</code> the buffer</h3>
+<p><code>read_input</code> uses <code>sprint</code> to print the buffer as an implicit-length string.  But <code>sys_read</code> doesn't append a trailing zero, so this is only safe if the caller zeroed the buffer so there's a terminating zero somewhere.</p>
+<p>If your intent was to print was you got from <code>sys_read</code>, you should use the length return value in <code>rax</code> instead of examining memory.  If your intent was to print out the buffer as an implicit-length string, then document that carefully (because it's weird).</p>
+<p><strong>Things would be simpler if you wrote a wrapper function that printed explicit-length strings</strong>.  You could use that here, and from <code>sprint_linefeed</code>.</p>
+<h3>Return the <code>sys_read</code> result from <code>read_input</code></h3>
+<p>Otherwise the caller can't tell how many bytes were read.  The input bytes could be the same as what was already in the buffer.  (Even on an interactive TTY, a user can type <code>^V</code> to escape any literal byte including a zero byte.)  (See <a href="https://stackoverflow.com/questions/46329447/write-non-ascii-characters-to-stdin-of-a-progam-on-a-tty-over-ssh">this SO Q&amp;A for example</a>.</p>
+<hr>
+<h3><code>sys_write</code> may return early for very large buffers</h3>
+<p>Nothing guarantees that <code>sys_write</code> will write <em>all</em> of the characters you pass it.  For small strings this is usually fine, but see <a href="https://stackoverflow.com/questions/694188/when-does-the-write-system-call-write-all-of-the-requested-buffer-versus-just">When does the write() system call write all of the requested buffer versus just doing a partial write?</a>.  e.g. if writing to a pipe, you're unlikely to be able to write more than the size of the kernel's pipe buffer in one system call.</p>
+<p>If you want to be robust, check the <code>sys_write</code> return value to see if it's <code>==</code> the length, and if not advance the pointer and decrease the length and try again.  (If the return value wasn't an error code: <code>-4096</code> to <code>-1</code>).</p>
+<hr>
+<h3>My version of your code</h3>
+<pre><code>SECTION .rodata
+inputTemplate:  db  "User input: ", 0h
+
+;;maxBytesToRead equ 255
+
+;;; void sprint(char *str) // in RSI
+;;; {  sys_write(stdout, str, strlen(buf); }
+
+;;; clobbers RAX and R11, everything else unmodified
+;;; doesn't attempt to retry on interrupted or incomplete writes.
+
+;;; returns sys_write return value in RAX unless string length was zero, then leaves RAX unmodified.
+
+ALIGN 16
+global sprint
+sprint:
+    cmp     byte [rsi], 0  ; don't even make a syscall at all with zero length
+    jz      .no_print
+
+    push    rdx
+    push    rdi
+    mov     rdx, rsi
+.next_char:              ; first byte already checked earlier
+    inc     rdx
+    cmp     byte [rdx], 0
+    jnz     .next_char
+
+    sub rdx, rsi          ; string length (excluding terminator)
+
+ kernel_fn_print_string:
+    push    rcx          ; syscall clobbers RCX and R11.
+
+    mov     eax, 1       ; __NR_write
+    mov     edi, eax     ; stdout = 1 as well
+    syscall              ; sys_write(stdout, buf, rdx)
+
+     ;; TODO: check return value and retry if not all the bytes were written.
+
+    pop     rcx
+    pop     rdi
+    pop     rdx
+.no_print:
+    ret
+
+ALIGN 16
+global sprint_linefeed
+;;; sprint(rsi);  sprint("\n");
+sprint_linefeed:
+    call    sprint
+
+    ; calling  kernel_fn_print_string  is inconvenient here because it wants to pop more than it pushes.
+    ; could just inline that code
+    ; or for small strings, would be more optimal to copy to a local buffer and append the newline to make one sys_write() call
+    push    rsi
+    push    0xa          ; '\n'
+    mov     rsi, rsp
+    call sprint
+    pop     rsi          ; pop the newline
+    pop     rsi          ; restore caller's RSI
+    ret
+
+ALIGN 16
+global  read_input
+;;; size_t read_input(buf=RSI, len=RDX)
+;;; { length = sys_read(0, buf, len);
+;;;   print it out
+;;;   return length;
+;;;  }
+;;; clobbers RAX, R8-R11
+read_input:
+    push    rdi
+    push    rcx          ; syscall clobbers RCX and R11
+
+    xor     eax, eax     ; __NR_read
+    xor     edi, edi     ; stdin = 0
+    ; rsi = buf
+    ; rdx = len
+    syscall              ; Linux syscalls preserve everything but RCX and R11
+
+    ;; TODO: check for error (rax = -1 to -4095)
+    mov     r8, rax      ; save write return value
+    mov     r9, rsi
+
+    mov     esi,  inputTemplate    ; static data is in the low 32 bits
+    call    sprint       ; print constant string (TODO: length is known, don't waste time on strlen)
+    mov     rsi, r9
+    call    sprint       ; length is known here, too, if buffer was zeroed before.
+
+    pop     rcx
+    pop     rdi
+    mov     rax, r8
+    mov     rsi, r9      ; restore caller's RSI
+
+    ret
+
+ALIGN  8        ; tiny function, almost fits in 8 bytes
+global quit
+quit:
+kernel_fn_quit:
+    mov   eax, 60       ; __NR_exit
+    xor   edi, edi
+    syscall             ; sys_exit(0)
+</code></pre>
+<p>As I said earlier, this is still a mess.  IDK what to recommend because IDK what this code is supposed to be useful for.</p>
+<p>This still has some code-paths that save / restore and then save/restore the same register twice, e.g. <code>sprint_newline</code>, because it uses <code>sprint</code> internally multiple times.  If you care more about code-size than speed, then it can make sense to do it that way.</p>
+    </div>

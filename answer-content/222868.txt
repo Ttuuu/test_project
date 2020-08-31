@@ -1,0 +1,140 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>To add to @MaLiN223's answer, I think adding each line to <code>lines</code> is unnecessary and leads to weird looping behavior. You'll wind up looping over earlier lines multiple times. For example:</p>
+
+<pre class="lang-py prettyprint-override"><code>lines = []
+
+lines.append('a')
+for line in lines:
+    print(line)
+
+# a
+
+lines.append('b')
+for line in lines:
+    print(line)
+
+# a
+# b
+</code></pre>
+
+<p>I'm not sure if that's the desired behavior or not, you might need to take another look at what you're trying to accomplish. I would say it's much better to keep it as a single for loop</p>
+
+<h2><code>str.strip()</code></h2>
+
+<p>You are using excess memory and losing readability by creating new objects from <code>baris</code> and calling them different things. You don't use the original <code>baris</code> past the <code>re.sub</code> part, so you carry around extra objects. I would keep the name <code>baris</code>, as it's clear what it is: it's your looping variable:</p>
+
+<pre class="lang-py prettyprint-override"><code>for baris in data:
+    baris = baris.rstrip() 
+    baris = re.sub(r'\t|\n|\r|\s{2,}',' ', baris)
+</code></pre>
+
+<h2><code>re.compile</code></h2>
+
+<p>The benefit of <code>re.compile</code> is you cut way down on the overhead required to re-parse your regular expression, especially in a loop:</p>
+
+<pre class="lang-py prettyprint-override"><code>python -m timeit -s 'import re; x = "abc123"' 'for i in range(100000): re.match("\w\d", x)'
+10 loops, best of 3: 64.1 msec per loop
+
+python -m timeit -s 'import re; x = "abc123"; y = re.compile("\w\d")' 'for i in range(100000): y.match(x)'
+10 loops, best of 3: 27.8 msec per loop
+</code></pre>
+
+<p>However, by compiling <em>inside</em> a loop, you lose that benefit entirely. I would move these regular expressions:</p>
+
+<pre class="lang-py prettyprint-override"><code>befSelect   = re.compile(r'^.+?(?=SELECT)')
+date        = re.search(r"\b(\d{6})(?=\s\d{1,}:\d{2}:\d{2})\b", line)
+select      = re.search(r'\b(SELECT)\b',line)
+parentheses = re.compile('[(){}]')
+</code></pre>
+
+<p>Up to the top, outside of your <code>with open</code> statement. This way you aren't re-compiling during every line, even if you don't need to.</p>
+
+<p>So your regex should look like:</p>
+
+<pre class="lang-py prettyprint-override"><code>def getSelectMySql(log):
+    befSelect_re   = re.compile(r'^.+?(?=SELECT)')
+    date_re        = re.compile(r"\b(\d{6})(?=\s\d{1,}:\d{2}:\d{2})\b")
+    select_re      = re.compile(r'\b(SELECT)\b')
+    parentheses_re = re.compile('[(){}]')
+
+    with open....:
+        ~snip~
+        for baris in data:
+            ~snip~
+            # compiled regex supports search, sub, find, etc.
+            date = date_re.search(baris)
+            select = select_re.search(baris)
+
+            ~snip~
+                baris = befSelect_re.sub('', baris)
+                baris = parentheses_re.sub('', baris)
+</code></pre>
+
+<h2>Value of <code>success</code></h2>
+
+<p>One of the big problems I see is that you are re-setting <code>success = False</code> during every iteration of the file handle. I would set that outside of the <code>for</code> loop:</p>
+
+<pre class="lang-py prettyprint-override"><code>success = False
+with open...
+</code></pre>
+
+<p>However, this brings up a new logical flow question. In your <code>if</code> statement:</p>
+
+<pre class="lang-py prettyprint-override"><code>if baris.endswith("important") or baris.endswith("'%general_log%'") or baris.endswith("puro"):
+    success = True if baris.endswith("important") else False
+</code></pre>
+
+<p>It seems odd to check for all of them if you are going to re-check again. I'd break this into multiple statements:</p>
+
+<pre class="lang-py prettyprint-override"><code>if baris.endswith("important"):
+    success = True
+elif baris.endswith("'%general_log%'") or baris.endswith("puro"):
+    success = False
+else:
+    # put this in one line. The ternary operator will evaluate early
+    # if success is False, avoiding the rest of the boolean checks
+    if success and select and not baris.endswith("SELECT"):
+        ...
+</code></pre>
+
+<p>Overall, keeping things as a single loop will keep memory overhead down for large files, allow you to iterate over the lines once and only once, and keep your variables relatively easy to track:</p>
+
+<pre class="lang-py prettyprint-override"><code>def getSelectMySql(log):
+    befSelect_re   = re.compile(r'^.+?(?=SELECT)')
+    date_re        = re.compile(r"\b(\d{6})(?=\s\d{1,}:\d{2}:\d{2})\b")# (\d{1,}:\d{2}:\d{2})
+    select_re      = re.compile(r'\b(SELECT)\b')
+    parentheses_re = re.compile('[(){}]')
+    spacing = re.compile(r'\t|\n|\r|\s{2,}')
+    success = False
+
+    with open(log,'r', encoding='utf-8', errors='ignore') as data:
+        for baris in data:
+            baris      = baris.rstrip()
+            baris      = spacing.sub(' ', baris)
+            result, buffer = [], []
+            date        = date_re.search(baris)
+            select      = select_re.search(baris)
+
+            if date:
+                dat = datetime.datetime.strptime(date.group(), '%y%m%d').strftime('%Y-%m-%d')
+                if buffer:
+                    result.append(tuple(buffer))
+                    buffer.clear()
+                buffer.append(dat)
+            if baris.endswith("important"):
+                success = True
+            elif baris.endswith("'%general_log%'") or baris.endswith("puro"):
+                success = False
+            else:
+                # this will terminate early if success is false
+                # and won't evaluate the rest of the expression
+                if success and select and not baris.endswith("SELECT"):
+                    baris = befSelect_re.sub('', baris)
+                    baris = parentheses_re.sub('', baris)
+                    buffer.append(baris)
+            result.append(tuple(buffer))
+        print('Done\n')
+        return result
+<span class="math-container">```</span>
+</code></pre>
+    </div>

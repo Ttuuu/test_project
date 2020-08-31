@@ -1,0 +1,275 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>It looks like you'll have to set up three dictionaries that reference the same data. In your case, the dictionaries are based on your TARGET data that should change: <code>updateSheetArray</code>. You need three dictionaries because you want to access the data three different ways. The trick is in choosing a <strong><em>unique</em></strong> value from the data to be used as the key into the data. The first two values are simple, single column values: PlanningGroup and GC.</p>
+
+<p>Since one of your choices is "Both", you have to create a key from the data that combines both of those fields into a single value. This can be done on the worksheet itself in the form of a visible or hidden column (and thus also pulled into a memory array), or you can combine the fields in your VBA code. My preferred method for this is to combine the two (or more) fields into a single string in the code, though each situation is different. You can do a simple concatenate or concatenate with a delimiter, it does't matter.</p>
+
+<p>Before we get to the dictionary part of the answer, I will suggest a few items in the code review part of this answer.</p>
+
+<ol>
+<li><a href="https://www.excel-easy.com/vba/examples/option-explicit.html" rel="nofollow noreferrer">Always use <code>Option Explicit</code></a>. You might be doing this, but it's good to make sure it's visible in your questions (or answers) so it doesn't come up like this.</li>
+<li>Declare your variables as close as possible to the first use of the variable. It saves lots of back and forth searching for declarations, plus your code is now a little grouped into "logic blocks".</li>
+<li>Define constants for "magic numbers". These are typically a straight numerical value you've hard-coded into your routines. Any other developer that comes along will have to scratch their head to figure out why you're starting a loop from index 6. You also might need to use the same value in multiple places, so creating a <code>Const</code> once isolates the definition and then you only have to change it once.</li>
+</ol>
+
+<p>The constants I've defined for my example solution are:</p>
+
+<pre><code>Private Const LOOKUP_TYPE_COL As Long = 5
+Private Const LOOKUP_GROUP_COL As Long = 3
+Private Const LOOKUP_GC_COL As Long = 4
+Private Const LOOKUP_CHANGE_COL As Long = 6
+Private Const UPDATE_GROUP_COL As Long = 13
+Private Const UPDATE_GC_COL As Long = 3
+Private Const UPDATE_CHANGE_COL As Long = 49
+Private Const START_OF_LOOKUP_DATA As Long = 2
+Private Const START_OF_UPDATE_DATA As Long = 6
+</code></pre>
+
+<p>I've made these constants <code>Private</code> at the global module level, but they easily could be restricted in scope to the single <code>Sub</code> in the code. (The example <code>Sub</code> below is a bit long and I could have separated it into smaller functions, I'll leave that as an exercise for the reader :) ).</p>
+
+<p>One problem I noticed in your code is when you're calculating the last row. Your statement is good but you've missed a worksheet reference when using <code>Rows.Count</code>. Since the <code>Rows</code> is not qualified with a worksheet reference, it is counting the rows on the currently active sheet. My habit is to wrap the statement in a <code>With</code> block, just to make sure I have to correct reference:</p>
+
+<pre><code>Dim lookUpSheet As Worksheet
+Dim lastRowLookup As Long
+Dim lookUpSheetRange As Range
+Dim lookUpSheetArray As Variant
+Set lookUpSheet = Worksheets("Manual price changes")
+With lookUpSheet
+    lastRowLookup = .Cells(.Rows.Count, "F").End(xlUp).Row
+    Set lookUpSheetRange = .Range("A1").Resize(lastRowLookup, 6)
+    lookUpSheetArray = lookUpSheetRange.value
+End With
+
+Dim updateSheet As Worksheet
+Dim lastRowUpdate As Long
+Dim updateSheetRange As Range
+Dim updateSheetArray As Variant
+Set updateSheet = Worksheets("Price Build-up")
+With updateSheet
+    lastRowUpdate = .Cells(.Rows.Count, "B").End(xlUp).Row
+    Set updateSheetRange = .Range("A1").Resize(lastRowUpdate, 49)
+    updateSheetArray = updateSheetRange.value
+End With
+</code></pre>
+
+<p>You are copying data from the worksheet <code>Range</code> into a memory-based array, and that will give you a much faster execution. The bonus is that you're not interacting with the screen, so <code>Application.ScreenUpdating = False</code> is not necessary. (You'll see another change to support this below)</p>
+
+<p>Now comes the <code>Dictionary</code> build up. We're working with your target data, which is the sheet that needs to be updated. You want to be able to find any row in your data with a single reference. I'm assuming the data on your <code>updateSheet</code> could be hundreds or thousands of lines long. Notice in the loop below that I'm creating three dictionaries, including using a combination key to pick up the option to reference entries for "both".</p>
+
+<p>Also, I figured that there could be more than one row in the data that may match the update criteria. So the dictionary keeps track by building a (string) list of row numbers to use later.</p>
+
+<pre><code>Dim groupKeys As Dictionary
+Dim gcKeys As Dictionary
+Dim bothKeys As Dictionary
+Set groupKeys = New Dictionary
+Set gcKeys = New Dictionary
+Set bothKeys = New Dictionary
+
+Dim updateGroup As String
+Dim updateGC As String
+Dim bothKey As String
+Dim existingList As String
+Dim i As Long
+For i = START_OF_UPDATE_DATA To UBound(updateSheetArray, 1)
+    updateGroup = updateSheetArray(i, UPDATE_GROUP_COL)
+    updateGC = updateSheetArray(i, UPDATE_GC_COL)
+
+    If Not groupKeys.Exists(updateGroup) Then
+        groupKeys.Add updateGroup, CStr(i)
+    Else
+        existingList = groupKeys(updateGroup)
+        groupKeys(updateGroup) = existingList &amp; "," &amp; CStr(i)
+    End If
+
+    If Not gcKeys.Exists(updateGC) Then
+        gcKeys.Add updateGC, CStr(i)
+    Else
+        existingList = gcKeys(updateGC)
+        gcKeys(updateGC) = existingList &amp; "," &amp; CStr(i)
+    End If
+
+    bothKey = updateGroup &amp; updateGC
+    If Not bothKeys.Exists(bothKey) Then
+        bothKeys.Add bothKey, CStr(i)
+    Else
+        existingList = bothKeys(bothKey)
+        bothKeys(bothKey) = existingList &amp; "," &amp; CStr(i)
+    End If
+Next i
+</code></pre>
+
+<p>Now that we have the dictionaries complete, we only need a single pass through the <code>lookUpSheet</code> data. We'll get the list of rows from the selected dictionary, then update only those rows in the memory-based array <strong><em>NOT</em></strong> directly on the worksheet. So this inside loop is restricted to ONLY the rows needing updated values. This is where you get your other burst of speed.</p>
+
+<pre><code>Dim valueGroup As String
+Dim valueGC As String
+Dim valueType As String
+Dim valueChange As Double
+Dim updateRows As Variant
+For i = START_OF_LOOKUP_DATA To UBound(lookUpSheetArray, 1)
+    valueType = lookUpSheetArray(i, LOOKUP_TYPE_COL)
+    valueGroup = lookUpSheetArray(i, LOOKUP_GROUP_COL)
+    valueGC = lookUpSheetArray(i, LOOKUP_GC_COL)
+    bothKey = valueGroup &amp; valueGC
+
+    valueChange = lookUpSheetArray(i, LOOKUP_CHANGE_COL)
+
+    updateRows = -1      'reset to a non-array value
+    Select Case valueType
+        Case "Planning group"
+            If groupKeys.Exists(valueGroup) Then
+                updateRows = Split(groupKeys(valueGroup), ",")
+            End If
+
+        Case "GC"
+            If gcKeys.Exists(valueGC) Then
+                updateRows = Split(gcKeys(valueGC), ",")
+            End If
+
+        Case "Both"
+            If bothKeys.Exists(bothKey) Then
+                updateRows = Split(bothKeys(bothKey), ",")
+            End If
+
+    End Select
+
+    '--- update the values if we found the rows to update
+    If IsArray(updateRows) Then
+        Dim j As Long
+        For j = LBound(updateRows, 1) To UBound(updateRows, 1)
+            updateSheetArray(CLng(updateRows(j)), UPDATE_CHANGE_COL) = valueChange
+        Next j
+    End If
+Next i
+</code></pre>
+
+<p>The final step is to copy the modified memory array back to the worksheet (which is why I created the <code>updateSheetRange</code> variable earlier).</p>
+
+<pre><code>updateSheetRange.value = updateSheetArray
+</code></pre>
+
+<p>Here is the whole solution in a single module:</p>
+
+<pre><code>Option Explicit
+
+Private Const LOOKUP_TYPE_COL As Long = 5
+Private Const LOOKUP_GROUP_COL As Long = 3
+Private Const LOOKUP_GC_COL As Long = 4
+Private Const LOOKUP_CHANGE_COL As Long = 6
+Private Const UPDATE_GROUP_COL As Long = 13
+Private Const UPDATE_GC_COL As Long = 3
+Private Const UPDATE_CHANGE_COL As Long = 49
+Private Const START_OF_LOOKUP_DATA As Long = 2
+Private Const START_OF_UPDATE_DATA As Long = 6
+
+Sub UpdateManualUpdates()
+    Dim lookUpSheet As Worksheet
+    Dim lastRowLookup As Long
+    Dim lookUpSheetRange As Range
+    Dim lookUpSheetArray As Variant
+    Set lookUpSheet = Worksheets("Manual price changes")
+    With lookUpSheet
+        lastRowLookup = .Cells(.Rows.Count, "F").End(xlUp).Row
+        Set lookUpSheetRange = .Range("A1").Resize(lastRowLookup, 6)
+        lookUpSheetArray = lookUpSheetRange.value
+    End With
+
+    Dim updateSheet As Worksheet
+    Dim lastRowUpdate As Long
+    Dim updateSheetRange As Range
+    Dim updateSheetArray As Variant
+    Set updateSheet = Worksheets("Price Build-up")
+    With updateSheet
+        lastRowUpdate = .Cells(.Rows.Count, "B").End(xlUp).Row
+        Set updateSheetRange = .Range("A1").Resize(lastRowUpdate, 49)
+        updateSheetArray = updateSheetRange.value
+    End With
+
+    '--- build up the dictionaries for the UPDATE array where the keys
+    '    are single or multiple fields and the entry is CSV list of
+    '    row numbers that match the given key
+    Dim groupKeys As Dictionary
+    Dim gcKeys As Dictionary
+    Dim bothKeys As Dictionary
+    Set groupKeys = New Dictionary
+    Set gcKeys = New Dictionary
+    Set bothKeys = New Dictionary
+
+    Dim updateGroup As String
+    Dim updateGC As String
+    Dim bothKey As String
+    Dim existingList As String
+    Dim i As Long
+    For i = START_OF_UPDATE_DATA To UBound(updateSheetArray, 1)
+        updateGroup = updateSheetArray(i, UPDATE_GROUP_COL)
+        updateGC = updateSheetArray(i, UPDATE_GC_COL)
+
+        If Not groupKeys.Exists(updateGroup) Then
+            groupKeys.Add updateGroup, CStr(i)
+        Else
+            existingList = groupKeys(updateGroup)
+            groupKeys(updateGroup) = existingList &amp; "," &amp; CStr(i)
+        End If
+
+        If Not gcKeys.Exists(updateGC) Then
+            gcKeys.Add updateGC, CStr(i)
+        Else
+            existingList = gcKeys(updateGC)
+            gcKeys(updateGC) = existingList &amp; "," &amp; CStr(i)
+        End If
+
+        bothKey = updateGroup &amp; updateGC
+        If Not bothKeys.Exists(bothKey) Then
+            bothKeys.Add bothKey, CStr(i)
+        Else
+            existingList = bothKeys(bothKey)
+            bothKeys(bothKey) = existingList &amp; "," &amp; CStr(i)
+        End If
+    Next i
+
+    '--- now compare each row of the lookup data to find it in the update
+    '    data and make the appropriate change to the memory array
+    Dim valueGroup As String
+    Dim valueGC As String
+    Dim valueType As String
+    Dim valueChange As Double
+    Dim updateRows As Variant
+    For i = START_OF_LOOKUP_DATA To UBound(lookUpSheetArray, 1)
+        valueType = lookUpSheetArray(i, LOOKUP_TYPE_COL)
+        valueGroup = lookUpSheetArray(i, LOOKUP_GROUP_COL)
+        valueGC = lookUpSheetArray(i, LOOKUP_GC_COL)
+        bothKey = valueGroup &amp; valueGC
+
+        valueChange = lookUpSheetArray(i, LOOKUP_CHANGE_COL)
+
+        updateRows = -1      'reset to a non-array value
+        Select Case valueType
+            Case "Planning group"
+                If groupKeys.Exists(valueGroup) Then
+                    updateRows = Split(groupKeys(valueGroup), ",")
+                End If
+
+            Case "GC"
+                If gcKeys.Exists(valueGC) Then
+                    updateRows = Split(gcKeys(valueGC), ",")
+                End If
+
+            Case "Both"
+                If bothKeys.Exists(bothKey) Then
+                    updateRows = Split(bothKeys(bothKey), ",")
+                End If
+
+        End Select
+
+        '--- update the values if we found the rows to update
+        If IsArray(updateRows) Then
+            Dim j As Long
+            For j = LBound(updateRows, 1) To UBound(updateRows, 1)
+                updateSheetArray(CLng(updateRows(j)), UPDATE_CHANGE_COL) = valueChange
+            Next j
+        End If
+    Next i
+
+    '--- all of the requested updates are complete, copy the array back to the worksheet
+    updateSheetRange.value = updateSheetArray
+End Sub
+</code></pre>
+    </div>

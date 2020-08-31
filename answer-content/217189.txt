@@ -1,0 +1,156 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><code>libmyutf8.c</code> should be including <code>"libmyutf8.h"</code> rather than <code>"headerAll.h"</code> - that ensures that the function definitions are consistent with the header's prototypes.  With that change, there's no need for a separate <code>"headerAll.h"</code>, so it can be inlined into <code>"libmyutf8.h"</code>.</p>
+
+<hr>
+
+<p>The non-public functions ought to be declared with static linkage, so that they don't pollute the namespace of user code.  By adding <code>static</code> to the signature, we can prevent the problem where other code can use the same identifier but then find conflicts when linking the object files together.</p>
+
+<hr>
+
+<p>Our functions should accept pointer to const, since we don't intend to modify the input string.</p>
+
+<hr>
+
+<p>I recommend using an unsigned <code>1u</code> rather than <code>1</code> here:</p>
+
+<blockquote>
+<pre><code>#define CHECK_BIT(var,pos) ((var) &amp; (1&lt;&lt;(pos)) )
+</code></pre>
+</blockquote>
+
+<p>That ensures that all the terms of the calculation are unsigned, and there's no unexpected promotion to a signed type (I don't believe that's a problem anywhere this is used, but it makes it easier to reason about; always prefer unsigned types for bit operations where possible).</p>
+
+<hr>
+
+<p>The URI in the comment can be shortened: <code>https://stackoverflow.com/q/523724</code>.</p>
+
+<hr>
+
+<p>Testing a group of bits is simpler when done as a <em>mask</em> operation.  So instead of:</p>
+
+<blockquote>
+<pre><code>        } else if (CHECK_BIT(currentByte, 7) &amp;&amp; CHECK_BIT(currentByte, 6) &amp;&amp;
+                   CHECK_BIT(currentByte, 5) &amp;&amp; CHECK_BIT(currentByte, 4) &amp;&amp;
+                  !CHECK_BIT(currentByte, 3))
+</code></pre>
+</blockquote>
+
+<p>We can write:</p>
+
+<pre><code>        } else if ((currentByte &amp; 0xf8) == 0xf0)
+</code></pre>
+
+<hr>
+
+<p>Instead of a linear search in <code>increseCodeBlock</code> (is that a typo for <code>increase</code>?), we could use a binary search.  An alternative would be to have a table of pointers using the high portion of the character to index to the start point in <code>codePointBlocks</code>.  I haven't fully thought this through, but it would go something like this:</p>
+
+<pre><code>/* Instead of writing this by hand, we could initialise this using
+   code to determine where each xx00 can be found */
+static int blockIndex[] = {
+                           0,   /* 00xx - Basic Latin and Latin-1 */
+                           2,   /* 01xx - Latin Extended A and B */
+                           3,   /* 02xx - Latin B, to Spacing Modifiers */
+                           6,   /* 03xx - Combining Diacriticals, Greek, Coptic */
+                           ... /* lots more... */
+};
+static const size_t blockIndexSize = sizeof blockIndex / sizeof *blockIndex;
+
+unsigned long highPart = codePoint / 0x100;
+if (highPart &gt;= blockIndexSize) {
+    highPart = blockIndexSize - 1;
+}
+
+for (int i = blockIndex[highPart]; i &lt; codeBlocksCount; i++) {
+</code></pre>
+
+<p>The <code>blockIndex</code> table just serves to allow us to start <code>i</code> at a point nearer to the target, so saving us testing so many entries.</p>
+
+<hr>
+
+<p>The big <code>do</code>/<code>while</code> loop in <code>scanUtf8</code> looks like it could be a <code>for</code> loop (we have an initial <code>i = 0</code>, a test of <code>i</code> and an increment <code>++i</code>, so would be clearer expressed that way).  It looks like</p>
+
+<blockquote>
+<pre><code>int i = 0;
+do {
+    /* code */
+    ++i;
+} while (i &lt; maxLength);
+</code></pre>
+</blockquote>
+
+<p>Most C programmers would expect to see that as</p>
+
+<pre><code>for (int i = 0;  i &lt; maxLength;  ++i) {
+    /* code */
+}
+</code></pre>
+
+<p>(The equivalence does require <code>0 &lt; maxLength</code>, because this change moves the test from the end to the beginning of each loop)</p>
+
+<hr>
+
+<p>Instead of four variables <code>byte1</code>, <code>byte2</code>, <code>byte3</code>, <code>byte4</code>, it may be better to build up the code point incrementally:</p>
+
+<pre><code>/* UNTESTED! */
+
+/* Store next UTF-8 character into ch, and return next start position */
+const char* scanUTF8(const char *s, wchar_t *ch)
+{
+    int remaining = 0;
+
+    for (; *s;  ++s) {
+        unsigned char c = *s;
+        if (remaining) {
+            /* check that it's a continuation byte */
+            if (c &amp; 0xc0 != 0x80) {
+                *ch = BAD_UTF8;
+                return s;
+            }
+            *ch = (*ch &lt;&lt; 6) + (c &amp; 0x3f);
+            if (!--remaining) {
+                return s;
+            }
+        } else if (c &amp; 0x80 == 0) {
+            /* single-byte (ASCII) */
+            *ch = c;
+            return s;
+        } else {
+            /* should be a start byte */
+            for (remaining = 3;  remaining &gt; 0;  --remaining) {
+                if (~c &gt;&gt; (6 - remaining) == 1u) {
+                    *ch = c &amp; ((1u &lt;&lt; (6 - remaining)) - 1);
+                    break;
+                }
+            }
+            if (!remaining) {
+                /* not a valid start byte */
+                *ch = BAD_UTF8;
+                return ++s;
+            }
+        }
+    }
+
+    /* incomplete UTF-8 sequence */
+    *ch = BAD_UTF8;
+    return s;
+}
+</code></pre>
+
+<hr>
+
+<p>The test program assumes that <code>malloc()</code> will succeed, without checking.  Don't do this, not even in test programs.  Actually, <em>especially</em> not in test programs - make it fail with a useful message, so we don't confuse runtime errors with code bugs.</p>
+
+<hr>
+
+<p>A utility of this nature really deserves a decent unit-test suite.  Whilst it's good that there is a test program included, we can do better.  Making a set of minimal inputs and expected outputs has these benefits over the test program:</p>
+
+<ul>
+<li>It's self-contained, rather than needing a separate input file.</li>
+<li>Each test exercises a known subset of the code (making it easier to relate a failed test to its underlying cause).</li>
+<li>Tests can be run automatically every build (and fail the build if they don't all pass).</li>
+</ul>
+
+<p>If we have access to a C++ compiler, that allows us to use one of the excellent test frameworks implemented in that language (it's easy to link our C function into a C++ program, using <code>extern "C"</code>).</p>
+
+<p>When writing unit tests, I usually start with the easy error cases first (null string, empty string).  That will quickly get us into the testing mindset.  After that, we can start adding the success cases and more complex errors (out-of-range characters, extra or missing continuation bytes, surrogate codepoints, overlong encoding, and so on).  You might want to read <a href="https://www.cl.cam.ac.uk/~mgk25/ucs/examples/UTF-8-test.txt" rel="nofollow noreferrer">Markus Kuhn's decoder capability tests</a> for some ideas on what to test.</p>
+    </div>

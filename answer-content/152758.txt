@@ -1,0 +1,415 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First of all, you should run the <code>FindPath</code> method a couple of times before measuring, to give the C# runtime a chance to optimize the code.</p>
+
+<pre><code>// Warmup iterations for profiling
+for (int j = 0; j &lt; 10; j++) {
+    FindPath(start, end, CellFilter);
+}
+</code></pre>
+
+<p>Doing this gets the time down to about 17 ms on my machine (from 38 ms initially).</p>
+
+<p>Running the code in a profiler shows that over 70% of the time is spent in <code>Dictionary</code> and <code>SortedSet</code> methods. For the JIT to optimize those you have to provide it with the necessary information for its Key types, otherwise it will fall back to runtime reflection and virtual method calls.</p>
+
+<p>Any struct that is used as a <code>Key</code> in a <code>Dictionary</code> should implement the <code>IEquatable&lt;T&gt;</code> interface. Also <code>GetHashCode</code> and <code>Equals</code> should be overridden (the compiler even warns about it).</p>
+
+<pre><code>struct Vec3 : IComparable&lt;Vec3&gt;, IEquatable&lt;Vec3&gt; {
+    [...]
+    public bool Equals(Vec3 other) {
+        return other == this;
+    }
+
+    public override int GetHashCode() {
+        return ((x.GetHashCode()
+            ^ (y.GetHashCode() &lt;&lt; 1)) &gt;&gt; 1)
+            ^ (z.GetHashCode() &lt;&lt; 1);
+    }
+
+    public override bool Equals(object obj) {
+        if (obj is Vec3) {
+            return (Vec3)obj == this;
+        }
+
+        return false;
+    }
+}
+</code></pre>
+
+<p><code>SortedSet</code> mostlikely needs the <code>IComparable&lt;T&gt;</code> interface which QueueNode already had, but it should be changed to the generic one.</p>
+
+<pre><code>struct QueueNode : IComparable&lt;QueueNode&gt; {
+    [...]
+    public int CompareTo(QueueNode other) {
+        if (Dist != other.Dist) {
+            return Dist.CompareTo(other.Dist);
+        } else {
+            return Value.CompareTo(other.Value);
+        }
+    }
+}
+</code></pre>
+
+<p>After these changes <code>FindPath</code> only takes 4 ms.</p>
+
+<p>We can further optimize the Dictionaries by passing in a custom <code>IEqualityComparer</code>and eliminating the <code>int.GetHashCode()</code> calls.</p>
+
+<pre><code>class Vec3Comparer : IEqualityComparer&lt;Vec3&gt;
+{
+    public bool Equals(Vec3 a, Vec3 b) {
+        return a == b;
+    }
+
+    public int GetHashCode(Vec3 obj) {
+        return ((IntegerHash(obj.x)
+                ^ (IntegerHash(obj.y) &lt;&lt; 1)) &gt;&gt; 1)
+                ^ (IntegerHash(obj.z) &lt;&lt; 1);
+    }
+
+    static int IntegerHash(int a) {
+        // fmix32 from murmurhash
+        uint h = (uint)a;
+        h ^= h &gt;&gt; 16;
+        h *= 0x85ebca6bU;
+        h ^= h &gt;&gt; 13;
+        h *= 0xc2b2ae35U;
+        h ^= h &gt;&gt; 16;
+        return (int)h;
+    }
+}
+
+void FindPath(...) {
+    [...]
+
+    // Initialize data structures
+    Vec3Comparer comparer = new Vec3Comparer();
+    var dist = new Dictionary&lt;Vec3, float&gt;(comparer);
+    var prev = new Dictionary&lt;Vec3, Vec3?&gt;(comparer);
+
+    [...]
+}
+</code></pre>
+
+<p>The final code takes about 2.8 ms for <code>FindPath</code>.</p>
+
+<p>In conclusion, always implement the correct generic interfaces on structures that are used in collections. It allows the JIT to actually optimize the code.</p>
+
+<h1>Useful links</h1>
+
+<ul>
+<li><p><em><a href="https://msdn.microsoft.com/en-us/library/xfhwa508(v=vs.110).aspx#Anchor_7">Dictionary(Of TKey, TValue) Class</a></em>. See the <em>Remarks</em> section, thanks to @t3chb0t.</p></li>
+<li><p><em><a href="http://www.somasim.com/blog/2015/08/c-performance-tips-for-unity-part-2-structs-and-enums/">C# performance tips for Unity, part 2: structs and enums</a></em>. It talks specifically about the Unity implementation.</p></li>
+</ul>
+
+<h1>Final Code</h1>
+
+<pre><code>using System;
+using System.Collections.Generic;
+using System.IO;
+
+namespace PathFinding.NET {
+    struct Vec3 : IComparable&lt;Vec3&gt;, IEquatable&lt;Vec3&gt; {
+        public int x, y, z;
+
+        public Vec3(int x, int y, int z) {
+            this.x = x;
+            this.y = y;
+            this.z = z;
+        }
+
+        public static Vec3 operator +(Vec3 a, Vec3 b) {
+            return new Vec3(a.x + b.x, a.y + b.y, a.z + b.z);
+        }
+
+        public static bool operator ==(Vec3 a, Vec3 b) {
+            return a.x == b.x &amp;&amp; a.y == b.y &amp;&amp; a.z == b.z;
+        }
+
+        public static bool operator !=(Vec3 a, Vec3 b) {
+            return !(a == b);
+        }
+
+        public static float Dist(Vec3 a, Vec3 b) {
+            int dx = a.x - b.x;
+            int dy = a.y - b.y;
+            int dz = a.z - b.z;
+
+            return (float)Math.Sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        public static Vec3 Min(Vec3 a, Vec3 b) {
+            return new Vec3(
+                Math.Min(a.x, b.x),
+                Math.Min(a.y, b.y),
+                Math.Min(a.z, b.z)
+            );
+        }
+
+        public static Vec3 Max(Vec3 a, Vec3 b) {
+            return new Vec3(
+                Math.Max(a.x, b.x),
+                Math.Max(a.y, b.y),
+                Math.Max(a.z, b.z)
+            );
+        }
+
+        public override string ToString() {
+            return "(" + x + ", " + y + ", " + z + ")";
+        }
+
+        public int CompareTo(Vec3 other) {
+            if (x == other.x) {
+                if (y == other.y) {
+                    return z.CompareTo(other.z);
+                } else {
+                    return y.CompareTo(other.y);
+                }
+            } else {
+                return x.CompareTo(other.x);
+            }
+        }
+
+        public bool Equals(Vec3 other) {
+            return other == this;
+        }
+
+        public override int GetHashCode() {
+            return ((x.GetHashCode()
+                ^ (y.GetHashCode() &lt;&lt; 1)) &gt;&gt; 1)
+                ^ (z.GetHashCode() &lt;&lt; 1);
+        }
+
+        public override bool Equals(object obj) {
+            if (obj is Vec3) {
+                return (Vec3)obj == this;
+            }
+
+            return false;
+        }
+    }
+
+    struct Cell {
+        public bool Occupied;
+        public bool WalkableSurface;
+    }
+
+    struct QueueNode : IComparable&lt;QueueNode&gt; {
+        public Vec3 Value;
+        public float Dist;
+
+        public QueueNode(Vec3 value, float dist) {
+            Value = value;
+            Dist = dist;
+        }
+
+        public int CompareTo(QueueNode other) {
+            if (Dist != other.Dist) {
+                return Dist.CompareTo(other.Dist);
+            } else {
+                return Value.CompareTo(other.Value);
+            }
+        }
+    }
+
+    class Vec3Comparer : IEqualityComparer&lt;Vec3&gt;
+    {
+        public bool Equals(Vec3 a, Vec3 b) {
+            return a == b;
+        }
+
+        public int GetHashCode(Vec3 obj) {
+            return ((IntegerHash(obj.x)
+                    ^ (IntegerHash(obj.y) &lt;&lt; 1)) &gt;&gt; 1)
+                    ^ (IntegerHash(obj.z) &lt;&lt; 1);
+        }
+
+        static int IntegerHash(int a) {
+            // fmix32 from murmurhash
+            uint h = (uint)a;
+            h ^= h &gt;&gt; 16;
+            h *= 0x85ebca6bU;
+            h ^= h &gt;&gt; 13;
+            h *= 0xc2b2ae35U;
+            h ^= h &gt;&gt; 16;
+            return (int)h;
+        }
+    }
+
+    class Program {
+        private static Cell[,,] Grid = null;
+        private static int sx, sy, sz;
+
+        private static List&lt;Vec3&gt; GetNeighbours(Vec3 cell, List&lt;Vec3&gt; neighbours) {
+            neighbours.Clear();
+
+            for (int dx = -1; dx &lt;= 1; dx++) {
+                for (int dy = -1; dy &lt;= 1; dy++) {
+                    for (int dz = -1; dz &lt;= 1; dz++) {
+                        var coord = cell + new Vec3(dx, dy, dz);
+
+                        bool notSelf = !(dx == 0 &amp;&amp; dy == 0 &amp;&amp; dz == 0);
+                        bool connectivity = Math.Abs(dx) + Math.Abs(dy) + Math.Abs(dz) &lt;= 2;
+                        bool withinGrid = coord.x &gt;= 0 &amp;&amp; coord.y &gt;= 0 &amp;&amp; coord.z &gt;= 0 &amp;&amp; coord.x &lt; sx &amp;&amp; coord.y &lt; sy &amp;&amp; coord.z &lt; sz;
+
+                        if (notSelf &amp;&amp; connectivity &amp;&amp; withinGrid) {
+                            neighbours.Add(coord);
+                        }
+                    }
+                }
+            }
+
+            return neighbours;
+        }
+
+        private static List&lt;Vec3&gt; FindPath(Vec3 start, Vec3 end, Func&lt;Vec3, Vec3, bool&gt; cellFilter) {
+            if (!cellFilter(start, start) || !cellFilter(end, end)) {
+                throw new ArgumentException("Start and/or end fail cell filter!");
+            }
+
+            // Initialize data structures
+            Vec3Comparer comparer = new Vec3Comparer();
+            var dist = new Dictionary&lt;Vec3, float&gt;(comparer);
+            var prev = new Dictionary&lt;Vec3, Vec3?&gt;(comparer);
+
+            // We're intentionally not using the update priority function to mimic the C++ algorithm
+            var Q = new SortedSet&lt;QueueNode&gt;();
+
+            for (int x = 0; x &lt; sx; x++) {
+                for (int y = 0; y &lt; sy; y++) {
+                    for (int z = 0; z &lt; sz; z++) {
+                        var coord = new Vec3(x, y, z);
+
+                        if (cellFilter(coord, coord)) {
+                            dist[coord] = float.MaxValue;
+                            Q.Add(new QueueNode(coord, float.MaxValue));
+
+                            prev[coord] = null;
+                        }
+                    }
+                }
+            }
+
+            dist[start] = 0;
+            Q.Add(new QueueNode(start, 0));
+
+            List&lt;Vec3&gt; neighbours = new List&lt;Vec3&gt;();
+
+            // Search loop
+            while (Q.Count &gt; 0) {
+                var u = Q.Min;
+                Q.Remove(Q.Min);
+
+                // Old priority queue value
+                if (u.Dist != dist[u.Value]) {
+                    continue;
+                }
+
+                if (u.Value == end) {
+                    break;
+                }
+
+                foreach (var v in GetNeighbours(u.Value, neighbours)) {
+                    if (cellFilter(u.Value, v)) {
+                        float alt = dist[u.Value] + Vec3.Dist(u.Value, v);
+                        if (alt &lt; dist[v]) {
+                            dist[v] = alt;
+                            Q.Add(new QueueNode(v, alt));
+
+                            prev[v] = u.Value;
+                        }
+                    }
+                }
+            }
+
+            // Trace path - if there is one
+            var path = new List&lt;Vec3&gt;();
+
+            if (prev[end] != null) {
+                Vec3? current = end;
+
+                while (current != null) {
+                    path.Add(current.Value);
+                    current = prev[current.Value];
+                }
+
+                path.Reverse();
+            }
+
+            return path;
+        }
+
+        private static bool IsFloor(Vec3 pos) {
+            if (pos.y &gt; 0) {
+                var posBelow = pos + new Vec3(0, -1, 0);
+                return !Grid[pos.x, pos.y, pos.z].Occupied &amp;&amp; Grid[posBelow.x, posBelow.y, posBelow.z].WalkableSurface;
+            } else {
+                return false;
+            }
+        }
+
+        private static bool CellFilter(Vec3 from, Vec3 to) {
+            if (from.y == to.y) {
+                // Check if all cells we're moving through are floors (important when moving diagonally)
+                var min = Vec3.Min(from, to);
+                var max = Vec3.Max(from, to);
+
+                for (int x = min.x; x &lt;= max.x; x++) {
+                    for (int z = min.z; z &lt;= max.z; z++) {
+                        if (!IsFloor(new Vec3(x, min.y, z))) {
+                            return false;
+                        }
+                    }
+                }
+
+                return true;
+            } else {
+                // If the movement is vertical, then perform no diagonal check
+                return IsFloor(to);
+            }
+        }
+
+        public static void Main(string[] args) {
+            // Read grid
+            string[] gridLines = File.ReadAllLines("grid.txt");
+
+            sx = int.Parse(gridLines[0].Split(' ')[0]);
+            sy = int.Parse(gridLines[0].Split(' ')[1]);
+            sz = int.Parse(gridLines[0].Split(' ')[2]);
+
+            Grid = new Cell[sx, sy, sz];
+
+            int i = 1;
+            for (int x = 0; x &lt; sx; x++) {
+                for (int y = 0; y &lt; sy; y++) {
+                    for (int z = 0; z &lt; sz; z++) {
+                        Cell cell = new Cell();
+                        cell.Occupied = bool.Parse(gridLines[i].Split(' ')[0]);
+                        cell.WalkableSurface = bool.Parse(gridLines[i].Split(' ')[0]);
+                        Grid[x, y, z] = cell;
+
+                        i++;
+                    }
+                }
+            }
+
+            // Do pathfinding
+            Vec3 start = new Vec3(9, 2, 6);
+            Vec3 end = new Vec3(45, 2, 0);
+
+            // Warmup iterations for profiling
+            for (int j = 0; j &lt; 10; j++) {
+                FindPath(start, end, CellFilter);
+            }
+
+            var timer = new System.Diagnostics.Stopwatch();
+
+            timer.Start();
+            var path = FindPath(start, end, CellFilter);
+            timer.Stop();
+
+            Console.WriteLine("best path is " + path.Count + " cells long");
+            Console.WriteLine("path finding took " + timer.Elapsed.TotalMilliseconds + " ms");
+        }
+    }
+}
+</code></pre>
+    </div>

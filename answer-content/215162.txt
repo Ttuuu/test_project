@@ -1,0 +1,143 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><em>NB: This review assumes Perl5, specifically the Unicode features in 5.12 (released 2010) and later.</em></p>
+<hr>
+<h3>1. the parsing could be simpler and more featureful</h3>
+<p>Much code is devoted to handling delimiters that we're only going to throw away.</p>
+<p>Explicit N/S/E/W should override <code>-lonlat</code> but don't.</p>
+<p>The sole error message ("malformed input") is vague and happens at the very end, after a series of transformations on the input.   The mangled string—which may not resemble original input much anymore—is included in the error message and only adds to the confusion.</p>
+<p>In general: modifying an input string to impart meaning is usually a mistake.  Modify to remove noise, extract the meaningful parts as structured data, and deal with them there.</p>
+<h3>2. there is a fair amount of duplicated or nearly-duplicated code</h3>
+<p>A dispatch table is the standard way to choose code based on data.  Your "a2b" functions have a lot of common code, and can be merged once the unique parts are moved into a data structure.</p>
+<h3>3. the data representations could be more suitable</h3>
+<p><code>squares</code> and <code>tosquare</code> use 2-digit values, but you never need values in that format.  You always need a pair of single digits, and this complicates the conversion functions.  Restructure to suit the need, such that <code>$squares{A} == [ 0, 4 ]</code> (hash of arrays) and <code>$tosquare[0][4] == 'A'</code> (array of arrays).</p>
+<p><code>100000</code> is better written as <code>100_000</code> or <code>1e5</code>.</p>
+<p><code>$numpat</code> can be simplified to <code>qr/[+-]? \d+ \.?\d* \s* /x</code>.  Write regular expression pieces with the <code>qr/REGEXP/</code> quoting construct, so that they are only compiled once; you then won't need <code>/o</code> modifiers when you reference them.  The <code>/x</code> modifier allows the use of whitespace in regular expressions, and makes long expressions more readable.  Space within <code>[ ]</code> is still recognized; other whitespace is ignored.</p>
+<h3>4. Unicode handling is haphazard</h3>
+<p>This is an artifact of writing in Perl4, which had no Unicode facilities.  In Perl5, UTF-8 source code (<code>s/°/d/g;</code> etc.) should inform Perl of the source encoding via <code>use utf8;</code>.</p>
+<p>To accept UTF-8 input, <code>STDIN</code> should be placed in <code>:utf8</code> mode, via <code>binmode STDIN, ":utf8"</code>.  As you're including user input in <code>die</code> messages, <code>STDERR</code> should get the same treatment.</p>
+<h3>5. tricks and minor stuff</h3>
+<p><code>getnext()</code> is about three times longer and more confusing than it ought to be; see below for a revised version.</p>
+<p>Every output ends in a newline; use the <code>-l</code> switch instead.</p>
+<p><code>%tosquare = reverse %squares</code> is the idiomatic version of <code>%tosquare = map { ($squares{$_}, $_) } keys %squares</code>.</p>
+<p><code>local $_ = shift;</code> is usually what you want when assigning to <code>$_</code> in a sub, else it will be clobbered in the calling scope.  (The rewrite contravenes this advice and clobbers <code>$_</code> on purpose.)</p>
+<p><code>nadgrids=</code> can be adjusted at setup time to ignore missing files.  Calls to <code>-&gt;transform()</code> should print error on failure (due to, say, a missing nadgrids file :)</p>
+<p>A long series of synonym-to-canonical-value substitutions, as you're doing with <code>s/°/d/g</code>, etc., can be replaced by a hash table where the keys combine into a regex, as in:</p>
+<pre><code>    my %decoratives=(qw( ' m   " s   ° d   ′ m   ″ s ),  ("," =&gt; " ") );
+    s/([@{[ join '', keys %decoratives ]}])/$decoratives{$1}/g; 
+</code></pre>
+<h3>revision</h3>
+<p>Here's my response to my own criticisms.  It's not much shorter—about 75% of the original's size—but does improve the error messages and is (perhaps) more clear in its intent.</p>
+<pre class="lang-perl prettyprint-override"><code>#!/usr/bin/perl -wl
+use strict;
+use Getopt::Long;
+use Geo::Proj4;
+use utf8;
+binmode STDIN, ":utf8";
+binmode STDERR, ":utf8";
+sub grid2xy(_);
+sub xy2grid($$$);
+sub getnext();
+
+my %squares = qw( 
+    A 04   B 14   C 24   D 34   E 44   F 03   G 13   H 23   J 33   K 43   L 02   M 12   N 22   
+    O 32   P 42   Q 01   R 11   S 21   T 31   U 41   V 00   W 10   X 20   Y 30   Z 40 
+);
+my @tosquare;
+$tosquare[ int $squares{$_}/10 ][ $squares{$_}%10 ] = $_ for keys %squares;
+$_ = [ split '' ] for values %squares; 
+
+my %howto=(
+    GB =&gt; {
+        setup =&gt; 'epsg:27700 +nadgrids=' . join(',' =&gt; grep { -f } qw( scotland.gsb england-wales.gsb )),
+        parse =&gt; qr/^(\D\D)(\d+)$/,
+        xy2os =&gt; sub {  [ map { int($_[$_]/5e5) + 2 - $_ } 0..1 ], [ map { ($_[$_]/1e5) % 5 } 0..1 ] },
+        os2xy =&gt; sub { map { 5*$_[0][$_] + $_[1][$_] - 10 + 5*$_ } 0..1 }
+    },
+    IE =&gt; {
+        setup =&gt; 'epsg:29901',
+        parse =&gt; qr/^(\D)(\d+)$/,
+        xy2os =&gt; sub { [ map int($_/1e5) =&gt; @_ ] },
+        os2xy =&gt; sub { @{ $_[0] } }
+    }
+);
+
+my ($grid, $datum, $precision,$lonlat,$reverse,$verbose) = ('GB', 'WGS84', 5);
+GetOptions(
+    'grid=s'      =&gt; <span class="math-container">\$grid,
+    'reverse!'    =&gt; \$</span>reverse,
+    'lonlat!'     =&gt; <span class="math-container">\$lonlat,
+    'datum=s'     =&gt; \$</span>datum,
+    'precision=i' =&gt; <span class="math-container">\$precision,
+    'verbose!'    =&gt; \$</span>verbose
+) or die "Option parsing failure\n";
+
+our %do=%{ $howto{$grid} or die "Unknown grid $grid\n" };
+
+my $wgs84 = Geo::Proj4-&gt;new(proj =&gt; 'latlon', datum =&gt; $datum) or die Geo::Proj4-&gt;error;
+my $proj = Geo::Proj4-&gt;new(init =&gt; $do{setup}) or die Geo::Proj4-&gt;error;
+
+@ARGV=('-') unless @ARGV;
+while (getnext) { 
+    if ($reverse) {
+        my @lola = @{ $proj-&gt;transform($wgs84, grid2xy) or die $proj-&gt;error };
+        local $,="  ";
+        print $lonlat ? @lola : reverse @lola;
+    } else {
+        my @tokens= map {uc} /( [+-]? \d+ \.?\d* | [NSEW] )/gix;
+        print "tokens: @tokens" if $verbose;
+        my @lalo=(0,0);
+        my @dms=( 1, 60, 3600 );
+        my ($unit,$ll,$seenNS, $seenEW)=(0,0,0,0);
+        my %seen=( N =&gt; <span class="math-container">\$seenNS, S =&gt; \$</span>seenNS, E =&gt; <span class="math-container">\$seenEW, W =&gt; \$</span>seenEW );
+        my %sign=( N =&gt; 1, S =&gt; -1, E =&gt; 1, W =&gt; -1 );
+        while (@tokens) { 
+            my $tok=shift @tokens;
+            if ($sign{$tok}) { 
+                die "Repeated or conflicting direction '$tok'\n" if ${ $seen{$tok} };
+                die "Directions come after the coordinates\n" unless $unit;
+                $lalo[$ll++] *= $sign{$tok};
+                ${ $seen{$tok} } = $ll;  # after the increment so that it's nonzero.
+                $unit=0;
+            } else {
+                if ($unit&gt;$#dms) {  $ll++; $unit=0; }
+                die "Too many coordinates in '$_'\n" if $ll&gt;1;
+                $lalo[$ll] += $tok / $dms[$unit++];
+            }
+        }
+        @lalo=reverse @lalo if (!$seenNS &amp;&amp; !$seenEW &amp;&amp; $lonlat or $seenNS==1 or $seenEW==2);
+        print STDERR "lat/lon @lalo" if $verbose;
+        my ($x, $y) = @{ $wgs84-&gt;transform($proj, [ @lalo ]) or die $wgs84-&gt;error };
+        print xy2grid($x, $y, $precision);
+    }
+}
+exit 0;
+
+sub grid2xy(_) {
+    local $_=shift;
+    my ($letters, $numbers) = /$do{parse}/ or die "Malformed ref '$_'\n";
+    my $len = length $numbers;
+    die "Odd gridref length - '$_' ($len)\n" if $len % 2;
+    $len /= 2;
+    my @sq = map { $squares{$_} or die "Non-grid square '$_'\n" } split '', $letters;
+    my ($x,$y) = $do{os2xy}(@sq);
+    $x = 100000 * ("$x.".substr($numbers, 0, $len).'5');
+    $y = 100000 * ("$y.".substr($numbers, $len).'5');
+    return [$x, $y];
+}
+
+sub xy2grid($$$) { 
+   my ($x, $y, $prec) = @_;
+   local $,=","; # for the die()
+   my $sq = join '', map { $tosquare[ $_-&gt;[0] ][ $_-&gt;[1] ] or die "No square for @$_\n" } $do{xy2os}($x,$y); 
+   return sprintf('%s%s%s', $sq, map { substr(100000 + $_%100000, 1, $prec) } ($x, $y));
+}
+
+sub getnext() {
+    if (@ARGV and $ARGV[0] eq '-') {
+        if ($_ = &lt;STDIN&gt;) { chomp; return $_ }
+        else { shift @ARGV }
+    }
+    return $_=shift @ARGV;
+}
+</code></pre>
+    </div>

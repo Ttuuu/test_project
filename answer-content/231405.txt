@@ -1,0 +1,129 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Actually, the initial <em>producer-consumer</em> scheme is over-complicated and has the following issues:</p>
+
+<p><strong><em>Using 2 separate <code>threading.Semaphore</code> objects</em></strong>:<br>
+One of them is used for <em>producer</em> (<code>remaining_space</code>), another - for <em>consumer</em> (<code>fill_count</code>). <br>Though they won't be convenient here (as I'll describe below), but for your future potential cases, a better naming would be <code>self.producer_counter</code> and <code>self.consumer_counter</code>.<br>What those 2 semaphors (as internal counters) do is just emulating <strong><em>limitation</em></strong> of the capacity of a resource (the resource is <code>deque</code> in our case)
+<br>How it starts and flows:</p>
+
+<p>On running the producer starts appending random items in a loop of <code>100</code> iterations:</p>
+
+<pre><code>    ...
+    for _ in range(self.times):
+        self.queue.append(random.randint(0, 100))
+</code></pre>
+
+<p>on each iteration the <code>producer</code> thread will acquire <code>self.remaining_space.acquire()</code> decrementing the internal counter. When producer's counter is zero (<code>0</code>) the <code>producer</code> thread will <strong>block</strong> until the <code>consumer</code> thread calls <code>self.remaining_space.release()</code> thus increasing the producer's counter by <code>1</code> and letting the <code>producer</code> thread to proceed.<br>Such a "dragging" of <code>acquire/release</code> in multiple places can be just replaced with well-known <a href="https://docs.python.org/3/library/queue.html#queue.Queue" rel="nofollow noreferrer"><strong><code>queue.Queue</code></strong></a>, which is FIFO queue that already uses <code>deque</code> under the hood and already provides the needed <em>locking</em> mechanism and <em>timeout</em> logic.</p>
+
+<blockquote>
+  <p>The <code>queue</code> module implements multi-producer, multi-consumer queues.
+  It is especially useful in threaded programming when information must
+  be exchanged safely between multiple threads. The <code>Queue</code> class in
+  this module implements all the required locking semantics.</p>
+</blockquote>
+
+<p>...</p>
+
+<blockquote>
+<pre><code>class queue.Queue(maxsize=0)
+</code></pre>
+  
+  <p>Constructor for a FIFO queue. <code>maxsize</code> is an integer that sets the upperbound limit on the number of items that can be placed in the
+  queue. Insertion will block once this size has been reached, until
+  queue items are consumed. If <code>maxsize</code> is less than or equal to zero,
+  the queue size is infinite.</p>
+</blockquote>
+
+<p>So <code>maxsize</code> already gives us a <em>limited</em> <em>capacity</em>.</p>
+
+<p><strong><em>Namings:</em></strong><br>
+A better names for a numeric constants in our new scheme would be:</p>
+
+<pre><code>MAX_QSIZE = 10  # max queue size
+BUF_SIZE = 100  # total number of iterations/items to process
+</code></pre>
+
+<p><strong><em>"Tricky" passing of <code>TIMES</code> constant:</em></strong><br>
+It's not good to pass total number of processed items to <code>Consumer</code> constructor:</p>
+
+<pre><code>class Consumer:
+    def __init__(self, queue, times=TIMES):
+    ...
+</code></pre>
+
+<p>that allows compromising and specifying <em>improper</em> number of items to process.<br>Consider the following case:</p>
+
+<pre><code>TIMES = 100
+...
+    producer = Producer(queue)
+    producer_thread = threading.Thread(target=producer.run)
+    consumer = Consumer(queue, times=50)
+    consumer_thread = threading.Thread(target=consumer.run)
+</code></pre>
+
+<p>this will point the <code>consumer</code> to consume less items than the <code>queue</code> contains, eventually having the queue with dangled items.<br>If you run that case you'll have the pipeline blocked/hanged. <br>To avoid that we need to ensure the <code>consumer</code> has gotten and processed all items in the queue:</p>
+
+<pre><code>class Consumer:
+    def __init__(self, queue):
+        self.queue = queue
+
+    def run(self):
+        while not self.queue.empty():
+            item = self.queue.get()
+            self.queue.task_done()
+            print(item)
+</code></pre>
+
+<p>To enrich the queue communication we can incorporate <a href="https://docs.python.org/3/library/queue.html#queue.Queue.task_done" rel="nofollow noreferrer"><code>queue.task_done()</code></a> and <a href="https://docs.python.org/3/library/queue.html#queue.Queue.join" rel="nofollow noreferrer"><code>queue.join()</code></a> (the final version will incorporate them).</p>
+
+<p><em>The final concise version:</em></p>
+
+<pre><code>from queue import Queue
+import random
+import threading
+
+MAX_QSIZE = 10  # max queue size
+BUF_SIZE = 100  # total number of iterations/items to process
+
+
+class Producer:
+    def __init__(self, queue, buf_size=BUF_SIZE):
+        self.queue = queue
+        self.buf_size = buf_size
+
+    def run(self):
+        for _ in range(self.buf_size):
+            self.queue.put(random.randint(0, 100))
+
+
+class Consumer:
+    def __init__(self, queue):
+        self.queue = queue
+
+    def run(self):
+        while not self.queue.empty():
+            item = self.queue.get()
+            self.queue.task_done()
+            print(item)
+
+
+def main():
+    q = Queue(maxsize=MAX_QSIZE)
+
+    producer = Producer(q)
+    producer_thread = threading.Thread(target=producer.run)
+
+    consumer = Consumer(q)
+    consumer_thread = threading.Thread(target=consumer.run)
+
+    producer_thread.start()
+    consumer_thread.start()
+
+    producer_thread.join()
+    consumer_thread.join()
+    q.join()
+
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+    </div>

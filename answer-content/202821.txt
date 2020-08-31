@@ -1,0 +1,134 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<ol>
+<li><p>If a Python module contains no imports, then the code in the post fails with an error like this:</p>
+
+<pre class="lang-none prettyprint-override"><code>Module's path has a .so suffix, quitting program. Try again with a different module!
+Traceback (most recent call last):
+  File "cr201985.py", line 41, in _scan_dict
+    return rd, md
+UnboundLocalError: local variable 'rd' referenced before assignment
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "&lt;stdin&gt;", line 1, in &lt;module&gt;
+  File "cr201985.py", line 15, in __init__
+    rd, md = self._scan_dict(rd, md)
+  File "cr201985.py", line 44, in _scan_dict
+    print("Module path:", module_dict[module])
+UnboundLocalError: local variable 'module' referenced before assignment
+</code></pre>
+
+<p>Notice that the error message (about the .so suffix) is incorrect.</p></li>
+<li><p>The methods <code>_parse_line_for_module_name</code> and <code>_parse_line_for_module_mnemonic</code> don't use the <code>self</code> argument, so they don't need to be methods, they could just be plain functions. Plain functions are easier to develop and test than methods, because you can just call them with your test data, you don't have to create an object first.</p></li>
+<li><p>Here's how you use the <code>ImportGraph</code> class:</p>
+
+<pre><code>ig = ImportGraph(base_filename)
+final_relationship_dict = ig.final
+</code></pre>
+
+<p>After this, <code>ig</code> is not needed any more (and it doesn't have any other public methods or attributes other than <code>final</code>, so you couldn't use it for anything else even if you wanted to). This suggests that you don't actually need a class here, and what you actually want is a function that takes the base filename and returns the module relationship dictionary.</p>
+
+<p>So instead of a class, use a function; instead of attributes, use local variables; and instead of private methods, use locally defined functions. Like this:</p>
+
+<pre><code>def import_graph(base_filename):
+    "Return import relationship mapping starting at base_filename."
+    relationship_dict = defaultdict(list)
+    module_dict = defaultdict(list)
+
+    def parse_file(filename):
+        # ... update relationship_dict and module_dict here ...
+
+    def scan_dict():
+        # ... update relationship_dict and module_dict here ...
+
+    # ... call parse_file and scan_dict here ...
+
+    return relationship_dict
+</code></pre>
+
+<p>See Jack Diederich's talk "<a href="https://www.youtube.com/watch?v=o9pEzgHorH0" rel="nofollow noreferrer">Stop Writing Classes</a>" for more about this issue.</p></li>
+<li><p>The strategy for finding all the imports is to call the <code>_scan_dict</code> method thirty times in a loop:</p>
+
+<pre><code>for i in range(30): 
+    rd, md = self._scan_dict(rd, md)
+</code></pre>
+
+<p>Each time round this loop, <code>_scan_dict</code> looks at all the modules that have been discovered so far, and parses the corresponding files to look for more <code>import</code> statements. The trouble with this approach is that each imported file gets parsed up to thirty times!</p>
+
+<p>The way to avoid duplicated work here is to maintain a collection of files that have been discovered but not yet parsed:</p>
+
+<pre><code>unparsed_files = {base_filename}
+</code></pre>
+
+<p>and a collection of files that have been parsed:</p>
+
+<pre><code>parsed_files = set()
+</code></pre>
+
+<p>and then the main loop can work something like this:</p>
+
+<pre><code>while unparsed_files:
+    filename = unparsed_files.pop()
+    parsed_files.add(filename)
+    parse_file(filename)
+</code></pre>
+
+<p>and when an <code>import</code> statement is discovered, you can check whether the imported file has already been parsed:</p>
+
+<pre><code>if filename not in parsed_files:
+    unparsed_files.add(filename)
+</code></pre>
+
+<p>This approach means that each file gets parsed exactly once, and there is no magic number "30", so import chains of arbitrary depth can be processed.</p>
+
+<p>(This is similar to the <a href="https://en.wikipedia.org/wiki/Breadth-first_search" rel="nofollow noreferrer">breadth-first search</a> algorithm, except that in this case you don't care about the order in which you explore the graph, so <code>unparsed_files</code> can be a set instead of a queue.)</p></li>
+<li><p>The purpose of <code>_parse_file</code> is to parse Python source code and identify <code>import</code> statements. It works by iterating over the lines looking for the string <code>import</code>, together with some heuristics to try to discard strings and comments. Unfortunately the heuristics don't cover all the cases, and it is easy to fool them. Here are four imports which are all ignored by <code>_parse_file</code>:</p>
+
+<pre><code>import heapq # comment on the same line as import
+
+# ''' triple quotes are commented out
+import heapq
+# '''
+
+'''triple quotes finish on same line they started'''
+import heapq
+''''''
+
+# line continuation
+import \
+    heapq
+</code></pre>
+
+<p>There is really no substitute for actually parsing the file. Luckily, Python has a built-in parser in the <a href="https://docs.python.org/3/library/ast.html" rel="nofollow noreferrer"><code>ast</code></a> module, so getting it right is easy. The way you do it is to call <a href="https://docs.python.org/3/library/ast.html#ast.parse" rel="nofollow noreferrer"><code>ast.parse</code></a> to get an abstract syntax tree:</p>
+
+<pre><code>import ast
+with open(filename, 'rb') as f:
+    tree = ast.parse(f.read(), filename)
+</code></pre>
+
+<p>(Notice that you must open the file in binary mode — this allows the parser to handle file encoding declarations, and so avoid the <code>UnicodeDecodeError</code> that you had trouble with.)</p>
+
+<p>Then you can walk the tree looking for <code>import ...</code> and <code>from ... import ...</code> statements. This is most easily done by subclassing the <a href="https://docs.python.org/3/library/ast.html#ast.NodeVisitor" rel="nofollow noreferrer"><code>ast.NodeVisitor</code></a> class, for example:</p>
+
+<pre><code>class ImportVisitor(ast.NodeVisitor):
+    "AST visitor that prints the import statements."
+    def visit_Import(self, node):
+        print('import', ', '.join(alias.name for alias in node.names))
+
+    def visit_ImportFrom(self, node):
+        print('from', node.module, 'import',
+              ', '.join(alias.name for alias in node.names))
+</code></pre>
+
+<p>and then visit the tree that you parsed earlier:</p>
+
+<pre><code>visitor = ImportVisitor()
+visitor.visit(tree)
+</code></pre>
+
+<p>You'll see that this approach is much simpler than <code>_parse_line_for_module_name</code> and <code>_parse_line_for_module_mnemonic</code>, and it copes with all the difficult cases that I noted above.</p>
+
+<p>(Of course, in a real program you wouldn't print the imports, you'd accumulate them for further processing, but printing is a simple way to demonstrate the approach.)</p></li>
+</ol>
+    </div>

@@ -1,0 +1,201 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Your FileStream looks like it is an IDisposable as well, you should put it into a using statement as well, then you don't have to worry about missing a chance to dispose it.</p>
+
+<hr>
+
+<p>Right here</p>
+
+<blockquote>
+<pre><code>    if (ExistingLength &gt; 0)
+        saveFileStream = new FileStream(Path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+    else
+        saveFileStream = new FileStream(Path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+</code></pre>
+</blockquote>
+
+<p>In my opinion you should use curly braces, I almost always use curly braces.</p>
+
+<hr>
+
+<p><a href="https://msdn.microsoft.com/en-us/library/yh598w02.aspx" rel="nofollow">MSDN Using Statement</a></p>
+
+<p>One of the reasons to use a using statement is because, no matter what happens the object that you opened with the statement is always closed, no matter what happens.  It's like throwing the dispose call into the Finally statement of a try catch block.  </p>
+
+<hr>
+
+<p>You should remove the <code>saveFileStream.Dispose</code> and replace it with <code>saveFileStream.Flush()</code> (<em>Clears buffers for this stream and causes any buffered data to be written to the file.</em>) which will allow you to get rid of this line as well because that is essentially what it was doing in the first place</p>
+
+<blockquote>
+<pre><code>File.WriteAllText(Path, string.Empty); // clear the contents of the half downloaded file that can't be resumed
+</code></pre>
+</blockquote>
+
+<p><strong>Edit:</strong> We are going to use a Try/Catch and re-<code>New</code> the filestream each time, instead of try to bunch it into a using statement block.</p>
+
+<p>I also realized that you do not need this</p>
+
+<blockquote>
+<pre><code>saveFileStream = new FileStream(Path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+</code></pre>
+</blockquote>
+
+<p>since we are not disposing the filestream, we are just flushing the stream, so the stream still has the same path, mode, and access.  so that line is unneeded.</p>
+
+<hr>
+
+<p>I would one line this</p>
+
+<blockquote>
+<pre><code>if (stop == true) 
+    return;
+</code></pre>
+</blockquote>
+
+<p>like this</p>
+
+<pre><code>if (stop == true) return;
+</code></pre>
+
+<p>Because if I am going to create an if statement and not use curly braces I should be able to one line it and leave and extra line after it, so that I can tell there is nothing else inside that if statement.</p>
+
+<p>and because <code>stop</code> is a boolean already</p>
+
+<pre><code>if (stop) return;
+</code></pre>
+
+<p>just because...</p>
+
+<hr>
+
+<p>Don't let your Comments get too long, multi line them if you need to.</p>
+
+<p>And get rid of comments that don't need to be there as well.</p>
+
+<hr>
+
+<p>Your else statement</p>
+
+<blockquote>
+<pre><code>  else
+  {   
+      //args.ProgressPercentage = Unknown;
+      //args.TimeLeft = Unknown;
+  }
+</code></pre>
+</blockquote>
+
+<p>doesn't do anything, so get rid of it.</p>
+
+<hr>
+
+<p>I left a lot of Comments in here that I would have probably just documented in my documentation. I am sure that someone maintaining this would know exactly what most of this is doing. the comments aren't horrible though, so leaving them there is probably okay, just keep in mind that too many make the code hard to read.</p>
+
+<hr>
+
+<p>Here is what I came up with.  </p>
+
+<pre><code>public void DownloadFile(string DownloadLink, string Path)
+{
+    stop = false; 
+
+    long ExistingLength = 0;
+    //using (FileStream saveFileStream = new FileStream()
+    try
+    {
+        if (File.Exists(Path))
+        {
+            FileInfo fileInfo = new FileInfo(Path);
+            ExistingLength = fileInfo.Length;
+        }
+
+        if (ExistingLength &gt; 0)
+        {
+            saveFileStream = new FileStream(Path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+        }
+        else
+        {
+            saveFileStream = new FileStream(Path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite);
+        }
+
+        var request = (HttpWebRequest)HttpWebRequest.Create(DownloadLink);
+        request.Proxy = null;
+        request.AddRange(ExistingLength);
+
+        try
+        {
+            using (var response = (HttpWebResponse)request.GetResponse())
+            {
+                long FileSize = ExistingLength + response.ContentLength; //response.ContentLength gives me the size that is remaining to be downloaded
+                bool downloadResumable; // need it for sending empty progress
+
+                if ((int)response.StatusCode == 206)
+                {
+                    //Console.WriteLine("Resumable");
+                    var downloadStatusArgs = new DownloadStatusChangedEventArgs();
+                    downloadResumable = true;
+                    downloadStatusArgs.ResumeSupported = downloadResumable;
+                    OnDownloadStatusChanged(downloadStatusArgs);
+                }
+                else // sometimes a server that supports partial content will lose its ability to send partial content(weird behavior) and thus the download will lose its resumability
+                {
+                    //Console.WriteLine("Resume Not Supported");
+                    ExistingLength = 0;
+                    var downloadStatusArgs = new DownloadStatusChangedEventArgs();
+                    downloadResumable = false;
+                    downloadStatusArgs.ResumeSupported = downloadResumable;
+                    OnDownloadStatusChanged(downloadStatusArgs);
+                    // restart downloading the file from the beginning because it isn't resumable
+                    // if this isn't done, the method downloads the file from the beginning and starts writing it after the 
+                    // previously half downloaded file, thus increasing the filesize and corrupting the downloaded file
+                    saveFileStream.Flush();// clear the contents of the half downloaded file that can't be resumed
+                }
+
+                using (var stream = response.GetResponseStream())
+                {
+                    byte[] downBuffer = new byte[4096];
+                    int byteSize = 0;
+                    long totalReceived = byteSize + ExistingLength;
+                    var sw = new Stopwatch();
+                    sw.Start();
+                    while ((byteSize = stream.Read(downBuffer, 0, downBuffer.Length)) &gt; 0)
+                    {
+                        saveFileStream.Write(downBuffer, 0, byteSize);
+                        totalReceived += byteSize;
+
+                        var args = new DownloadProgressChangedEventArgs();
+                        args.BytesReceived = totalReceived;
+                        args.TotalBytesToReceive = FileSize;
+                        float currentSpeed = totalReceived / (float)sw.Elapsed.TotalSeconds;
+                        args.CurrentSpeed = currentSpeed;
+                        if (downloadResumable == true)
+                        {
+                            args.ProgressPercentage = ((float)totalReceived / (float)FileSize) * 100;
+                            long bytesRemainingtoBeReceived = FileSize - totalReceived;
+                            args.TimeLeft = (long)(bytesRemainingtoBeReceived / currentSpeed);
+                        }
+
+                        OnDownloadProgressChanged(args);
+
+                        if (stop == true) return;
+
+                    }
+                    sw.Stop();
+                }
+            }
+            var completedArgs = new EventArgs();
+            OnDownloadCompleted(completedArgs);
+        }
+        catch (WebException e)
+        {
+            string filename = System.IO.Path.GetFileName(Path);
+            Console.WriteLine(e.Message);
+        }
+    }
+    finally
+    {
+        saveFileStream.Close()
+        saveFileStream.Dispose()
+    }
+}
+</code></pre>
+    </div>

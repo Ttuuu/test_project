@@ -1,0 +1,185 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Some style issues first:</h2>
+<ul>
+<li><p>Package names should be all lowercase ASCII letters. No <code>camelCase</code>, <code>PascalCase</code>, <code>snake_case</code> or <code>kebab-case</code>. So <code>tennisproject</code> and <code>scanner</code>.</p>
+</li>
+<li><p>Local variables should never be uppercase <code>SNAKE_CASE</code>, but <code>camelCase</code>. So <code>atpUrlPrefix</code> instead of <code>ATP_URL_PREFIX</code> and so on. You probably want those to be class <em>constants</em> anyways, which use uppercase <code>SNAKE_CASE</code>. These are <strong>fields</strong> that are <code>private static final</code>.</p>
+</li>
+<li><p>The same is true for parameters. Always <code>camelCase</code>. So <code>urlPrefix</code> <code>url_prefix</code> and so on.</p>
+</li>
+<li><p>Don't declare a method called <code>main</code> that isn't actually a Java style main method. It's confusing. You can get rid of the <code>TennisProject</code> class all together.</p>
+</li>
+</ul>
+<hr>
+<h2>Some notes on code snippets before I present a "cleaned up" version</h2>
+<pre><code>ArrayList&lt;String&gt; weeks = new ArrayList&lt;&gt;();
+weeks = getWeeksForRankings(ATP_URL_PREFIX, weeks);
+</code></pre>
+<p>No need to create a list and pass it to the method here. Remove the list parameter and have the method create the list. Also change the return type of <code>getWeeksForRankings</code> from <code>ArrayList</code> to <code>List&lt;String&gt;</code>. Raw type usage is discouraged, and there is usually no need for the caller to know which list implementation is returned. The same is true for the parameter. Use the broadest type of Collection possible.</p>
+<hr>
+<pre><code>} catch (IOException e) {
+    System.out.println("Error while connecting and parsing HTML: " + e);
+    System.exit(1);
+} catch (Exception e) {
+    System.out.println("Fatal Error: " + e);
+    System.exit(1);
+}
+</code></pre>
+<p>(Re)throw the exception(s) after handling them (in your case, handling them is just printing out an error message) if the error is unrecoverable instead of using <code>System.exit</code> and let the caller handle the exception. In your case, it would just be the runtime terminating the application.</p>
+<hr>
+<pre><code>if (weeks.size() == 0) {
+</code></pre>
+<p>Use <code>weeks.isEmpty()</code> instead.</p>
+<hr>
+<h2>"Cleaned up" code</h2>
+<p>Now, I would make it so that <code>Scanner</code> is an instantiable class with instance methods. That way you can create multiple instances and pass different parameters if needed.</p>
+<p>First, we add a Result POJO:</p>
+<pre><code>public class WeeklyResult {
+    private final String week;
+    private final String playerName;
+
+    public WeeklyResult(final String week, final String playerName) {
+        this.week = week;
+        this.playerName = playerName;
+    }
+
+    public String getWeek() {
+        return week;
+    }
+
+    public String getPlayerName() {
+        return playerName;
+    }
+}
+</code></pre>
+<p>Now, the cleaned up <code>Scraper</code> class. The changes are substantial, so please read the explanation below.</p>
+<pre><code>import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.util.*;
+import java.util.stream.Collectors;
+
+public class Scraper {
+    private final String urlPrefix;
+    private final String urlSuffix;
+    private final Duration timeout;
+
+    public Scraper(final String urlPrefix, final String urlSuffix, final Duration timeout) {
+        this.urlPrefix = urlPrefix;
+        this.urlSuffix = urlSuffix;
+        this.timeout = timeout;
+    }
+
+    public List&lt;WeeklyResult&gt; scrape() throws IOException {
+        final List&lt;String&gt; weeks = loadWeeks();
+
+        return loadResults(weeks);
+    }
+
+    private List&lt;String&gt; loadWeeks() throws IOException {
+        final Document document = loadDocument(urlPrefix);
+        final Elements elements = selectRankingWeeksElements(document);
+        final List&lt;String&gt; result = extractWeeks(elements);
+
+        return notEmptyElseThrow(result);
+    }
+
+    private Document loadDocument(final String url) throws IOException {
+        return Jsoup.connect(url).timeout((int) timeout.toMillis()).get();
+    }
+
+    private static List&lt;String&gt; extractWeeks(final Collection&lt;Element&gt; elements) {
+        return elements.stream()
+                       .map(Scraper::extractWeek)
+                       .collect(Collectors.toList());
+    }
+
+    private List&lt;WeeklyResult&gt; loadResults(final List&lt;String&gt; weeks) throws IOException {
+        final List&lt;WeeklyResult&gt; result = new ArrayList&lt;&gt;();
+
+        for (final String week : weeks) {
+            loadWeeklyResult(week).ifPresent(result::add);
+        }
+
+        return result;
+    }
+
+    private Optional&lt;WeeklyResult&gt; loadWeeklyResult(final String week) throws IOException {
+        final Document document = loadDocument(weeklyResultUrl(week));
+        final Element playerCell = selectPlayerCellElement(document);
+
+        return Optional.ofNullable(playerCell).map(element -&gt; new WeeklyResult(week, element.text()));
+    }
+
+    private String weeklyResultUrl(final String week) {
+        return urlPrefix + "rankDate=" + week + urlSuffix;
+    }
+
+    private static String extractWeek(final Element li) {
+        return li.text().replaceAll("\\.", "-");
+    }
+
+    private static Elements selectRankingWeeksElements(final Document document) {
+        final Elements result = document.getElementsByAttributeValue("data-value", "rankDate")
+                                        .select("ul li");
+
+        Collections.reverse(result);
+        return result;
+    }
+
+    private static List&lt;String&gt; notEmptyElseThrow(final List&lt;String&gt; weeks) throws IOException {
+        if (weeks.isEmpty()) {
+            throw new IOException("Please provide a historical time range! Cannot rank otherwise!");
+        }
+
+        return weeks;
+    }
+
+    private static Element selectPlayerCellElement(final Document document) {
+        return document.getElementsByClass("player-cell").first();
+    }
+
+    public static void main(final String[] args) throws IOException {
+        final Scraper scraper =
+                new Scraper("https://www.atptour.com/en/rankings/singles?", "&amp;rankRange=0-100", Duration.ofSeconds(180));
+
+        for (final WeeklyResult weeklyResult : scraper.scrape()) {
+            System.out.println("Week: " + weeklyResult.getWeek() + " No.1: " + weeklyResult.getPlayerName());
+        }
+    }
+}
+</code></pre>
+<p>You will notice that there are a lot of methods, but all methods are <strong>very small</strong>. In fact they are so small that <strong>no method has more than four lines of actual code.</strong></p>
+<p>Nobody expects you to do this right of the bat as a novice, but it is something you can strive towards. Notice that the code got <strong>longer</strong>, which many people think is a bad thing. It isn't. The fact that every method is no longer than four lines makes each methods purpose blindingly obvious, especially if you use meaningful names.</p>
+<p>As I said earlier, I made the <code>Scraper</code> an instantiable object that has the url prefix and suffix as constructor parameters, as well as the desired timeout as a <code>Duration</code> object.</p>
+<p>I've made all the error handling a responsibility of the caller. Ideally, you might want to define your own exception and wrap the IOExceptions in them, for example you could have a <code>ScraperException</code> that is thrown when the Scraper encounters an error.</p>
+<p>Note also that all the result handling is moved to the caller also. The caller receives a result object in form of a <code>List&lt;WeeklyResult&gt;</code> and can do with it whatever they please. If you want to handle results as soon as they are parsed but want to stay flexible, you migth want to consider using <a href="https://en.wikipedia.org/wiki/Callback_(computer_programming)" rel="nofollow noreferrer">Callbacks</a>.</p>
+<hr>
+<h2>Questions</h2>
+<blockquote>
+<ol>
+<li>Collection vs Elements for the parameter of extractWeeks: does this again relate to “use the broadest type of collection possible”?</li>
+</ol>
+</blockquote>
+<p>To be honest, it wasn't a conscious choice since I let the IDE perform <em>Extract Method</em>, but generally, yes. <code>Elements</code> is a type of <code>Collection&lt;Element&gt;</code>, but none of it's features are needed in <code>extractWeeks</code> so you might as well use <code>Collection&lt;Element&gt;</code> to make the method more broadly applicable (even though you might not need it).</p>
+<blockquote>
+<ol start="2">
+<li>static member functions vs non-static: I’m definitely going to look into this more myself but I couldn’t help getting confused over why certain functions (like extractWeeks) were static, but others (like weeklyResultUrl) are not static. In both cases, the object doesn’t directly call it, so wouldn’t it make sense to declare all such functions as static?</li>
+</ol>
+</blockquote>
+<p>Methods can't be <code>static</code> if they use members of their class. Since <code>weeklyResultUrl</code> uses the fields <code>urlPrefix</code> and <code>urlSuffix</code>, it cannot be <code>static</code>. I could declare all methods none-<code>static</code>, but declaring a method <code>static</code> has a few advantages to the reader and to the programmer:</p>
+<p>When calling a <code>static</code> method, you can be sure that it does not modify the instance state. Likewise, when inside a <code>static</code> method, you are not able to modify the instance state. Both of these decrease the mental load when reading and writing code.</p>
+<p>Also, since a <code>static</code> clearly doesn't require an instance to function, you are able to call a <code>public static</code> method without an instance from outside the class.</p>
+<blockquote>
+<ol start="3">
+<li>The noEmptyElseThrow strictly isn’t an IOException, is it? Can I throw other exceptions instead (IllegalArgumentExcpetion or NullPointerException, and I’m not sure which is the more suited of the two?), and if so would the caller have to rethrow them?</li>
+</ol>
+</blockquote>
+<p>Yes, technically you're right. I don't think either of the Exceptions you suggested are quite what you'd want. I would only ever throw <code>IllegalArgumentExcpetion</code> if you pass an invalid argument to a method. I would assume that you could extract the numbers from <code>&amp;rankRange=0-100</code> and add them as an argument to the method. Then IAE might be more applicable.</p>
+<p>There's something to be said about throwing a checked exception, which might be some further reading points as well.</p>
+<p>But NPE definitely doesn't fit. Only ever throw an NPE if something is <code>null</code> when it shouldn't be.</p>
+    </div>

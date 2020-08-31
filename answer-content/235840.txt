@@ -1,0 +1,137 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<ul>
+<li><p>Regarding the overall format of the string, I recommend requiring that non-roll-based substrings be postioned after roll-based substrings.  This will vastly improve the readability, elegance, and efficiency of the string/code. This requirement will ensure that input strings never start with a sign and that all non-roll-based substrings will be signed. More specifically, instead of using regex to validate, chunk, then make successive matches in a loop; you should be able to use a single pattern with <code>\G</code> in <code>preg_match_all()</code> to completely parse the string, then handle the capture groups based on their index.</p></li>
+<li><p>I don't think I support the allowance of multiple non-random roll tokens in a single sequence (<code>3d6-5+3</code>) -- this should be discouraged/disallowed purely because it looks messy.</p></li>
+<li><p>I am also not sure why you can't have min/max selections (<code>v</code> and <code>^</code>) on separate "roll tokens". I think this example should be valid/acceptable:</p>
+
+<pre><code>5d8v2+2d20v1
+</code></pre>
+
+<p>Roll an eight-sided die five times keeping the lowest two rolls, added to, roll a twenty-sided die twice keeping the lower roll.</p></li>
+<li><p>You can eliminate this condition:</p>
+
+<pre><code>if (empty($rollToken)) {
+    continue;
+}
+</code></pre>
+
+<p>if you deny the empty elements in the <code>preg_split()</code> call like this:</p>
+
+<pre><code>preg_split('/(?=[+-])/', $inputClean, null, PREG_SPLIT_NO_EMPTY)
+</code></pre></li>
+<li><p>If a roll token is found to not require a randomizing step, just add the value to the subtotal after casting as <code>(int)</code>. There is no need to separate the sign from the integer in this case.</p></li>
+</ul>
+
+<p>If you agree to tightening the string format, I think I'd be interested in offering a complete regex pattern for you.</p>
+
+<hr>
+
+<p>UPDATE: I love the idea of inventing a purposeful notation (I once had a go at a pinochle notation many years ago). I used a couple days of commute time on my phone to try to rewrite your script, so here it is...</p>
+
+<p>Here is the only regex pattern that I needed to parse/validate/chunk your input strings:</p>
+
+<pre><code>~
+\G(^-?|[+-])
+(?:
+  (\d+d\d+)(r\d+)?([v^]\d+)?
+  |
+  (\d+)
+)
+(?=[+-]|$)
+~x
+</code></pre>
+
+<p>This pattern will check from start to finish for consecutive, valid sequences (random or constant).  For the specific breakdown, please refer to regex101.com </p>
+
+<p>Once <code>preg_match_all()</code> has broken the string into meaningful groups, no more regex is required.</p>
+
+<p>I also streamlined the high/low roll keeping technique.</p>
+
+<p>If something isn't fit for purpose, let me know and I'll try to fix it.</p>
+
+<p>Code: (<a href="https://3v4l.org/kI5eo" rel="nofollow noreferrer">Demo</a>)</p>
+
+<pre><code>function parseRollCode($rollCode) {
+    $cleanRollCode = preg_replace('/\s+/', '', strtolower($rollCode));
+    $intro = "&lt;strong&gt;Dice Roll:&lt;/strong&gt; {$cleanRollCode}";
+    $error = "Invalid Roll Code";
+    $result = [
+        'input'      =&gt; $rollCode,
+        'total'      =&gt; 0,
+        'detailText' =&gt; $intro
+    ];
+
+    if (!preg_match_all('~\G(^-?|[+-])(?:(\d+d\d+)(r\d+)?([v^]\d+)?|(\d+))(?=[+-]|$)~', $cleanRollCode, $out)) {
+        $result['detailText'] .= "\n{$error}";
+        return $result;
+    }
+
+    /*
+    $out...
+    [0] =&gt; roll tokens (optional leading sign)
+    [1] =&gt; optional signs
+    [2] =&gt; number&amp;type die segments
+    [3] =&gt; reroll threshold segments
+    [4] =&gt; keep setting segments
+    [5] =&gt; constant segments
+    */
+
+    foreach ($out[0] as $index =&gt; $segment) {
+        $result['detailText'] .= "\n&lt;strong&gt;{$segment} Results:&lt;/strong&gt;";
+        if (!empty($out[5][$index])) {
+            $result['detailText'] .= ' (subtotal: ' . ((int)$segment) . ')';
+            $result['total'] += $segment;
+        } else {
+            // dice count &amp; die type
+            [$diceCount, $dieType] = explode('d', $out[2][$index], 2);
+
+            // positive or negative arithmetic
+            $signFactor = (!empty($out[1][$index][0]) &amp;&amp; $out[1][$index][0] == '-' ? -1 : 1);
+
+            // reroll threshold
+            $rerollThreshold = (int)ltrim($out[3][$index] ?? 0, 'r');
+            if ($rerollThreshold &gt;= $dieType) {
+                return ['input' =&gt; $rollCode, 'total' =&gt; 0, 'detailText' =&gt; "{$intro}\n{$error}"];
+            }
+            $rollResults = [];
+            for ($r = 0; $r &lt; $diceCount; ++$r) {
+                $rollResults[] = rand($rerollThreshold + 1, $dieType);
+            }
+
+            // keep settings
+            if (!empty($out[4][$index])) {
+                $keepCount = ltrim($out[4][$index], '^v');
+                if ($keepCount &gt; $diceCount) {
+                    return ['input' =&gt; $rollCode, 'total' =&gt; 0, 'detailText' =&gt; "{$intro}\n{$error}"];
+                }
+                if ($out[4][$index][0] == '^') {
+                    arsort($rollResults);
+                } else {
+                    asort($rollResults);
+                }
+                $keep = array_slice($rollResults, 0, $keepCount, true);
+                $subtotal = array_sum($keep) * $signFactor;
+                for ($i = 0, $len = count($rollResults); $i &lt; $len; ++$i) {
+                    $result['detailText'] .= ' ' .  ($keep[$i] ?? "&lt;s&gt;{$rollResults[$i]}&lt;/s&gt;");
+                }
+                $result['detailText'] .= " (subtotal: {$subtotal})";
+                $result['total'] += $subtotal;
+            } else {
+                $subtotal = array_sum($rollResults) * $signFactor;
+                $result['detailText'] .= " " . implode(" ", $rollResults) . " (subtotal: {$subtotal})";
+                $result['total'] += $subtotal;
+            }
+        }
+    }
+    return $result;
+}
+
+$rolls = ["1 d2 0", "-1d20+5", "d20", "2d20^1", "4d6r1^3", "5d20^3", "5d8v2", "2d20v1", "5+3d4", "3d20^1",
+   "3d6r1 + 1d4r2", "-1d20", "1d20+5", "1d20 + 5", "1d-20", "1d20+1d6", "5d20-3d6", "1d6r2", "5d6r-6", "3d20^1v1",
+   "1d20r30", "1d20r20", "1d20r19", "1d20v2", "1d20v1", "1d20^2", "1d20+5d8r2^3-5-1d6+3d4+2-4+6-8"];
+foreach ($rolls as $roll) {
+    $rollResult = parseRollCode($roll);
+    echo "{$rollResult['detailText']}\n&lt;strong&gt;Total:&lt;/strong&gt; {$rollResult['total']}\n---\n";
+}
+</code></pre>
+    </div>

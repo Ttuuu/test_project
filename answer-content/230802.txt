@@ -1,0 +1,210 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Below is the code I have come up with. It basically follows the code used for the <a href="https://s-macke.github.io/VoxelSpace/VoxelSpace.html" rel="nofollow noreferrer">web demo</a> in the github repo you had linked to. I will add some explanation to this answer on how I had made some basic optimizations to better fit cython's memoryview model as well as potential room for improvement later, but figured I should post the code now as it might be another few days before I can get back to it.</p>
+
+<pre><code>cimport libc.math as c_math
+from libc.stdint cimport *
+import math
+import numpy as np
+from PIL import Image
+
+import os
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
+import pygame
+import sys
+import time
+
+ctypedef struct Point:
+    float x
+    float y
+
+ctypedef struct Color:
+    uint8_t r
+    uint8_t g
+    uint8_t b
+
+cdef class Camera:
+    cdef:
+        public int x
+        public int y
+        public int height
+        public int angle
+        public int horizon
+        public int distance
+
+    def __init__(self, int x, int y, int height, int angle, int horizon, int distance):
+        self.x = x
+        self.y = y
+        self.height = height
+        self.angle = angle
+        self.horizon = horizon
+        self.distance = distance
+
+cdef class Map:
+    cdef:
+        int width
+        int height
+        int shift
+        const uint8_t[:, :, :] color_data
+        const uint8_t[:, :] height_data
+
+    def __init__(self, int width=1024, int height=1024, int shift=10):
+        self.width = width
+        self.height = height
+        self.shift = shift
+        self.color_data = None
+        self.height_data = None
+
+    def load_color_data(self, str color_path):
+        cdef object image
+        image = Image.open(color_path).convert("RGB")
+        self.color_data = np.asarray(image)
+
+    def load_height_data(self, str height_path):
+        cdef object image
+        image = Image.open(height_path).convert("L")
+        self.height_data = np.asarray(image)
+
+cdef class Window:
+    cdef:
+        int width
+        int height
+        str title
+        object screen
+        object clock
+        int32_t[:] hidden_y
+        uint8_t[:, :, :] output
+        Color background_color
+        Camera camera
+        Map map
+
+    def __init__(self, int width, int height, str title):
+        self.width = width
+        self.height = height
+        self.screen = pygame.display.set_mode((self.width, self.height))
+        self.title = title
+        pygame.display.set_caption(self.title)
+        self.hidden_y = np.zeros(self.width, dtype=np.int32)
+        self.output = np.zeros((self.width, self.height, 3), dtype=np.uint8)
+        self.clock = pygame.time.Clock()
+
+    def set_background_color(self, uint8_t r, uint8_t g, uint8_t b):
+        self.background_color.r = r
+        self.background_color.g = g
+        self.background_color.b = b
+
+    def set_camera(self, Camera camera):
+        self.camera = camera
+
+    def set_map(self, Map map):
+        self.map = map
+
+    cdef void draw_background(self):
+        cdef int x, y
+        for x in range(self.width):
+            for y in range(self.height):
+                self.output[x, y, 0] = self.background_color.r
+                self.output[x, y, 1] = self.background_color.g
+                self.output[x, y, 2] = self.background_color.b
+
+    cdef void draw_vertical_line(self, int x, int y_top, int y_bottom, Color *color):
+        cdef int y
+
+        if y_top &lt; 0:
+            y_top = 0
+        if y_top &gt; y_bottom:
+            return
+        for y in range(y_top, y_bottom):
+            self.output[x, y, 0] = color.r
+            self.output[x, y, 1] = color.g
+            self.output[x, y, 2] = color.b
+
+    cdef display(self):
+        surf = pygame.surfarray.make_surface(np.asarray(self.output))
+        self.screen.blit(surf, (0, 0))
+        pygame.display.flip()
+        pygame.display.set_caption("{0}: {1} fps".format(self.title, &lt;int&gt;self.clock.get_fps()))
+
+    def render(self):
+        cdef:
+            int map_width_period = self.map.width - 1
+            int map_height_period = self.map.height - 1
+            float s = c_math.sin(self.camera.angle)
+            float c = c_math.cos(self.camera.angle)
+
+            float z = 1.0
+            float delta_z = 1.0
+            float inv_z
+            Point left, right, delta
+            int i
+            int map_x
+            int map_y
+            int height_on_screen
+            Color color
+
+        for i in range(self.width):
+            self.hidden_y[i] = self.height
+        self.draw_background()
+        while z &lt; self.camera.distance:
+            left = Point(
+                (-c * z) - (s * z), 
+                (s * z) - (c * z),
+            )
+            right = Point(
+                (c * z) - (s * z), 
+                (-s * z) - (c * z),
+            )
+            delta = Point(
+                (right.x - left.x) / self.width,
+                (right.y - left.y) / self.width,
+            )
+            left.x += self.camera.x
+            left.y += self.camera.y
+
+            inv_z = 1.0 / z * 240
+            for i in range(self.width):
+                map_x = &lt;int&gt;c_math.floor(left.x) &amp; map_height_period
+                map_y = &lt;int&gt;c_math.floor(left.y) &amp; map_width_period
+                height_on_screen = &lt;int&gt;((self.camera.height - self.map.height_data[map_x, map_y]) * inv_z + self.camera.horizon)
+                color.r = self.map.color_data[map_x, map_y, 0]
+                color.g = self.map.color_data[map_x, map_y, 1]
+                color.b = self.map.color_data[map_x, map_y, 2]
+
+                self.draw_vertical_line(i, height_on_screen, self.hidden_y[i], &amp;color)
+                if height_on_screen &lt; self.hidden_y[i]:
+                    self.hidden_y[i] = height_on_screen
+                left.x += delta.x
+                left.y += delta.y
+
+            delta_z += 0.005
+            z += delta_z
+
+        self.display()
+        self.clock.tick(60)#60 fps
+
+pygame.init()
+
+window = Window(width=800, height=600, title="VoxelSpace")
+window.set_background_color(144, 144, 224)
+
+map = Map()
+map.load_color_data("./images/C1W.png")
+map.load_height_data("./images/D1.png")
+window.set_map(map)
+
+camera = Camera(x=512, y=800, height=78, angle=0, horizon=100, distance=800)
+window.set_camera(camera)
+
+while True:
+    #win.handle_input()
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            pygame.quit()
+            sys.exit()
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_UP:
+                print("up")
+
+    camera.y -= 1
+    window.render()
+</code></pre>
+    </div>

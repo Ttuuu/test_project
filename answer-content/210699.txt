@@ -1,0 +1,368 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Harold has given a pretty comprehensive answer. I thought your code for building the Huffman tree was a little obscure, the usual approach is to use a "heap" which efficiently maintains the smallest element of a array in position zero. </p>
+
+<p>I have been working on an implementation of RFC 1951 in C#, so far I have found that it's fairly unusual for the bit length limits to be exceeded in practice ( I am using it to write PDF files ), so my approach was simply to try a smaller block size if the limits were exceeded.</p>
+
+<p>Here's my C# "deflate" code for comparison ( hope it's alright to post code as part of a reply, I am new here ):</p>
+
+<pre><code>using G = System.Collections.Generic; 
+using U = System.UInt16; // Could also be UInt32 or UInt64, not sure what is best.
+
+class Encoder : G.List&lt;byte&gt; // Compression per RFC1950, RFC1951.
+{
+  public G.List&lt;byte&gt; Deflate( byte [] inp )
+  {
+    Clear();
+    Add( 0x78); Add( 0x9C ); // RFC 1950 bytes
+    ReadInp( inp );
+    while ( DoOutput( 1 ) == 0 );
+    FlushBitBuf();
+    Put32( Adler32( inp ) ); // RFC 1950 checksum
+    // System.Console.WriteLine( "Encoder.Deflate, input size=" + inp.Length + " output size=" + this.Count );
+    return this;  
+  }
+
+  class OffsetList{ public uint Offset; public OffsetList Next; } // List of 3-byte match offsets.
+
+  void ReadInp( byte [] inp ) // LZ77 compression, per RFC1951
+  { 
+    G.Dictionary &lt;uint,OffsetList&gt; lookup = new G.Dictionary&lt;uint,OffsetList&gt;(); // Note: could reduce storage requirement by removing entries outside 32k window
+    uint n = (uint)inp.Length;
+    SetIBufSize( n );  
+
+    uint w = 0; // holds last 3 bytes of input
+    int todo = 0; // number of bytes in w that have not yet been output to IBuf, can be negative when a match is found
+    uint pendingMatchLen=0, pendingDist=0;
+
+    for ( uint i = 0; i &lt;= 1 &amp;&amp; i &lt; n; i += 1 ) { w = ( ( w &lt;&lt; 8 ) | inp[i] ); todo += 1; }
+
+    for ( uint i = 2; i &lt; n; i += 1 )
+    {
+      w = ( ( w &lt;&lt; 8 ) | inp[i] ) &amp; 0xffffffu; todo += 1;
+      OffsetList e, x = new OffsetList(); x.Offset = i;
+      uint bestMatchLen = 0, bestDist = 0;
+      if ( lookup.TryGetValue( w, out e ) )
+      {
+        x.Next = e;
+        OffsetList p = x;
+        if ( todo &gt;= 3 ) while ( e != null )
+        {
+          uint dist = i - e.Offset; if ( dist &gt; 32768 ) { p.Next = null; break; }
+          uint matchLen = MatchLen( inp, dist, i );
+          if ( matchLen &gt; bestMatchLen ) { bestMatchLen = matchLen; bestDist = dist; }  
+          p = e; e = e.Next;         
+        }
+      }
+      lookup[ w ] = x; ISpace();
+
+      // "Lazy matching" RFC 1951 p.15 : if there are overlapping matches, there is a choice over which of the match to use.
+      // Example:  abc012bc345.... abc345 : abc345 can be encoded as either [abc][345] or as a[bc345].
+      // Since a range needs more bits to encode than a literal the latter is better.
+
+      if ( pendingMatchLen &gt; 0 )
+      {
+        if ( bestMatchLen &gt; pendingMatchLen || bestMatchLen == pendingMatchLen &amp;&amp; bestDist &lt; pendingDist )
+        { IPut( inp[i-3] ); todo -= 1; }
+        else // Save the pending match, suppress bestMatch if any.
+        {
+          IPut( (ushort)(257 + pendingMatchLen) );
+          IPut( (ushort) pendingDist );
+          todo -= (int)pendingMatchLen;
+          bestMatchLen = 0;
+        }
+        pendingMatchLen = 0;
+      }
+      if ( bestMatchLen &gt; 0 ) { pendingMatchLen = bestMatchLen; pendingDist = bestDist; }
+      else if ( todo == 3  ) { IPut( (byte)(w &gt;&gt; 16) ); todo = 2; }      
+    } // end for loop
+    if ( pendingMatchLen &gt; 0 )
+    {
+      IPut( (ushort)(257 + pendingMatchLen) );
+      IPut( (ushort) pendingDist );
+      todo -= (int)pendingMatchLen;
+    }
+    while ( todo &gt; 0 ){ todo -= 1; IPut( (byte)( w &gt;&gt; (todo*8) ) ); }
+  } // end ReadInp
+
+  uint MatchLen( byte [] inp, uint dist, uint i )
+  {
+    // From lookup, we already have a match of 3 bytes, this function computes how many more bytes match.
+    uint x = i+1;
+    ulong end = (ulong)inp.Length;
+    if ( end - i &gt; 256 ) end = i + 256; // Maximum match is 258
+    while ( x &lt; end &amp;&amp; inp[x] == inp[x-dist] ) x += 1;
+    return x - i + 2; 
+  }
+
+  ushort [] IBuf; // Intermediate buffer, holds output from LZ99 algorithm.
+  const uint IBufSizeMax = 0x40000;
+  uint IBufSize, IBufI, IBufJ;
+  void IPut( ushort x ) { IBuf[IBufI++] = x; if ( IBufI == IBufSize ) IBufI = 0; }
+  ushort IGet(){ ushort result = IBuf[IBufJ++]; if ( IBufJ == IBufSize ) IBufJ = 0; return result; }
+  uint ICount(){ if ( IBufI &gt;= IBufJ ) return IBufI - IBufJ; else return IBufI + IBufSize - IBufJ; } // Number of values in IBuf
+  void ISpace(){ while ( ICount() &gt; IBufSize - 10 ) DoOutput( 0 ); } // Ensure IBuf has space for at least 10 values.
+  void SetIBufSize( uint x ) { x += 20; if ( x &gt; IBufSizeMax ) x = IBufSizeMax; if ( IBufSize &lt; x ) { IBufSize = x; IBuf = new ushort[x]; } }
+
+  U DoOutput( U last ) // while DoBlock fails, retry with a smaller amount of input
+  {
+    uint n = ICount();
+    while ( !DoBlock( n, last ) ) { last = 0; n -= n / 20; }
+    return last;
+  }
+
+  ///////////////////////////////////////////////////////////////////////////////
+  // RFC 1951 encoding constants.
+
+  static readonly byte [] ClenAlphabet = { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 }; // size = 19
+  static readonly byte [] MatchExtra = { 0,0,0,0, 0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3, 4,4,4,4, 5,5,5,5, 0 }; // size = 29
+  static readonly ushort [] MatchOff = { 3,4,5,6, 7,8,9,10, 11,13,15,17, 19,23,27,31, 35,43,51,59, 67,83,99,115, 131,163,195,227, 258, 0xffff };
+  static readonly byte [] DistExtra = { 0,0,0,0, 1,1,2,2, 3,3,4,4, 5,5,6,6, 7,7,8,8, 9,9,10,10, 11,11,12,12, 13,13 }; // size = 30
+  static readonly ushort [] DistOff = { 1,2,3,4, 5,7,9,13, 17,25,33,49, 65,97,129,193, 257,385,513,769, 1025,1537,2049,3073,
+     4097,6145,8193,12289, 16385,24577, 0xffff };
+
+  readonly U [] LitFreq = new U[288], LitLen = new U[288], LitCode = new U[288];
+  readonly U [] DistFreq = new U[32], DistLen = new U[32], DistCode = new U[32];
+  readonly U [] LenFreq = new U[19], LenLen = new U[19], LenCode = new U[19];
+
+  bool DoBlock( uint n, U last )
+  {
+    Clear( LitFreq ); Clear( DistFreq ); Clear( LenFreq );
+    uint saveI = IBufI, saveJ = IBufJ;
+    int got = 0; while ( got &lt; n )
+    {
+      ushort x = IGet(); got += 1;
+      if ( x &lt; 256 ) LitFreq[ x ] += 1;
+      else
+      { 
+        x -= 257;
+        uint dist = IGet(); got += 1;
+        uint mc=0; while ( x &gt;= MatchOff[mc] ) mc += 1; mc -= 1;
+        uint dc=0; while ( dist &gt;= DistOff[dc] ) dc += 1; dc -= 1;
+        LitFreq[ 257+mc ] += 1;
+        DistFreq[ dc ] += 1;
+      }
+    }
+    LitFreq[256] += 1; // end of block code
+    IBufI = saveI; IBufJ = saveJ;
+
+    int nLitCode = HE.ComputeCode( 15, LitFreq, LitLen, LitCode ); if ( nLitCode &lt; 0 ) return false;
+    int nDistCode = HE.ComputeCode( 15, DistFreq, DistLen, DistCode ); if ( nDistCode &lt; 0 ) return false;
+
+    if ( nDistCode == 0 ) nDistCode = 1;
+    LenPass = 1; DoLengths( nLitCode, LitLen, true ); DoLengths( nDistCode, DistLen, false );
+
+    if ( HE.ComputeCode( 7, LenFreq, LenLen, LenCode ) &lt; 0 ) return false;
+
+    int nLenCode = 19;
+    while ( nLenCode &gt; 0 &amp;&amp; LenLen[ ClenAlphabet[nLenCode-1] ] == 0 ) nLenCode -= 1;
+
+    PutBit( last ); // Last block flag
+    PutBits( 2, 2 ); // Dynamic Huffman ( for small blocks fixed coding may work better, not implemented )
+
+    PutBits( 5, (U)( nLitCode - 257 ) ); PutBits( 5, (U)( nDistCode - 1 ) ); PutBits( 4, (U)( nLenCode - 4 ) );
+    for ( int i=0; i &lt; nLenCode; i += 1 ) PutBits( 3, LenLen[ ClenAlphabet[i] ] );
+    LenPass = 2; DoLengths( nLitCode, LitLen, true ); DoLengths( nDistCode, DistLen, false ); 
+
+    got = 0; while ( got &lt; n )
+    {
+      U x = IGet(); got += 1;
+      if ( x &lt; 256 ) PutBits( LitLen[x], LitCode[x] );
+      else
+      { 
+        x -= 257;
+        ushort dist = IGet(); got += 1;
+        uint mc=0; while ( x &gt;= MatchOff[mc] ) mc += 1; mc -= 1;
+        uint dc=0; while ( dist &gt;= DistOff[dc] ) dc += 1; dc -= 1;
+        PutBits( LitLen[257+mc], LitCode[257+mc] );
+        PutBits( MatchExtra[mc], (U)(x-MatchOff[mc]) );
+        PutBits( DistLen[dc], DistCode[dc] );
+        PutBits( DistExtra[dc], (U)(dist-DistOff[dc]) );
+      }
+    }
+    PutBits( LitLen[256], LitCode[256] ); // block end code
+    return true;
+  } // end DoBlock
+
+  // Encoding of code lengths ( RFC 1951, page 13 ).
+
+  U LenPass, Plen, ZeroRun, Repeat;
+
+  void PutLenCode( U code ) { if ( LenPass == 1 ) LenFreq[code] += 1; else PutBits( LenLen[code], LenCode[code] ); }
+
+  void DoLengths( int n, U [] a, bool isLit )
+  {
+    if ( isLit ) { Plen = 0; ZeroRun = 0; Repeat = 0; }
+    for ( int i=0; i&lt;n; i += 1 )
+    {
+      U len = a[i];
+      if ( len == 0 ){ EncRepeat(); ZeroRun += 1; Plen = 0; }
+      else if ( len == Plen ) { Repeat += 1; }
+      else { EncZeroRun(); EncRepeat(); PutLenCode( len ); Plen = len; }
+    }      
+    if ( !isLit ) { EncZeroRun(); EncRepeat(); }
+  }
+
+  void EncRepeat()
+  {
+    while ( Repeat &gt; 0 )
+    {
+      if ( Repeat &lt; 3 ) { PutLenCode( Plen ); Repeat -= 1; }
+      else { U x = Repeat; if ( x &gt; 6 ) x = 6; PutLenCode( 16 ); if ( LenPass == 2 ) PutBits( 2,(U)(x-3) ); Repeat -= x;  }
+    }
+  }
+
+  void EncZeroRun()
+  {
+    while ( ZeroRun &gt; 0 )
+    {
+      if ( ZeroRun &lt; 3 ) { PutLenCode( 0 ); ZeroRun -= 1; }
+      else if ( ZeroRun &lt; 11 ) { PutLenCode( 17 ); if ( LenPass == 2 ) PutBits( 3, (U)(ZeroRun-3) ); ZeroRun = 0;  }
+      else { U x = ZeroRun; if ( x &gt; 138 ) x = 138; PutLenCode( 18 ); if ( LenPass == 2 ) PutBits( 7,(U)(x-11) ); ZeroRun -= x; }
+    }
+  }
+
+  static void Clear( U [] a ){ System.Array.Clear( a, 0, a.Length ); /*for ( int i=0; i &lt; a.Length; i += 1 ) a[i] = 0;*/ }
+
+  public static uint Adler32( byte [] b ) // per RFC1950
+  {
+    uint s1=1, s2=0;
+    for ( int i=0; i&lt;b.Length; i+= 1 )
+    {
+      s1 = ( s1 + b[i] ) % 65521;
+      s2 = ( s2 + s1 ) % 65521;
+    }
+    return s2*65536 + s1;    
+  }
+
+  // Output bitstream
+  byte Buf = 0, M = 1;
+  public void PutBit( U b ) { if ( b != 0 ) Buf |= M; M &lt;&lt;= 1; if ( M == 0 ) { Add(Buf); Buf = 0; M = 1; } }
+  public void PutBits( U n, U x ) { for ( int i = 0; i &lt; n; i += 1 ) { PutBit( (U)(x &amp; 1u) ); x &gt;&gt;= 1; } }
+  public void FlushBitBuf(){ while ( M != 1 ) PutBit( 0 ); }
+  public void Put32( uint x ) { Add( (byte)( x &gt;&gt; 24 ) ); Add( (byte)( x &gt;&gt; 16 ) ); Add( (byte)( x &gt;&gt; 8 ) ); Add( (byte) x ); } 
+}  // end class Encoder
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+class HE // Given a list of frequencies (freq), compute Huffman code lengths (nbits) and codes (tree_code).
+{
+  public static int ComputeCode( int limit, U [] freq, U [] nbits, U [] tree_code )
+  {
+    int ncode = freq.Length;
+    Node [] heap = new Node[ncode];
+    int hn = 0;
+    for ( int i = 0; i &lt; ncode; i += 1 )
+    {
+      U f = freq[i];
+      if ( f &gt; 0 )
+      {
+        Node n = new Node();
+        n.Freq = f;
+        n.Code = (U)i;
+        HeapInsert( heap, hn, n );
+        hn += 1;
+      }
+    }
+
+    for ( int i = 0; i &lt; nbits.Length; i += 1 ) nbits[i] = 0;
+    if ( hn &lt;= 1 ) // Special case
+    { if ( hn == 1 ) nbits[ heap[0].Code ] = 1; }
+    else
+    {
+      while ( hn &gt; 1 )
+      {
+        Node n = new Node();
+        hn -= 1; n.Left = HeapRemove( heap, hn );
+        hn -= 1; n.Right = HeapRemove( heap, hn );
+        n.Freq = (U) ( n.Left.Freq + n.Right.Freq );  
+        n.Depth = (U) ( 1 + ( n.Left.Depth &gt; n.Right.Depth ? n.Left.Depth : n.Right.Depth ) );    
+        HeapInsert( heap, hn, n );
+        hn += 1;
+      }
+      Walk( nbits, heap[0], 0 ); // Walk the tree to find the code lengths (nbits).
+    }
+
+    for ( int i = 0; i &lt; ncode; i += 1 ) if ( nbits[i] &gt; limit ) return -1;
+
+    // Now compute codes, code below is from rfc1951 page 7
+
+    uint maxBits = 0;
+    for ( int i = 0; i &lt; ncode; i += 1 ) if ( nbits[i] &gt; maxBits ) maxBits = nbits[i];
+
+    U [] bl_count = new U[maxBits+1];
+    for ( int i=0; i &lt; ncode; i += 1 ) bl_count[ nbits[i] ] += 1;
+
+    U [] next_code = new U[maxBits+1];
+    U code = 0; bl_count[0] = 0;
+    for ( int i = 0; i &lt; maxBits; i += 1 ) 
+    {
+      code = (U)( ( code + bl_count[i] ) &lt;&lt; 1 );
+      next_code[i+1] = code;
+    }
+
+    for ( int i = 0; i &lt; ncode; i += 1 ) 
+    {
+      uint len = nbits[i];
+      if (len != 0) 
+      {
+        tree_code[i] = Reverse( next_code[len], len );
+        next_code[len] += 1;
+      }
+    }
+
+    //System.Console.WriteLine( "Huff Code" );
+    //   for ( uint i=0; i &lt; ncode; i += 1 ) if ( nbits[i] &gt; 0 )
+    //     System.Console.WriteLine( "i=" + i + " len=" + nbits[i] + " tc=" + tree_code[i].ToString("X") + " freq=" + freq[i] );
+
+    while ( ncode &gt; 0 &amp;&amp; nbits[ ncode-1 ] == 0 ) ncode -= 1;
+    return ncode;
+  }
+
+  class Node{ public U Freq; public U Code, Depth; public Node Left, Right; }
+
+  static U Reverse( U x, uint bits )
+  { U result = 0; for ( int i = 0; i &lt; bits; i += 1 ) { result &lt;&lt;= 1; result |= (U)(x &amp; 1u); x &gt;&gt;= 1; } return result; } 
+
+  static void Walk( U [] a, Node n,U len )
+  { if ( n.Left == null ) a[n.Code] = len; else { Walk( a, n.Left, (U)(len+1) ); Walk( a, n.Right, (U)(len+1) ); } }
+
+  static bool LessThan( Node a, Node b )
+  { return a.Freq &lt; b.Freq || a.Freq == b.Freq &amp;&amp; a.Depth &lt; b.Depth; }
+
+  static void HeapInsert( Node [] heap, int h, Node n ) // h is size of heap before insertion
+  {
+    int j = h;
+    while ( j &gt; 0 )
+    {
+      int p = ( j - 1 ) / 2; // parent
+      Node pn = heap[p];
+      if ( !LessThan(n,pn) ) break;
+      heap[j] = pn; // move parent down
+      j = p;
+    }    
+    heap[j] = n;
+  }
+
+  static Node HeapRemove( Node [] heap, int h ) // h is size of heap after removal
+  {
+    Node result = heap[0];
+    Node n = heap[h];
+    int j = 0;
+    while ( true )
+    {
+      int c = j * 2 + 1; if ( c &gt;= h ) break;
+      Node cn = heap[c];
+      if ( c+1 &lt; h )
+      {
+        Node cn2 = heap[c+1];
+        if ( LessThan(cn2,cn) ) { c += 1; cn = cn2; }
+      } 
+      if ( !LessThan(cn,n) ) break;
+      heap[j] = cn; j = c;  
+    }
+    heap[j] = n;
+    return result;
+  }
+} // end class HE
+</code></pre>
+    </div>

@@ -1,0 +1,143 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Without specific explain plan details, consider these broad stroke recommendations. Currently, I do not see how <code>UNION</code> fits into your needs as you are essentially joining two conditional aggregation queries. And due to re-use of calculated columns, you require sub-select derived tables.</p>
+
+<ol>
+<li><p>Of course as always, analyze each <code>SELECT</code> queries' <a href="https://docs.microsoft.com/en-us/sql/relational-databases/performance/analyze-an-actual-execution-plan?view=sql-server-2017" rel="nofollow noreferrer">explain plan</a> and add necessary indexes on <code>JOIN</code> fields such as <em>EmployeeId</em> across the tables.</p></li>
+<li><p>Avoid unnecessary date casting such as with date fields in <code>WHERE</code> clauses using <code>CAST(... AS Date)</code>. If date fields are already date or datetime, simply <a href="https://stackoverflow.com/questions/1947436/datetime-in-where-clause">compare directly</a> using the ISO-8601 standard format (<code>'YYYYMMDD'</code>) that is agnostic to  language and regional settings. If these fields are not dates, consider changing them with <code>ALTER</code>.</p>
+
+<pre><code>WHERE HE.Present_Status = 1 
+  AND HE.Joining_Date &lt;= '20190401'
+  AND [Date] &gt;= '20190401' 
+  AND [Date] &lt;= '20190430'
+</code></pre></li>
+<li><p>Avoid unnecessary <code>ISNULL(..., 0)</code> conversion. Instead use a 1 or 0 conditional calculation and then run <code>SUM</code> on top level query which are essentially counts of the boolean flags:</p>
+
+<pre><code>CASE WHEN (AttendanceStatus=1 AND HAH.[Status]=1) THEN 1 ELSE 0 END AS OK,
+CASE WHEN (AttendanceStatus=2 AND HAH.[Status]=1) THEN 1 ELSE 0 END AS LateDays,
+CASE WHEN (AttendanceStatus=3 AND HAH.[Status]=1) THEN 1 ELSE 0 END AS AbsentDays,
+CASE WHEN (AttendanceStatus=4 AND HAH.[Status]=1) THEN 1 ELSE 0 END AS LeaveDays,
+
+...
+
+SUM(TT.LateDays) AS LateDays,
+SUM(TT.AbsentDays) AS AbsentDays,
+SUM(TT.LeaveDays) AS LeaveDays,
+SUM(TT.HolidayOffdays) AS HolidayOffdays
+</code></pre></li>
+<li><p>Consider a CTE instead of a table variable to bypass the <code>DECLARE</code> and <code>INSERT</code> lines. However, do note this may <a href="https://stackoverflow.com/questions/690465/which-are-more-performant-cte-or-temporary-tables">depend on your situation</a>.</p>
+
+<pre><code>WITH EmployeePayrollDataTable AS
+  (...inner join of A and B aggregate subqueries...)
+
+SELECT EmployeeId, BasicPay, HouseRent, MedicalFoodTransportCost, GrossPay,
+       (OK+LateDays+LeaveDays+HolidayOffdays), HolidayOffdays, LeaveDays,
+       AbsentDays, AbsentDays*BasicPayRate,  GrossPay-(AbsentDays*BasicPayRate),
+       CASE WHEN AbsentDays&gt;0 or LeaveDays&gt;0 or LateDays&gt;2 
+            THEN 0
+            ELSE AttendanceBonus 
+       END AS AttendanceBonus,
+       LegalOverTime, OverTimeRate, LegalOverTime*OverTimeRate, StampDeduction, 
+       CASE WHEN AbsentDays&gt;0 or LeaveDays&gt;0 or LateDays&gt;2 
+            THEN (LegalOverTime*OverTimeRate) +
+                 (GrossPay-(AbsentDays*BasicPayRate))-StampDeduction
+            ELSE (LegalOverTime*OverTimeRate) + 
+                 (GrossPay-(AbsentDays*BasicPayRate) + AttendanceBonus) -
+                 StampDeduction 
+      END AS OvertimeAmount
+FROM EmployeePayrollDataTable
+</code></pre></li>
+<li><p>Since you use <code>INNER JOIN</code> across all <code>SELECT</code> queries and levels, you can conceivably join both aggregates to avoid the main query's <code>JOIN</code> and facilitate readability. </p>
+
+<pre><code>SELECT ...all unit level CASE statements...
+
+FROM HRMS_Attendance_History HAH
+JOIN HRMS_Employee HE ON HAH.EmployeeId = HE.ID
+JOIN HRMS_EodRecord er ON HAH.EmployeeId = er.EmployeeId
+JOIN HRMS_Employee e ON er.EmployeeId = e.ID                 
+WHERE HE.Present_Status = 1 
+  AND HE.Joining_Date &lt;= '20190401'
+  AND [Date] &gt;= '20190401' 
+  AND [Date] &lt;= '20190430'
+  AND e.Present_Status = 1
+          AND e.Joining_Date as Date &lt;= '20190401'
+</code></pre></li>
+</ol>
+
+<hr>
+
+<p>Overall re-factoring of SQL:</p>
+
+<pre><code>WITH EmployeePayrollDataTable AS
+  (SELECT A.EmployeeId, A.LegalOverTime, A.ExtraOverTime, A.ToatalOverTime, 
+          A.OK, A.LateDays, A.AbsentDays, A.LeaveDays, A.HolidayOffdays,
+          A.BasicPay, A.GrossPay, A.HouseRent, A.MedicalFoodTransportCost, A.BasicPayRate, 
+          A.GrossPayRate, A.OverTimeRate, A.AttendanceBonus, A.StampDeduction 
+   FROM 
+        (SELECT TT.EmployeeId, 
+                SUM(TT.LegalOverTime) AS LegalOverTime,
+                SUM(TT.ExtraOverTime) AS ExtraOverTime, 
+                SUM(TT.LegalOverTime) + SUM(TT.ExtraOverTime) AS ToatalOverTime,
+                SUM(TT.OK) AS OK,
+                SUM(TT.LateDays) AS LateDays,
+                SUM(TT.AbsentDays) AS AbsentDays,
+                SUM(TT.LeaveDays) AS LeaveDays,
+                SUM(TT.HolidayOffdays) AS HolidayOffdays,
+
+                SUM(TT.BasicPay) AS BasicPay,
+                SUM(TT.GrossPay) AS GrossPay,
+                SUM(TT.HouseRent) AS HouseRent,
+                SUM(TT.MedicalFoodTransportCost) AS MedicalFoodTransportCost,
+                SUM(TT.BasicPay)/30 AS BasicPayRate,
+                SUM(TT.GrossPay)/30 AS GrossPayRate,
+                SUM(TT.OverTimeRate) AS OverTimeRate,
+                SUM(TT.AttendanceBonus) AS AttendanceBonus,
+                SUM(TT.StampDeduction) AS StampDeduction 
+        FROM
+                (SELECT HAH.EmployeeId,
+                        CASE WHEN HAH.AttendanceStatus!=5 OR HAH.AttendanceStatus!=6 
+                             THEN 
+                                  CASE WHEN HAH.PayableOverTime &lt;= 2 THEN HAH.PayableOverTime
+                                       WHEN HAH.PayableOverTime &gt; 2 THEN 2
+                                       ELSE 0
+                                  END
+                             ELSE 0
+                        END AS LegalOverTime,
+
+                        CASE WHEN HAH.AttendanceStatus!=5 OR HAH.AttendanceStatus!=6 
+                             THEN 
+                                  CASE WHEN HAH.PayableOverTime &lt;= 2 THEN 0
+                                       WHEN HAH.PayableOverTime &gt; 2 THEN HAH.PayableOverTime-2
+                                       ELSE 0
+                                  END
+                            ELSE HAH.PayableOverTime
+                        END AS ExtraOverTime,
+
+                        CASE WHEN (AttendanceStatus=1 AND HAH.[Status]=1) THEN 1 ELSE 0 END AS OK,
+                        CASE WHEN (AttendanceStatus=2 AND HAH.[Status]=1) THEN 1 ELSE 0 END AS LateDays,
+                        CASE WHEN (AttendanceStatus=3 AND HAH.[Status]=1) THEN 1 ELSE 0 END AS AbsentDays,
+                        CASE WHEN (AttendanceStatus=4 AND HAH.[Status]=1) THEN 1 ELSE 0 END AS LeaveDays,
+                        CASE WHEN ((AttendanceStatus=5 OR AttendanceStatus=6) AND HAH.[Status]=1) THEN AttendanceStatus END AS HolidayOffdays,
+
+                        CASE WHEN (Eod_RefFk=1 AND er.[Status]=1) THEN ActualAmount ELSE 0 END AS BasicPay,
+                        CASE WHEN ((Eod_RefFk=1 OR Eod_RefFk=2 OR Eod_RefFk=3) AND er.[Status]=1) THEN ActualAmount ELSE 0 END AS GrossPay,
+                        CASE WHEN (Eod_RefFk=2 AND er.[Status]=1) THEN ActualAmount ELSE 0 END AS HouseRent,
+                        CASE WHEN (Eod_RefFk=3 AND er.[Status]=1) THEN ActualAmount ELSE 0 END AS MedicalFoodTransportCost,
+                        CASE WHEN (Eod_RefFk=11 AND er.[Status]=1) THEN ActualAmount ELSE 0 END AS OverTimeRate,
+                        CASE WHEN (Eod_RefFk=7 AND er.[Status]=1) THEN ActualAmount ELSE 0 END AS AttendanceBonus,
+                        CASE WHEN (Eod_RefFk=12 AND er.[Status]=1) THEN ActualAmount ELSE 0 END AS StampDeduction
+
+                FROM HRMS_Attendance_History HAH
+                JOIN HRMS_Employee HE ON HAH.EmployeeId = HE.ID
+                JOIN HRMS_EodRecord er ON HAH.EmployeeId = er.EmployeeId
+                JOIN HRMS_Employee e ON er.EmployeeId=e.ID 
+                WHERE HE.Present_Status = 1 
+                  AND HE.Joining_Date &lt;= '20190401'
+                  AND [Date] &gt;= '20190401' 
+                  AND [Date] &lt;= '20190430'
+                  AND e.Present_Status = 1
+                  AND e.Joining_Date as Date &lt;= '20190401'
+               ) TT
+        GROUP BY TT.EmployeeId)  A
+  )
+</code></pre>
+    </div>

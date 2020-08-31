@@ -1,0 +1,119 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><a href="https://codereview.meta.stackexchange.com/questions/9250/mod-team-updates-and-site-status?cb=1">someone</a> suggested we should deal with the growing number of Zombies...</p>
+
+<h1>Easy Performance Win</h1>
+
+<p>The performance measurement is wholly inadequate, and when I run your code as provided it tells me that your code is <em>slower</em> than that provided by Rolfl.</p>
+
+<p>Using <code>BenchmarkDotNet</code> to get sensible measurements (with the proviso that they are running on my machine, at the same time as it is doing a lot of other work), I can agree your method is faster than that provided by Rolfl, running in <code>~1.8 s</code> rather than <code>~1.5 s</code> for the 4-length string test.</p>
+
+<p>There is, however, an easy way to do better: you shouldn't be initialising a new <code>StringBuilder</code> for each word: create one and clear it as you need. This tiny change halves the runtime for strings of length 4, giving <code>~700 ms</code>.</p>
+
+<blockquote>
+  <p>// this loop seems to be the fastest ways to generate a string</p>
+</blockquote>
+
+<p>You must have missed the most obvious option: fill an array! There are 2 obvious ways to do this: create a big array and use the appropriate overload of <code>String..ctor</code> (1), or create an array of the right length when we need it (2). Neither seems to give any real improvement over the <code>StringBuilder</code> for these short strings, certainly not enough to accept the reduction in readability and reusability (the <code>StringBuilder</code> method can be easily adapted to work with strings rather than chars, which will be important if non-ASCII-characters are needed) without better measurements.</p>
+
+<p>Table of measurements:</p>
+
+<pre><code>|        Method | StringLength |        Mean |      Error |     StdDev |
+|-------------- |------------- |------------:|-----------:|-----------:|
+|         Rolfl |            3 |    36.57 ms |  0.7292 ms |  1.9590 ms |
+|       T3chb0t |            3 |    32.51 ms |  0.6764 ms |  1.9732 ms |
+| StringBuilder |            3 |    12.51 ms |  0.2493 ms |  0.7154 ms |
+|        Array1 |            3 |    11.20 ms |  0.2233 ms |  0.5882 ms |
+|        Array2 |            3 |    10.65 ms |  0.2538 ms |  0.7444 ms |
+|         Rolfl |            4 | 1,849.73 ms | 36.1277 ms | 56.2465 ms |
+|       T3chb0t |            4 | 1,472.04 ms | 28.1790 ms | 68.0553 ms |
+| StringBuilder |            4 |   682.75 ms | 16.3137 ms | 48.1013 ms |
+|        Array1 |            4 |   623.12 ms | 14.8381 ms | 43.2836 ms |
+|        Array2 |            4 |   679.26 ms | 23.1619 ms | 67.5642 ms |
+</code></pre>
+
+<p>Test code: <a href="https://gist.github.com/VisualMelon/46d8cb1172c642242fb0e8b745230910" rel="nofollow noreferrer">gist</a>.</p>
+
+<h1>Char Sets Ranges</h1>
+
+<p>The <code>StringGerator(CharSets)</code> constructor could be made much tidier by using a <code>List&lt;T&gt;</code> to accumulate the results (rather than shuffling <code>IEnumerable</code>s), and using a helper method to create Ascii Ranges:</p>
+
+
+
+<pre><code>private static IEnumerable&lt;char&gt; AsciiRange(char start, char end)
+{
+    if (end &lt; start)
+        throw new ArgumentException("The end character must not occur before the start character");
+    // TODO: bounds checks are probably in order
+
+    return Enumerable.Range(start, end - start + 1).Select(c =&gt; (char)c);
+}
+
+public StringGenerator(CharSets charSets = CharSets.Lowercase)
+{
+    var chars = new List&lt;char&gt;();
+
+    if (charSets.HasFlag(CharSets.Lowercase))
+    {
+        chars.AddRange(AsciiRange('a', 'z'));
+    }
+
+    if (charSets.HasFlag(CharSets.Uppercase))
+    {
+        chars.AddRange(AsciiRange('A', 'Z'));
+    }
+
+    if (charSets.HasFlag(CharSets.Numbers))
+    {
+        chars.AddRange(AsciiRange('0', '9'));
+    }
+
+    _charSet = chars.ToArray();
+}
+</code></pre>
+
+<p>This is much more maintainable, as there is reduced repetition, and you don't need an ASCII table at hand to make modifications.</p>
+
+<h1>Odometer is not reusable</h1>
+
+<p>I also don't like that <code>Increase</code> creates a another <code>RolloverCounter</code> at the very end of the enumeration: it is basically ignoring <code>_gearCount</code>. It has the consequence that when you 'reuse' the odometer, you end up with another gear on the end, and if you use it a few more times, you end up with another gear on the end...</p>
+
+<p>For example, using just <code>var _charSet = new char[] { 'a', 'b', 'c' };</code>, the time you get the correct output:</p>
+
+<p><code>a</code>, <code>b</code>, <code>c</code>, <code>aa</code>, <code>ab</code>, etc.</p>
+
+<p>using it again, you get:</p>
+
+<p><code>aaaa</code>, <code>baaa</code>, <code>caaa</code>, etc.</p>
+
+<p>And again, the last <code>a</code> becomes a <code>b</code>... it's a total nightmare. It needs something like this on the end:</p>
+
+<pre><code>if (gear == _gearCount)
+{
+    // rollover
+    Gears.RemoveRange(1, Gears.Count - 1);
+    return true;
+}
+else
+{
+    return false;
+}
+</code></pre>
+
+<p>A check to avoid the last gear being added in the first place would avoid an allocation which takes the list over its initial capacity:</p>
+
+<pre><code>if (gear &lt; _gearCount)
+    Gears.Add(new RolloverCounter(_min, _max, _min));
+</code></pre>
+
+<p>I don't know if reusability is a goal, but if it isn't then it should be documented. Honestly, the behaviour seems a bit weird from the outset, having gears introduced over-time.</p>
+
+<h1>Misc</h1>
+
+<ul>
+<li><p>I would be strongly inclined to specify the values for the <code>CharSets</code> enum since you are using them as default parameters (their values become part of the API, and so changing them becomes a breaking change).</p></li>
+<li><p>The constructors for <code>RolloverCounter</code> could obvious do with some bounds checking and documentation (e.g. explaining that the 'default' value is the min, and the <code>max</code> is an exclusive upper-bound).</p></li>
+<li><p>I don't like that <code>Odometer.Gears</code> is public, given it is mutable. I'd be strongly inclined to provide a readonly-view of it; however, unfortunately, this does seem to degrade performance.</p></li>
+<li><p><code>Odometer.Max</code> is redundant with <code>Odometer._max</code>; I can't see any reason not to make it <code>Max =&gt; _max</code>. It doesn't make much sense to me to provide <code>Value</code> and <code>Max</code> but not <code>Min</code>.</p></li>
+<li><p>I'd feel compelled to rename <code>RolloverCounter.Increase</code> to <code>Increment</code> or <code>Advance</code>, but that's pretty subjective. <code>Increase</code> feels like it should have a parameter to determine how much by which to increase (which would be a fun extension).</p></li>
+</ul>
+    </div>

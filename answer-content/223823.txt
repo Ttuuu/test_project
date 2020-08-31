@@ -1,0 +1,185 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>Review</h3>
+
+<ul>
+<li><code>ArchiveBuilder</code> should be declared static. It does not have any non-static state or operations.</li>
+<li>Both the argument and return value of <code>Build</code> should be <code>IEnumerable&lt;&gt;</code>. There is no reason to use a <code>List&lt;&gt;</code>. You should not remove values from <code>entries</code> anyway, there is an alternative.</li>
+<li>The alternative to removing elements from <code>entries</code> is to use a <code>ILookup&lt;string, ArchiveDefinition&gt;</code> and iterate the children from this local cache.</li>
+<li><code>entries</code> is an unfortunate name, since the return values are entries, not the arguments. Use <code>items</code> instead.</li>
+<li>You are not taking advantage of enum <code>ArchiveType</code>. Items of type <code>ArchiveEntry</code> are leafs and should not be walked further down the tree. </li>
+</ul>
+
+<h3>Proposed changes</h3>
+
+<p>Implementing the lookup and exiting recursion early at leaf nodes, we could create a simple and performant strategy, with only side-effect additional memory usage in constructing the intermediate lookup table.</p>
+
+<p>ArchiveBuilder</p>
+
+<pre><code>public static class ArchiveBuilder
+{
+    public static IEnumerable&lt;ArchiveTreeEntry&gt; Build(IEnumerable&lt;ArchiveDefinition&gt; items)
+    {
+        var rootItems = items.Where(x =&gt; x.TypeOfArchive == ArchiveType.Archive);
+        var lookup = items.ToLookup(x =&gt; x.ParentId);
+        var entries = rootItems.Select(x =&gt; new ArchiveTreeEntry(x)).ToArray();
+
+        foreach (var entry in entries)
+        {
+            Build(entry, lookup);
+        }
+
+        return entries;
+    }
+
+    private static void Build(ArchiveTreeEntry current, ILookup&lt;string, ArchiveDefinition&gt; lookup)
+    {
+        if (current.ArchiveEntryType == ArchiveType.ArchiveEntry) return;
+
+        foreach (var childItem in lookup[current.Id])
+        {
+            var child = new ArchiveTreeEntry(childItem);
+            current.AddChild(child);
+            Build(child, lookup);
+        }
+    }
+}
+</code></pre>
+
+<p>Use Case</p>
+
+<pre><code>[TestMethod]
+public void UseCase()
+{
+    var root1 = new ArchiveDefinition(null, "1", ArchiveType.Archive);
+    var root1node1 = new ArchiveDefinition("1", "11", ArchiveType.ArchiveGroup);
+    var root1node1leaf1 = new ArchiveDefinition("11", "111", ArchiveType.ArchiveEntry);
+    var root1node1leaf2 = new ArchiveDefinition("11", "112", ArchiveType.ArchiveEntry);
+
+    var root2 = new ArchiveDefinition(null, "2", ArchiveType.Archive);
+    var root2node1 = new ArchiveDefinition("2", "21", ArchiveType.ArchiveGroup);
+    var root2node1node1 = new ArchiveDefinition("21", "211", ArchiveType.ArchiveGroup);
+    var root2node1node1leaf1 = new ArchiveDefinition("211", "2111", ArchiveType.ArchiveEntry);
+
+    var items = new[] {
+        root1, root1node1, root1node1leaf1, root1node1leaf2,
+        root2, root2node1, root2node1node1, root2node1node1leaf1
+    };
+
+    var nodes = ArchiveBuilder.Build(items).ToArray();
+
+    Assert.AreEqual("1", nodes[0].Id);
+    Assert.AreEqual("11", nodes[0].Children[0].Id);
+    Assert.AreEqual("111", nodes[0].Children[0].Children[0].Id);
+    Assert.AreEqual("112", nodes[0].Children[0].Children[1].Id);
+
+    Assert.AreEqual("2", nodes[1].Id);
+    Assert.AreEqual("21", nodes[1].Children[0].Id);
+    Assert.AreEqual("211", nodes[1].Children[0].Children[0].Id);
+    Assert.AreEqual("2111", nodes[1].Children[0].Children[0].Children[0].Id);
+}
+</code></pre>
+
+<h3>Further Improvements</h3>
+
+<ul>
+<li>Guards arguments against <code>null</code></li>
+<li>Guard trees against cyclic entries</li>
+<li>Refactor the algorithm to use a generic functional approach, unaware of your classes and reusable for any flattened list to tree builder (that adheres to some sort of rules)</li>
+</ul>
+
+<hr>
+
+<p>EDIT: I went on for the functional, generic approach. Not sure whether this is a useful extension or tailored to very specific situations. </p>
+
+<p>So the code above can be refactored to use the extension method..</p>
+
+<pre><code>public static IEnumerable&lt;ArchiveTreeEntry&gt; Build(IEnumerable&lt;ArchiveDefinition&gt; items)
+{
+    return items.ToTree(
+        x =&gt; x.ArchiveNodeId,
+        x =&gt; x.ParentId,
+        x =&gt; new ArchiveTreeEntry(x),
+        (parent, child) =&gt; parent.AddChild(child),
+        x =&gt; x.TypeOfArchive == ArchiveType.Archive,
+        x =&gt; x.TypeOfArchive == ArchiveType.ArchiveEntry);
+}
+</code></pre>
+
+<p>And the extension method..</p>
+
+<pre><code>public static IEnumerable&lt;TResult&gt; ToTree&lt;TSource, TResult, TId&gt;(
+    this IEnumerable&lt;TSource&gt; source,
+    Func&lt;TSource, TId&gt; idSelector,
+    Func&lt;TSource, TId&gt; parentIdSelector,
+    Func&lt;TSource, TResult&gt; resultFactory,
+    Action&lt;TResult, TResult&gt; childAppender,
+    Func&lt;TSource, bool&gt; rootPredicate = null,
+    Func&lt;TSource, bool&gt; leafPredicate = null) where TSource : class
+{
+    if (source == null) throw new ArgumentNullException(nameof(source));
+    if (idSelector == null) throw new ArgumentNullException(nameof(idSelector));
+    if (parentIdSelector == null) throw new ArgumentNullException(nameof(parentIdSelector));
+    if (resultFactory == null) throw new ArgumentNullException(nameof(resultFactory));
+    if (childAppender == null) throw new ArgumentNullException(nameof(childAppender));
+
+    rootPredicate = rootPredicate ?? (x =&gt; idSelector(x) == default);
+    leafPredicate = leafPredicate ?? (x =&gt; false);
+    var visited = new List&lt;TSource&gt;();
+
+    return BuildTreeInternal(
+        source, idSelector, parentIdSelector, resultFactory, childAppender, 
+        rootPredicate, leafPredicate, visited);
+}
+
+private static IEnumerable&lt;TResult&gt; BuildTreeInternal&lt;TSource, TResult, TId&gt;(
+    this IEnumerable&lt;TSource&gt; source,
+    Func&lt;TSource, TId&gt; idSelector,
+    Func&lt;TSource, TId&gt; parentIdSelector,
+    Func&lt;TSource, TResult&gt; resultFactory,
+    Action&lt;TResult, TResult&gt; childAppender,
+    Func&lt;TSource, bool&gt; rootPredicate,
+    Func&lt;TSource, bool&gt; leafPredicate,
+    List&lt;TSource&gt; visited) where TSource : class
+{
+    var sourceRoots = source.Where(rootPredicate);
+    var lookup = source.ToLookup(parentIdSelector);
+    var results = sourceRoots.Select(
+        x =&gt; (source: x, result: resultFactory(x))).ToArray();
+
+    foreach (var result in results)
+    {
+        BuildTreeInternal(
+            result, lookup, idSelector, resultFactory, 
+            childAppender, leafPredicate, visited);
+    }
+
+    return results.Select(x =&gt; x.result);
+}
+
+private static void BuildTreeInternal&lt;TSource, TResult, TId&gt;(
+    (TSource source, TResult result) current, 
+    ILookup&lt;TId, TSource&gt; lookup,
+    Func&lt;TSource, TId&gt; idSelector,
+    Func&lt;TSource, TResult&gt; resultFactory,
+    Action&lt;TResult, TResult&gt; childAppender,
+    Func&lt;TSource, bool&gt; leafPredicate,
+    List&lt;TSource&gt; visited)
+{
+    if (leafPredicate(current.source)) return;
+    if (visited.Contains(current.source))
+        throw new InvalidOperationException("cyclic graph not allowed");
+    visited.Add(current.source);
+
+    foreach (var sourceChild in lookup[idSelector(current.source)])
+    {
+        var resultChild = resultFactory(sourceChild);
+        childAppender(current.result, resultChild);
+
+        BuildTreeInternal(
+            (sourceChild, resultChild), lookup, idSelector,
+            resultFactory, childAppender, 
+            leafPredicate, visited);
+    }
+}
+</code></pre>
+    </div>

@@ -1,0 +1,132 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Simple mistakes:</p>
+
+<ul>
+<li><code>main()</code> must return an int, and it's good practice to give it a full prototype: <code>int main(void)</code>.</li>
+<li>Unused variable <code>pi</code> in <code>player()</code> function.</li>
+</ul>
+
+<hr>
+
+<p>It's a bad idea to seed the random generator repeatedly from the current time (which changes very slowly compared to your program execution).  Seed it once, around the beginning of the program (or once per thread; see below).</p>
+
+<p>As others have noted, <code>rand()</code> is not thread-safe.  We could create a critical section where you use it:</p>
+
+<pre><code>#pragma omp critical
+    {
+        x = fRand(-1.0, 1.0);
+        y = fRand(-1.0, 1.0);
+    }
+</code></pre>
+
+<p>However, that will really hammer performance here (where <code>rand()</code> is a large part of the runtime).  We will be much better off using <code>rand_r()</code> (if you have it; it's required by POSIX but not standard C).</p>
+
+<p>To use <code>rand_r</code>, we need a seed per thread, which needs to be passed through like this:</p>
+
+<pre><code>long double fRand(long double fMin, long double fMax, unsigned int *seedp)
+{
+    return fMin + (long double)rand_r(seedp) * (fMax - fMin) / RAND_MAX;
+}
+
+
+int player(int playersDarts)
+{
+    unsigned int seed;
+#pragma omp critical
+    {
+        seed = (unsigned int)rand();
+    }
+
+    int score = 0;    
+    for (int i = 0; i &lt; playersDarts; i++)
+        {
+            long double x = fRand(-1.0, 1.0, &amp;seed);
+            long double y = fRand(-1.0, 1.0, &amp;seed);
+
+            if (x*x + y*y &lt; 1.0)
+                score++;
+        }
+    return score;
+}
+</code></pre>
+
+<hr>
+
+<p>The <code>+=</code> operation on <code>score</code> is not atomic, so it needs a critical section, or we can use an OpenMP <code>reduction</code> clause to give each thread its own copy, and add them all together at the end:</p>
+
+<pre><code>    int score = 0;
+#pragma omp for reduction(+:score)
+    for (int i = 0;  i &lt; playersDarts;  ++i)
+        {
+            const long double x = fRand(-1.0, 1.0, &amp;seed);
+            const long double y = fRand(-1.0, 1.0, &amp;seed);
+            score += x*x + y*y &lt; 1.0;
+        }
+</code></pre>
+
+<hr>
+
+<p>Instead of having to specify the number of threads to use, we can just ask OpenMP to divide the work across all available cores (which won't suffer the possibility of rounding when <code>DART</code> isn't an exact multiple of <code>MAXPLAYERS</code>).</p>
+
+<p>Here's a modified version that lets OpenMP divide the work amongst the cores - note how we can make the execution single-threaded just by setting <code>OMP_NUM_THREADS</code> in the environment:</p>
+
+<pre><code>#include &lt;math.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;omp.h&gt;
+#include &lt;unistd.h&gt;
+
+#define DART 100000000    // Number of darts each player throws
+
+long double fRand(long double fMin, long double fMax, unsigned int *seedp)
+{
+    return fMin + (long double)rand_r(seedp) * (fMax - fMin) / RAND_MAX;
+}
+
+
+int main(int argc, char **argv)
+{
+    long const double REAL_PI = 4 * atan(1);
+
+    double beginTime, endTime;
+    int score = 0;
+
+    double beginTime = omp_get_wtime();
+#pragma omp parallel
+    {
+        unsigned int seed;
+#pragma omp critical
+        {
+            seed = (unsigned int)rand();
+        }
+
+#pragma omp for reduction(+:score)
+        for (int i = 0;  i &lt; DART;  ++i)
+            {
+                const long double x = fRand(-1.0, 1.0, &amp;seed);
+                const long double y = fRand(-1.0, 1.0, &amp;seed);
+                score += x*x + y*y &lt; 1.0;
+            }
+    }
+    double endTime = omp_get_wtime();
+
+    long double pi = 4.0L * score / DART;
+
+    printf("\n\t Calculated pi : %.12Lf\n", pi);
+    printf(  "\t       Real pi : %.12Lf\n", REAL_PI);
+    printf(  "\t         Error : %.3Lf%%\n", 100 * (pi - REAL_PI) / REAL_PI);
+    printf("\n\t %d threads execution Time: %f\n", omp_get_max_threads(), endTime - beginTime);
+
+    if (getenv("OMP_NUM_THREADS")) {
+        return 0;
+    }
+    /* Do it all again, constrained to a single thread */
+    setenv("OMP_NUM_THREADS", "1", 1);
+    execvp(argv[0], argv);
+}
+</code></pre>
+
+<p>I did have to add a couple of orders of magnitude to DARTS to get a meaningful difference in execution time between the single and parallel cases; the overhead of thread creation is simply too large otherwise, when the total runtime is under 100 ms.</p>
+
+<p>I didn't seed the random number generator, so we get reproducible output.  But if you do choose to do so, that must be <em>before</em> the <code>#pragma omp parallel</code>.</p>
+    </div>

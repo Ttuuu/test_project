@@ -1,0 +1,70 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I just recently wrote a similar bit of code, and I put it through half a dozen iterations before I was finally happy with it. Along the way, I ran into several issues you're probably encountering with this system. I'll talk through some of the pitfalls I ran into and how I dealt with them. Before that, here are some more general modifications I'd suggest...</p>
+<h1>Physical State vs. Logical State</h1>
+<p>Don't expose implementation -- C++ allows for access modifiers for exactly this purpose. For logical abstractions like this, favor classes and keep internal implementation (like pointers to parent and child nodes/ports) private. <strong>PHYSICAL</strong> state shouldn't matter to the user -- the values of your class's internal members. <strong>LOGICAL</strong> state should be accessible and (where applicable) mutable to the user. A connection is a logical abstraction from a set of child-to-parent pointers -- let the user think about the connection, you mess with the pointers.</p>
+<p>Along the same vein, the current design has too much latitude -- writing a check to ensure that two output ports aren't connected should hint to you that you are exposing too much functionality to the client code. If output ports shouldn't be connected together, your code should never allow it to happen.</p>
+<p>As for the node system and its implementation, there are several design choices to be made. First is your choice to tackle this problem with polymorphism -- a natural place to go given that every type of node is-a node. Each node contains a list of inputs and outputs. A drawback to this design choice is that the evaluation algorithm is tightly coupled to the hierarchy itself. A potential alternative would be to have a free function to traverse the hierarchy and evaluate it:</p>
+<pre class="lang-cpp prettyprint-override"><code>    template &lt;typename T&gt; T evaluate(port&lt;T&gt; port) {
+        // ...
+    }
+</code></pre>
+<p>This allows slightly more latitude, as the internal node implementation no longer matters as long as the interface the function used to traverse the node graph doesn't change. The decreased coupling means that you could do something like this if you ever needed to:</p>
+<pre class="lang-cpp prettyprint-override"><code>    template &lt;typename T&gt; std::string asExpression(port&lt;T&gt; port) {
+        // Returns the string "(2 * 3) + 2"
+    }
+    
+    template &lt;typename T&gt; T evaluate(port&lt;T&gt; port) {
+        // Returns the number 8
+    }
+</code></pre>
+<h1>Memory Management</h1>
+<p>Another drawback of using polymorphism is copy semantics. Consider the factory method:</p>
+<pre class="lang-cpp prettyprint-override"><code>    node&lt;float&gt; getSomeUsefulFunction() {
+        // ...
+    }
+
+</code></pre>
+<p>How is this function implemented? If we create several node instances on the stack, point them at each other and return the root, its parent nodes go out of scope and we get an access violation trying to evaluate the result. Do we allocate heap memory for those nodes? Who deletes them? How do you decide which ones to delete? If a node has the same parent for two inputs, a naive algorithm could accidentally delete an object twice. Even if you decide who owns what and who deletes what, you'd still have problems if you ever wanted to copy-construct the whole hierarchy. You don't know the type of each node, so you can't simply copy-construct them. The typical solution to this dilemma is often known as the prototype pattern -- each node must implement a virtual <code>clone</code> method returning a <code>node</code> instance of the same type and with identical fields. Here again you run into memory management issues -- how do you allocate and manage memory you create within <code>clone()</code>?</p>
+<p>You could try to use shared memory by only using shared pointers to these structures, or specifically enforcing it by making node structures work like shared pointers to an internal implementation. However, with this method, we no longer have a zero-cost abstraction -- we're using garbage collection. More importantly, though, does this choice properly reflect the intent of your program -- are the nodes supposed to have shared ownership? It might be a better idea to create a class to represent a node graph and force nodes to be created as part of a node graph. This way ownership is clear and undisputed. This means that the factory from earlier could be modified like this:</p>
+<pre class="lang-cpp prettyprint-override"><code>    node_graph&lt;float&gt; getSomeUsefulFunction() {
+        node_graph&lt;float&gt; graph;
+        node&lt;float&gt;&amp; n = // note the return by reference -- the memory is acquired
+                         // and initialized by the node_graph and you get a handle
+            graph.add_node();
+        // ...
+        return graph; // Copy constructor implementation here is critical
+    }
+</code></pre>
+<p>At this point, you could even reference input/output nodes simply by their index within the node_graph's internal node container (although this quickly creates a problem for insertion or removal of nodes -- but it makes copying the structure much easier).</p>
+<p>This brings me to the non-polymorphic <code>node</code> class. Instead of making a subclass for every different function, you could add a separate field, possibly an <code>enum</code>, to track the node's function. In other words, replace <code>addition_node</code>, <code>multiplication_node</code>, etc. with <code>node(func::add)</code>, <code>node(func::multiply)</code>, etc. It might look like this:</p>
+<pre class="lang-cpp prettyprint-override"><code>    enum class node_func { add, subtract, value };
+    
+    template &lt;typename T&gt; class node {
+    public:
+        node_func func;
+        T value;
+    }
+
+    template &lt;typename T&gt; T evaluate(node&lt;T&gt; n) {
+        switch (n.func) {
+        case node_func::value:
+            return n.value;
+        case node_func::add:
+            return evaluate(*n.input[0]) + evaluate(*n.input[1]);
+        // etc.
+        }
+    }
+</code></pre>
+<p>As long as your node_graph's copy and move constructors are properly implemented, you won't have problems with access violations because all the nodes used in the graph come with it in the copy/move. You won't have problems with deleting because the graph can simply delete all of its nodes when it goes out of scope with the assurance that nothing else should be referencing the nodes within that system.</p>
+<p>The biggest drawback for this design lies within the copy/move functionality. Because the nodes would all contain pointers to nodes memory-managed by their parent node_graph, the node_graph would need to take special care to make sure all of these pointers are valid. A possible algorithm might look something like this:</p>
+<pre class="lang-cpp prettyprint-override"><code>    node_graph::node_graph(const node_graph&amp; other) {
+        m_nodes = other.m_nodes;
+        for (node&amp; n : m_nodes) {
+            // for each pointer, get the index in 'other' of the node it points to
+            // set that pointer to point at our own node at that index
+        }
+    }
+</code></pre>
+<h1>Recursion</h1>
+<p>One final consideration is recursion -- what happens when you connect a node's output to a node that eventually drives it? Your evaluation code will go on forever. Note that with the free-function design I proposed earlier, your code wouldn't necessarily ever encounter a problem with recursion -- for example, if you used the system to represent a set of logic gates and you wanted to simulate signals propagating through, recursion would be a common occurrence. Your evaluation function could then simply use only the current input values to advance the simulation instead of recursing all the way down the hierarchy into an infinite loop. Thus, recursion within a node graph system is not inherently evil. That said, you're still best off adding a function to traverse the hierarchy and detect loops. That way, when a recursive setup would result in an infinite evaluation, you can handle the case before you attempt to evaluate.</p>
+    </div>

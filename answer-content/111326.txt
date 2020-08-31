@@ -1,0 +1,168 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Have you actually profiled your script to be sure that your time issue really is related to the <code>for ... in</code> loops? I'm pretty confident that your timing issue is more likely related to you doing this over network shares. You state yourself that if using local folders it runs in 6-8 minutes, but using network shares it takes hours. </p>
+
+<p>Depending on how many changes your loops does, you might consider changing it so that all the network shares a copied once to local folders, run your script which potentially modifies the folders, and then copy back to the network share. This would reduce the amount of smaller read/writes across the network, which might be your issue.</p>
+
+<p>Now onto some style and code issues:</p>
+
+<ul>
+<li><em>Get better names</em> – Please don't use abbrevations in variable names. It makes your code way harder to read and understand. What is the <code>GnR</code>, <code>FCProducts</code> or <code>listAdBdryFC</code>. I was close to not reviewing this, simply due to bad naming</li>
+<li><em>Gather similar code blocks</em> – It seems like all the second level for loops, actually does the same but with different files. These code blocks could be gathered into functions, and you could make a loop calling this function one by one</li>
+<li><em>Update instead of convert, delete and rename?</em> – I don't know <code>arcpy</code>, but after testing for where you're using your time (read: it's not the actual <code>for</code> loop of Python!), possibly optimising how you do the needed change. Possibly <code>arcpy</code> has better ways of directly looking up the <em>one</em> item you are looking for, instead of traversering the entire list of feature classes?</li>
+<li><em>Break out when finished updating</em> – If your for loops are reading through massive amounts of feature classes, and the one item you are updating is located early in the list, you could benefit from doing a <code>break</code> after updating, so that you don't read through the rest of the list.</li>
+<li><em>Debug-tip: Add time to print's</em> – If you're unsure where your time vanishes you could either run profilers, or you could add current time to the start of your generours output. You don't need to add the deltas, as it is easy to detect time spans when just looking down the time presented at start of line.</li>
+</ul>
+
+<p>Here is your code refactore for style and simplification issues:</p>
+
+<pre><code>from __future__ import print_functions
+import time
+import arcpy
+
+FC_PRODUCTS = r"C:\Python\DataConversion\shapefiles"
+GB_PRODUCTS = r"C:\Python\DataConversion\shapefile_gp"
+ADMIN_BDRY = r"C:\Python\DataConversion\temp1.gdb"
+G_N_R = r"C:\DataConversion\temp2.gdb"
+INVENORIES = r"C:\Python\DataConversion\temp3.gdb"
+NFE = r"C:\Python\DataConversion\temp4.gdb"
+
+
+def handle_file(filename, product):
+    """Look through filename, and handle product_update."""
+
+    new_product = product[:-4] + "_new"
+    stripped_product = product[:-4]
+
+    arcpy.env.workspace = filename
+    feature_classes = arcpy.ListFeatureClasses()
+
+    for feature_class in feature_classes:
+        if feature_class == stripped_product:
+
+            arcpy.FeatureClassToFeatureClass_conversion(stripped_product, filename, new_product)
+            print('{}: {} copied to {}'.format(time.clock(), product, filename))
+
+            arcpy.Delete_management(filename)
+            print('{}: Old {} deleted'.format(time.clock(), filename))
+
+            arcpy.Rename_management(new_product, stripped_product)
+            print('{}: Output renamed\n'.format(time.clock()))
+
+            return  # Done updating for this file (assuming only update pr. file)
+
+
+def main():
+
+    start_time = time.clock()
+    print("{}: Start main".format(start_time))
+
+    arcpy.env.overwriteOutput = True
+
+    arcpy.env.workspace = FC_PRODUCTS
+    listFC = [0]
+    listFC = arcpy.ListFeatureClasses()
+    del arcpy.env.workspace
+
+    for product in listFC:
+        for filename in (G_N_R, ADMIN_BDRY, INVENORIES, NFE):
+            handle_file(filename, product)
+
+
+
+    arcpy.env.workspace = GB_PRODUCTS
+    listFCgb = [0]
+    listFCgb = arcpy.ListFeatureClasses()
+
+    for productGB in listFCgb:
+
+        for filename in (INVENORIES, NFE):
+            handle_file(filename, productGB)
+
+    end_time = time.clock()
+    print("{}: Ended within {} seconds".format(end_time, end_time - start_time))
+
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+
+<p>When refactoring I also saw one possible major issue: <strong>For each product in either the <code>FC_PRODUCTS</code> or <code>GB_PRODUCTS</code> you read through each of the corresponding files updating <em>one</em> item at a time, possibly rewriting the file each time as well</strong>. This update converts, deletes and renames that particular item. This means that you have a time complexity of \$O(n*m)\$, where \$n\$ is items in the products file, and \$m\$ is items in the secondary file. This is bad...</p>
+
+<p>You should aim for doing a single run through each of the secondary files reversing the lookup you now do. That is instead of looking through all products one at a time in the corresponding files, go through the corresponding files and see if it exists in the main file. This will change time complexity to \$O(m)\$ for each of the corresponding files. If you in addition can do in-memory handling (or delay writing of the file), you'll might save quite a lot of time!</p>
+
+<p>Gist of code (still untested as I don't have data files or <code>arcpy</code>):</p>
+
+<pre><code>from __future__ import print_functions
+import time
+import arcpy
+
+FC_PRODUCTS = r"C:\Python\DataConversion\shapefiles"
+GB_PRODUCTS = r"C:\Python\DataConversion\shapefile_gp"
+ADMIN_BDRY = r"C:\Python\DataConversion\temp1.gdb"
+G_N_R = r"C:\DataConversion\temp2.gdb"
+INVENORIES = r"C:\Python\DataConversion\temp3.gdb"
+NFE = r"C:\Python\DataConversion\temp4.gdb"
+
+
+def handle_file(main_features, filename):
+    """Look through filename, and handle product_update."""
+
+    arcpy.env.workspace = filename
+    feature_classes = arcpy.ListFeatureClasses()
+
+    for feature_class in feature_classes:
+        if feature_class in main_features:
+
+            # Get product from main_feature
+            main_idx = main_features.index(feature_class)
+            product = main_features[main_idx]
+            new_product = product[:-4] + "_new"
+            stripped_product = product[:-4]
+
+            # Convert
+            arcpy.FeatureClassToFeatureClass_conversion(stripped_product, filename, new_product)
+            print('{}: {} copied to {}'.format(time.clock(), product, filename))
+
+            # Delete
+            arcpy.Delete_management(filename)
+            print('{}: Old {} deleted'.format(time.clock(), filename))
+
+            # Rename
+            arcpy.Rename_management(new_product, stripped_product)
+            print('{}: Output renamed\n'.format(time.clock()))
+
+
+def handle_main_file(main_filename, *filenames):
+    """Update main features in all the filenames."""
+
+    # Clear it out for next run?
+    del arcpy.env.workspace     
+
+    arcpy.env.workspace = main_filename
+    # main_features = [0]  # Why this line?
+    main_features = set(arcpy.ListFeatureClasses())
+
+    for filename in filenames:
+        handle_file(main_features, filename)
+
+
+def main():
+
+    start_time = time.clock()
+    print("{}: Start main".format(start_time))
+
+    arcpy.env.overwriteOutput = True
+
+    handle_main_file(FC_PRODUCTS, G_N_R, ADMIN_BDRY, INVENORIES, NFE) 
+    handle_main_file(GB_PRODUCTS, INVENORIES, NFE)
+
+    end_time = time.clock()
+    print("{}: Ended within {} seconds".format(end_time, end_time - start_time))
+
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+
+<p><strong>Edit:</strong> As suggested by Joe Wallis, I've changed the <code>main_features</code> into a set to speed lookups. Do note, that this (as the rest) is still untested, but Joe Wallis should be correct that this specific lookup should then go a lot faster. And Joe Wallis is also correct in his answer that printing does take time, so you need to consider whether it is worthwhile to actually print inbetween each operation. I think I would keep it for a little while as it clearly indicates where you spend your time, and compared to read/writing files the time to print should be neglible.</p>
+    </div>

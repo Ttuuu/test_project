@@ -1,0 +1,91 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>As promised in the comments, here's a test case that breaks your use of <code>is_incomplete</code>.
+Two translation units; in one <code>struct Widget</code> is incomplete, and in the other it's not. This leads to a different mangled name for <code>value_ptr&lt;Widget&gt;</code>, which leads to linker errors when the two translation units are linked together.</p>
+
+<p><a href="https://wandbox.org/permlink/jbEMn5ms5HO7u3dA" rel="nofollow noreferrer">https://wandbox.org/permlink/jbEMn5ms5HO7u3dA</a></p>
+
+<p>Solution: <em>don't use <code>is_incomplete</code>.</em> Either make it a precondition of your <code>value_ptr</code> that it works only on complete types, or make it a guarantee that it works <em>even</em> on incomplete types. Don't have it switch its mangling (or its size, or its behavior) based on transient, ephemeral properties such as "completeness."</p>
+
+<hr>
+
+<pre><code>    // reset pointer
+    template &lt;typename Px = std::nullptr_t&gt;
+    void reset( Px px = nullptr ) {
+</code></pre>
+
+<p>I question this function template. You're saying, <code>reset</code> should accept <em>any function argument at all</em>; but also, if a template argument is provided, then it should default its argument to <code>nullptr</code>? So, like,</p>
+
+<pre><code>myvalueptr.reset(42);  // OK, dies deep inside
+myvalueptr.reset&lt;int*&gt;();  // OK, compiles
+</code></pre>
+
+<p>I would think that a much better way to write the desired overload set would be</p>
+
+<pre><code>    template&lt;class Px, class = std::enable_if_t&lt;std::is_convertible_v&lt;Px, pointer&gt;&gt;&gt;
+    void reset(Px px);  // template accepting just convertible types
+
+    void reset() { reset(nullptr); }  // non-template
+</code></pre>
+
+<hr>
+
+<pre><code>    const_reference operator*() const { return *this-&gt;get(); }
+    reference operator*() { return *this-&gt;get(); }
+</code></pre>
+
+<p>This is a very common brain-fart for people implementing pointers and iterators. Just because a <em>pointer object</em> is <code>const</code>-qualified, doesn't mean the <em>pointed-to object</em> is immutable. And just because the pointer object is mutable, doesn't mean the pointed-to object should be mutable!</p>
+
+<pre><code>value_ptr&lt;int&gt; vp1 = ...; int&amp; i1 = *vp1;  // OK
+
+const value_ptr&lt;int&gt; vp2 = vp1; int&amp; i2 = *vp2;  // OK!
+
+int&amp; i3 = *value_ptr&lt;int&gt;(vp1);  // OK!
+</code></pre>
+
+<p>Now, the interesting thing in your case is... all three of these cases compile cleanly <em>anyway</em>. Why is that?!</p>
+
+<pre><code>    using pointer = typename base_type::pointer;
+    using const_pointer = const pointer;
+
+    using reference = typename std::add_lvalue_reference&lt;element_type&gt;::type;
+    using const_reference = const reference;
+</code></pre>
+
+<p>Aha. I'm actually mildly surprised you got no compiler warning here. Suppose <code>reference</code> is <code>int&amp;</code>; then what is <code>const reference</code>? Well, applying <code>const</code> to a reference type doesn't do anything... so your <code>const_reference</code> typedef is actually a synonym for <code>reference</code>!</p>
+
+<pre><code>static_assert(std::is_same_v&lt;value_ptr&lt;int&gt;::reference, int&amp;&gt;);
+static_assert(std::is_same_v&lt;value_ptr&lt;int&gt;::const_reference, int&amp;&gt;);
+</code></pre>
+
+<p>We see the problem more clearly with <code>const_pointer</code>:</p>
+
+<pre><code>static_assert(std::is_same_v&lt;value_ptr&lt;int&gt;::pointer, int*&gt;);
+static_assert(std::is_same_v&lt;value_ptr&lt;int&gt;::const_pointer, int* const&gt;);
+</code></pre>
+
+<hr>
+
+<p>Gotta run now; sorry I found only this unsubtle (if fundamental) issue.</p>
+
+<p>Style-wise, I would say that your line lengths are unnaturally short, which leads to vertically stretched code, which makes it harder to read and review. I'm not sure exactly what I'd do differently; but I'd try to make e.g. the definition of <code>default_copy</code> shorter than it currently is, by hook or by crook. The number of lines in a class should somehow reflect its importance in the grand scheme of the code.</p>
+
+<hr>
+
+<p>P.S. to add:</p>
+
+<pre><code>template &lt;class T, class D, class C&gt; bool operator &gt;( const value_ptr&lt;T, D, C&gt;&amp; x, std::nullptr_t ) { return !( nullptr &lt; x ); }
+</code></pre>
+
+<p>This is a bug. But also, you should think about ways to reduce the amount of boilerplate associated with these operators. One way to do it would be to give <code>value_ptr</code> a base class (not dependent on <code>D</code> or <code>C</code>) and then provide the comparison operators specifically for that base class. Another way would be to provide a type-trait <code>is_value_ptr&lt;P&gt;</code> and then, at global scope, write:</p>
+
+<pre><code>template&lt;class T, class U, class = std::enable_if_t&lt;is_value_ptr_v&lt;T&gt; &amp;&amp; is_value_ptr&lt;U&gt;&gt;&gt;
+bool operator&lt; (const T&amp; t, const U&amp; u) { return t.get() &lt; u.get(); }
+template&lt;class T, class U, class = std::enable_if_t&lt;is_value_ptr_v&lt;T&gt; &amp;&amp; is_value_ptr&lt;U&gt;&gt;&gt;
+bool operator&lt;= (const T&amp; t, const U&amp; u) { return t.get() &lt;= u.get(); }
+template&lt;class T, class U, class = std::enable_if_t&lt;is_value_ptr_v&lt;T&gt; &amp;&amp; is_value_ptr&lt;U&gt;&gt;&gt;
+bool operator&gt; (const T&amp; t, const U&amp; u) { return t.get() &gt; u.get(); }
+// ...
+</code></pre>
+
+<p>I would definitely recommend <em>against</em> the current spaghetti, and especially against the semi-circular dependency where some <code>operator&lt;</code> are implemented in terms of <code>std::less</code>.</p>
+    </div>

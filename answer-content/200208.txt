@@ -1,0 +1,189 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Don't make unnecessary type aliases</h2>
+
+<pre><code>using string_t = std::string;
+using CharT = string_t::value_type;
+</code></pre>
+
+<p>Those neither add readability nor make the existing facilities easy to use. When seeing those, I always recall the matlab C++ code generator, and the code it generated was frankly rubbish (Your code is good, it's just that those aliases trigger the feeling of disgust). </p>
+
+<h2>Take by std::string_view</h2>
+
+<p>I know you tagged this as C++14, but support for C++17 language is already good on all compilers, and standard library implementations are catching up. <code>std::string_view</code> is just more explicit way of saying that you don't need a copy of a string, just wanna read it.</p>
+
+<h2>Less verbose ways to overload</h2>
+
+<p>I'd be inclined to use <code>if constexpr</code> or tag based dispatch. The latter would probably end up the same length as current code.</p>
+
+<h2>Don't inhibit RVO</h2>
+
+<pre><code>auto s = std::move(format(str, std::forward&lt;Ts&gt;(args)...));
+</code></pre>
+
+<p>RVO/NRVO (named return value optimization) is an optimization performed by compiler which is a form of copy elision. Compilers are allowed to eliminate a copy in some cases (can't recall strictly in which cases) Move would happen anyway, and in C++17 the guaranteed copy elision would work anyway, too. </p>
+
+<h2>Easy to use correctly, hard to use incorrectly</h2>
+
+<p>Perhaps I read too much of <em>"Nobody wants to read your sh*t"</em>, but I see some similarity between what Scott Meyers writes and what Steven Pressfield describes. Both try to convey idea of being user/reader-friendly. Guiding them at the correct usage/idea, rather than expecting them to know it (or at least to try one's best). At the moment, the code doesn't throw exception if number of arguments is not equal to number of replacement symbols in the format string, nor any other warning/error. Not everybody knows that the functions don't support custom types with <code>operator&lt;&lt;</code> overloaded. C++ users usually use <code>std::fstream</code>, or some other custom build streams, which the code doesn't support. Very few C++ programmers are paranoid about ADL, which the code will invoke in case the intended print didn't compile. <a href="https://stackoverflow.com/questions/49748423/how-does-this-template-type-deduction-and-overload-resolution-work">Some ADL calls are extremely evil</a>. </p>
+
+<p>People praise code for being nice, and great interface and reasonable performance is sufficient definition of nice (IMO). Implementation can be amended as time goes by, but changing interface/contracts is rarely an option. Although implementation matters, having great interface offers much greater possibilities of optimizations.</p>
+
+<h2>Executable size is not that important</h2>
+
+<p>Size of <code>iostream</code> gets dwarfed by the rest of application, usually. Using standard library algorithms, or especially boost, will make additional size of <code>iostream</code> insignificant. It might be important in some cases, but those who encounter would usually have no <code>std::FILE</code> either, as they want to output to embedded 8*8 LED screen or something like that.</p>
+
+<h2>Alternative implementation</h2>
+
+<p>I would use pseudo runtime tuple indexing to access elements, rather than recursing. That would eliminate the weird edge case of no arguments, and make everything more consistent.</p>
+
+<p><strong>Important excerpt:</strong></p>
+
+<pre><code>template &lt;std::size_t static_index, typename ... ArgumentTypes&gt;
+std::string runtime_get(std::size_t runtime_index, std::tuple&lt;ArgumentTypes...&gt;&amp;&amp; rest) {
+    if constexpr (static_index == std::size_t(-1)) {
+        throw std::invalid_argument("number of format symbols is more than arguments");
+    }
+    else {
+        if (runtime_index == static_index)
+            return to_string(std::get&lt;static_index&gt;(rest));
+        else
+            return to_string(runtime_get&lt;static_index - 1&gt;(runtime_index, std::move(rest)));
+    }
+}
+
+template &lt;typename... Ts&gt;
+string_t format(const CharT *str, const Ts &amp;... args) {
+    std::size_t current_index = 0;
+    string_t res;
+    for (; *str; str++) {
+        if (*str != '%') {
+            res += *str;
+            continue;
+        }
+        if (*(str + 1) == '%') {
+            res += '%';
+            ++str;
+        }
+        else {
+            res += runtime_get&lt;sizeof...(Ts) - 1&gt;(current_index,
+                std::forward_as_tuple(args...));
+            ++current_index;
+        }
+    }
+    return res;
+}
+</code></pre>
+
+<p>It is easy to see that one can only pass data into a function, but trying to get the wanted element is impossible due to type being different depending on <em>runtime</em> index. The function usually compiles into a loop for differing user defined types, and into jump table in case of the same or only built in types.</p>
+
+<hr>
+
+<h2>Full code of alternative implementation:</h2>
+
+<pre><code>#include &lt;cstdlib&gt;
+#include &lt;string&gt;
+#include &lt;stdexcept&gt;
+#include &lt;tuple&gt;
+
+namespace gupta {
+    using string_t = std::string;
+    using CharT = string_t::value_type;
+
+    template &lt;typename T&gt; inline string_t to_string(const T &amp;f) { return std::to_string(f); }
+    inline string_t to_string(const char *str) { return std::string{ str }; }
+    inline string_t to_string(string_t s) { return (s); }
+
+    template &lt;std::size_t static_index, typename ... ArgumentTypes&gt;
+    std::string runtime_get(std::size_t runtime_index, std::tuple&lt;ArgumentTypes...&gt;&amp;&amp; rest) {
+        if constexpr (static_index == std::size_t(-1)) {
+            throw std::invalid_argument("number of format symbols is more than arguments");
+        }
+        else {
+            if (runtime_index == static_index)
+                return to_string(std::get&lt;static_index&gt;(rest));
+            else
+                return to_string(runtime_get&lt;static_index - 1&gt;(runtime_index, std::move(rest)));
+        }
+    }
+
+    template &lt;typename... Ts&gt;
+    string_t format(const CharT *str, const Ts &amp;... args) {
+        std::size_t current_index = 0;
+        string_t res;
+        for (; *str; str++) {
+            if (*str != '%') {
+                res += *str;
+                continue;
+            }
+            if (*(str + 1) == '%') {
+                res += '%';
+                ++str;
+            }
+            else {
+                res += runtime_get&lt;sizeof...(Ts) - 1&gt;(current_index,
+                    std::forward_as_tuple(args...));
+                ++current_index;
+            }
+        }
+        return res;
+    }
+
+    template &lt;typename... Ts&gt; auto fprint(std::FILE *f, const char *str, Ts &amp;&amp;... args) {
+        auto s = std::move(format(str, std::forward&lt;Ts&gt;(args)...));
+        return fwrite(s.data(), 1, s.size(), f);
+    }
+
+    template &lt;typename... Ts&gt; inline auto print(const char *str, Ts &amp;&amp;... args) {
+        return fprint(stdout, str, std::forward&lt;Ts&gt;(args)...);
+    }
+
+    template &lt;typename... Ts&gt; inline auto debug(const char *str, Ts &amp;&amp;... args) {
+        return fprint(stderr, str, std::forward&lt;Ts&gt;(args)...);
+    }
+
+    namespace detail {
+        class _stdout_object {};
+        class _stderr_object {};
+    } // namespace detail
+
+    namespace printing_shortcuts {
+
+        template &lt;typename T&gt; detail::_stdout_object operator&lt;&lt;(detail::_stdout_object f, const T &amp;arg) {
+            auto s = to_string(arg);
+            fwrite(s.data(), 1, s.size(), stdout);
+            return f;
+        }
+
+        template &lt;typename T&gt; detail::_stderr_object operator&lt;&lt;(detail::_stderr_object f, const T &amp;arg) {
+            auto s = to_string(arg);
+            fwrite(s.data(), 1, s.size(), stderr);
+            return f;
+        }
+
+        detail::_stdout_object print() { return {}; }
+        detail::_stderr_object debug() { return {}; }
+
+    } // namespace printing_shortcuts
+
+    using namespace printing_shortcuts;
+
+} // namespace gupta
+
+using namespace gupta::printing_shortcuts;
+
+class test {};
+
+std::string to_string(const test &amp;) { return "test"; }
+
+#include &lt;assert.h&gt;
+#include &lt;iostream&gt;
+
+int main() {
+    using namespace gupta;
+    std::cout &lt;&lt; format("%% %", 12) &lt;&lt; '\n';
+    assert(format("%% %", 12) == "% 12");
+}
+</code></pre>
+
+<p><a href="https://wandbox.org/permlink/MQNDhqJ9auOrhGKO" rel="nofollow noreferrer">Demo on Wandbox</a></p>
+    </div>

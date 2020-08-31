@@ -1,0 +1,177 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p>... this code just smells very bad. But, cannot figure out better way
+  to do this.</p>
+</blockquote>
+
+<p>Let's look at a more complete, more fragrant implementation.</p>
+
+<hr>
+
+<p>For data, you are using PostgreSQL: <code>db.Query(selectFlightsSQL, pq.Array(codes), ...)</code>. Therefore, define data using the SQL Data Definition Language (DDL). For example,</p>
+
+<pre><code>CREATE TABLE airlines (
+    airlinecode char(3) NOT NULL,
+    airlinename varchar(64) NOT NULL,
+    PRIMARY KEY (airlinecode),
+    UNIQUE (airlinename)
+);
+
+CREATE TABLE airports (
+    airportcode char(3) NOT NULL,
+    airportname varchar(64) NOT NULL,
+    timezonename varchar(64) NOT NULL,
+    PRIMARY KEY (airportcode),
+    UNIQUE (airportname)
+);
+
+CREATE TABLE flights (
+    airlinecode char(3) NOT NULL,
+    flightno integer NOT NULL,
+    departtime timestamptz NOT NULL, -- local time
+    origincode char(3) NOT NULL,
+    arrivetime timestamptz NOT NULL, -- local time
+    destinationcode char(3) NOT NULL,
+    PRIMARY KEY (airlinecode, flightno, departtime),
+    FOREIGN KEY (airlinecode) REFERENCES airlines,
+    FOREIGN KEY (origincode) REFERENCES airports,
+    FOREIGN KEY (destinationcode) REFERENCES airports
+);
+</code></pre>
+
+<p>Access the data using the SQL Data Manipulation Language (DML). For example,</p>
+
+<pre><code>    -- $1  origincode list
+    -- $2  origincode list length
+    -- $3  earliest arrivaltime
+    -- $4  latest arrivaltime
+    SELECT destinationcode, airportd.airportname AS destinationname, arrivetime, airportd.timezonename AS arrivezone,
+        origincode, airporto.airportname AS originname, departtime, airporto.timezonename AS departzone,
+        destinations.airlinecode, airlines.airlinename, flightno
+
+    FROM (
+
+        SELECT destinationcode, origincode, airlinecode, flightno, departtime, arrivetime,
+            count(origincode) OVER (PARTITION BY destinationcode) AS origins
+        FROM flights
+        WHERE arrivetime &gt;= $3 AND arrivetime &lt;= $4
+            AND origincode = ANY($1)
+            AND destinationcode != ANY($1)
+
+    ) AS destinations 
+    LEFT JOIN airlines ON airlines.airlinecode = destinations.airlinecode
+    LEFT JOIN airports AS airportd ON airportd.airportcode = destinationcode
+    LEFT JOIN airports AS airporto ON airporto.airportcode = origincode
+
+    WHERE origins = $2 
+
+    ORDER BY destinationcode, arrivetime, airlinecode, flightno, departtime
+    ;
+</code></pre>
+
+<p>Consider optimizations such as indices.</p>
+
+<p>Data access is implemented in SQL for any programming language that implements an interface to PostgreSQL (and other relational DBMS`s), not just Go.</p>
+
+<hr>
+
+<p>In Go, the remaining algorithmic, procedural task is simple: convert the SQL rows to a Go hash map indexed by destination code. For example,</p>
+
+<pre><code>package main
+
+import (
+    "database/sql"
+    "time"
+
+    "github.com/lib/pq"
+    _ "github.com/lib/pq"
+)
+
+type Flight struct {
+    DestinationCode string
+    DestinationName string
+    ArriveTime      time.Time
+    ArriveZone      string
+    OriginCode      string
+    OriginName      string
+    DepartTime      time.Time
+    DepartZone      string
+    AirlineCode     string
+    AirlineName     string
+    FlightNo        int
+}
+
+func destinations(db *sql.DB, origins []string, earliest, latest time.Time) (map[string][]Flight, error) {
+    query := `
+        -- $1  origincode list
+        -- $2  origincode list length
+        -- $3  earliest arrivaltime
+        -- $4  latest arrivaltime
+       SELECT destinationcode, airportd.airportname AS destinationname, arrivetime, airportd.timezonename AS arrivezone,
+            origincode, airporto.airportname AS originname, departtime, airporto.timezonename AS departzone,
+            destinations.airlinecode, airlines.airlinename, flightno
+
+        FROM (
+
+            SELECT destinationcode, origincode, airlinecode, flightno, departtime, arrivetime,
+                count(origincode) OVER (PARTITION BY destinationcode) AS origins
+            FROM flights
+            WHERE arrivetime &gt;= $3 AND arrivetime &lt;= $4
+                AND origincode = ANY($1)
+                AND destinationcode != ANY($1)
+
+        ) AS destinations 
+        LEFT JOIN airlines ON airlines.airlinecode = destinations.airlinecode
+        LEFT JOIN airports AS airportd ON airportd.airportcode = destinationcode
+        LEFT JOIN airports AS airporto ON airporto.airportcode = origincode
+
+        WHERE origins = $2 
+
+        ORDER BY destinationcode, arrivetime, airlinecode, flightno, departtime
+        ;
+        `
+
+    dst := make(map[string][]Flight)
+    rows, err := db.Query(query, pq.Array(origins), len(origins), earliest, latest)
+    if err != nil {
+        return nil, err
+    }
+    defer rows.Close()
+    for rows.Next() {
+        var flt Flight
+        err := rows.Scan(
+            &amp;flt.DestinationCode,
+            &amp;flt.DestinationName,
+            &amp;flt.ArriveTime,
+            &amp;flt.ArriveZone,
+            &amp;flt.OriginCode,
+            &amp;flt.OriginName,
+            &amp;flt.DepartTime,
+            &amp;flt.DepartZone,
+            &amp;flt.AirlineCode,
+            &amp;flt.AirlineName,
+            &amp;flt.FlightNo,
+        )
+        if err != nil {
+            return nil, err
+        }
+        dst[flt.DestinationCode] = append(dst[flt.DestinationCode], flt)
+    }
+    err = rows.Err()
+    if err != nil {
+        return nil, err
+    }
+    return dst, nil
+}
+
+func main() {}
+</code></pre>
+
+<hr>
+
+<p>The XY problem is asking about your attempted solution rather than your actual problem: <a href="http://xyproblem.info/" rel="nofollow noreferrer">The XY Problem</a>. Therefore, without a problem, we have no way of knowing whether a solution is correct. There are no use cases or examples.</p>
+
+<hr>
+
+<p>TODO: Domain knowledge is important. Airline arrival and departure times are local times. Any solution needs to be verified and tested across time zones and for standard and daylight saving times.</p>
+    </div>

@@ -1,0 +1,118 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>The code you have works, and is very nicely-formatted.</h3>
+
+<p>There are only two things I would change, stylistically speaking:</p>
+
+<ol>
+<li><p>Explicitly pass input parameters by value. This should have been the default, but it wasn't in classic COM-based VB, so you need to write it out. <code>ByRef</code> is actually a perverse choice for the default, since it is almost never what you want. It is <em>certainly</em> not what you want for primitive types like <code>Long</code>. (But it probably <em>is</em> what you want for strings, unless passing them out-of-process, <em>e.g.</em> in a COM server.)</p></li>
+<li><p>As others have pointed out, <code>l</code> is a rather poor choice for a parameter name. Roland says one problem with it is that it can be difficult to distinguish from the digit 1 or a capital I. I'd say that's more a reflection on your choice of a font for your editor, but this is still a valid concern. My major issue with it is that it looks like a lame attempt at Systems Hungarian notation. I know this used to be all the rage in VB programming, but that was mostly cargo-cult. Unless you're using variants (and you probably shouldn't be) the language is sufficiently strongly-typed that embedding type information in the name of the variable serves little point. The only type prefixes I allow myself are for names of controls (mostly because it makes finding them in IntelliSense significantly easier; I always remember the type of control much more readily than I remember its name) and "member" prefixes (<em>e.g.</em>, <code>m_</code>). Aside from that, the only prefixes you should be using are <em>meaningful semantic</em> ones, <a href="https://en.wikipedia.org/wiki/Hungarian_notation#Systems_vs._Apps_Hungarian" rel="nofollow noreferrer">in the Apps Hungarian vein</a>.</p></li>
+</ol>
+
+<p>Therefore, I would rewrite your function's prototype to look like the following:</p>
+
+<pre><code>Function RgbToHex(ByVal color As Long) As String
+</code></pre>
+
+<h3>Otherwise, the primary issue with your code is that it is <em>slow</em>!</h3>
+
+<p>Why? Well, there are a couple of reasons:</p>
+
+<ol>
+<li><p>String operations are <em>extremely</em> slow in VB since they all require multiple BSTR allocations and deallocations, not to mention the fact that the calls to the string-manipulation functions themselves cannot be inlined.</p>
+
+<p>Now, I notice that you did correctly force the use of the string-based <code>Right</code> function by using the <code>$</code> type suffix, which is a standard trick to ensure as optimal code as possible. This is good. You <em>didn't</em> do the same thing for <code>Hex</code>. Personally, I have no idea whether it is actually necessary or not—is there a variant-based version of <code>Hex</code>? Maybe, I don't know. And I don't want to have to worry about it when I write or review code, so I <em>always</em> use the <code>$</code> type suffix when I am working with strings. I suggest that you do the same. (<a href="https://codereview.stackexchange.com/a/149907/121675">Mat's Mug says <code>Hex</code> does have a variant version</a>, so looks like this is sage advice after all!)</p>
+
+<p>But the <em>major</em> problem here is that you're calling <em>six</em> different string-manipulation functions, <em>plus</em> concatenating those three intermediate strings. Slooooow! To optimize the code, it will be critical that we find a way to keep these calls to a minimum.</p></li>
+<li><p>You are using floating-point operations in your byte-extraction code.</p>
+
+<p>In your defense, constant expressions like <code>2 ^ 8</code> should be computed by the compiler at compile-time, so that your code never actually has to do an exponentiation operation. I would have made exactly that same assumption. Unfortunately, the VB 6 compiler (even with all optimizations enabled) is not that smart. These two exponentiation operations are done at run-time, with a call to the <code>vbaPower</code> function exported by the run-time library. Personally, I'd say this is a bug in the compiler, but it's not going to get fixed now, and you have no choice but to work around it.</p>
+
+<p>The other bad news is, once you've got a floating-point value, the entire arithmetic operation has to be done in floating-point mode. So for each of your bit-extraction operations, the compiler is going to emit code that converts an integer value into a floating-point value, loads floating-point constants, performs an exponentiation operation, fixes up the result, and then does a division.</p>
+
+<p>While it is true that floating-point operations are no longer as slow on modern machines as they used to be, generally obsoleting the classic optimization advice to avoid floating-point operations whenever possible, VB 6 is not sufficiently modern for that advice to hold. :-) There is no way to get the VB 6 compiler to emit SSE instructions, so you're stuck with the legacy x87 FPU, and that means that you're stuck with a bottleneck intrinsic in its design, arising from the inability to move values directly from the floating-point stack into integer registers and vice versa. The compiler emits code to handle all of this for you seamlessly, but it's still slow. So, at least in the context of VB 6, it's still valid optimization wisdom <em>not</em> to inter-mix floating-point and integer operations.</p>
+
+<p>In this case, though, you don't need floating-point operations at all! You could have done everything in integer mode, just by explicitly using an integer division:</p>
+
+<pre><code>r = (l And ColorConstants.vbRed)
+g = (l And ColorConstants.vbGreen) \ (2 ^ 8)
+b = (l And ColorConstants.vbBlue)  \ (2 ^ 16)
+</code></pre>
+
+<p>Then, the constants even get folded correctly, with the exponentiation being done at compile-time.</p></li>
+</ol>
+
+<p>As originally written, your function compiles to <em>hundreds</em> of lines of machine code. I made an optimized build and then disassembled it, revealing a total of over 1,000 bytes of machine code just for that one function. It contains <em>tons</em> of embedded function calls (slow), string allocations/deallocations (slow), and extremely sub-optimal code to store, compare, and manipulate floating-point values (slow).</p>
+
+<h3>Let's have a go at optimizing it.</h3>
+
+<p><a href="https://codereview.stackexchange.com/a/149906/121675">Comintern made one attempt already</a>, and it is interesting to study. Immediately one problem jumps out—it does not produce correct results. Specifically, the order of the red and blue component values are reversed, such that instead of <code>AABBCC</code>, his code gives <code>CCBBAA</code>. On little-endian architectures, like the x86, integer values are stored in memory with the least-significant byte at the smallest address. This means that "RGB" colors are actually represented in memory using an <code>BBGGRR</code> format, whereas you are wanting the standard, web-style <code>RRGGBB</code> format for your hexadecimal output. This is a minor bug, though, and should be fixable.</p>
+
+<p>My real issue with his code is that it makes a series of function calls, specifically to the <code>RtlMoveMemory</code> API function, which he has aliased to <code>CopyMemory</code>. I've seen this technique before for optimizing code in VB 6, and while it has power, it's not a panacea. Why? Function calls are expensive, too! Memory copying is a relatively cheap operation, <em>O(n)</em> at the worst, and has a small constant multiplier assuming an optimal implementation (which <code>RtlMoveMemory</code> does provide), but the context switching required for a function call introduces a lot of overhead that it would be nice to avoid. This is especially important in a very small, do-one-simple-thing function like you have here. VB 6's compiler does a very poor job of inlining code, so the execution cost of this function would be dwarfed by the overhead cost of making these system calls.</p>
+
+<p>To be fair, Comintern's code is still going to be significantly faster than your original attempt, but we can do even better.</p>
+
+<p>How? By using bit-manipulation tricks to do the byte-swapping. Basically, you do what you would have done in C (or at least, what <em>I</em> would have done in C, maybe you're a real VB programmer and don't think in the language of blasphemy). This is basically what <a href="https://codereview.stackexchange.com/a/149926/121675">Roland Illig did in his code</a>. You start with the input value, in <code>AABBGGRR</code> format. Then, you isolate each of the individual color components (except the alpha channel, which we don't care about):</p>
+
+<ul>
+<li>The red component is trivial: you just mask off all but the bottom-most byte. Bitwise masking is done with a bitwise <code>And</code> operation. </li>
+<li>For the green component, you first divide by <code>&amp;H100</code> (which is the same as a right-shift by 8, except that you can't do a right-shift in VB). That throws away the bottom-most byte, shifting everything down by one byte. Then you can simply mask off all but the bottom-most byte, which is the one that used to be the middle byte.</li>
+<li>The same thing is true for the red component, except that we divide by a larger constant, <code>&amp;H10000</code>, to achieve what is effectively a right-shift by 16.</li>
+</ul>
+
+<p>My hope/expectation was that the VB 6 compiler would actually optimize these division operations to right-shift operations, since that will be faster—and indeed, that is exactly what it did! Notice that it is critical that we use the integer-multiply operator, <code>\</code>, here.</p>
+
+<p>The next step is to take those isolated byte values, and pack them together in the proper order. Again, Roland's code does the same thing I would have done: uses a multiplication in lieu of a left-shift operator. Unfortunately, VB 6's compiler can't/won't optimize this multiplication into a left-shift. Fortunately, multiplications are not slow on modern processors, so this is not a big loss.</p>
+
+<p>Finally, we want to make a <em>single</em> call each string-formatting function to pretty-print the final output. Roland's idea was to multiply the integer value by <code>&amp;H1000000</code> to ensure that it is properly zero-padded—very clever! I did it a bit differently: I decided to check and see if padding is actually necessary, and if not, skipping the call to <code>Right</code> altogether!</p>
+
+<pre><code>Public Function RgbToHex(ByVal color As Long) As String
+    ' On little-endian architectures, "RGB" color values are actually stored in memory
+    ' in an AABBGGRR format. However, web-style hex colors are always formatted in an
+    ' AARRGGBB format. Neither Windows nor HTML care about the alpha-channel value
+    ' (always the upper, most-significant bit), so we are going to simply ignore it.
+    ' Otherwise, we have to do some bit-twiddling to swap the red and blue color channels.
+
+    ' Extract the individual red, green, and blue color channels.
+    ' (Although they are only bytes, continue to store these intermediate values
+    ' as 32-bit integers for maximum speed.)
+    Dim r As Long
+    Dim g As Long
+    Dim b As Long
+    r = (color And &amp;HFF)
+    g = ((color \ &amp;H100) And &amp;HFF)
+    b = ((color \ &amp;H10000) And &amp;HFF)
+
+    ' Now, arrange these byte values in the correct order (RRGGBB).
+    color = ((r * &amp;H10000) + (g * &amp;H100) + b)
+
+    ' And finally, format it as a hexadecimal string, left-padding with zeros as necessary.
+    ' Note that if the red component value is large enough, padding does not need to be
+    ' done, which allows us to skip an expensive string operation.
+    If (r &gt;= &amp;H10) Then
+        RgbToHex = Hex$(color)
+    Else
+        RgbToHex = Right$("00000" &amp; Hex$(color), 6)
+    End If
+End Function
+</code></pre>
+
+<p>If this were C, I would guess that Roland's solution would probably be faster, since it does not involve a conditional branch (and <a href="https://stackoverflow.com/questions/40991778/an-expensive-jump-with-gcc-5-4-0/40993519#40993519">conditional branches can be expensive when they are not properly predicted</a>). However, since this is VB, I suspect that my code will be slightly faster, mainly because string operations are so <em>incredibly</em> expensive that it is worth a mispredicted branch penalty to elide one if at all possible. And, if I may compliment myself, I'd say that my solution is slightly more readable from a code-review perspective. (But either solution would require explicit comments describing the rationale.)</p>
+
+<p>Notice, also, that in my implementation, I have a comment about choosing to keep the intermediate values in a 32-bit <code>Long</code>, even though they are just bytes and could be represented using the <code>Byte</code> type. The reason for this is that it is inherently faster to work with 32-bit values on 32-bit architectures, since they fit directly into the processor's native 32-bit wide registers. (This is why you should <em>always</em> use <code>Long</code> in VB 6, rather than the 16-bit <code>Short</code> type. You pay an <em>additional</em> penalty when working with 16-bit values!) If we'd tried to store them as <code>Byte</code>s, they'd take up less memory, but the realistic limitations of VB 6's optimizer mean that there will be some unnecessary conversion going on. If VB supported <em>unsigned</em> types, using them would open up even more potential for the optimizer to do its magic, especially when doing bit-twiddling operations; alas, it doesn't, so we're stuck with signed types.</p>
+
+<h3>Can we make it even faster?</h3>
+
+<p>One quick and easy way to speed up the code is to change the compiler flags. Too few people do this in VB 6, since it is so well hidden. When building your EXE (File → Make *.exe), click the Options button to bring up a dialog. Switch to the "Compile" tab. "Compile to Native Code" is selected by default, and so is "Optimize for Fast Code", which are both good for speed. However, you should <em>also</em> turn on "Favor Pentium Pro" and "Create Symbolic Debug Info".</p>
+
+<p><a href="https://stackoverflow.com/questions/5457095/release-generating-pdb-files-why">Creating debug info is just a good idea, in case you ever have to debug your application</a>, and it is impossible to generate it later. This is arguably less useful for a strictly VB programmer who wouldn't know how to use another debugger with a gun to his head, but it is a skill that is truly worth learning, and if you ever have to call in an expert, a PDB file is invaluable. It doesn't hurt anything to generate it and ignore it.</p>
+
+<p>Why favor the Pentium Pro? Granted, this sounds like a hyper-specific option to favor a certain obsolete family of microprocessor, and indeed it was at the time that VB 5 was released, but it is actually the best general choice because all modern processors bear far more similarity to the Pentium Pro than they do to other generations of processors (with the exception of the Pentium 4, but VB 6 can't optimize for that anyway, and optimizing for PPro is still not a pessimization). The Pentium Pro was a unique processor in a number of ways, but two things were most important from an optimization sense. First, it supported out-of-order execution, where individual instructions could be dynamically re-ordered by the processor to overcome instruction-level data dependencies. Thus, it is better if the compiler generates shorter sequences of instructions (RISC-style), because these can be better reordered. Second, the Pentium Pro has a stall for certain partial-register accesses. The details are complicated and beyond the scope of this answer, but the important fact is that while the earlier Pentium didn't have these, all modern processors do, so having the optimizer generate code accordingly is a good idea.</p>
+
+<p>Other important checkboxes are buried behind the "Advanced Optimizations" button. The UI tries to make these sound scary, but if you understand what they do, and your code has been truly and correctly debugged, some of them are worth enabling. Most obviously, you can turn on the bottom option, "Remove Safe Pentium FDIV Checks". The early Pentium processors with the infamous FDIV bug are long dead now, so this is just pointless baggage to carry around. The other options actually can be slightly unsafe, but it is worth considering turning on the "Remove Integer Overflow Checks" option, and possibly the "Remove Floating Point Error Checks" and "Allow Unrounded Floating Point Operations" options. These three options have a <em>massive</em> impact on the object code that is generated by the compiler, and enabling them can cause a correspondingly massive speed-up in the execution time of your code.</p>
+
+<p>As an example, when I threw the "Remove Integer Overflow Checks" switch and recompiled my code, I saw that it had used shift instructions, instead of multiplication instructions, like I earlier wished that it had! Better yet, removing these overflow checks means that the compiler no longer emits conditional branches after each integer (or floating-point) operation, and even though these branches will be properly predicted to fall through most of the time, leaving them out entirely is still faster. This is a cheap way to make your code run a lot faster, without having to rewrite any of it.</p>
+
+<hr>
+
+<p>For the hardcore among you, <a href="https://gist.github.com/anonymous/4026d9d4aecf06ef39a3dac655c3e69e" rel="nofollow noreferrer">here is my annotated disassembly</a> for the final code generated by the VB 6 compiler with optimizations enabled. You should be able to see some of what I'm talking about in terms of the rather-optimal bit-twiddling instructions, as well as the less-than-optimal string-manipulation code. But being completely overwhelmed is also normal.</p>
+    </div>

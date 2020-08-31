@@ -1,0 +1,107 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The use of <code>eval()</code> here is less than ideal as it allows you to call the URL <code>delete/User/3/</code>, for instance, and it will work against all odds. Worse, you can call the URL <code>delete/delete/9</code> where eval will resolve <code>delete</code> to this view function and lead to all kind of weird behavior.</p>
+
+<p>So the first step is to restrict which symbols can be found from there. The easiest way is to retrieve the attribute directly from your models:</p>
+
+<pre><code>from . import models
+
+...
+
+def delete(request, type_name, object_id):
+    try:
+        cls = getattr(models, type_name)
+    except AttributeError:
+        raise Http404
+    get_object_or_404(cls, id=object_id).delete()
+    redirect(dashboard)
+</code></pre>
+
+<p>But this is still too large as anything that you imported in <code>models</code> can still be retrieved. So you're better off using a base class in your <code>models.py</code> that only your deletable models will inherit from:</p>
+
+<pre><code>class Deletable:
+    def can_delete(self, user):
+        return user.is_active and user.is_staff
+
+class OneOfYourCustomModel(Deletable, models.Model):
+    # whatever
+</code></pre>
+
+<p>And check in your view that whatever you get is Deletable:</p>
+
+<pre><code>def delete(request, type_name, object_id):
+    try:
+        cls = getattr(models, type_name)
+    except AttributeError:
+        raise Http404
+    if inspect.isclass(cls) and issubclass(cls, models.Deletable):
+        get_object_or_404(cls, id=object_id).delete()
+    else:
+        raise Http404
+    redirect(dashboard)
+</code></pre>
+
+<p>You'll also note that it also lead to easy customization of which user can delete what: you just need to override one method and add proper logic (<em>eg</em> raising 403 forbidden) in your view. This can be more useful than the <a href="https://docs.djangoproject.com/en/2.2/ref/contrib/admin/#django.contrib.admin.views.decorators.staff_member_required" rel="nofollow noreferrer"><code>@staff_member_required</code></a> in case your models can be associated to (owned by) a particular user:</p>
+
+<pre><code>class MyOwnedModel(Deletable, models.Model):
+    owner = models.ForeignKey(django.contrib.auth.models.User, …)
+
+    def can_delete(self, user):
+        return user == self.owner or super().can_delete(user)
+</code></pre>
+
+<p>But of course, if only the staff can delete things, the decorator is plenty sufficient.</p>
+
+<hr>
+
+<p>Lastly, it would be good to separate the "retrieve the actual model" logic from the "delete the particular instance of that model" one. The latter being the responsibility of the view, but the former would better fit as a custom <a href="https://docs.djangoproject.com/en/2.2/topics/http/urls/#registering-custom-path-converters" rel="nofollow noreferrer">URL converter</a>.</p>
+
+<p>The main advantage being that you don't need to handle the 404s for unknown models in your view, django will take care of that itself if your converter ever raises a <code>ValueError</code>. Going this route, you can have a <code>converters.py</code>:</p>
+
+<pre><code>from inspect import isclass
+
+from django.urls.converters import StringConverter
+
+from . import models
+
+
+class DeletableConverter(StringConverter):
+    def to_python(self, value):
+        try:
+            cls = getattr(models, value)
+        except AttributeError:
+            raise ValueError
+        if not isclass(cls) or not issubclass(cls, models.Deletable):
+            raise ValueError
+        return cls
+
+    def to_url(self, value):
+        return value.__name__
+</code></pre>
+
+<p>Usage in your <code>urls.py</code>:</p>
+
+<pre><code>from django.urls import path, register_converter
+
+from . converters import DeletableConverter
+
+
+register_converter(DeletableConverter, 'deletable')
+
+
+urlpatterns = [
+    …,
+    path('delete/&lt;deletable:model&gt;/&lt;int:object_id&gt;', views.delete),
+    …,
+]
+</code></pre>
+
+<p>And in your view:</p>
+
+<pre><code>def delete(request, model, object_id):
+    instance = get_object_or_404(model, id=object_id)
+    if instance.can_delete(request.user):
+        # or a simple @staff_member_required decorator
+        instance.delete()
+    redirect(dashboard)
+</code></pre>
+    </div>

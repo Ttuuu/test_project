@@ -1,0 +1,59 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You've received good style advice so far.</p>
+
+<p>But your pool doesn't work. So let's try to address that.</p>
+
+<h1>1. 'resize' is both wrong and not needed.</h1>
+
+<p>As others mentioned, it's not thread safe. Making it so is exceedingly difficult. And in practice, you don't need to change the thread pool's size after after start.</p>
+
+<h1>2. You only use one thread at a time.</h1>
+
+<p>In threadManager(), you execute jobs with the mutex taken. That means a single job a time can be executed, negating the very reason you created the pool in the first place. </p>
+
+<p>Fix it by copying the job to a local variable, pop it from the queue, unlock the mutex and only then execute it.</p>
+
+<h1>3. shared_ptr is slower than unique_ptr </h1>
+
+<p>and not needed for the jobs queue. But best to get rid of them both, as suggested at #6.</p>
+
+<h1>4. detach() is lazy and dangerous</h1>
+
+<p>There are only few good uses of it in practice, because it will kill threads at program exit, rather than gracefully wait for jobs to be completed. </p>
+
+<p>Replace it with join() in the class destructor. (One more reason to stop using that singleton that a few others explain it's bad).</p>
+
+<p>You will need to add extra code to control the exit:</p>
+
+<ul>
+<li>add an atomic bool isStopping. </li>
+<li>initialize it to false in the constructor's initializer list. </li>
+<li>On destructor, set it to true. </li>
+<li>Then call notify_all() on the condition variable. This way all threads are woken up and can test for the value of isStopping. </li>
+<li>in threadManager(), before <em>and</em> after executing the job, check if isStopping is set to true, and return if needed, exiting the thread.</li>
+</ul>
+
+<p>You will also need to adjust the condition variable lambda to return if isStopping is true.</p>
+
+<ul>
+<li>Finally, back in the destructor, call join() on all threads.</li>
+</ul>
+
+<p>You can play with two different exit strategies: execute all pending jobs first or discard them. Discarding is a good default, because otherwise the exit will be delayed for an unspecified amount of time untill the queue is processed.</p>
+
+<h1>5. That singleton</h1>
+
+<p>It not only prevents you from closing the thread pool gracefully (because singleton destructors are called very late in the exit process, but can prevent genuine use-cases of your pool. Let's say you want to process two kinds of tasks - one whick is very fast and one which is very slow. Imagine you queue many slow tasks in the pool, which will make the fast tasks wait for them all to be executed.</p>
+
+<p>Having two pools, one for the fast, one for the slow ones allows you to separate resources and offer better performance for the fast ones.</p>
+
+<h1>6. You can replace both Job and AnyJob with std::function</h1>
+
+<p>and a proper initializer with a lambda which captures the packaged_task.</p>
+
+<h1>7. There is no good default for number of threads</h1>
+
+<p>A purely computational load - like scientific simulations - running on a dedicated server will best work with a thread per core (actually even this basic assumption is wrong in the face of hyperthreading). But this is a tiny minority of cases. If you do I/O, you can use effectively many more threads than cores. If you use multiple pools for different parts of your app (one for I/O, one for processing), you'll need to choose wisely the resource distribution between them. And in a server shared by more than one app, you need to keep other tenants in mind.</p>
+
+<p>I suggest removing the use of hardware_concurrency altogether. It invites the user to take lazy and poor decisions.</p>
+    </div>

@@ -1,0 +1,103 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>For SIMD optimization, I tried doing it with SSE2, as the compilation flags imply SSSE3 is disabled, and SSE3 is not useful here. </p>
+
+<p>It's mostly a transliteration of the scalar code, but there are a few points of interest:</p>
+
+<ul>
+<li>Except the squaring of <code>gx</code> and <code>gy</code> which is done in 32bit, and taking the square root which is done in floating point, most arithmetic is done in 16bit. That shouldn't change the results as everything fits well within the margins.</li>
+<li>16bit is more than 8bit, so basically there is a choice between doing some half-wide loads and stores, or "doubling" the code. Often "doubling" the code is a little faster because it gets more arithmetic done with the same number of loads and stores, but that didn't pan out this time. So I used the less-common <code>_mm_loadl_epi64</code> and the corresponding store. Note that these notionally take a pointer to <code>__m128i</code>, but they <em>actually</em> just load and store a qword (with no alignment restriction).</li>
+<li><code>_mm_madd_epi16</code> is used for the <code>gx*gx + gy*gy</code> expression, which requires interleaving <code>gx</code> and <code>gy</code>, but is still more convenient than the alternatives.</li>
+<li>There is no good way to conditionally <em>not</em> write a byte somewhere in the middle of a qword store, so for gradients less than 20 I write a zero, which is definitely different than the scalar code (but maybe safer anyway)</li>
+<li>SSE2 has no single instruction to take an absolute value, but SSSE3 does. I didn't use it, but I factored it out so it can easily be updated if SSSE3 support can be assumed someday.</li>
+<li>I paid no particular attention to alignment. The qword loads and stores don't care that much about alignment inherently, but on Core2 it is nevertheless Quite Bad to cross a cache line that way. If Core2 is a serious target, perhaps that aspect can be improved.</li>
+<li>No testing was done other than for performance.</li>
+</ul>
+
+<p>The results on <a href="http://quick-bench.com/HqyPJN8LIH2GZ_s0aiVPZlbpEiw" rel="nofollow noreferrer">quick-bench</a> are OK but not amazing, about an 4x improvement (the final code there is labeled Gradient2). But maybe that's all we can hope for, given that there are square roots to be done. Of course you can still add threading on top of this which should (mostly) stack multiplicatively.</p>
+
+<pre><code>#include &lt;x86intrin.h&gt;
+
+__m128i abs_epi16(__m128i x)
+{
+    __m128i m = _mm_srai_epi16(x, 15);
+    return _mm_xor_si128(_mm_add_epi16(x, m), m);
+}
+
+void Gradient(unsigned char *smoothImg, short *gradImg, unsigned char* dirImg, size_t rows, size_t cols) {
+    for (size_t i = 1; i + 1 &lt; rows; i++) {
+        size_t j = 1;
+        // do blocks of 8 pixels at the time until near the edge
+        for (; j + 8 &lt; cols; j += 8) {
+            __m128i zero = _mm_setzero_si128();
+            // com1
+            __m128i img1 = _mm_loadl_epi64((__m128i*)&amp;smoothImg[(i + 1)*cols + j + 1]);
+            __m128i img2 = _mm_loadl_epi64((__m128i*)&amp;smoothImg[(i - 1)*cols + j - 1]);
+            __m128i img1A = _mm_unpacklo_epi8(img1, zero);
+            __m128i img2A = _mm_unpacklo_epi8(img2, zero);
+            __m128i com1 = _mm_sub_epi16(img1A, img2A);
+            // com2
+            __m128i img3 = _mm_loadl_epi64((__m128i*)&amp;smoothImg[(i - 1)*cols + j + 1]);
+            __m128i img4 = _mm_loadl_epi64((__m128i*)&amp;smoothImg[(i + 1)*cols + j - 1]);
+            __m128i img3A = _mm_unpacklo_epi8(img3, zero);
+            __m128i img4A = _mm_unpacklo_epi8(img4, zero);
+            __m128i com2 = _mm_sub_epi16(img3A, img4A);
+            // gx
+            __m128i img5 = _mm_loadl_epi64((__m128i*)&amp;smoothImg[i*cols + j + 1]);
+            __m128i img6 = _mm_loadl_epi64((__m128i*)&amp;smoothImg[i*cols + j - 1]);
+            __m128i img5A = _mm_unpacklo_epi8(img5, zero);
+            __m128i img6A = _mm_unpacklo_epi8(img6, zero);
+            __m128i gx = _mm_add_epi16(_mm_add_epi16(com1, com2), _mm_sub_epi16(img5A, img6A));
+            // gy
+            __m128i img7 = _mm_loadl_epi64((__m128i*)&amp;smoothImg[(i + 1)*cols + j]);
+            __m128i img8 = _mm_loadl_epi64((__m128i*)&amp;smoothImg[(i - 1)*cols + j]);
+            __m128i img7A = _mm_unpacklo_epi8(img7, zero);
+            __m128i img8A = _mm_unpacklo_epi8(img8, zero);
+            __m128i gy = _mm_add_epi16(_mm_sub_epi16(com1, com2), _mm_sub_epi16(img7A, img8A));
+            // sum
+            // gx and gy are interleaved, multiplied by themselves and
+            // horizontally added in pairs, creating gx*gx+gy*gy as a dword
+            // 32bits is required here to avoid overflow, but also convenient for the next step
+            __m128i gxgyL = _mm_unpacklo_epi16(gx, gy);
+            __m128i gxgyH = _mm_unpackhi_epi16(gx, gy);
+            __m128i lensqL = _mm_madd_epi16(gxgyL, gxgyL);
+            __m128i lensqH = _mm_madd_epi16(gxgyH, gxgyH);
+            __m128i lenL = _mm_cvttps_epi32(_mm_sqrt_ps(_mm_cvtepi32_ps(lensqL)));
+            __m128i lenH = _mm_cvttps_epi32(_mm_sqrt_ps(_mm_cvtepi32_ps(lensqH)));
+            __m128i sum = _mm_packs_epi32(lenL, lenH);
+
+            // store gradient lengths
+            size_t index = i*cols + j;
+            _mm_storeu_si128((__m128i*)&amp;gradImg[index], sum);
+
+            // classify H/V/low
+            __m128i thresholdLow = _mm_set1_epi16(19);
+            __m128i markerV = _mm_set1_epi8(1);
+            __m128i isSignificant = _mm_cmpgt_epi16(sum, thresholdLow);
+            __m128i isHorizontal = _mm_cmplt_epi16(abs_epi16(gx), abs_epi16(gy));
+            // if not horizontal, then 1 - 0 = 1
+            // if horizontal,  then 1 - (-1) = 2
+            // if not significant, then make it zero
+            __m128i classifier = _mm_and_si128(_mm_sub_epi16(markerV, isHorizontal), isSignificant);
+            _mm_storel_epi64((__m128i*)&amp;dirImg[index], _mm_packs_epi16(classifier, classifier));
+        }
+        for (; j + 1 &lt; cols; j++) {
+            int com1 = smoothImg[(i + 1)*cols + j + 1] - smoothImg[(i - 1)*cols + j - 1];                                                                                                     
+            int com2 = smoothImg[(i - 1)*cols + j + 1] - smoothImg[(i + 1)*cols + j - 1];
+
+            int gx=abs(com1+com2+(smoothImg[i*cols + j + 1] - smoothImg[i*cols + j - 1]));
+            int gy=abs(com1-com2+(smoothImg[(i + 1)*cols + j] - smoothImg[(i - 1)*cols + j]));
+
+            int sum = (int)sqrt((double)gx*gx + gy*gy);
+
+            size_t index = i*cols + j;
+
+            gradImg[index] = sum;
+            if (sum &gt;= 20) {
+                if (gx &gt;= gy) dirImg[index] = 1; //1 vertical
+                else      dirImg[index] = 2; //2 Horizontal
+            }
+        }
+    }
+}
+</code></pre>
+    </div>

@@ -1,0 +1,168 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>Code:</strong></p>
+
+<ul>
+<li><p><a href="https://stackoverflow.com/a/1453605/673679">Don't use <code>using namespace std;</code>.</a></p></li>
+<li><p>It looks like you're including more dependencies in the header than necessary (<code>cmath</code>, <code>fstream</code>, <code>cctype</code>). These are only used in the <code>.cpp</code> file, so they should be included there.</p></li>
+<li><p>Use <code>enum class</code> for type safety instead of a plain <code>enum</code>.</p></li>
+<li><p>We don't need to call <code>imageData.clear()</code> in the destructor, or even define a destructor. (The compiler generated destructor will call the <code>std::vector</code> destructor automatically).</p></li>
+<li><p>It's easier to store width and height directly in the image class, instead of getting them from the vectors.</p></li>
+<li><p>It's more efficient to store data in a one-dimensional vector of <code>width * height</code> elements, as the allocated memory is all in one place, and we aren't storing a size for each individual row vector. The index in this vector can be calculated as <code>x + width * y</code>.</p></li>
+<li><p>The file formats seem to indicate a max component value of 65535. This can be represented by a <code>std::uint16_t</code> (i.e. <code>short unsigned int</code>), so it might be better to use that for the pixel component type and for <code>maxValue</code>.</p></li>
+<li><p><code>ColorPixel()</code> can use braced init-list to return values, which is rather more concise:</p>
+
+<pre><code>Image::Pixel Image::ColorPixel(Enum_Colors color) const {
+    switch (color) {
+    case Enum_Colors::WHITE: return{ maxValue, maxValue, maxValue };
+    case Enum_Colors::BLACK: return{ 0, 0, 0 };
+    // ...
+    }
+}
+</code></pre></li>
+<li><p><code>ColorPixel()</code> should perhaps <code>assert</code> or <code>throw</code> an exception if the <code>enum</code> value is invalid, rather than returning white.</p></li>
+</ul>
+
+<hr>
+
+<p><strong>Design:</strong></p>
+
+<p>I'd suggest a slightly different architecture.</p>
+
+<p>Currently this class is doing 3 separate things:</p>
+
+<ul>
+<li>Storing image data.</li>
+<li>Converting image data from one format to another (for export to each file format).</li>
+<li>Exporting image data.</li>
+</ul>
+
+<p>It would be cleaner to split this up accordingly. Something like the following:</p>
+
+<pre><code>#include &lt;array&gt;
+#include &lt;cstdint&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+// IMAGE STORAGE:
+template&lt;class T, std::size_t Size&gt;
+struct Pixel
+{
+    std::array&lt;T, Size&gt; Data;
+};
+
+using Pixel_BW = Pixel&lt;bool, 1u&gt;;
+using Pixel_Gray8 = Pixel&lt;std::uint8_t, 1u&gt;;
+using Pixel_RGB8 = Pixel&lt;std::uint8_t, 3u&gt;;
+
+template&lt;class PixelT&gt;
+class Image
+{
+public:
+
+    Image(std::size_t width, std::size_t height, PixelT initialValue):
+        m_width(width),
+        m_height(height),
+        m_data(width * height)
+    {
+
+    }
+
+    PixelT const&amp; At(std::size_t x, std::size_t y) const
+    {
+        return m_data.at(GetIndex(x, y));
+    }
+
+    PixelT&amp; At(std::size_t x, std::size_t y)
+    {
+        return m_data.at(GetIndex(x, y));
+    }
+
+    // ...
+
+private:
+
+    std::size_t GetIndex(std::size_t x, std::size_t y) const
+    {
+        return x + m_width * y;
+    }
+
+    std::size_t m_width;
+    std::size_t m_height;
+    std::vector&lt;PixelT&gt; m_data;
+};
+
+// CONVERT:
+Image&lt;Pixel_BW&gt; ConvertRGBToBW(Image&lt;Pixel_RGB8&gt; const&amp; image)
+{
+    auto result = Image&lt;Pixel_BW&gt;(image.GetWidth(), image.GetHeight(), false);
+
+    // ... convert
+    // ... for each (x, y): result.At(x, y) = ConvertRGBPixelToBWPixel(image.At(x, y));
+
+    return result;
+}
+
+// EXPORT:
+void ExportPBM(std::string const&amp; fileName, Image&lt;Pixel_BW&gt; const&amp; data)
+{
+    // ... export
+}
+
+void ExportPGM(std::string const&amp; fileName, Image&lt;Pixel_Gray&gt; const&amp; data)
+{
+    // ... export
+}
+
+void ExportPPM(std::string const&amp; fileName, Image&lt;Pixel_RGB&gt; const&amp; data)
+{
+    // ... export
+}
+</code></pre>
+
+<p>Making <code>Pixel</code> an externally visible class and templating <code>Image</code> on it is much more flexible, and allows us to create whatever image types we need. We can access elements of the array by index, or we could use inheritance instead of typedefs to get named accessors for each component, e.g.:</p>
+
+<pre><code>struct Pixel_RGB8 : Pixel&lt;std::uint8_t, 3u&gt;
+{
+    std::uint8_t const&amp; R() const
+    {
+        return Data[0];
+    }
+
+    std::uint8_t&amp; R()
+    {
+        return Data[0];
+    }
+
+    // ... G(), B()
+};
+</code></pre>
+
+<p>This would also provide type safety for storing images with the same component types, but different meanings (e.g. RGB vs YUV).</p>
+
+<p>Since there are lots of different ways to convert an image from RGB to Grayscale (e.g. specifying different multipliers for each color component) it's more flexible to separate the conversion from the image export. Using separate functions like this does create an extra copy of the image data, but that probably isn't a concern unless working with very large images. (And we could solve that issue by creating an <code>ImageView</code> class that performs the conversion on accessing a pixel).</p>
+
+<hr>
+
+<p>This does make creating colors a little more difficult, since something like "magenta" doesn't really make sense for a black and white image. The simplest thing to do is probably to define the constants that do make sense for each pixel type:</p>
+
+<pre><code>namespace Colors
+{
+
+    constexpr auto Black_BW = Pixel_BW{ false };
+    constexpr auto White_BW = Pixel_BW{ true };
+
+    constexpr auto Black_RGB8 = Pixel_RGB8{ 0, 0, 0 };
+    constexpr auto White_RGB8 = Pixel_RGB8{ 255, 255, 255 };
+    // ...
+
+    constexpr auto Black_RGB32F = Pixel_RGB32F{ 0.f, 0.f, 0.f };
+    constexpr auto White_RGB32F = Pixel_RGB32F{ 1.f, 1.f, 1.f };
+    // ...
+
+} // Colors
+</code></pre>
+
+<p>We could perhaps use templates or multiplication to reduce duplication between different RGB pixel types.</p>
+
+<hr>
+    </div>

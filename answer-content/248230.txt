@@ -1,0 +1,33 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I am not fluent in Rust, so I cannot comment on the overall implementation. However, what I can say is that this implementation is <em>not</em> thread-safe, as it contains several race conditions.</p>
+<pre><code>let tail = self.tail.load(Ordering::Acquire, guard);
+        if tail.is_null() {
+            self.head.store(new_node, Ordering::Release);
+            self.tail.store(new_node, Ordering::Release);
+</code></pre>
+<p>If two threads observe a null pointer in <code>tail</code>, both directly update <code>head</code>/<code>tail</code>. This is obviously a race condition. Instead, you need to create an empty dummy node during initialization of the queue (i.e., the queue always has to hold at least one node; it is empty if <code>head == tail</code>).</p>
+<p>I am not sure what you mean by this comment:</p>
+<pre><code>// Unlike the enqueue algorithm described in M&amp;S's paper, we don't need to check if the tail is consistent
+// between now and our CAS on the tail. Our `guard` ensures this.
+</code></pre>
+<p>The <code>guard</code> is part of the reclamation scheme (epoch based reclamation in this case), and it only prevents you from deleting a node that might still be accessed by some other thread. But it does not prevent tail from getting changed right under your nose.</p>
+<pre><code>            let mut tail_node = unsafe { tail.deref() };
+            let mut next = tail_node.next.load(Ordering::Acquire, guard);
+
+            // Here we swing the tail forward if the last node in the queue is not the current node.
+            while !next.is_null() {
+                tail_node = unsafe { next.deref() };
+                next = tail_node.next.load(Ordering::Acquire, guard);
+            }
+
+            // this is a race condition!!
+            tail_node.next.store(new_node, Ordering::Release);
+            let _ = self
+                .tail
+                .compare_and_set(tail, new_node, Ordering::Release, guard);
+</code></pre>
+<p>You cannot directly store the new node into tail`s next! This is also a race condition since other threads might be doing the same, effectively overwritting the values written by some other threads. You have to use a CAS loop for that.</p>
+<p>The same goes for updating head in <code>dequeue</code>.</p>
+<p>You might want to take a look at my implementation of the Michael Scott queue: <a href="https://github.com/mpoeter/xenium/blob/master/xenium/michael_scott_queue.hpp" rel="nofollow noreferrer">https://github.com/mpoeter/xenium/blob/master/xenium/michael_scott_queue.hpp</a><br>
+It is done in C++, but it uses a similar guard concept to solve the memory reclamation problem.</p>
+    </div>

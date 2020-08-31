@@ -1,0 +1,147 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I've come back to this question about 4 or 5 times since it was originally posted, started writing up an answer, started doubting my alternative implementation, scrapped it, and then come back about a month later. This tells me a few things:</p>
+
+<ol>
+<li>You have a tricky problem, where the "best" solution is not necessarily intuitive, and how you measure "best" can vary wildly</li>
+<li>Overall, the code is pretty good, so I can't just write a more nit-picky answer and ignore the larger question of "is this structured the right way"</li>
+</ol>
+
+<p>Because I had such a hard time with this, I'm not going to completely rewrite this, or provide an alternate implementation, or anything like that. Instead, I'm going to call out some overall architecture and design choices that I think have made this tricky, some potential solutions with pros/cons, and then leave it as an exercise for the reader to decide what they want to do.</p>
+
+<p>I'll also include a few nitpicky things about the code, because that's just who I am as a person and I'll feel bad if I don't review your code at all.</p>
+
+<p>Lastly, I've never used Django before, so its very possible a much better solution exists within the framework, or that someone else has solved the problem in another 3rd party library, or whatever. I encourage you to do your own research on if Django can make this easier.</p>
+
+<hr>
+
+<h2>The problem</h2>
+
+<blockquote>
+  <p>How can I refactor this function to make it easier to test?</p>
+</blockquote>
+
+<p>You're right that this is hard to test as-is. The most significant reason for this, IMO, is that you're mixing up a lot of magic, a lot of state that your function doesn't own, and the business logic that your function <em>does own</em>.</p>
+
+<h3>Magic</h3>
+
+<p>Your function(s) are littered with magic numbers, strings, etc. These are all things that apparently have significant meaning, and are very tightly coupled with your implementation. If you ever decide that you want your colors to change, or you want to change somethings title, or the default resource type, or whatever, then you have a lot of logic that assumes the magic.</p>
+
+<p>A good way to make this less magic, easier to test, and easier to update is to at least make all magic values constants at the beginning of the file. For example, if you do this <code>msg_state.get('resource_type', 'all')</code> then it seems a little unclear what we're doing; just some place-holder, or something more meaningful? But if you do this <code>msg_state.get('resource_type', DEFAULT_RESOURCE_TYPE)</code> then it becomes immediately clear. </p>
+
+<p>Note that you wouldn't want to do this <code>msg_state.get('resource_type', ALL_RESOURCE_TYPE)</code> because that isn't really any better than just putting <code>'all'</code> there, unless you think that the resource type meaning all would change values. </p>
+
+<p>This is also a good time to propose using <a href="https://docs.python.org/3/library/enum.html" rel="noreferrer"><code>enum</code>s</a> instead of strings, as you get runtime validation of correct values (e.g. <code>ResourceTypeEnum.lAl</code> will give you an error that <code>lAl</code> is not a valid enum, while <code>'lAl'</code> won't warn you that you typoed your string.</p>
+
+<h3>State</h3>
+
+<p>Your function to build a message depends a lot on the state of your application, of third party libraries, the framework, etc. In just this one function, you explicitly query the following kinds of state:</p>
+
+<ol>
+<li>Django state (pages and tasks)</li>
+<li>Slack state (users)</li>
+<li>Application state (message, channels, teams)</li>
+</ol>
+
+<p>This couples you really tightly with these things that your function can't control, and is the death of any truly repeatable unit testing. There are a lot of ways you could address them; for example you could make a service per state and use <a href="https://en.wikipedia.org/wiki/Dependency_injection" rel="noreferrer">dependency injection</a> or some other inversion of control methodology. This is what I was playing around with for a while, and eventually came up with a 500 line, OOPomination that was super generic and super unreadable. I don't know what support Django has for this, but I would guess that at some point someone has made dependency injection easier.</p>
+
+<p>Ultimately, I think there is room for some level of encapsulation here. It is likely worthwhile to create separate methods for the different types of work, and filtering, etc. Could you subclass <code>Page</code> or <code>AsyncTask</code> to provide a <code>slack_item</code> property? Is there a better spot in your application to filter on resource type, or team, or availability, or channel, etc?</p>
+
+<h3>Business Logic</h3>
+
+<p>Once you peel everything back, your actual logic is pretty straightforward:</p>
+
+<ol>
+<li>Get the list of resources that meet some filtering criteria</li>
+<li>Transform them into json that meets some Slack specification</li>
+<li>Send it back</li>
+</ol>
+
+<p>This part is pretty straightforward, and I don't have a lot to say about it. These each sound like good candidates for unit testing though, and might be worth splitting up that way.</p>
+
+<h2>A potential solution</h2>
+
+<p>I think whatever you do to restructure this is going to add more code and complexity (by becoming more generic/loosely coupled), and how much of that makes sense for your use-case depends. If your tool is meant to just be a quick-and-dirty tool for your team, it might not make sense to split up the code. If you want this to be around longer, or there are plans for future enhancements, this might be a good time to break things up. I think I'd roughly recommend the following:</p>
+
+<ol>
+<li>For different kinds of data (e.g. <code>Page</code> vs <code>AsyncTask</code> vs other stuff), create different methods/handlers/classes/whatever for each one that is responsible for transforming it into the Slack format json. A perfect solution would be able to take advantage of duck-typing, where you could just do <code>input_object.to_slack_json()</code> </li>
+<li>Play around with the filtering - can this be done by the caller instead of your application? Can you encapsulate how to do it in the same per-type method/handler/class/whatever as previously suggested?</li>
+<li>Instead of getting your state within the function, pass it in instead. Then it can be truly independent of how it is being run, and the unit test can construct the input as desired.</li>
+</ol>
+
+<hr>
+
+<p>As promised, here are some </p>
+
+<h2>Little nitpicky things</h2>
+
+<p>When doing this:</p>
+
+<pre><code>if not msg_state:
+    msg_state = {}
+</code></pre>
+
+<p>It may be easier to write it this way: <code>msg_state = msg_state or {}</code>. <code>or</code> will pick the first truthy-element, or the last non-truthy element (e.g. the empty dictionary).</p>
+
+<hr>
+
+<p>Instead of using this (and needlessly building lists just to throw them away)</p>
+
+<pre><code>attachments = [
+    _build_filters(resource_type, availability),
+    *[_build_page_item(p, user) for p in pages],
+    *[_build_async_task_item(at, user) for at in async_tasks]
+]
+</code></pre>
+
+<p>Consider using <a href="https://docs.python.org/3.7/library/itertools.html#itertools.chain" rel="noreferrer"><code>itertools.chain</code></a>:</p>
+
+<pre><code>attachments = list(
+    itertools.chain(
+        (_build_filters(resource_type, availability), ),
+        (_build_page_item(p, user) for p in pages),
+        (_build_async_task_item(at, user) for at in async_tasks)
+    )
+)
+</code></pre>
+
+<hr>
+
+<p>Instead of using <code>list</code> + <code>filter</code>, and <code>lambda</code> functions that add just a bit of extra mental overhead</p>
+
+<pre><code>selected_resource_types = list(filter(
+    lambda t: t['value'] == resource_type, resource_types))
+
+selected_availability_choices = list(filter(
+    lambda a: a['value'] == availability, availability_choices))
+</code></pre>
+
+<p>Use a list comprehension</p>
+
+<pre><code>selected_resource_types = [
+    rt for rt in resource_types if resource_type["value"] == rt
+]
+
+selected_availability_choices = [
+    ac for ac in availability_choices if availability["value"] == ac 
+]
+</code></pre>
+
+<p>Or, define a class that represents a Slack option, or a selection of Slack options, and encapsulate this logic in that class. Then you don't have to repeat yourself between <code>resource_types</code> and <code>availability_choices</code>.</p>
+
+<p>Rough outline:</p>
+
+<pre><code>class SlackOption:
+
+    def __init__(self, text, value):
+        self.text = text
+        self.value = value
+
+class SlackOptions:
+
+    def __init__(self, choices):
+        self.choices = choices
+
+    def get_selection(self, choice):
+        return [option for option in self.choices if option.value == choice]
+</code></pre>
+    </div>

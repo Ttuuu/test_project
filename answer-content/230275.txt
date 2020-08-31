@@ -1,0 +1,123 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You're doing multiple clone operations because of the types you've used. Due to the fact that consul's KV store is a <strong>tree</strong>, it does not really make that much sense to represent it as a set of nested <code>Vec</code>s. As I'm sure you found out, you're running into serious issues trying to figure out whether keys are inserted, what keys are inserted, and how to modify them without getting the borrow checker in a twist.</p>
+
+<p>I'd like to share with you a <a href="https://play.rust-lang.org/?version=stable&amp;mode=debug&amp;edition=2018&amp;gist=be066aca1540aab0fa333e7563b75e03" rel="nofollow noreferrer"><strong>simpler implementation</strong></a>, one that sidesteps all the problems you've had entirely. Since we're dealing with a KV tree, we can and should take advantage of a <code>HashMap</code> for this - its type is absolutely ideal for what we are about to do. We're going to define two enum types, one for the keys, one for the value:</p>
+
+<pre><code>#[derive(Eq, PartialEq, Hash, Debug)]
+pub enum Key {
+    Leaf(String),
+    Branch(String)
+}
+
+#[derive(Eq, PartialEq, Debug)]
+pub enum Node {
+    Leaf {
+        key: String,
+        value: String
+    },
+    Branch {
+        key: String,
+        children: HashMap&lt;Key, Node&gt;
+    }
+}
+</code></pre>
+
+<p>We're going to then proceed through a little game of indirection to avoid some of the reference issues we might encounter...</p>
+
+<pre><code>impl Node {
+    fn insert_key(children: &amp;mut HashMap&lt;Key, Node&gt;, key: String, value: String) {
+        match children.entry(Key::Leaf(key.clone())) {
+            Entry::Occupied(mut state) =&gt; {
+                state.insert(Node::Leaf {
+                    key: key,
+                    value: value
+                });
+            },
+            Entry::Vacant(state) =&gt; {
+
+                state.insert(Node::Leaf {
+                    key: key,
+                    value: value
+                });
+            }
+        }
+    }
+    fn branch(children: &amp;mut HashMap&lt;Key, Node&gt;, key: String, remainder: Vec&lt;String&gt;, value: String) {
+        match children.entry(Key::Branch(key.clone())) {
+            Entry::Occupied(mut state) =&gt; {
+                // We already have a branch of that name, we just
+                // forward the call and move on
+                state.get_mut().add_value(remainder, value)
+            },
+            Entry::Vacant(state) =&gt; {
+                // We need to create the node
+                let mut node = Node::Branch {
+                    key: key,
+                    children: HashMap::new()
+                };
+                let status = node.add_value(remainder, value);
+                state.insert(node);
+                status
+            }
+        };
+    }
+    pub fn get(&amp;self, test: &amp;Key) -&gt; Option&lt;&amp;Node&gt; {
+        match self {
+            Node::Branch {
+                key: _key,
+                ref children
+            } =&gt; children.get(test),
+            _ =&gt; None
+        }
+    }
+    pub fn add_value(&amp;mut self, mut path: Vec&lt;String&gt;, value: String) {
+        (match self {
+            Node::Leaf {
+                key: _key,
+                value: _value
+            } =&gt; None,
+            Node::Branch {
+                key: _key,
+                ref mut children
+            } =&gt; Some(children)
+        }).map(|contents| {
+            match path.len() {
+                0 =&gt; panic!("Path cannot be empty"),
+                1 =&gt; Node::insert_key(contents, path.pop().unwrap(), value),
+                _ =&gt; Node::branch(contents, path.pop().unwrap(), path, value)
+            }
+        });
+    }
+}
+</code></pre>
+
+<p>And finally, we create a method to construct our tree:</p>
+
+<pre><code>pub fn into_tree(collection: Vec&lt;RawKV&gt;) -&gt; Node {
+    // Create the root namespace
+    println!("Creating nodes");
+    let mut root_node = Node::Branch {
+        key: "/".to_string(),
+        children: HashMap::new()
+    };
+
+    for node in collection {
+        let mut path_elements:Vec&lt;String&gt; = node.key.split("/").map(|r| r.to_string()).collect();
+        path_elements.reverse();
+        root_node.add_value(path_elements, node.value);
+    }
+
+    root_node
+}
+</code></pre>
+
+<p>This is more efficient than your method in multiple respects:</p>
+
+<ul>
+<li>Less allocations (I am not copying nodes unless I absolutely <em>have</em> to)</li>
+<li>Less re-processing (no use of <code>group_by</code>, no <code>partition</code>, nothing but recursive tree access)</li>
+<li>Clearer code</li>
+</ul>
+
+<p>Let me know what you think :-)</p>
+    </div>

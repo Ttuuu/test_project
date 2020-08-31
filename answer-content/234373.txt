@@ -1,0 +1,106 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>It is fine to read the body and replace it, although see <a href="https://golang.org/pkg/io/ioutil/#NopCloser" rel="nofollow noreferrer">ioutil.NopCloser</a>.</p>
+
+<p>However, </p>
+
+<ul>
+<li>it does not make sense to duplicate the <a href="https://golang.org/pkg/net/http/#Request" rel="nofollow noreferrer">http.Request</a> type. Re use it instead. If you need finer control, embed it.</li>
+<li>take care to make true copy when passing around slices, maps and pointers.</li>
+<li>the code is lacking structured factorization, make use of <a href="https://golang.org/ref/spec#Types" rel="nofollow noreferrer">type</a> definition</li>
+</ul>
+
+<p>This is a revised version i suggest,</p>
+
+<pre><code>package main
+
+import (
+    "bytes"
+    "flag"
+    "io"
+    "io/ioutil"
+    "log"
+    "net/http"
+    "net/url"
+    "regexp"
+    "sync"
+
+    "github.com/elazarl/goproxy"
+)
+
+type store struct {
+    requests map[string][]http.Request
+    sync.Mutex
+}
+
+func (s *store) Add(r *http.Request) {
+    var c http.Request
+    c.Method = r.Method
+    c.Proto = r.Proto
+    c.ProtoMajor = r.ProtoMajor
+    c.ProtoMinor = r.ProtoMinor
+    c.Host = r.Host
+    c.RequestURI = r.RequestURI
+    c.ContentLength = r.ContentLength
+    c.URL = r.URL
+
+    c.Header = http.Header{}
+    for k, vv := range r.Header {
+        for _, v := range vv {
+            c.Header.Set(k, v)
+        }
+    }
+
+    c.PostForm = url.Values{}
+    for k, vv := range r.PostForm {
+        for _, v := range vv {
+            c.PostForm.Set(k, v)
+        }
+    }
+
+    c.Form = url.Values{}
+    for k, vv := range r.Form {
+        for _, v := range vv {
+            c.Form.Set(k, v)
+        }
+    }
+
+    var b bytes.Buffer
+    io.Copy(&amp;b, r.Body)
+    r.Body.Close()
+    buf := b.Bytes()
+
+    var b1 bytes.Buffer
+    b1.Write(buf)
+    r.Body = ioutil.NopCloser(&amp;b1)
+
+    c.Body = ioutil.NopCloser(bytes.NewBuffer(buf))
+
+    key := r.URL.Host
+    s.Lock()
+    s.requests[key] = append(s.requests[key], c)
+    s.Unlock()
+}
+
+type storeHandler struct {
+    requests *store
+}
+
+func (s storeHandler) Handle(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+    s.requests.Add(r)
+    return r, nil
+}
+
+func main() {
+    h := storeHandler{requests: &amp;store{requests: map[string][]http.Request{}}}
+
+    proxy := goproxy.NewProxyHttpServer()
+    proxy.OnRequest(goproxy.ReqHostMatches(regexp.MustCompile("^.*$"))).
+        HandleConnect(goproxy.AlwaysMitm)
+    proxy.OnRequest().DoFunc(h.Handle)
+
+    addr := flag.String("addr", ":8080", "proxy listen address")
+    flag.Parse()
+    log.Fatal(http.ListenAndServe(*addr, proxy))
+}
+</code></pre>
+    </div>

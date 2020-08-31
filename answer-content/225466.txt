@@ -1,0 +1,94 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This part looks ripe for refactoring:</p>
+
+<pre><code>        top_k = Tuple(argmin()).as_vector();
+        // Insert a single element into a sorted list without actually branching
+        top_k.push_back(next_val);
+        top_k.push_back(next_x);
+        top_k.push_back(next_y);
+        for (int i = k; i &gt; 0; i--) {
+            Expr prev_val = top_k[(i-1)*3];
+            Expr prev_x = top_k[(i-1)*3 + 1];
+            Expr prev_y = top_k[(i-1)*3 + 2];
+            Expr should_swap = top_k[i*3] &lt; prev_val;
+
+            top_k[(i-1)*3] = select(should_swap, top_k[i*3], prev_val);
+            top_k[(i-1)*3 + 1] = select(should_swap, top_k[i*3 + 1], prev_x);
+            top_k[(i-1)*3 + 2] = select(should_swap, top_k[i*3 + 2], prev_y);
+            top_k[i*3] = select(should_swap, prev_val, top_k[i*3]);
+            top_k[i*3 + 1] = select(should_swap, prev_x, top_k[i*3 + 1]);
+            top_k[i*3 + 2] = select(should_swap, prev_y, top_k[i*3 + 2]);
+        }
+        // Discard the k+1th element
+        top_k.pop_back(); top_k.pop_back(); top_k.pop_back();
+</code></pre>
+
+<p>If I understand correctly, what you're doing here is bubble-sorting a triple <code>(next_val, next_x, next_y)</code> into the proper place in vector <code>top_k</code>, and then removing the now-smallest triple from the vector.</p>
+
+<p>The first thing you could do is use proper data types. Instead of triples of ints (and the continual multiplications-by-<code>3</code> that entails), you should make a struct type, like</p>
+
+<pre><code>struct Triple {
+    int x;
+    int y;
+    int value;
+    struct descending {
+        bool operator()(const Triple&amp; a, const Triple&amp; b) const {
+            return a.value &gt; b.value;
+        }
+    };
+};
+</code></pre>
+
+<p>And then your insertion can become</p>
+
+<pre><code>std::vector&lt;Triple&gt; top_k = [...]
+Triple new_item = { next_x, next_y, next_val };
+auto insertion_point = std::lower_bound(top_k.begin(), top_k.end(), new_item, Triple::descending);
+top_k.insert(insertion_point, new_item);
+top_k.pop_back();
+</code></pre>
+
+<p>(Or maybe my <code>descending</code> should be <code>ascending</code>. I didn't expend many brain cells on it.)</p>
+
+<hr>
+
+<p>If your algorithm <em>depends</em> on this operation, then (A) maybe you should use a <code>priority_queue</code>, (B) maybe you should use a <code>priority_queue</code> that supports the <a href="https://quuxplusone.github.io/blog/2018/04/27/pq-replace-top/" rel="nofollow noreferrer"><code>replace_top</code> operation</a>, and (C) <em>certainly</em> you should use something that never allocates memory in your inner loop.</p>
+
+<p>Right now it seems you're spending a lot of time resizing STL containers in the inner loop, which causes heap traffic. For performance, instead of</p>
+
+<pre><code>for (int yi = 0; yi &lt; left_buffer.height(); yi++) {
+    for (int xi = 0; xi &lt; left_buffer.width() - 2; xi++) {
+        [...]
+        vector&lt;pair&lt;Expr, Expr&gt;&gt; scan_range = {scan_width, scan_height};
+</code></pre>
+
+<p>you should do</p>
+
+<pre><code>vector&lt;pair&lt;Expr, Expr&gt;&gt; scan_range(2);
+for (int yi = 0; yi &lt; left_buffer.height(); yi++) {
+    for (int xi = 0; xi &lt; left_buffer.width() - 2; xi++) {
+        [...]
+        scan_range[0] = scan_width;
+        scan_range[1] = scan_height;
+</code></pre>
+
+<p>This puts the heap allocation <em>outside</em> the inner loop, which means now you're doing 1 allocation where in your original code you're doing <code>left_buffer.height()*(left_buffer.width() - 2)</code> allocations.</p>
+
+<p>Applying this strategy to your other allocations (e.g. <code>top_k</code> itself) should give a <em>huge</em> performance boost.</p>
+
+<hr>
+
+<p>EDIT: Looking for more wasted cycles in your updated code, I see the following four lines at the end of your loop:</p>
+
+<pre><code>        argmin.compile_to_lowered_stmt("argmin.html", {}, HTML);
+//            cout&lt;&lt;"(184)"&lt;&lt;endl;
+        Realization real = argmin.realize(); //1.5 ms
+//            cout&lt;&lt;"(186)"&lt;&lt;endl;
+</code></pre>
+
+<p>Variable <code>real</code> is never used, so you can eliminate it. If I'm interpreting that comment correctly, eliminating <code>real</code> will save you 1.5ms per loop.</p>
+
+<p><code>argmin.compile_to_lowered_stmt(...)</code> seems to be Halide's equivalent of a "debugging printf." It will do a lot of work to compile the function, and then also open a file, write to it, and close the file again. Those are both horribly slow operations. So unless you <em>need</em> <code>argmin.html</code> — and I don't see how you possibly could, since you overwrite it for every pixel of the input — you should eliminate this line.</p>
+
+<p>In general, when you're trying to make something run fast, you should go over each line with a critical eye and ask, "How expensive is this line? What benefit does this line get me?" If it's expensive and has no benefit, then remove or rewrite it.</p>
+    </div>

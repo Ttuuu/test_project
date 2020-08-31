@@ -1,0 +1,296 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Testability</h1>
+
+<p>This is my main concern when creating an API that talks to external references, in this case <em>The CAN library</em>. 
+The problem with this library is that we are forced to consume a static class <code>PCANbasic</code>. 
+There is no interface provided for us to work with. Testing our own code depends on a connection to the CAN bus.</p>
+
+<blockquote>
+<pre><code>// static class is a tight dependency, hard to mock out
+PCANBasic.Write(_handle, ref msg);
+</code></pre>
+</blockquote>
+
+<p>Therefore, it is up to us to create an interface, an implementation using the static library and use a variable of this interface <code>_canBusService</code> in <code>CanbusConnection</code>. This way, we can </p>
+
+<ul>
+<li>mock the library for unit tests</li>
+<li>use a different version of the library (considering the signatures remain)</li>
+</ul>
+
+<p>interface <code>ICanService</code></p>
+
+<pre><code>public interface ICanService : IDisposable
+{ 
+    TPCANHandle Handle { get; }
+    bool Initialize();
+    TPCANStatus Read(out TPCANMsg message);
+    void Write(ref TPCANMsg message);
+}
+</code></pre>
+
+<p>implementation <code>CanService</code></p>
+
+<pre><code>public class CanService : ICanService
+{
+    public TPCANHandle Handle { get; private set; }
+
+    public bool Initialize()
+    {
+        // Handle = [redacted]
+        return true;
+    }
+
+    public TPCANStatus Read(out TPCANMsg message)
+    {
+        return PCANBasic.Read(Handle, out message);
+    }
+
+    public void Read(ref TPCANMsg message)
+    {
+        PCANBasic.Write(Handle, ref message);
+    }
+
+    public void Dispose()
+    {
+        PCANBasic.Uninitialize(Handle);
+        Handle = 0;
+    }
+}
+</code></pre>
+
+<hr>
+
+<h1>Data Integrity</h1>
+
+<p>You have stated in the comments that the library is half-duplex, non-concurrent. This simplifies design, but still requires measures to enforce thread-safety.</p>
+
+<p>Consider using a lock for <code>Open</code> and <code>WriteCanMsg</code> to avoid race conditions.</p>
+
+<pre><code>public object SyncRoot { get; } // .. create a new object() in the constructor
+</code></pre>
+
+<p>method <code>Open</code></p>
+
+<p>Since no lock is used, another thread can call the method after we think it is not opened.</p>
+
+<blockquote>
+<pre><code>if (IsOpen) { return true; }
+// .. other code that assumes IsOpen == false
+</code></pre>
+</blockquote>
+
+<p>We no longer store the handle and use the newly created interface.</p>
+
+<blockquote>
+  <p><code>IsOpen = TryInitializePCANChannel(out _handle);</code></p>
+</blockquote>
+
+<pre><code>IsOpen = _canBusService.Initialize();
+</code></pre>
+
+<p>What happens if the call was not succesfull?</p>
+
+<blockquote>
+<pre><code>if(IsOpen)
+{
+    _canbusListenerThread = new Thread(new ThreadStart(CanbusListener));
+    _canbusListenerThread.Start();
+} // else ??
+</code></pre>
+</blockquote>
+
+<p>Invert the condition and trow on failure.</p>
+
+<pre><code>if (!IsOpen)
+{
+    throw new IOException("Failure initializing CAN bus");
+}
+</code></pre>
+
+<p>Use <code>throw</code> to keep the original stacktrace.</p>
+
+<blockquote>
+<pre><code>catch(Exception ex)
+{
+    Log.Error("Error opening PCAN connection: {Message}, Error: {Error}", ex.Message, ex);
+    throw ex;
+}
+</code></pre>
+</blockquote>
+
+<pre><code>catch(Exception ex)
+{
+    Log.Error("Error opening PCAN connection: {Message}, Error: {Error}", ex.Message, ex);
+    throw;   // preserves stacktrace
+}
+</code></pre>
+
+<p>refactor <code>Open</code></p>
+
+<pre><code>public bool Open()
+{
+    lock (SyncRoot)
+    {
+        if (IsOpen) { return true; }
+
+        try
+        {
+            IsOpen = _canBusService.Initialize();
+            if (!IsOpen)
+            {
+                throw new IOException("Failure initializing CAN bus");
+            }
+            _canbusListenerThread = new Thread(new ThreadStart(CanbusListener));
+            _canbusListenerThread.Start();
+        }
+        catch(Exception ex)
+        {
+            Log.Error("Error opening PCAN connection: {Message}, Error: {Error}", ex.Message, ex);
+            throw;
+        }
+        return success;
+    }
+}
+</code></pre>
+
+<p>method <code>WriteCanMsg</code></p>
+
+<p>Guard against bad user input.</p>
+
+<pre><code>msg = msg ?? throw new ArgumentNullException(nameof(msg));
+</code></pre>
+
+<p>Same tips as with <code>Open</code>: use lock, interface, throw</p>
+
+<p>refactor <code>WriteCanMsg</code></p>
+
+<pre><code>public void WriteCanMsg(TPCANMsg msg)
+{
+    msg = msg ?? throw new ArgumentNullException(nameof(msg));
+    lock (SyncRoot)
+    {
+        try
+        {
+            _canBusService.Write(ref msg);
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Error writing CAN message: {Error}, Bytes: {Bytes}", ex.Message, String.Join(" ", msg.DATA));
+            throw;
+        }
+    }
+}
+</code></pre>
+
+<p>The commands should reuse the lock. For instance, <code>CommandBase</code></p>
+
+<pre><code> //lock (connection)
+ lock (connection.SyncRoot)
+ {
+     connection.CanbusPacketReceived += Connection_CanbusPacketReceived;
+     connection.WriteCanMsg(msg);
+ }
+</code></pre>
+
+<p>refactor <code>CanbusListener</code> to use <code>_canBusService</code></p>
+
+<pre><code>// ..
+while(_canBusService.Read(out msg) == TPCANStatus.PCAN_ERROR_OK)
+{
+    // ..
+}
+// ..
+Thread.Sleep(100); // &lt;- I am surprised this is required. 
+                   //    I would expect `_canBusService.Read` to be blocking.
+</code></pre>
+
+<hr>
+
+<h1>Resource Management</h1>
+
+<p>Let <code>Close</code> do the actual work.</p>
+
+<pre><code>public void Close()
+{  
+    lock (SyncRoot) 
+    {
+        if (IsOpen)
+        {
+           _canBusService.Dispose();
+           if(_canbusListenerThread.IsAlive &amp;&amp; !_canbusListenerThread.Join(200))
+           {
+               _canbusListenerThread.Abort();
+           }
+        }
+    }
+}
+</code></pre>
+
+<p>Have <code>Dispose</code> calling <code>Close</code>. You could also refactor <code>Dispose</code> to use the dispose pattern. Clear event listeners and provide a destructor.</p>
+
+<pre><code>public void Dispose()
+{
+    Dispose(true);
+    GC.SuppressFinalize(this);
+}
+
+~CanbusConnection()
+{
+    Dispose(false);
+}
+
+protected virtual void Dispose(bool disposing)
+{
+    if (disposing)
+    {
+        CanbusPacketReceived = null;
+    }
+    Close();
+}
+</code></pre>
+
+<hr>
+
+<h1>Separation of Concerns</h1>
+
+<ul>
+<li>I would not expect <code>CommandBase</code> to have an operation 
+<code>protected async Task&lt;bool&gt; ExecuteCommandBase(CanbusConnection connection, TPCANMsg msg)</code>. 
+This should be a method on <code>CanbusConnection</code> as 
+<code>public async Task&lt;bool&gt; ExecuteCommand(CommandBase command)</code>.</li>
+<li>Each specific command should provide a method <code>BuildMessage()</code> which would create the <code>TPCANMsg</code> from own state.</li>
+</ul>
+
+<p>code <code>CanbusConnection.ExecuteCommand</code></p>
+
+<pre><code>public class CanbusConnection
+{
+    // ..
+
+    public async Task&lt;bool&gt; ExecuteCommand(CommandBase command)
+    {
+        var message = command.BuildMessage();
+        // continue implementation with 'message' ..
+    }
+}
+</code></pre>
+
+<p>code <code>CmdMpuSerialNumber.BuildMessage</code></p>
+
+<pre><code>public class CmdMpuSerialNumber : CommandBase
+{
+    // ..
+
+    public TPCANMsg BuildMessage()
+    {
+        var msg = new TPCANMsg();
+        msg.DATA = new byte[] { 0xAA, 0xAA, 0x08, 0x08, 0, 0, 0, 0 };
+        msg.LEN = 8;
+        msg.MSGTYPE = TPCANMessageType.PCAN_MESSAGE_EXTENDED;
+        msg.ID = (uint)CanbusAddress.PC;
+        return msg;
+    }
+}
+</code></pre>
+    </div>

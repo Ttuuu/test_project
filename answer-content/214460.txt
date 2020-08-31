@@ -1,0 +1,199 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The classic Python file structure is this:</p>
+
+<pre><code>import this
+
+CONSTANT = None
+
+class Foo:
+    def methods(self):
+        pass
+
+def function():
+    pass
+
+def main():
+    pass
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+
+<p>While you do have all of those elements, by putting the classes all the way at the end you had me quite confused.</p>
+
+<hr>
+
+<p>In your <code>regex</code> function you are just printing the name of the exception, not the exception text. So you will always just get back <code>ValueError: &lt;class 'sre_constants.error'&gt;</code> instead of a helpful description. Just use <code>as</code>:</p>
+
+<pre><code>def regex(string: str) -&gt; Pattern:
+    """Returns a regular expression."""
+    try:
+        return compile(string)
+    except error as e:
+        raise ValueError(str(e))
+</code></pre>
+
+<hr>
+
+<p>For the command line interface I would use the functionalities <code>argparse</code> supplies for multiple arguments, instead of parsing it yourself:</p>
+
+<pre><code>def get_args(args=None):
+    """Returns the parsed arguments."""
+
+    parser = ArgumentParser(description=__doc__)
+    parser.add_argument(
+        '--sort', '-s', nargs="+", help='sort by the respective properties')
+    parser.add_argument('--reverse', '-r', action='store_true', help='sort in reversed order')
+    parser.add_argument(
+        '--countries', '-c', nargs="+", help='match mirrors of these countries')
+    parser.add_argument(
+        '--protocols', '-p', nargs="+",
+        help='match mirrors that use one of the specified protocols')
+    parser.add_argument(
+        '--max-age', '-a', type=int, default=None,
+        help='match mirrors updated more recently than this')
+    parser.add_argument(
+        '--regex-incl', '-i',
+        help='match mirrors that match the regular expression')
+    parser.add_argument(
+        '--regex-excl', '-x',
+        help='exclude mirrors that match the regular expression')
+    parser.add_argument(
+        '--limit', '-l', type=int,
+        help='limit output to this amount of results')
+    parser.add_argument(
+        '--output', '-o', type=Path, default=None, metavar='file',
+        help='write the output to the specified file instead of stdout')
+    return parser.parse_args(args)
+</code></pre>
+
+<p>Also the default value of an unspecified optional argument already is <code>None</code>, so you don't need to specify it every time and an option like <code>--regex-incl</code> will automatically be stored in <code>regex_incl</code>, so no need for that either.</p>
+
+<p>And finally, if you give your function an argument which you pass on to the parsing and default it to <code>None</code>, you can test this function by passing a list of strings.</p>
+
+<hr>
+
+<p>I think you have slightly over-engineered this. Instead I would use a simple <code>pandas.DataFrame</code>, which can easily be filtered and sorted.</p>
+
+<pre><code>import pandas as pd
+from datetime import datetime
+
+args = get_args(["--countries", "US", "Germany",
+                 "--sort", "age", "country",
+                 "--max-age", "24",
+                 "--limit", "10",
+                 "--regex-incl", "https://"])
+
+
+mirrors = get_json()
+df = pd.DataFrame(mirrors['urls'])
+df['age'] = (datetime.now() - pd.to_datetime(df.last_sync)).dt.total_seconds() / 3600
+df = df[df.active]
+</code></pre>
+
+<p>For the filtering you can either hardcode it similar to how you are currently doing:</p>
+
+<pre><code>if args.max_age is not None:
+    df = df[df.age &lt;= args.max_age]
+if args.countries is not None:
+    df = df[df.country.isin(args.countries) | df.country_code.isin(args.countries)]
+if args.protocols is not None:
+    df = df[df.protocol.isin(args.protocols)]
+</code></pre>
+
+<p>Or you could accept a <a href="https://pandas.pydata.org/pandas-docs/version/0.17.0/generated/pandas.DataFrame.query.html" rel="nofollow noreferrer">query string which you pass along to the dataframe</a> directly:</p>
+
+<pre><code>args.query = "age &lt; 24 and country_code == 'US'"
+df = df.query(args.query)
+</code></pre>
+
+<p>Or even support both. </p>
+
+<p><a href="https://pandas.pydata.org/pandas-docs/stable/user_guide/text.html#testing-for-strings-that-match-or-contain-a-pattern" rel="nofollow noreferrer">Regex patterns are also supported</a>:</p>
+
+<pre><code>if args.regex_incl is not None:
+    df = df[df.url.str.match(args.regex_incl)]
+if args.regex_excl is not None:
+    df = df[~df.url.str.match(args.regex_excl)]
+</code></pre>
+
+<p>Sorting by arbitrary column names is also quite easy:</p>
+
+<pre><code>df = df.sort_values(args.sort, ascending=not args.reverse)
+</code></pre>
+
+<p>And so is limiting:</p>
+
+<pre><code>df = df.head(args.limit)
+</code></pre>
+
+<p>Even with the explanations in between, this code is way less to read than your module. And a lot more readable IMO. It does however add an additional dependency, since <code>pandas</code> is not in the Python Standard Library.</p>
+
+<hr>
+
+<p>Of course you could just implement it using just standard library tools:</p>
+
+<pre><code>import argparse
+from datetime import datetime
+from functools import partial
+from operator import itemgetter
+from pathlib import Path
+import re
+import requests
+
+DATE_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
+
+def get_args(args=None):
+    """Returns the parsed arguments."""
+    ...
+
+def get_mirrors(url):
+    res = requests.get(url)
+    res.raise_for_status()
+    return res.json()
+
+def filter_mirrors(args, mirror):
+    if not mirror['active']:
+        return False
+    try:
+        mirror['age'] = (datetime.now() - datetime.strptime(mirror['last_sync'], DATE_FORMAT)).total_seconds() / 3600
+    except TypeError:
+        return False
+    if args.max_age is not None and mirror['age'] &gt; args.max_age:
+        return False
+    if args.countries is not None:
+        if mirror['country'] not in args.countries and mirror['country_code'] not in args.countries:
+            return False
+    if args.protocols is not None:
+        if mirror['protocol'] not in args.protocols:
+            return False
+    if args.regex_incl is not None:
+        match = re.match(args.regex_incl, mirror['url'])
+        if match is None:
+            return False
+    if args.regex_excl is not None:
+        match = re.match(args.regex_excl, mirror['url'])
+        if match is not None:
+            return False
+    return True
+
+def match_mirrors(mirrors, args):
+    mirrors = mirrors['urls']
+    mirrors = filter(partial(filter_mirrors, args), mirrors)
+    mirrors = sorted(mirrors, key=itemgetter(*args.sort), reverse=args.reverse)
+    return [mirror['url'] for mirror in mirrors[:args.limit]]
+
+
+if __name__ == "__main__":
+    mirrors = get_mirrors('https://www.archlinux.org/mirrors/status/json/')
+    args = get_args(["--countries", "US", "Germany",
+                     "--sort", "age", "country",
+                     "--max-age", "24",
+                     "--limit", "10",
+                     "--regex-incl", "https://"])
+
+    print(match_mirrors(mirrors, args))
+</code></pre>
+
+<p>And this would still be vastly shorter and more readable than your code...</p>
+    </div>

@@ -1,0 +1,474 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This was a pretty difficult challenge - principally because R doesn't have a built-in <a href="https://en.wikipedia.org/wiki/Priority_queue" rel="nofollow noreferrer">priority queue</a> data-structure, but also because the priority-queue-like data-frame (<code>time_parts</code>) was wrapped around the results-storing data-frame (<code>production_df</code>) and the main <code>while</code> loop contains code at a few different levels of abstraction.</p>
+
+<h1>Idiomatic <code>R</code></h1>
+
+<p>I did some simple stuff first: pulled all your functions to the start of the script, reformatted some code/comments.</p>
+
+<p>There was a couple of things I changed for idiomatic reasons:</p>
+
+<pre><code>which(production_df$id == time_parts$id[1])
+# --&gt;
+match(time_parts$id[1], production_df$id)
+
+# time_parts[2:(nrow(time_parts)), ] # and
+# time_parts[FALSE, ] # when time_parts has only one row
+# can both be replaced with
+time_parts[-1, ]
+# (which is the idiomatic way to drop the first row) so this allowed us to remove an if-else clause
+
+# You don't need to do rep(some_value, n) when you're adding a
+# constant column to a data-frame at construction:
+production_df &lt;- data.frame(id = time_parts$id,
+                            time = time_parts$t,
+                            production_start = rep(0, nrow(time_parts)),
+                            no_failures = rep(0, nrow(time_parts)),
+                            stringsAsFactors = FALSE)
+# --&gt;
+production_df &lt;- data.frame(id = time_parts$id,
+                            time = time_parts$t,
+                            production_start = 0,
+                            no_failures = 0,
+                            stringsAsFactors = FALSE)
+
+# `order(...)` does the same thing as `sort(..., index.return)$ix`
+sort(time_parts$t, index.return = TRUE)$ix
+# --&gt;
+order(time_parts$t)
+
+# `nrow(x)` is more idiomatic than `length(x$some_column)`
+while(length(time_parts$t) &gt; 0){ 
+# --&gt;
+while(nrow(time_parts) &gt; 0) {
+# but I subsequently replaced this newer line as well
+</code></pre>
+
+<h1>Explicit data-classes</h1>
+
+<p>I converted your <code>create_machine</code> function so that it returns an object of class "Machine"; this wasn't really necessary.</p>
+
+<pre><code>create_machine &lt;- function(failure_rate, production_rate) {
+  structure(
+    list(
+      failure_rate = failure_rate,
+      production_rate = production_rate,
+      is_occupied = FALSE
+    ),
+    class = "Machine"
+  )
+}
+</code></pre>
+
+<p>I added a <code>create_part</code> function that similarly returns a <code>Part</code> object. There was a lot of repeats of <code>1 / machine$production_rate</code> in your code; I replaced these with a call to part$production_duration. Also I thought your test to see whether a produced part was a failure should be associated with the produced part object (<code>part$is_failure</code>); with this, the while-loop logic becomes more explicit:</p>
+
+<pre><code>create_part &lt;- function(machine) {
+  structure(
+    list(
+      is_failure = runif(1) &lt; machine$failure_rate,
+      production_duration = 1 / machine$production_rate
+    ),
+    class = "Part"
+  )
+}
+
+# then we can use this in the while-loop
+part &lt;- create_part(machine)
+
+if (part$is_failure) {
+  # bad part logic
+  ...
+} else {
+  # good part logic
+  ...
+}
+</code></pre>
+
+<h1>Restructuring the <code>while</code> loop</h1>
+
+<p>I wanted to push that while-loop into a function - the less work you do in the global environment, the better.</p>
+
+<p>Since you want to extract data from <code>production_df</code> for your report, the function should return the <code>production_df</code>. During the while-loop, you access <code>production_df</code>, <code>time_parts</code>, <code>t</code>, <code>dt</code> (which I renamed <code>dt_recovery</code> based on your comments), <code>n</code> and <code>machine</code>.
+So we might want to pass all of those into that function. But we can compute some of those from the others: </p>
+
+<ul>
+<li><p><code>n</code> is the nrow of <code>production_df</code>,</p></li>
+<li><p><code>t</code> isn't needed outside of the while loop and</p></li>
+<li><p>the data that initialises <code>time_parts</code> also initialises <code>production_df</code>.</p></li>
+</ul>
+
+<p>The only thing we need to initialise both <code>time_parts</code> and <code>production_df</code> is the arrival-times or times at which the parts were ordered (which I renamed <code>t_ordered</code>).</p>
+
+<p>So, we can put that while-loop into a function that takes arguments <code>t_ordered</code>, <code>dt_recovery</code>, <code>machine</code>.</p>
+
+<pre><code>run_event_simulation &lt;- function(t_ordered, machine, dt_recovery) {
+  n_parts &lt;- length(t_ordered)
+
+  # results data-frame
+  production_df &lt;- data.frame(
+    id = seq(n_parts),
+    t_ordered = t_ordered,
+    t_started = 0,
+    t_completed = 0,
+    no_failures = 0,
+    stringsAsFactors = FALSE
+  )
+
+  time_parts &lt;- ... # define in terms of production_df
+
+   # while-loop logic
+
+   # return the updated production_df
+</code></pre>
+
+<p>I added the column <code>t_completed</code> into <code>production_df</code> so that you can more easily compute <code>total_production_time</code> from <code>production_df</code> in your report (this allows you to generalise the production rates)</p>
+
+<pre><code># in `production_summary`
+...
+total_production_time &lt;- max(production_df$t_completed)
+...
+</code></pre>
+
+<h1>A functional priority queue</h1>
+
+<p>The really big step:</p>
+
+<p>R doesn't have a native priority-queue, and it would be pretty hard to encode using the S3 or S4 classes since you can't update by reference in those classes. There is a priority-queue defined in the package <code>liqueueR</code>, but I've no experience of that. So I just wrote a simpler version of the priority queue (as an S3 class): this allows you to</p>
+
+<ul>
+<li><code>peek</code>: extract the element in the queue with the lowest priority value (without mutating the queue)</li>
+<li><code>delete_min</code>: remove that element with the lowest priority value from the queue and return the resulting queue</li>
+<li><code>add</code>: add a new element to the queue according to it's priority, returning the resulting queue</li>
+<li>and provides a couple of helper methods (<code>is_empty</code>, <code>nrow</code>)</li>
+</ul>
+
+<p>However, this doesn't provide a <code>pop_element(queue)</code>: typically, <code>pop_element</code> removes the leading element from the queue and returns that element. That is, it returns the leading element and updates the queue through a side-effect. This side-effect is problematic in R, so I didn't include a <code>pop_element</code> function. To achieve <code>pop_element</code> you have to <code>peek</code> and then <code>delete_min</code>.</p>
+
+<pre><code>
+# Priority Queue class
+
+create_priority_queue &lt;- function(x, priority_column) {
+  structure(
+    list(
+      # note that we only `order` once - see `add` for how this is possible
+      queue = x[order(x[[priority_column]]), ]
+    ),
+    class = "PriorityQueue",
+    priority_column = priority_column
+  )
+}
+
+# generic methods for Priority Queue
+is_empty &lt;- function(x, ...) UseMethod("is_empty")
+peek &lt;- function(x, ...) UseMethod("peek")
+delete_min &lt;- function(x, ...) UseMethod("delete_min")
+add &lt;- function(x, ...) UseMethod("add")
+nrow &lt;- function(x, ...) UseMethod("nrow")
+
+nrow.default &lt;- function(x, ...) {
+  base::nrow(x)
+}
+
+# implemented methods for Priority Queue
+nrow.PriorityQueue &lt;- function(x, ...) {
+  nrow(x$queue)
+}
+is_empty.PriorityQueue &lt;- function(x, ...) {
+  nrow(x) == 0
+}
+peek.PriorityQueue &lt;- function(x, ...) {
+  x$queue[1, ]
+}
+delete_min.PriorityQueue &lt;- function(x, ...) {
+  x$queue &lt;- x$queue[-1, ]
+  x
+}
+add.PriorityQueue &lt;- function(x, new_element, ...) {
+  priority_column &lt;- attr(x, "priority_column")
+  # split the existing values by comparison of their priorities to
+  #  those of the new-element
+  lhs &lt;- which(x$queue[[priority_column]] &lt;= new_element[[priority_column]])
+  rhs &lt;- setdiff(seq(nrow(x)), lhs)
+  x$queue &lt;- rbind(x$queue[lhs, ], new_element, x$queue[rhs, ])
+  x
+}
+</code></pre>
+
+<p>Then I replaced your <code>time_parts</code> data-frame with a PriorityQueue:</p>
+
+<pre><code># inside run_event_simulation
+...
+  # Create initial list of tasks. Once produced, a part will be removed from the
+  # queue.
+  product_queue &lt;- create_priority_queue(
+    data.frame(
+      id = production_df$id,
+      t = production_df$t_ordered
+    ),
+    "t"
+  )
+...
+</code></pre>
+
+<p>I added a few other helpers. The final code looks like this:</p>
+
+<pre><code># ---- classes
+
+# Priority Queue class
+
+create_priority_queue &lt;- function(x, priority_column) {
+  structure(
+    list(
+      queue = x[order(x[[priority_column]]), ]
+    ),
+    class = "PriorityQueue",
+    priority_column = priority_column
+  )
+}
+
+# A machine for producing `Part`s
+
+create_machine &lt;- function(failure_rate, production_rate) {
+  structure(
+    list(
+      failure_rate = failure_rate,
+      production_rate = production_rate,
+      is_occupied = FALSE
+    ),
+    class = "Machine"
+  )
+}
+
+# A manufactured part
+
+create_part &lt;- function(machine) {
+  structure(
+    list(
+      is_failure = runif(1) &lt; machine$failure_rate,
+      production_duration = 1 / machine$production_rate
+    ),
+    class = "Part"
+  )
+}
+
+# methods for Priority Queue
+
+is_empty &lt;- function(x, ...) UseMethod("is_empty")
+peek &lt;- function(x, ...) UseMethod("peek")
+delete_min &lt;- function(x, ...) UseMethod("delete_min")
+add &lt;- function(x, ...) UseMethod("add")
+nrow &lt;- function(x, ...) UseMethod("nrow")
+
+nrow.default &lt;- function(x, ...) {
+  base::nrow(x)
+}
+
+nrow.PriorityQueue &lt;- function(x, ...) {
+  nrow(x$queue)
+}
+
+is_empty.PriorityQueue &lt;- function(x, ...) {
+  nrow(x) == 0
+}
+
+peek.PriorityQueue &lt;- function(x, ...) {
+  x$queue[1, ]
+}
+
+delete_min.PriorityQueue &lt;- function(x, ...) {
+  x$queue &lt;- x$queue[-1, ]
+  x
+}
+
+add.PriorityQueue &lt;- function(x, new_element, ...) {
+  priority_column &lt;- attr(x, "priority_column")
+  lhs &lt;- which(x$queue[[priority_column]] &lt;= new_element[[priority_column]])
+  rhs &lt;- setdiff(seq(nrow(x)), lhs)
+  x$queue &lt;- rbind(x$queue[lhs, ], new_element, x$queue[rhs, ])
+  x
+}
+
+# ---- functions
+
+update_machine &lt;- function(machine,
+                           ind_production_df,
+                           production_df,
+                           current_time) {
+  if (machine$is_occupied) {
+    if (
+      production_df$t_started[ind_production_df]
+      + 1 / machine$production_rate &lt;= current_time
+    ) {
+      machine$is_occupied &lt;- FALSE
+    }
+  }
+  return(machine)
+}
+
+should_produce_part &lt;- function(machine,
+                                earliest_production_time,
+                                current_time) {
+  !machine$is_occupied &amp;&amp;
+    earliest_production_time &lt;= current_time
+}
+
+increment_failures &lt;- function(df, i) {
+  df[i, "no_failures"] &lt;- 1 + df[i, "no_failures"]
+  df
+}
+
+# ---- format results
+
+production_summary &lt;- function(production_df, machine, input_rate) {
+  n_parts &lt;- nrow(production_df)
+  no_of_failures &lt;- sum(production_df$no_failures)
+  total_production_time &lt;- max(production_df$t_completed)
+  uptime &lt;- (no_of_failures + n_parts) / machine$production_rate
+  print(paste0(
+    "Estimated machine$failure_rate ",
+    round(no_of_failures / (no_of_failures + n_parts), 2),
+    " [theory ", round(machine$failure_rate, 2), "]"
+  ))
+  print(paste0(
+    "Up-time ", uptime,
+    ", of total time ", total_production_time, ". Auslastung ",
+    round(uptime / total_production_time, 2),
+    " [theory ",
+    round(
+      input_rate / machine$production_rate * 1 / (1 - machine$failure_rate), 2
+    ),
+    "]"
+  ))
+}
+
+
+# ---- discrete-event simulation
+#
+run_event_simulation &lt;- function(t_ordered, machine, dt_recovery) {
+  n_parts &lt;- length(t_ordered)
+
+  # results data-frame
+  production_df &lt;- data.frame(
+    id = seq(n_parts),
+    t_ordered = t_ordered,
+    t_started = 0,
+    t_completed = 0,
+    no_failures = 0,
+    stringsAsFactors = FALSE
+  )
+
+  # Create initial list of tasks. Once produced, a part will be removed from the
+  # queue.
+  product_queue &lt;- create_priority_queue(
+    data.frame(
+      id = production_df$id,
+      t = production_df$t_ordered
+    ),
+    "t"
+  )
+
+  t &lt;- 0
+  while (!is_empty(product_queue)) {
+    queued_part &lt;- peek(product_queue)
+
+    ind_production_df &lt;- match(
+      queued_part$id, production_df$id
+    )
+
+    machine &lt;- update_machine(machine, ind_production_df, production_df, t)
+
+    if (
+      should_produce_part(machine,
+                          earliest_production_time = queued_part$t,
+                          current_time = t)
+    ) {
+      # A machine is available and a part needs to be produced
+
+      # - pop the scheduled part from the queue; add it back if it's production
+      # fails
+      product_queue &lt;- delete_min(product_queue)
+
+      machine$is_occupied &lt;- TRUE
+      production_df$t_started[ind_production_df] &lt;- t
+      part &lt;- create_part(machine)
+
+      if (part$is_failure) {
+        # bad part - add it back to the schedule
+        queued_part$t &lt;- queued_part$t + dt_recovery
+        product_queue &lt;- add(product_queue, queued_part)
+
+        production_df &lt;- increment_failures(production_df, ind_production_df)
+
+        t &lt;- t + min(peek(product_queue)$t, dt_recovery)
+      } else {
+        # good part
+        t &lt;- t + part$production_duration
+        production_df$t_completed[ind_production_df] &lt;- t
+        machine$is_occupied &lt;- FALSE
+      }
+    } else {
+      # machine is occupied or no part needs to be produced
+      t &lt;- t + min(peek(product_queue)$t, dt_recovery)
+    }
+  }
+  production_df
+}
+
+# ---- script
+set.seed(123456)
+
+# Input rate [1/min, 1/input_rate corresponds to interarrival time in min]
+input_rate &lt;- 1 / 60
+
+# Number of parts
+n_parts &lt;- 1000
+
+# timestep = time to transfer faulty parts back to production. [min]
+dt_recovery &lt;- 1
+
+# Production rate [1/min]
+machine_production_rate &lt;- 1 / 40
+
+# Machine failure rate
+machine_failure_rate &lt;- 0.2
+
+# Sum all interarrival times
+t_ordered &lt;- cumsum(rpois(n_parts, 1 / input_rate))
+
+machine &lt;- create_machine(machine_failure_rate, machine_production_rate)
+
+# ---- results
+
+production_df &lt;- run_event_simulation(
+  t_ordered, machine, dt_recovery
+)
+
+production_summary(production_df, machine, input_rate)
+</code></pre>
+
+<hr>
+
+<p>Why aren't S3 queues easy?</p>
+
+<p>(This is actually quite hard to explain). Well, the <code>pop</code> method on a priority-queue returns an element from the queue and moves the queue on by one step. (In R) Updating the queue might look like <code>new_queue &lt;- old_queue[-1]</code> and obtaining the returned element might look like <code>returned_element &lt;- old_queue[1]</code>. So a pop function might look like</p>
+
+<pre><code>pop &lt;- function(q) {
+  # extract the head
+  el &lt;- q[1]
+
+  # In a reference-based language you could update the queue
+  #  using a side-effect like `q.drop()`
+  # But in R, this creates a new queue: and if it isn't returned 
+  # explicitly, it is thrown away at the end of the `pop` function
+  new_q &lt;- q[-1]
+
+  # return the element that's at the head of the original queue
+  el
+}
+
+# calling_env
+my_q &lt;- create_queue(...)
+my_head &lt;- pop(my_q)
+</code></pre>
+
+<p>But the queue has not been altered by that <code>pop</code>. Now we could rewrite that function to do something dangerous like <code>q &lt;&lt;- q[-1]</code> and that would update the <code>q</code> in the calling environment. I consider this dangerous because <code>q</code> might not exist in the calling environment and that introduces side-effects, which are much harder to reason about.</p>
+    </div>

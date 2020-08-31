@@ -1,0 +1,162 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I won't comment on the Java bit because I don't write Java very often. I agree with the other answer though that <code>sqrt</code> should only be called once. Computing the <code>sqrt</code> of a number is relatively expensive.</p>
+
+<hr>
+
+<p>First, for Clojure, a baseline on my computer:</p>
+
+<pre><code>(defn sieve [size]
+    (-&gt; (reduce (fn [prev i]
+                  (if (prev i)
+                    (vec (reduce #(assoc %1 %2 false)
+                                 prev
+                                 (range (+ i i) size i)))
+                    prev))
+                (vec (repeat size true))
+                (range 2 (-&gt; size Math/sqrt int inc)))
+        vec
+        (assoc 0 false)
+        (assoc 1 false)))
+
+(defn main []
+  (time
+    (let [limit 2000000
+          s (sieve limit)]
+      (reduce #(+ %1 (if (s %2) %2 0))
+              0 (range limit)))))
+
+; From REPL
+(main)
+"Elapsed time: 2274.584779 msecs"
+=&gt; 142913828922
+</code></pre>
+
+<p>I should note that I'm on a crappy M3 Surface Pro 4; not a power machine by a stretch of any definition. If this is taking 14 seconds, you must have something else going on. That's far too long.</p>
+
+<hr>
+
+<p>I actually prefer wrapping threading calls in parenthesis, even if they aren't required. I'd write lines such as <code>(-&gt; size Math/sqrt int inc)</code> as <code>(-&gt; size (Math/sqrt) (int) (inc))</code>. I find it helps differentiating between the form being a plain function call, and the threading of a value. The only time I omit them is when I'm golfing.</p>
+
+<hr>
+
+<p>Your nested reduction is a lot going on in only a few lines. I would definitely break the inner reduction off into its own function, give it a descriptive name, and call it in the outer reduction.</p>
+
+<pre><code>(defn calc [size i prev] ; Although give it a better name
+  (vec (reduce #(assoc %1 %2 false)
+               prev
+               (range (+ i i) size i))))
+
+(defn sieve [size]
+    (-&gt; (reduce (fn [prev i]
+                  (if (prev i)
+                    (calc size i prev)
+                    prev))
+                (vec (repeat size true))
+                (range 2 (-&gt; size Math/sqrt int inc)))
+        vec
+        (assoc 0 false)
+        (assoc 1 false)))
+</code></pre>
+
+<p>I like breaking functions up. Having giant functions forces you to consider a large amount of data and interactions at once. If you split a part off into its own function and ensure that it's pure, you know that no code in that function can manipulate any data that you haven't explicitly given it as a parameter. That's one less bit of the code to need to look at when debugging.</p>
+
+<hr>
+
+<p>For your second bit, interestingly, it performed the same for me:</p>
+
+<pre><code>(main) ; Using your arrays version
+"Elapsed time: 2106.530431 msecs"
+=&gt; 142913828922
+</code></pre>
+
+<p>You're making a critical error though when dealing with arrays in Clojure: don't use <code>aset</code> unless you have to. <code>aset</code> works on <code>Object</code>s, not primitives, as its documentation notes:</p>
+
+<blockquote>
+  <p>Sets the value at the index/indices. Works on Java arrays of
+    reference types. Returns val.</p>
+</blockquote>
+
+<p>Using <code>aset</code> forces your bools to be boxed into a <code>Boolean</code>, which is pricey when done over and over. <code>aset</code> has multiple overloads for primitive types that should be used instead. I'd switch to <code>aset-boolean</code>, and create the array using <code>boolean-array</code> instead:</p>
+
+<pre><code>(defn sieve2 [size]
+  (-&gt; (let [ar (boolean-array (repeat size true))]
+        (dorun (map (fn [i]
+                      (when (aget ar i)
+                        (dorun (map (fn [j] (aset-boolean ar j false))
+                                    (range (+ i i) size i)))))
+                    (range 2 (-&gt; size Math/sqrt int inc))))
+        ar)
+      vec
+      (assoc 0 false)
+      (assoc 1 false)))
+
+(defn main []
+  (time
+    (let [limit 2000000
+          s (sieve2 limit)]
+      (reduce #(+ %1 (if (s %2) %2 0))
+              0 (range limit)))))
+
+(main)
+"Elapsed time: 759.412393 msecs"
+=&gt; 142913828922
+</code></pre>
+
+<p>A little better. I'll also note though that use of <code>(dorun (map</code> is usually a code smell. You're better off just using <code>mapv</code> which is strict. Using laziness when you don't need it can be costly. <code>map</code>ing isn't the right tool here for the job anyways. Use <code>map</code> when you want to transform a list. Use <code>doseq</code> when you want to carry out side effects over a list. Think of it as Java's enhanced for-loop. I'm also using <code>doseq</code>'s <code>:when</code> clause to replace the use of the <code>when</code> macro:</p>
+
+<pre><code>(defn sieve2 [size]
+  (let [ar (boolean-array (repeat size true))]
+    (doseq [i (range 2 (-&gt; size (Math/sqrt) (int) (inc)))
+            :when (aget ar i)] ; Replacing the call to when
+      (doseq [j (range (+ i i) size i)]
+        (aset-boolean ar j false)))
+
+    (-&gt; ar
+        (vec)
+        (assoc 0 false)
+        (assoc 1 false))))
+
+(main)
+"Elapsed time: 577.607879 msecs"
+=&gt; 142913828922
+</code></pre>
+
+<p>Still not great, but better.</p>
+
+<hr>
+
+<p>Just for a laugh comparison, here's a implementation of Eratosthenes' Sieve I wrote back in April:</p>
+
+<pre><code>(defn sieve-primes [n]
+  (loop [p 2 ; First prime
+         marked #{} ; Found composites
+         primes []]
+    (let [mults (-&gt;&gt; n
+                     (range p)
+                     (map #(* p %))
+                     (take-while #(&lt; % n)))
+
+          next-p (-&gt;&gt; p
+                      (inc)
+                      (iterate inc)
+                      (remove marked)
+                      (first))
+
+          new-primes (conj primes p)]
+
+      (if (&gt;= next-p n)
+        new-primes
+        (recur next-p (into marked mults) new-primes)))))
+
+(time
+  (apply + (sieve-primes 2000000)))
+"Elapsed time: 8719.010487 msecs"
+=&gt; 142913828922
+</code></pre>
+
+<p>Ouch! I don't think I tried very hard to get it lower though. That was the first time I had ever written the sieve in any language, and was happy with just having a working implementation at the time. It is pretty though, even if it's slow.</p>
+
+<hr>
+
+<p>Clojure is really not a performance-oriented language though. Yes, you can add all sorts of optimizations to make good use of all cores and limit intermediate lists when doing transformations, but it generally won't perform as well as other languages. It's generally even slower than <em>Java</em> of all languages in my experience. I write Clojure because it's fun to write and produces nice looking code, not because it produces fast code.</p>
+    </div>

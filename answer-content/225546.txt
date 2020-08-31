@@ -1,0 +1,70 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Networking</h2>
+
+<p>You have done the classic thing that all people new to TCP do of assuming that whatever <code>NetworkStream.Read</code> gives you will be some meaningful chunk of data: this is not guaranteed, and only 'works' because you are sending tiny packages locally. Basically, if you want this to be a general-purpose and reusable system for sending discrete messages (i.e. <code>string</code>s), then you need to design a protocol to communicate this information. Instead of writing pages about it here, I'll just point you to <a href="https://codereview.stackexchange.com/questions/177358/send-messages-in-tcp-based-communication-system/177384#177384">an older answer of mine</a> which discusses this in more detail. You also have a fixed-size buffer, so it's impossible at the moment to send a message longer than 4096 bytes without ending up with 2 messages: how you handle really long packets is whole other concern I won't go into.</p>
+
+<p>You've done another classic thing, which is to provide a dedicated thread for reading. There a few reasons why this isn't ideal: it doesn't scale well (having hundres of blocked threads consumes memory and messes with scheduling), it means you end up managing threads (which is not fun), and it increases complexity (what do I do when the thread fails? who is responsible for killing the thread?). If you need asyncronous communication (as you have tried to implement), then you should use the asynchronous APIs on the <code>NetworkStream</code> (e.g. <a href="https://docs.microsoft.com/en-us/dotnet/api/system.net.sockets.networkstream.beginread?view=netstandard-2.1" rel="noreferrer"><code>BeginRead</code></a>/<a href="https://docs.microsoft.com/en-us/dotnet/api/system.net.sockets.networkstream.endread?view=netstandard-2.1" rel="noreferrer"><code>EndRead</code></a> or <a href="https://docs.microsoft.com/en-us/dotnet/api/system.net.sockets.networkstream.readasync?view=netstandard-2.1" rel="noreferrer"><code>ReadAsync</code></a>). Running a dedicated 'read and remember' loop can be necessary/useful in some cases, but it should still use the asynchronous APIs.</p>
+
+<p>Going asynchronous will also enable you to provide snappier reads to your queue. Currently a call to <code>GetReceivedString</code> can be blocked by pretty much anything, which means it has little use as a polling API.</p>
+
+<h2>Threading</h2>
+
+<p>Don't do this:</p>
+
+<pre><code>ListenThread.Abort();
+</code></pre>
+
+<p>Some people call exceptions hand-grenades, but they are wrong: exceptions are lovely and only make life better. <code>Thread.Abort</code>, however, is a demolition charge, and you give up a lot of confidence that anything will work if you ever do this. You have no idea what the thread was doing, and you have no idea if you are about to leave something in an invalid state. If you had some fancy lock-less concurrency going on (which currently you don't, but that may change...) you could easily lock up your entire program (which is honestly preferable to just killing a thread that was probably half way through something important).</p>
+
+<p>The simplest way to resolve this problem is to abandon the behaviour of allowing multiple calls to <code>Listen</code>: you can't guarantee what this will do, so you shouldn't even try to support it. If someone calls <code>Listen</code> twice, throw and exception telling them to not do so in future, and document the behaviour precisely. One of dfhwze's comments mentioned that it is odd to provide a class which does the job of both a client and a server, and this is related: you would be much better off separating the job of being a server out into a separate class (just like <code>TcpListener</code> is separate from <code>TcpClient</code>). At the same time, you can solve your problem with the endpoint not being set by setting it in a constructor (whereafter you can make it readonly).</p>
+
+<p>Even if you did have to terminate a reader, don't do it like this. Instead, kill the connection and detect this (somehow) within the read-loop if you need to close gracefully in that instance.</p>
+
+<h2>API and Error Handling</h2>
+
+<p>Your code can't send or receive empty strings. Implementing a proper protocol will solve this. For a polling <code>GetReceiveString</code> method, returning <code>null</code> when there is nothing available makes much more sense than returning <code>""</code>: that way you <em>can</em> send an empty string (if the protocol supports it), but it also has the benefit that it will crash violently if you try to use it. You also shouldn't be returning <code>""</code> in <code>GetReceivedString</code> if there is a failure. Another options is to have a <code>bool TryRead(out string message)</code> method that returns a <code>true</code> if there was something read and sets the message accordingly, and returns false and sets <code>message to</code>null` if there was not.</p>
+
+<p>If there is a failure, do <em>not</em> swallow the exception and carry on merrily: this will only make debugging harder in the future when something does actually go wrong. For instance, I would probably remove both <code>try...catch</code> statements in <code>GetReceivedString</code>: that code should never go wrong: if it does, then you have a problem with your implementation, and you <em>need</em> to address it. If I was building a larger API, I might define a new <code>Exception</code> type which I can return when something goes unexpectedly wrong pass the exception from the outer <code>try...catch</code> as an inner exception.</p>
+
+<p>In almost every method you swallow all the exceptions: sometimes this is 'ok', but that's only because I can see how it might map onto a carefully designed API, and I suspect that rather you are trying to make the code 'robust': this is a bad idea. If you are getting exceptions which you should be handling, then handling them <em>specifically</em>, and document the behaviour precisely. It's so much better for your program to crash and burn because something unexpected happened, than for it to pretend that everything is fine when it's ended up in an invalid state. Again, in much of your code you can just about get away with this, but it is not a good habit.</p>
+
+<p>I can see that you want to call <code>Listen</code> and then just start trying to read, but this gives you nothing that calling <code>Listen</code> and waiting for a client to connect (which you can package in another object) before trying to read would give you.</p>
+
+<p>Even if you did want some way to swap out the client without changing the reading object (which would be enough logic to warrant it's own class), then consider that fact that whoever is reading has <em>no idea</em> that the connection may have changed, and that it may have changed between their reading a message and writing one. This sort of thing needs a very clear set of requirements, and is not the job of a general purpose networking API.</p>
+
+<p>You should throw an <code>ArgumentNullException</code> if <code>Send</code> is called with a <code>null</code> parameter: it will throw one anyway, but this will be swallowed and look like a general failure.</p>
+
+<p><code>TcpIsConnected</code> is kind-of useless, because it doesn't tell you anything about whether you will be able to read again. It could be <code>false</code> because you are currently swapping reader, or simply not connected yet. Again, you've jammed three complex tasks (syncing reads from multiple places; listening for clients; reading from clients), and ended up with a confusing and unpredictable API. Much of the misery goes away if you separate the <code>Listen</code> and <code>Read</code> objects, because then you can make <code>TcpIsConnect</code> a one-way latch: it starts true, and if it ever goes false then you've lost it forever.</p>
+
+<p><code>TcpIsConnected</code> should probably also be taking the <code>SyncLock</code> or use <code>client?.Connected</code> (which explicitly caches the value of <code>client</code>); otherwise you are depending on dodgy runtime optimisations/luck to avoid a possible <code>NullReferenceException</code>.</p>
+
+<h2>Misc</h2>
+
+<ul>
+<li><p>Your class is hardcoded to use ASCII: consider making the encoding configurable, or at the very least use UTF-8, which will allow you to send any string without corruption.</p></li>
+<li><p>You can return from within a <code>lock</code>: you don't need all those <code>returnString</code> and <code>successFlag</code> variables, and I would consider getting rid of them: they make it harder for the compiler to help you, as the variables over-extend their meaningful scope.</p></li>
+<li><p>You should consider adding inline documentation (<code>///</code>) to all you public members: this commits you to writing a method that has a specific job, means that the maintainer knows what the code is meant to do, and allows someone consuming your API to interrogate it without leaving their API. Inline documentation is great.</p></li>
+<li><p>It's good that you are using <code>Environment.NewLine</code>, but it would be neater if you just used <code>Console.WriteLine</code>.</p></li>
+<li><p>Consider <code>Console.ReadKey(true)</code> for 'pausing': it's just a cleaner way which people come to expect. It feels wrong for the program to take your input, only to throw it away when you press return.</p></li>
+<li><p>You don't have (nor need) a finalizer, so it's not clear what <code>GC.SuppressFinalize</code> is doing for you.</p></li>
+<li><p>I have no idea why <code>ListeningMethod</code> has a <code>while</code> loop. It looks like it once either 'retried' or was meant to accept multiple clients, but now does not.</p></li>
+<li><p>It's conventional to use camel-case for all parameters, including initialisms like <code>ip</code> (which should probably have a clearer name).</p></li>
+<li><p>Avoid 'magic numbers' like <code>4096</code>: perhaps the user would like this to be configurable, and how is the maintainer supposed to know how this number was chosen? Put it in a constant somewhere with a helpful name, and explain why this hard-coded value was chosen: even if it just 'seemed like a good compromise' then write that, so that you know you didn't have some important reason for choosing it you need to bear in mind.</p></li>
+<li><p>You might consider detecting when the object is disposed and throwing an <a href="https://docs.microsoft.com/en-us/dotnet/api/system.objectdisposedexception?view=netstandard-2.0" rel="noreferrer"><code>ObjectDisposedException</code></a> if e.g. someone tries to send something.</p></li>
+</ul>
+
+<h2>Summary</h2>
+
+<p>I think the best think you could do is abandon any notion of having one instance of a class do the 4+ different jobs it is current doing (the 'Single Responsibility Principle' certainly applies here). Instead, provide a class to perform (basic) duplex communications (e.g. send and receive strings) over a <code>TcpClient</code>, and provide independent mechanisms (could just be a single static method each) for the following:</p>
+
+<ul>
+<li>Listen for and accept a <code>TcpClient</code> on some port, and wrap it in your class</li>
+<li>Create and connect a <code>TcpClient</code> to some endpoint, and wrap it in your class</li>
+</ul>
+
+<p>Do not even try to make your class reusable: that is just asking for misery. Instead, if you want a way to swap out clients (which is a questionable objective that needs a specification so that you know what your methods are meant to do, which is a domain problem with which we cannot help you), write another a simple class that provides this behaviour. A <code>ConcurrentQueue&lt;string&gt;</code> would probably suffice as a backing data-structure.</p>
+
+<p>The protocol is a detail of the API of the <code>TcpClient</code> wrapper, and can be worked out independently of the overall design.</p>
+
+<p>Once you have a sensible and working API, you can then worry about making it robust (i.e. handles invalid usage and network connections properly (not just swallowing all exceptions)). You can worry about making it fast when you discover that it is too slow.</p>
+    </div>

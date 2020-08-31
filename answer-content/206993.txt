@@ -1,0 +1,168 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>We're doing two distinct things in this function:</p>
+<ul>
+<li>finding the start and end of the substrings of interest</li>
+<li>packaging the results into a container.</li>
+</ul>
+<p>We might be able to get a more flexible implementation by using the Strategy pattern to allow us to choose each part independently.  That would allow us to support different kinds of splitting (fixed string, whitespace, set of characters, regular expression, or more), and would allow us to return different types (set of <code>std::string</code>, vector of <code>std::string_view</code>, or others) without a combinatorial explosion in the amount of code we write.</p>
+<p>I'd start with the interface of the strategy function itself.  I think a good start would be to pass the string view and beginning position, and have it return the positions of the start and end positions of the next token or next separator (one or both could be the appropriate <code>npos</code>, of course).  Equivalently, pass it the trailing substring to avoid the need for the beginning position argument, and return offset and count for compatibility with standard string and string-view functions:</p>
+<pre><code>std::pair&lt;std::string_view::size_type, std::string_view::size_type&gt;
+find(std::string view s);
+</code></pre>
+<p>The way we can generalize the return of results is the same way that it's done in the standard library - pass an output iterator.  Then we can give results to any kind of container we like, or use them immediately, without need for a container.</p>
+<p>This gets a bit harder when we want to construct strings from the views, since the necessary constructor is declared <code>explicit</code>.  I needed to create a proxy iterator to perform this construction.</p>
+<p>Finally, we might want to accept wide strings, and it would be good to match all known whitespace rather than just the portable subset - we can use <code>std::isspace()</code> for that, but we do need to launder its argument via <code>unsigned char</code> before promotion.</p>
+<hr>
+<h1>My version</h1>
+<pre><code>#include &lt;algorithm&gt;
+#include &lt;cctype&gt;
+#include &lt;iterator&gt;
+#include &lt;limits&gt;
+#include &lt;regex&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+// Split the input view according to chunks identified by the specified
+// finder, and write the results to the output iterator.
+template&lt;typename Iter, typename View, typename Finder&gt;
+Iter split_impl(Iter out,
+                View str,
+                Finder finder,
+                std::size_t maxsplit = std::numeric_limits&lt;typename View::size_type&gt;::max())
+{
+    for (std::size_t splits = 1;  splits &lt; maxsplit &amp;&amp; !str.empty();  ++splits) {
+        auto [start,end] = finder(str);
+        if (start == 0) {
+            // ignore consecutive separators
+            --splits; 
+        } else if (start == str.npos) {
+            // last part of string
+            *out++ = str;
+            return out;
+        } else {
+            // separator found
+            *out++ = str.substr(0, start);
+            str = str.substr(end);
+        }
+    }
+    // Have we a final match?  Ignore the end.
+    if (!str.empty()) {
+        *out++ = str;
+    }
+    return out;
+}
+
+
+template&lt;typename View, typename Finder&gt;
+auto split_to_vector(View str,
+                     Finder finder,
+                     std::size_t maxsplit = std::numeric_limits&lt;typename View::size_type&gt;::max())
+{
+    std::vector&lt;View&gt; result;
+    split_impl(result.back_inserter(), str, finder, maxsplit);
+    return result;
+}
+
+
+template&lt;typename View, typename Finder&gt;
+auto split_to_strings(View str,
+                     Finder finder,
+                     std::size_t maxsplit = std::numeric_limits&lt;typename View::size_type&gt;::max())
+{
+    using String = std::basic_string&lt;typename View::value_type&gt;;
+    using Container = std::vector&lt;String&gt;;
+
+    // An iterator wrapper to construct strings from views
+    struct inserter : std::back_insert_iterator&lt;Container&gt; {
+        using base_inserter = std::back_insert_iterator&lt;Container&gt;;
+        inserter(Container&amp; c) : base_inserter(c) {}
+        // automatically construct string from view
+        inserter&amp; operator=(View v) {
+            String s(v);
+            base_inserter::operator=(std::move(s));
+            return *this;
+        }
+        inserter&amp; operator++() { base_inserter::operator++(); return *this; }
+        inserter operator++(int i) { base_inserter::operator++(i); return *this; }
+        inserter&amp; operator*() { return *this; }
+    };
+
+    Container result;
+    split_impl(inserter{result}, str, finder, maxsplit);
+    return result;
+}
+
+
+std::vector&lt;std::string&gt; split(std::string_view str,
+                               std::size_t maxsplit = std::numeric_limits&lt;std::size_t&gt;::max())
+{
+    auto finder = [](std::string_view str) {
+        static auto const isspace = [](unsigned char c){ return std::isspace(c); };
+        auto start = std::find_if(str.begin(), str.end(), isspace);
+        auto end = std::find_if_not(start, str.end(), isspace);
+        return std::pair{start == str.end() ? str.npos : start - str.begin(),
+                end == str.end() ? str.npos : end - str.begin()};
+    };
+
+    return split_to_strings(str, finder, maxsplit);
+}
+
+std::vector&lt;std::string&gt; split(std::string_view str,
+                               std::string_view sep,
+                               std::size_t maxsplit = std::numeric_limits&lt;std::size_t&gt;::max())
+{
+    auto finder = [sep,len=sep.size()](std::string_view str) {
+        auto start = str.find(sep);
+        return start == str.npos
+            ? std::pair{str.npos, str.npos}
+            : std::pair{start,start+len};
+    };
+
+    return split_to_strings(str, finder, maxsplit);
+}
+
+std::vector&lt;std::string&gt; split(std::string_view str,
+                               std::regex const&amp; sep,
+                               std::size_t maxsplit = std::numeric_limits&lt;std::size_t&gt;::max())
+{
+    auto finder = [sep](std::string_view str) -&gt; std::pair&lt;std::size_t, std::size_t&gt; {
+        std::match_results&lt;std::string_view::iterator&gt; loc;
+        if (std::regex_search(str.begin(), str.end(), loc, sep)) {
+            return {std::distance(str.begin(), loc.prefix().second),
+                    std::distance(str.begin(), loc.suffix().first)};
+        } else {
+            return {str.npos, str.npos};
+        }
+    };
+
+    return split_to_strings(str, finder, maxsplit);
+}
+
+
+#include &lt;iostream&gt;
+int main()
+{
+    auto *alice =
+        "Alice was beginning to get very tired of sitting by her sister on the "
+        "bank, and of having nothing to do: once or twice she had peeped into the "
+        "book her sister was reading, but it had no pictures or conversations in "
+        "it, ‘and what is the use of a book,’ thought Alice ‘without pictures or "
+        "conversations?’";
+
+    //auto words = split(alice);
+    auto words = split(alice, std::regex{"\\W+"});
+
+    std::size_t total_len = 0;
+    for (auto const&amp; w: words) { total_len += w.size(); }
+
+    std::cout &lt;&lt; "Average word length = "
+              &lt;&lt; 1.0 * total_len / words.size()
+              &lt;&lt; '\n';
+}
+</code></pre>
+<p>There's a bit more code here, and it's overkill if you're not going to make use of the generalization, but it might help improve your insight if nothing else!</p>
+<p>I've made a few choices here that you might reasonably make differently - you could return match and remainder views from your <code>Finder</code> instead of start and end positions, or you might return iterators.  It may be worth experimenting to see which are easiest to work with.</p>
+<hr>
+<h1>Opportunities</h1>
+<p>Although I've made the code above quite general, I did hold back from supporting different string types (e.g. <code>std::wstring</code>).  Doing so might make a good exercise!</p>
+    </div>

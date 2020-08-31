@@ -1,0 +1,146 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Some benchmarking data as promised:</p>
+
+<p>Cut to the chase, results:</p>
+
+<pre><code>--------------------------------------------------------
+Benchmark              Time             CPU   Iterations
+--------------------------------------------------------
+stl/100             3940 ns         3940 ns       173735
+member/100          4756 ns         4756 ns       147187
+lambda/100          3979 ns         3979 ns       177405
+getter/100          8768 ns         8768 ns        79665
+stlgetter/100       3993 ns         3993 ns       179926
+</code></pre>
+
+<p>Summary: </p>
+
+<ul>
+<li>Passing a member variable to the helper does incur a cost (~15-20%, and ~ 10% for bigger containers) as predicted by @Quuxplusone and using a lambda (ie fixing the offset in a distinct compile time type) does get rid of that extra cost (back to normal STL levels). </li>
+<li>Slight shock (for me at least) was that passing the address of a getter into our helper slows things down by ~2x. Put in an extra benchmark with the STL using the getters, and as expected that is ~nil cost compared to base case. </li>
+</ul>
+
+<p>Attempt at a conclusion: </p>
+
+<ul>
+<li>This is not a zero cost abstraction.</li>
+<li>However, for the most commonly requested use-case (eg slack/cpplang query), which is "sort by this public member", there is "only" a 15-20% (and ~10% for bigger containers) penalty relative to a custom lambda, but this has a code size benefit and is not actually caused by the abstraction as such (but to do with static/runtime resolution of the "address"). </li>
+<li>passing "getters" seems to have a weirdly large costs, needs further investigation. </li>
+</ul>
+
+<p>Here is the benchmark code (using Google Benchmark):</p>
+
+<pre><code>#include &lt;algorithm&gt;
+#include &lt;benchmark/benchmark.h&gt;
+#include &lt;functional&gt;
+#include &lt;iostream&gt;
+#include &lt;random&gt;
+#include &lt;vector&gt;
+
+struct Date {
+  int year, month, day;
+  [[nodiscard]] int get_year() const noexcept { return year; }
+  [[nodiscard]] int get_month() const noexcept { return month; }
+  [[nodiscard]] int get_day() const noexcept { return day; }
+};
+
+namespace os::algo {
+
+// the following 6 lines make it possible
+template &lt;typename Container, typename Member, typename Comparison = std::less&lt;&gt;&gt;
+void sortby(Container&amp; c, const Member&amp; m, const Comparison&amp; comp = Comparison()) {
+  std::sort(std::begin(c), std::end(c), [&amp;](const auto&amp; a, const auto&amp; b) {
+    return comp(std::invoke(m, a), std::invoke(m, b));
+  });
+}
+
+} // namespace os::algo
+
+std::vector&lt;Date&gt; get_random_dates(std::size_t size) {
+  std::random_device                 rnd_device;
+  std::mt19937                       engine{1}; // rnd_device()};
+  std::uniform_int_distribution&lt;int&gt; year_dist{1940, 2025};
+  std::uniform_int_distribution&lt;int&gt; month_dist{1, 12};
+  std::uniform_int_distribution&lt;int&gt; day_dist{1, 28}; // ignore complexities
+
+  auto dates = std::vector&lt;Date&gt;{};
+  dates.reserve(size);
+  for (std::size_t i = 0; i &lt; size; ++i) {
+    dates.push_back({year_dist(engine), month_dist(engine), day_dist(engine)});
+  }
+  return dates;
+}
+
+void stl(benchmark::State&amp; state) {
+  auto ds = get_random_dates(state.range(0));
+  for (auto _: state) {
+    std::sort(ds.begin(), ds.end(), [](const auto&amp; a, const auto&amp; b) { return a.month &lt; b.month; });
+    std::sort(ds.begin(), ds.end(), [](const auto&amp; a, const auto&amp; b) { return a.year &lt; b.year; });
+  }
+}
+BENCHMARK(stl)-&gt;Arg(100);
+
+void member(benchmark::State&amp; state) {
+  auto ds = get_random_dates(state.range(0));
+  for (auto _: state) {
+    os::algo::sortby(ds, &amp;Date::month);
+    os::algo::sortby(ds, &amp;Date::year);
+  }
+}
+BENCHMARK(member)-&gt;Arg(100);
+
+void lambda(benchmark::State&amp; state) {
+  auto ds = get_random_dates(state.range(0));
+  for (auto _: state) {
+    os::algo::sortby(ds, [](const auto&amp; x) { return x.month; });
+    os::algo::sortby(ds, [](const auto&amp; x) { return x.year; });
+  }
+}
+BENCHMARK(lambda)-&gt;Arg(100);
+
+void getter(benchmark::State&amp; state) {
+  auto ds = get_random_dates(state.range(0));
+  for (auto _: state) {
+    os::algo::sortby(ds, &amp;Date::get_month);
+    os::algo::sortby(ds, &amp;Date::get_year);
+  }
+}
+BENCHMARK(getter)-&gt;Arg(100);
+
+void stlgetter(benchmark::State&amp; state) {
+  auto ds = get_random_dates(state.range(0));
+  for (auto _: state) {
+    std::sort(ds.begin(), ds.end(), [](const auto&amp; a, const auto&amp; b) { return a.get_month() &lt; b.get_month(); });
+    std::sort(ds.begin(), ds.end(), [](const auto&amp; a, const auto&amp; b) { return a.get_year() &lt; b.get_year(); });
+  }
+}
+BENCHMARK(stlgetter)-&gt;Arg(100);
+
+</code></pre>
+
+<p>I also did a quick study on code size. I compiled a stripped down version of above code (no random gen, and no google benchmark lib) using <code>clang-9</code> with <code>-O3</code> and checked the binary executable size. I commented out all sorting for the base case and then uncommented each one of the methods in turn. As well as binary size I recorded "lines of assembly" (LOA) <a href="https://godbolt.org/z/6goZwo" rel="nofollow noreferrer">shown in godbolt</a>. </p>
+
+<p>Results:</p>
+
+<pre><code>// base size without any sort function: 17248 bytes / 219 LOA
+
+// size with stl: 21864 bytes / 1913 LOA
+
+// size with member: 17984 bytes / 970 LOA
+
+// size with lambda: 22072 bytes / 1941 LOA
+
+// size with getter: 22656 bytes / 1128 LOA
+
+</code></pre>
+
+<p>The only anomaly is the highest binary size and very low LOA for "getter". But otherwise this makes sense. Generally:</p>
+
+<pre><code>"Info encoded in Fixed types" (ie lambdas) =&gt; 
+bigger binary =&gt; 
+higher LOA =&gt; 
+and (from above) faster performance 
+</code></pre>
+
+<p>This "code size conclusion" is quite different from my initial impression in the original post. There I thought that the <code>sortby</code> helper was increasing code size. It is not. If that was really happening it was a compiler optimisation artefact. This more proper test shows the logical conclusion just above. </p>
+    </div>

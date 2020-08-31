@@ -1,0 +1,251 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I had some difficulty in getting your code to run. There are a few variables that weren't defined (see comment #1 below). Additionally, you're working <code>With Worksheets(1)</code>, but there are places where you're referencing <code>Cells</code> instead of <code>.Cells</code>. The former references whatever sheet is currently active, whereas the latter directly references <code>Worksheets(1)</code>. This can be a subtle source of many problems, and it's something to watch out for.</p>
+
+<p>Your current solution using <code>Find</code> , <code>CountIf</code>, and <code>Max</code> relies heavily on Excel worksheet functions and interactions with the data directly on the worksheet. With larger data sets, this can be a big source of the slowness in your code.</p>
+
+<p>I'm suggesting a different approach which converts the entire student data range to a memory-based array and works from there. Working completely out of memory is much quicker and side-steps the need for Excel access individual cells and ranges.</p>
+
+<p>So, a few comments on your code and implementation:</p>
+
+<ol>
+<li><a href="https://www.excel-easy.com/vba/examples/option-explicit.html" rel="nofollow noreferrer">Please use <code>Option Explicit</code></a> in all your VBA code. It will help keep your sanity longer.</li>
+<li>Declare your variables close to where you're first using them. It's easier to see exactly what you intend by the variable at that point.</li>
+<li>Read up on <a href="https://www.thespreadsheetguru.com/blog/dynamically-populating-array-vba-variables" rel="nofollow noreferrer">using memory-based arrays</a> in VBA. </li>
+</ol>
+
+<p>I've split the solution into two parts: setup and execution. The setup routine determines the area of data to be used -- in this case it's the range <code>studentData</code>.</p>
+
+<pre><code> Option Explicit
+
+Sub ProcessStudentRecords()
+    Dim studentWS As Worksheet
+    Set studentWS = ThisWorkbook.Sheets("Sheet1")
+
+    Dim lastRow As Long
+    Dim lastCol As Long
+    With studentWS
+        lastRow = .Cells(.Rows.Count, 1).End(xlUp).Row
+        lastCol = .Cells(1, .Columns.Count).End(xlToLeft).Column
+    End With
+    Dim studentData As Range
+    Set studentData = studentWS.Range("A2").Resize(lastRow - 1, lastCol)
+
+    Dim filteredStudents As Variant
+    filteredStudents = FilterForRecentEnrollment(studentData)
+
+    '--- now set our destination... 
+    Dim destinationWS As Worksheet
+    Set destinationWS = ThisWorkbook.Sheets("Filtered")
+
+    '--- ... and define the range where it's going to the correct size
+    Dim destRange As Range
+    Set destRange = destinationWS.Range("A2").Resize(UBound(filteredStudents, 1), UBound(filteredStudents, 2))
+
+    '--- copy the filtered results to the range and we're done
+    destRange = filteredStudents
+End Sub
+</code></pre>
+
+<p>You can see that after the student data is filtered, the function returns a memory-based array. It's a simple couple of steps to write that data back to a worksheet range.</p>
+
+<p>The function <code>FilterForRecentEnrollment</code> does all the heavy lifting by copying your original data into the memory-based array. Your data is large (at 260,000+ rows), but this should still be quicker than relying on Excel moving data directly in and out of the cells.</p>
+
+<p>Moving the data into a memory-based array is quick and easy:</p>
+
+<pre><code>    '--- work with the student data in a memory array for speed
+    Dim studentData As Variant
+    studentData = studentRange
+</code></pre>
+
+<p>A <code>Dictionary</code> in VBA is an object that actively manages large amounts of data and you to very quickly access any item in the collection with a unique <code>Key</code>. A key is simply a string. You create the key by using information from your data either a single unique field or a combination of fields that will be unique. As best as I could tell, a "unique" identifier for your data is a combination of the Student ID and the Student Name. Using a key made from these fields, you can test if that entry already exists (and then test the dates).</p>
+
+<p>So, in order to save data in the dictionary, we'll create a simple data-only class called <code>StudentInfo</code>. In your VBA Editor, right-click in the VBA Project "tree" where you see the Microsoft Excel Objects and Modules, then select "Insert--&gt;Class Module". In the Properties window, name the class <code>StudentInfo</code>. This class looks like this:</p>
+
+<pre><code>'--- Class Module:  StudentInfo
+Option Explicit
+
+'--- ideally, these should be properties
+Public SchoolName As String
+Public StudentID As String
+Public IDWithSchool As String
+Public Student As String
+Public IDWithName As String
+Public Level As String
+Public Grade As String
+Public Status As String
+Public Exited As Date
+
+Public Property Get NumberOfFields() As Long
+    NumberOfFields = 9
+End Property
+</code></pre>
+
+<p>So what we'll do in the Filter routine is to scan a row of your student data, capture all the information into an StudentInfo object, and store it in the Dictionary. Of course, we'll only store the <strong>latest</strong> exit date of info in the dictionary. It looks like this:</p>
+
+<pre><code>Set rowInfo = New StudentInfo
+rowInfo.SchoolName = studentData(i, 1)
+rowInfo.StudentID = studentData(i, 2)
+rowInfo.IDWithSchool = studentData(i, 3)
+rowInfo.Student = studentData(i, 4)
+rowInfo.IDWithName = studentData(i, 5)
+rowInfo.Level = studentData(i, 6)
+rowInfo.Grade = studentData(i, 7)
+rowInfo.Status = studentData(i, 8)
+rowInfo.Exited = studentData(i, 9)
+
+'--- create a key value that is a unique combination of values that defines
+'    a single (non-duplicate) entry
+Dim dictionaryKey As String
+dictionaryKey = rowInfo.StudentID &amp; rowInfo.Student
+If Not students.Exists(dictionaryKey) Then
+    students.Add dictionaryKey, rowInfo
+Else
+    '--- this entry exists, but which has a later exit date?
+    Dim existingInfo As StudentInfo
+    Set existingInfo = students(dictionaryKey)
+    If rowInfo.Exited &gt; existingInfo.Exited Then
+        '--- the new row's exit date is later than the existing row,
+        '    so replace it
+        Set students(dictionaryKey) = rowInfo
+    Else
+        '--- keep the existing info and ignore the current row
+    End If
+End If
+</code></pre>
+
+<p>All that code is inside a loop to catch all the student information and filter it.</p>
+
+<p>Now that we have a collection (Dictionary) of filtered student data, we know exactly how many rows and columns in the data. So we can create a memory-based array and copy the data into that. Again, we're working directly in memory, so it's much faster than working with the sheet for large amounts of data.</p>
+
+<pre><code>'--- now that we have the filtered student data, we'll create an array
+'    to return the data
+Dim filteredData() As Variant
+ReDim filteredData(1 To students.Count, 1 To rowInfo.NumberOfFields)
+
+'--- now populate!
+Dim key As Variant
+i = 1
+For Each key In students.Keys
+    Set rowInfo = students(key)
+    filteredData(i, 1) = rowInfo.SchoolName
+    filteredData(i, 2) = rowInfo.StudentID
+    filteredData(i, 3) = rowInfo.IDWithSchool
+    filteredData(i, 4) = rowInfo.Student
+    filteredData(i, 5) = rowInfo.IDWithName
+    filteredData(i, 6) = rowInfo.Level
+    filteredData(i, 7) = rowInfo.Grade
+    filteredData(i, 8) = rowInfo.Status
+    filteredData(i, 9) = rowInfo.Exited
+    i = i + 1
+Next key
+</code></pre>
+
+<p>I tested this on the limited sample data you posted and the filtering works. Some decisions you can make would be to adjust the student information you're actually saving in the class and then transferring to the destination. You'll also possibly decide that a different combination of fields is necessary for a unique key. You'll have to determine this based on your real data set.</p>
+
+<p>Here's the full code for the module (don't forget to create the class, as above):</p>
+
+<pre><code>Option Explicit
+
+Sub ProcessStudentRecords()
+    Dim studentWS As Worksheet
+    Set studentWS = ThisWorkbook.Sheets("Sheet1")
+
+    Dim lastRow As Long
+    Dim lastCol As Long
+    With studentWS
+        lastRow = .Cells(.Rows.Count, 1).End(xlUp).Row
+        lastCol = .Cells(1, .Columns.Count).End(xlToLeft).Column
+    End With
+    Dim studentData As Range
+    Set studentData = studentWS.Range("A2").Resize(lastRow - 1, lastCol)
+
+    Dim filteredStudents As Variant
+    filteredStudents = FilterForRecentEnrollment(studentData)
+
+    '--- now set our destination...
+    Dim destinationWS As Worksheet
+    Set destinationWS = ThisWorkbook.Sheets("Filtered")
+
+    '--- ... and define the range where it's going to the correct size
+    Dim destRange As Range
+    Set destRange = destinationWS.Range("A2").Resize(UBound(filteredStudents, 1), UBound(filteredStudents, 2))
+
+    '--- copy the filtered results to the range and we're done
+    destRange = filteredStudents
+End Sub
+
+Public Function FilterForRecentEnrollment(ByRef studentRange As Range) As Variant
+    '--- works through each row in the data range and captures a new
+    '    dictionary entry for each new student/school combination.
+    '    the value in the dictionary is the information from that row
+
+    '--- work with the student data in a memory array for speed
+    Dim studentData As Variant
+    studentData = studentRange
+
+    '--- create a dictionary that will help determine if there are duplicates
+    Dim students As Scripting.Dictionary
+    Set students = New Scripting.Dictionary
+
+    Dim rowInfo As StudentInfo
+    Dim i As Long
+    For i = LBound(studentData, 1) To UBound(studentData, 1)
+        Set rowInfo = New StudentInfo
+        rowInfo.SchoolName = studentData(i, 1)
+        rowInfo.StudentID = studentData(i, 2)
+        rowInfo.IDWithSchool = studentData(i, 3)
+        rowInfo.Student = studentData(i, 4)
+        rowInfo.IDWithName = studentData(i, 5)
+        rowInfo.Level = studentData(i, 6)
+        rowInfo.Grade = studentData(i, 7)
+        rowInfo.Status = studentData(i, 8)
+        rowInfo.Exited = studentData(i, 9)
+
+        '--- create a key value that is a unique combination of values that defines
+        '    a single (non-duplicate) entry
+        Dim dictionaryKey As String
+        dictionaryKey = rowInfo.StudentID &amp; rowInfo.Student
+        If Not students.Exists(dictionaryKey) Then
+            students.Add dictionaryKey, rowInfo
+        Else
+            '--- this entry exists, but which has a later exit date?
+            Dim existingInfo As StudentInfo
+            Set existingInfo = students(dictionaryKey)
+            If rowInfo.Exited &gt; existingInfo.Exited Then
+                '--- the new row's exit date is later than the existing row,
+                '    so replace it
+                Set students(dictionaryKey) = rowInfo
+            Else
+                '--- keep the existing info and ignore the current row
+            End If
+        End If
+    Next i
+
+    '--- now that we have the filtered student data, we'll create an array
+    '    to return the data
+    Dim filteredData() As Variant
+    ReDim filteredData(1 To students.Count, 1 To rowInfo.NumberOfFields)
+
+    '--- now populate!
+    Dim numFields As Long
+    numFields = rowInfo.NumberOfFields
+
+    Dim key As Variant
+    i = 1
+    For Each key In students.Keys
+        Set rowInfo = students(key)
+        filteredData(i, 1) = rowInfo.SchoolName
+        filteredData(i, 2) = rowInfo.StudentID
+        filteredData(i, 3) = rowInfo.IDWithSchool
+        filteredData(i, 4) = rowInfo.Student
+        filteredData(i, 5) = rowInfo.IDWithName
+        filteredData(i, 6) = rowInfo.Level
+        filteredData(i, 7) = rowInfo.Grade
+        filteredData(i, 8) = rowInfo.Status
+        filteredData(i, 9) = rowInfo.Exited
+        i = i + 1
+    Next key
+    FilterForRecentEnrollment = filteredData
+End Function
+</code></pre>
+    </div>

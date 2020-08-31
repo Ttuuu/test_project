@@ -1,0 +1,367 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>More speed for both <code>C++</code> and <code>C#</code></h2>
+
+<p>Revisiting an older question. While reading this question and its already very good answers the following occurred to me:</p>
+
+<h2>Hash tables are slow</h2>
+
+<p>Both the hashing and the subsequent hopping around RAM are not that fast. C++ <code>unordered_map</code> is additionally hampered because it is trying to maintain backward ABI compatibility. The inner loop of the above algorithm is all about hastable lookups. The keys are an xor-mash of the 3 <code>int</code>s in <code>vec3</code>. </p>
+
+<p>First, we can try to make the hashtable faster. One way to do this, is often <strong>a better hash function</strong>. The one used above is a bit "generic". We can use our domain knowledge to improve it. We pretty much know that <code>x,y,z</code> in <code>vec3</code> will not exceed 1 million. So if we just mask out all but the lowest 20bits of each integer and then shift and <code>|</code> combine them into the 64bit output of the hash function, we would get "the perfect hash function": Fast to compute and a unique hash value for every input with zero collisions:</p>
+
+<pre><code>namespace std {
+template &lt;&gt;
+struct hash&lt;vec3&gt; {
+  std::size_t operator()(const vec3&amp; v) const {
+    return ((static_cast&lt;std::size_t&gt;(v.x) &amp; 0xfffffUL) &lt;&lt; 40U) |
+           ((static_cast&lt;std::size_t&gt;(v.y) &amp; 0xfffffUL) &lt;&lt; 20U) |
+           ((static_cast&lt;std::size_t&gt;(v.z) &amp; 0xfffffUL));
+  }
+};
+} // namespace std
+</code></pre>
+
+<p>This is actually a huge gain already. Something like 2x faster. If we use <a href="https://github.com/skarupke/flat_hash_map" rel="nofollow noreferrer">a better hashmap implementation</a> we can even make that 2.5x faster. </p>
+
+<p>But we can do even better if we understand that the fundamental insight is:</p>
+
+<p><strong>There is usually a time / space tradeoff between a hashtable and a sparse array</strong>. </p>
+
+<p>Those ints have limited range (size of grid), we could just use them as indeces into an array instead of the hashing. </p>
+
+<p>In C++ I could easily do this for <code>dist</code> and <code>prev</code> with the following template:</p>
+
+<pre><code>  template &lt;typename T&gt;
+  struct grid_vector {
+    explicit grid_vector(vec3 dims, const T&amp; defv = T())
+        : sx_{dims.x}, sy_{dims.y}, sz_{dims.z}, data_{std::vector&lt;T&gt;(
+                                                     sx_ * sy_ * sz_, defv)} {}
+
+    T&amp; operator[](const vec3&amp; index) {
+      return data_[index.x * sy_ * sz_ + index.y * sz_ + index.z];
+    }
+
+  private:
+    int            sx_, sy_, sz_;
+    std::vector&lt;T&gt; data_;
+  };
+</code></pre>
+
+<h2>Is it worth while?</h2>
+
+<p>Well firstly there is a space cost. There are 6000 "cells" and only ~800 of them pass the <code>cellFilter</code>. So by using <code>x,y,z</code> as the index for <code>dist</code> / <code>prev</code> we are wasting 5200 entries in each vector. It's "not a lot of memory" but your mileage may vary. </p>
+
+<p>If you are worried about the memory usage, or the grid dimensions are much bigger with few valid cells (more wasted space), then use the better hash function above with the better hashmap implementation. The gains below still apply. </p>
+
+<p>If you're happy to burn a bit of memory, the gains are significant. It turns out that removing the hashtable addresses the main bottleneck and the <code>find_path</code> section of the algorithm <strong>drops from 2ms to 0.4ms, ie a 5x gain</strong>. That's not bad. It depends on the application whether this is worthwhile, but the gains are there if they are wanted. I don't have figures for C#, but I suspect that significant gains (at the cost of space) are available there too. </p>
+
+<p>There is a lot of noise in the performance numbers now as we are in sub ms territory and things like <code>malloc</code> become signficant. </p>
+
+<h2>What else can we speed up?</h2>
+
+<p>Need to be careful not to fall into premature optimisation here. Given the OP was keen for <code>find_path()</code> to run as quickly as possible, there are a couple more easy gains we can make:</p>
+
+<ul>
+<li><code>get_neighbours()</code> is called in the inner loop and materializes a <code>std::vector</code> only to then loop over that vector and discard it. Basic lesson: <strong>Don't materialize heap based data structures in the inner loops of the hot path, if you don't need to</strong>. So we can change that method to <code>foreach_neighbours()</code> which takes a <code>Callback</code>. This change gains us ~25% from 0.4ms to 0.3ms. This is not less readable, and a good pattern to try. </li>
+<li>We changed the <code>vec3::dist</code> calculation to use<code>std::hypot</code> which is "more robust" against under/overflow, but not faster. In fact this function is only ever called for the 26 immediate 3D neighbours such that <code>dx,dy,dz</code> are all in range <code>[-1, 1]</code>. So we can statically cache these calculations in a 3x3x3 array and just lookup in that from the inner loop: A further 16% gain to ~0.24ms. </li>
+</ul>
+
+<p>So overall that gives us another 1.7x gain, bringing our <strong>overall gain to &gt; 8x</strong>. </p>
+
+<p>But, with the "hypot cache" we are getting into the territory of micro-optimisations: Time to stop? Almost...</p>
+
+<h2>Cascade improvements</h2>
+
+<p>Often when working on performance, we find that optimisations we rejected earlier, because they were not significant, become significant as we remove other bottlenecks. Also, some changes we make, might seem fine at the time, but, as we get faster, they end up being a bottleneck. </p>
+
+<p>This process was no exception. Some examples:</p>
+
+<ul>
+<li>The original code has <code>dist</code> and <code>prev</code> as <code>unordered_map</code>s. We changed that to <code>grid_vector&lt;vec3&gt;</code> and <code>grid_vector&lt;float&gt;</code> (see above). It turns out that, partially because they are indexed and accessed the same, we can combine them into a <code>grid_vector&lt;vertex&gt;</code> which holds <code>vec3</code> and <code>float</code>. It also turns out that this is the same structure as the old <code>grid_node</code> (although the semantics are different), so we can eliminate a <code>struct</code>. Small amount of space gained, due to in <code>struct</code> packing, but no speed gain ...yet. </li>
+<li>We changed the filter passing from a function pointer to <code>std::invoke</code> as we made the filter a member function. <code>std::invoke</code> is very convenient, but it does have overhead. A Lambda is almost as convenient and has no overhead (the compiler can se straight through it and inline if appropriate). Speedup 0.24ms down to 0.20ms =&gt; 16%. </li>
+<li><a href="https://www.youtube.com/watch?v=nXaxk27zwlk" rel="nofollow noreferrer">Profiling the app with <code>perf</code></a> we find that most of the effort is now in the <code>pop</code> <code>push</code> of the <code>priority queue</code>. This is not a surprise as Dijkstra's tends to be very much bound by data structure efficiency. The priority queue with the "keep pushing and lazy remove" approach is a very good way, but: We don't need to fill the queue with all vertices to begin with. This means ~800 infinite distance nodes are sitting in the priority queue and slowing down the <code>pop</code> <code>push</code> which are O(log n). If we just <code>push</code> the neighbours as we need them, we get the same result (tested for all start/end combinations) and we have a tiny queue. Speedup: 0.20ms =&gt; 0.17ms , or 16%</li>
+<li>Now that we are not filling the queue during <code>init</code> we only have to fill the <code>grid_vector&lt;vertex&gt;</code> and that can be done with a bulk constructor and not 3 nested loops. All of <code>init</code> effectively disappears. Speedup: 0.17ms 0.16ms or 6%</li>
+</ul>
+
+<p>So that makes our <strong>overall speedup from the OPs code 2ms =&gt; 0.16ms or 12.5x</strong>. Most of these changes will apply to the <code>C#</code> code as well. </p>
+
+<h2>Optimisations tried and rejected</h2>
+
+<ul>
+<li>Pre-allocating the std::vector underpinning <code>std::priority_queue</code> and <code>std::move</code>ing it in (using the <a href="https://en.cppreference.com/w/cpp/container/priority_queue/priority_queue" rel="nofollow noreferrer">version (4) of the queue constructor</a> ) after <code>emplace_back</code>ing the elements during initialisation. It made no measurable difference so I took it out again. This later became irrelevant as we decided not to bulk fill the queue.</li>
+<li>Precomputing an adjacency matrix with all neighbours and their distances. This takes ~1ms so it's slower than running Dijkstra's. Could be worthwhile if we call Dykstra many many times and the grid (ie <code>occupied</code> and <code>walkableSurface</code>) doesn't change often. But not worth it for the example given. Another example of: Don't materialize data structures if they are fast to compute. </li>
+</ul>
+
+<h2>Other refactors and final code</h2>
+
+<p>While refactoring, I ended up making a bunch of other "stylistic" changes, building on the <a href="https://codereview.stackexchange.com/a/152743/212940">very good answer by Jerry Coffin</a>. Including:</p>
+
+<ul>
+<li><code>Grid</code> is now a bigger class which encapsulates its internals </li>
+<li>Don't use globals, particularly <code>grid</code></li>
+<li>Changed the way <code>cellFilter</code> is being passed it, making use of <code>std::invoke</code> -- later changed to a lambda for performance.</li>
+<li>use "early return" to simply a bunch of the conditionals</li>
+<li>split the rather long main function. All functions &lt; 15 lines now.</li>
+<li><code>const</code> correctness: Apply <code>const</code> to everything that can be. This triggers a bunch of clang-tidy suggested additions of <code>[[nodiscard]]</code>, so do those as well. </li>
+<li>I am using my own little Timer class, link in code, although I used <a href="https://github.com/google/benchmark" rel="nofollow noreferrer">Google Benchmark</a> when I needed more robust, reliable numbers. </li>
+</ul>
+
+<p>Final code:</p>
+
+<pre><code>// https://raw.githubusercontent.com/oschonrock/toolbelt/master/os/bch.hpp
+#include "os/bch.hpp"
+#include &lt;benchmark/benchmark.h&gt;
+#include &lt;chrono&gt;
+#include &lt;cmath&gt;
+#include &lt;fstream&gt;
+#include &lt;functional&gt;
+#include &lt;iomanip&gt;
+#include &lt;iostream&gt;
+#include &lt;queue&gt;
+#include &lt;stdexcept&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+struct vec3 {
+  int x, y, z;
+
+  bool operator==(const vec3&amp; o) const noexcept {
+    return x == o.x &amp;&amp; y == o.y &amp;&amp; z == o.z;
+  }
+  vec3 operator+(const vec3&amp; o) const noexcept {
+    return {x + o.x, y + o.y, z + o.z};
+  }
+
+  static vec3 min(const vec3&amp; a, const vec3&amp; b) noexcept {
+    return {std::min(a.x, b.x), std::min(a.y, b.y), std::min(a.z, b.z)};
+  }
+
+  static vec3 max(const vec3&amp; a, const vec3&amp; b) noexcept {
+    return {std::max(a.x, b.x), std::max(a.y, b.y), std::max(a.z, b.z)};
+  }
+
+  static float dist(const vec3&amp; a, const vec3&amp; b) noexcept {
+    return std::hypot(float(a.x - b.x), float(a.y - b.y), float(a.z - b.z));
+  }
+
+  // limited to immediate neighbours: (int)dx,dy,dz: -1 =&gt; 1. uses lookup table
+  static float fast_dist(const vec3&amp; a, const vec3&amp; b) noexcept {
+    return hypot[a.x - b.x + 1][a.y - b.y + 1][a.z - b.z + 1];
+  }
+
+  inline static float hypot[3][3][3]{}; // NOLINT
+
+  static bool hypot_init() noexcept {
+    for (int dx = -1; dx &lt;= 1; dx++)
+      for (int dy = -1; dy &lt;= 1; dy++)
+        for (int dz = -1; dz &lt;= 1; dz++) {
+          hypot[dx + 1][dy + 1][dz + 1] =
+              std::hypot(float(dx), float(dy), float(dz));
+        }
+    return true;
+  }
+
+  inline static bool hypot_initialized = hypot_init();
+
+  friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; os, const vec3&amp; v3) {
+    return os &lt;&lt; "[" &lt;&lt; v3.x &lt;&lt; ", " &lt;&lt; v3.y &lt;&lt; ", " &lt;&lt; v3.z &lt;&lt; "]";
+  }
+};
+
+class grid {
+  struct cell; // fwd declaration
+
+public:
+  cell&amp; operator[](vec3 const&amp; index) noexcept {
+    return cells[index.x * sy_ * sz_ + index.y * sz_ + index.z];
+  }
+
+  const cell&amp; operator[](vec3 const&amp; index) const noexcept {
+    return cells[index.x * sy_ * sz_ + index.y * sz_ + index.z];
+  }
+
+  friend std::istream&amp; operator&gt;&gt;(std::istream&amp; istream, grid&amp; g) {
+    // os::bch::Timer t{"load"};
+    istream &gt;&gt; g.sx_ &gt;&gt; g.sy_ &gt;&gt; g.sz_;
+    g.cells.resize(g.sx_ * g.sy_ * g.sz_);
+    istream &gt;&gt; std::boolalpha;
+    int i = 0;
+    for (int x = 0; x &lt; g.sx_; ++x)
+      for (int y = 0; y &lt; g.sy_; ++y)
+        for (int z = 0; z &lt; g.sz_; ++z) istream &gt;&gt; g.cells[i++];
+    return istream;
+  }
+
+  [[nodiscard]] vec3 dims() const { return {sx_, sy_, sz_}; }
+
+  template &lt;typename Filter&gt;
+  [[nodiscard]] std::vector&lt;vec3&gt; find_path(const vec3&amp; start, const vec3&amp; end,
+                                            const Filter&amp; filter) const {
+
+    if (!filter(start, start) || !filter(end, end))
+      throw std::invalid_argument("start and/or end fail cell filter!");
+
+    // previuous coord / finalised dist to start
+    // could be added to grid.cells but that would make multi-threaded access
+    // very hard
+    grid_vector&lt;vertex&gt; vertices(
+        dims(), {{-1, -1, -1}, std::numeric_limits&lt;float&gt;::max()});
+
+    find_path_search(start, end, vertices, filter);
+    return find_path_extract(end, vertices);
+  }
+
+  [[nodiscard]] bool cellFilter(const vec3&amp; from, const vec3&amp; to) const {
+    if (from.y != to.y)
+      // If the movement is vertical, then perform no diagonal check
+      return isFreeFloor(to);
+
+    // Check if all cells we're moving through are floors
+    // important when moving diagonally
+    auto min = vec3::min(from, to);
+    auto max = vec3::max(from, to);
+
+    for (int x = min.x; x &lt;= max.x; ++x)
+      for (int z = min.z; z &lt;= max.z; ++z)
+        if (!isFreeFloor({x, min.y, z})) return false;
+    return true;
+  }
+
+private:
+  int sx_{}, sy_{}, sz_{};
+
+  struct cell {
+    bool occupied;
+    bool walkableSurface;
+
+    friend std::istream&amp; operator&gt;&gt;(std::istream&amp; is, cell&amp; c) {
+      return is &gt;&gt; c.occupied &gt;&gt; c.walkableSurface;
+    }
+  };
+
+  std::vector&lt;cell&gt; cells;
+
+  struct vertex {
+    vec3  coord;
+    float dist;
+
+    bool operator&lt;(vertex const&amp; o) const { return dist &gt; o.dist; } // min-heap!
+
+    friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; os, const vertex&amp; v) {
+      return os &lt;&lt; v.coord &lt;&lt; ": " &lt;&lt; v.dist;
+    }
+  };
+
+  template &lt;typename T&gt;
+  struct grid_vector {
+    explicit grid_vector(vec3 dims, const T&amp; defv = T())
+        : sx_{dims.x}, sy_{dims.y}, sz_{dims.z}, data_{std::vector&lt;T&gt;(
+                                                     sx_ * sy_ * sz_, defv)} {}
+
+    T&amp; operator[](const vec3&amp; index) {
+      return data_[index.x * sy_ * sz_ + index.y * sz_ + index.z];
+    }
+
+  private:
+    int            sx_, sy_, sz_;
+    std::vector&lt;T&gt; data_;
+  };
+
+  template &lt;typename Filter&gt;
+  void find_path_search(const vec3&amp; start, const vec3&amp; end,
+                        grid_vector&lt;vertex&gt;&amp; vertices,
+                        const Filter&amp;        filter) const {
+    // os::bch::Timer t{"find_path_search"};
+
+    // search queue: not prefilled, because not required and that slows it down
+    // current coord / estimated dist to start
+    std::priority_queue&lt;vertex&gt; queue;
+
+    vertices[start].dist = 0;
+    queue.push({start, 0});
+
+    while (!queue.empty()) {
+      auto u = queue.top();
+      queue.pop();
+      if (u.dist != vertices[u.coord].dist)
+        continue;                // lazy remove/skip of old queue value
+      if (u.coord == end) break; // we arrived. stop.
+
+      foreach_neighbours(u.coord, [&amp;](const vec3&amp; v) {
+        if (filter(u.coord, v)) {
+          float new_dist = vertices[u.coord].dist + vec3::fast_dist(u.coord, v);
+          if (new_dist &lt; vertices[v].dist) {
+            // update min distance to "start", record path "back"
+            vertices[v] = {u.coord, new_dist};
+            queue.push({v, new_dist}); // leave old one in, to be lazily removed
+          }
+        }
+      });
+    }
+  }
+
+  static std::vector&lt;vec3&gt; find_path_extract(const vec3&amp;          end,
+                                             grid_vector&lt;vertex&gt;&amp; vertices) {
+    // os::bch::Timer    t{"find_path_extract"};
+    std::vector&lt;vec3&gt; path;
+    if (vertices[end].coord.x != -1) {
+      vec3 current = end;
+      while (current.x != -1) {
+        path.push_back(current);
+        current = vertices[current].coord;
+      }
+      std::reverse(path.begin(), path.end());
+    }
+    return path;
+  }
+
+  [[nodiscard]] bool isFreeFloor(const vec3&amp; pos) const {
+    return pos.y &gt; 0 &amp;&amp; !(*this)[pos].occupied &amp;&amp;
+           (*this)[pos + vec3{0, -1, 0}].walkableSurface;
+  }
+
+  [[nodiscard]] bool contains(vec3 const&amp; coord) const {
+    // clang-format off
+    return coord.x &gt;= 0 &amp;&amp; coord.x &lt; sx_ &amp;&amp;
+           coord.y &gt;= 0 &amp;&amp; coord.y &lt; sy_ &amp;&amp;
+           coord.z &gt;= 0 &amp;&amp; coord.z &lt; sz_;
+    // clang-format on
+  }
+
+  // faster to loop with callback than to materialise
+  // a vector on heap and RVO return it
+  template &lt;typename Callback&gt;
+  void foreach_neighbours(const vec3&amp; coord, const Callback&amp; callback) const {
+    for (int dx = -1; dx &lt;= 1; dx++)
+      for (int dy = -1; dy &lt;= 1; dy++)
+        for (int dz = -1; dz &lt;= 1; dz++) {
+          if (dx == 0 &amp;&amp; dy == 0 &amp;&amp; dz == 0) continue; // ignore self
+          auto new_coord  = coord + vec3{dx, dy, dz};
+          bool connected  = abs(dx) + abs(dy) + abs(dz) &lt;= 2;
+          bool withinGrid = contains(new_coord);
+          if (connected &amp;&amp; withinGrid) callback(new_coord);
+        }
+  }
+}; // Grid
+
+int main() {
+  std::ifstream gridFile("grid.txt");
+  grid          g;
+  gridFile &gt;&gt; g;
+
+  vec3 start = {9, 2, 6};
+  vec3 end   = {45, 2, 0};
+
+  auto filter = [&amp;g](const vec3&amp; from, const vec3&amp; to) {
+    return g.cellFilter(from, to);
+  };
+  try {
+    auto path = g.find_path(start, end, filter);
+    std::cout &lt;&lt; "best path is " &lt;&lt; path.size() &lt;&lt; " cells long\n";
+    for (auto&amp; e: path) std::cout &lt;&lt; e &lt;&lt; "\n";
+  } catch (std::exception&amp; e) {
+    std::cout &lt;&lt; "exception: " &lt;&lt; e.what() &lt;&lt; '\n';
+  }
+}
+</code></pre>
+    </div>

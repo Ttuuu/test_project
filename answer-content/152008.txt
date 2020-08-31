@@ -1,0 +1,394 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Couple of bugs!</h1>
+
+<h2>File names typos</h2>
+
+<p>You seem to be using a case-insensitive OS. I've had to rename <code>Resources/pixelated.ttf</code> to <code>Pixelated.ttf</code> and <code>cmake/FindSDL2_image.cmake</code> to <code>FindSDL2_Image.cmake</code>.</p>
+
+<h2>Input issues</h2>
+
+<p><code>SDL_PollEvents</code> only returns the first event waiting in the event queue. Thus, the code in <code>Controller::control</code> only handles <em>one</em> event per frame. For this reason, the game was at first completely unresponsive. I've quickly changed it to:</p>
+
+<pre><code>while(SDL_PollEvent(&amp;current_event))
+    if (current_event.type == SDL_KEYDOWN) {
+        // Rest of the code...
+</code></pre>
+
+<p>Also, SDL KeySyms are good for text editing, but not great for game controls because they depend on the keyboard's layout. WASD in particular end up mapped to ZQSD on an AZERTY keyboard. <a href="https://stackoverflow.com/questions/31941446/what-is-the-difference-between-an-sdl-physical-key-code-and-an-sdl-virtual-key-c">Prefer scancodes for that</a>.</p>
+
+<h1>The actual review</h1>
+
+<p>These sections are in no particular order, they are pretty much my notes while I'm reading through the various files and refactoring as I go.</p>
+
+<h3>The magic <code>cleanup</code> function!</h3>
+
+<p>I like what you've gone for in <code>Cleanup.h</code>, abstracting the various cleanup functions behind a single one. There are, however, a couple of things that can be improved.</p>
+
+<h3>Overload rather than specialize</h3>
+
+<p>M. Sutter has explained it <a href="http://www.gotw.ca/publications/mill17.htm" rel="nofollow noreferrer">here</a> better than I ever could. In short: function template specializations act weird with overload resolution, so it's better to stick with plain overloads when they do the job:</p>
+
+<pre><code>inline void cleanup(SDL_Window *win) {
+    if (!win) {
+        return;
+    }
+    SDL_DestroyWindow(win);
+}
+
+// And so on.
+</code></pre>
+
+<h3>Pack expansions are cool</h3>
+
+<p>Okay, they don't look <em>that</em> great in C++11. But it is definitely a good idea to get used to them, because C++17 brings along fold expressions, which makes the syntax really neat. In cases like this one, where you just want to repeat something on each argument of a pack, recursion with perfect forwarding is not your only option:</p>
+
+<pre><code>template&lt;typename... Args&gt;
+void cleanup(Args *... args) {
+
+    // C++11, constructing a dummy `int` array
+    using ex = int[];
+    (void)ex{(cleanup(args), 0)..., 0};
+
+    // C++17
+    (void)(cleanup(args), ...);
+}
+</code></pre>
+
+<h3>Can't clean this! Now what?</h3>
+
+<p>Now is a good time to think about the error case of our <code>cleanup</code> function. What happens when a developer lacking caffeine tries to call <code>cleanup</code> with something that doesn't have a suitable implementation ? Your original code produces this error output, with no hint towards the actual error:</p>
+
+<pre><code>In instantiation of ‘void cleanup(T*, Args&amp;&amp; ...) [with T = int; Args = {}]’:
+  required from ‘void cleanup(T*, Args&amp;&amp; ...) [with T = int; Args = {SDL_Window*&amp;}]’
+  required from ‘void cleanup(T*, Args&amp;&amp; ...) [with T = SDL_Renderer; Args = {int*&amp;, SDL_Window*&amp;}]’
+error: no matching function for call to ‘cleanup()’
+     cleanup(std::forward&lt;Args&gt;(args)...);
+            ^
+note: candidate: template&lt;class T, class ... Args&gt; void cleanup(T*, Args&amp;&amp; ...)
+ void cleanup(T *t, Args&amp;&amp;... args){
+      ^
+note:   template argument deduction/substitution failed:
+note:   candidate expects at least 1 argument, 0 provided
+     cleanup(std::forward&lt;Args&gt;(args)...);
+            ^
+</code></pre>
+
+<p>Switching from specializations to overloads produces the same output. Using pack-expansion rather than recursion has... unfortunate results in this case: <code>cleanup</code> ends up calling itself recursively, compiling fine but blowing up the stack at runtime. Not ideal. To avoid both of these unpleasant symptoms of an error, we can declare a catch-all function which will be chosen whenever no version of <code>cleanup</code> can take in the argument.</p>
+
+<pre><code>template &lt;class T&gt;
+void cleanup(T *) = delete;
+</code></pre>
+
+<p>Now it fails with a shorter and more helpful error:</p>
+
+<pre><code>error: use of deleted function ‘void cleanup(T*) [with T = int]’
+</code></pre>
+
+<p>This is enough for a trained developer to recognize the deleted catch-all pattern: he needs to implement <code>cleanup(int*)</code>! But we can do better:</p>
+
+<pre><code>template &lt;class T&gt;
+struct zero {
+    static constexpr int value = 0;
+};
+
+template &lt;class T&gt;
+void cleanup(T *) {
+    static_assert(zero&lt;T&gt;::value, "No overload of `cleanup` for this type.");
+}
+</code></pre>
+
+<p>The <code>zero&lt;T&gt;::value</code> is here just to make sure the condition of <code>static_assert</code> <a href="https://stackoverflow.com/questions/5246049/c11-static-assert-and-template-instantiation">depends on the template parameter</a>, so it is only checked upon instantiating (trying to call) the function. Now the message appears clearly in the error log, guiding the developer towards solving the issue.</p>
+
+<h3>When to call <code>cleanup</code>?</h3>
+
+<p>So this <code>cleanup</code> function neatly reduces the syntax for cleaning up a couple of resources, being smart enough to know what to do depending on their types. But when do we actually call it? Turns out, C++ actually has a feature to know when to cleanup stuff: destructors! Rather than carefully calling <code>cleanup</code> at all the right places so nothing is left behind, even in the wildest cases of exception propagation, we can wrap every resource inside an object, whose destructor's job is to clean it up. This habit is known as RAII, probably the worst misnomer ever, but hey -- it's incredibly useful.</p>
+
+<p>So the most visible resources are the window, the renderer and the background, three pointers with special cleanup requirements. This falls squarely into the functionality offered by <code>std::unique_ptr</code>, so let's use that. We just have to wrap <code>cleanup</code> inside a functor, and then declare some typedefs:</p>
+
+<pre><code>struct Cleaner {
+    template &lt;class T&gt;
+    void operator() (T *p) const {
+        cleanup(p);
+    }
+};
+
+using SdlWinPtr = std::unique_ptr&lt;SDL_Window,   Cleaner&gt;;
+using SdlRenPtr = std::unique_ptr&lt;SDL_Renderer, Cleaner&gt;;
+using SdlTexPtr = std::unique_ptr&lt;SDL_Surface,  Cleaner&gt;;
+</code></pre>
+
+<p>Then later I stumbled upon some owning <code>SDL_Surface</code> and <code>TTF_Font</code> pointers, so I've added them too. This led to refactoring <code>View::render_font</code>, which returned an owning <code>SDL_Texture*</code>, which had to be cleaned up by the caller later. And guess what -- it wasn't done. Replacing the return type with <code>SdlTexPtr</code> fixed that bug for free :)</p>
+
+<h3>Clean ALL the things<a href="http://hyperboleandahalf.blogspot.fr/2010/06/this-is-why-ill-never-be-adult.html" rel="nofollow noreferrer">!</a></h3>
+
+<p>Now we can replace our raw owning pointers with these, and let them handle all of the cleaning for us. But wait! There's still cleanup code all over the place inside <code>View.cpp</code>, that is <code>TTF_Quit()</code>, <code>IMG_Quit()</code> and <code>SDL_Quit()</code>. Libraries are a resource too, so let's wrap them in some nice little RAII classes.</p>
+
+<pre><code>// Helper to avoid deleting functions all over the place
+struct NoCopy {
+    NoCopy() = default;
+    NoCopy(NoCopy const &amp;) = delete;
+    NoCopy &amp;operator = (NoCopy const &amp;) = delete;
+};
+
+struct SdlHandle : NoCopy {
+    SdlHandle(Uint32 flags) {
+        if(SDL_Init(flags))
+            throw std::runtime_error("Unable to initialise SDL");
+    }
+
+    ~SdlHandle() { SDL_Quit(); }
+};
+
+struct ImgHandle : NoCopy {
+    ImgHandle(int flags) {
+        if(IMG_Init(flags) != flags)
+            throw std::runtime_error("Unable to initialise SDL_img");
+    }
+
+    ~ImgHandle() { IMG_Quit(); }
+};
+
+struct TtfHandle : NoCopy {
+    TtfHandle() {
+        if(TTF_Init() == -1)
+            throw std::runtime_error("Unable to initialise SDL_ttf");
+    }
+
+    ~TtfHandle() { TTF_Quit(); }
+};
+</code></pre>
+
+<p>Exceptions go hand-in-hand with RAII -- and are in fact part of the explanation for this bizarre abbreviation. <em>Resource Acquisition Is Initialization</em> means that the lifetime of a resource is tied to the lifetime of an object. When the object is initialised, the resource is acquired. If the resource cannot be acquired, the object must fail to construct: this is done by throwing an exception.</p>
+
+<p>Oh, by the way, did you spot the bug? You had forgotten to call <code>TTF_Quit()</code> if the initialization inside <code>View</code>'s constructor failed ;)</p>
+
+<p>But let's integrate these three handles into <code>View</code>, so they are constructed and destructed automatically with it. We can do this either by placing them as first members, or as base classes. The latter stretches a bit what base classes were intended for, but avoids creating a name that won't be used otherwise, so I'll do that. YMMV.</p>
+
+<pre><code>class View : private SdlHandle, ImgHandle, TtfHandle {
+    // ...
+</code></pre>
+
+<p>And the constructor becomes:</p>
+
+<pre><code>View::View(Field *field)
+: SdlHandle(SDL_INIT_EVERYTHING)
+, ImgHandle(IMG_INIT_PNG | IMG_INIT_JPG)
+, field_ptr(field) {
+    // All is setup!
+    // ...
+</code></pre>
+
+<p>And the destructor becomes... nothing! We have "accidentally" met the <em>Rule of Zero</em>: now that all of our resources are managed by autonomous objects and we don't have to juggle error conditions, we don't have to implement a destructor. Note that we also lost the copy- and move- constructors and assignment operators. These were originally available for <code>View</code>, but were meaningless -- if you ended up calling them, you were in for a bunch of bugs, ending with Undefined Behaviour from double deletion. Now they're implicitly deleted, because those from the <code>Handle</code>s are too. Good riddance!</p>
+
+<h3><code>std::exit</code> with a <strong>bang</strong></h3>
+
+<p>From <a href="http://en.cppreference.com/w/cpp/utility/program/exit" rel="nofollow noreferrer">cppreference</a>:</p>
+
+<blockquote>
+  <p>Stack is not unwound: destructors of variables with automatic storage duration are not called.</p>
+</blockquote>
+
+<p>While not as drastic as <code>std::abort</code>, <code>std::exit</code> is essentially a self-destruct function. It's only to be used when nothing can be done anymore to recover from an error, and you <em>have</em> to make your program blow up on the spot. In more civilised cases, prefer throwing exceptions.</p>
+
+<p><code>logSDLError</code> has interesting functionality, retrieving the error message from SDL. Let's mix this with the above recommendation:</p>
+
+<pre><code>[[noreturn]] void throwSdlError(std::string const &amp;msg) {
+    throw std::runtime_error(msg + " error: " + SDL_GetError());
+}
+</code></pre>
+
+<p>And now <code>View</code>'s constructor (and some other functions) looks like this:</p>
+
+<pre><code>    // ...
+    win.reset(SDL_CreateWindow(/* ... */));
+    if (!win)
+        throwSdlError("Window Initialisation");
+
+    ren.reset(SDL_CreateRenderer(/* ... */));
+    if (!ren)
+        throwSdlError("Renderer Initialisation");
+
+    background.reset(IMG_LoadTexture(/* ... */));
+    if (!background)
+        throwSdlError("Texture");
+}
+</code></pre>
+
+<h3>Sowing zeroes</h3>
+
+<p>Let's look at <code>Field</code>'s constructor:</p>
+
+<pre><code>Field::Field() {
+    std::memset(field_matrix, NOTHING, sizeof(field_matrix[0][0]) * HEIGHT * WIDTH);
+}
+</code></pre>
+
+<p>There's a subtle, not-yet-a-bug hidden in there.</p>
+
+<ul>
+<li><code>Objects</code> is a plain enum with no fixed underlying type, which means that <a href="http://en.cppreference.com/w/cpp/language/enum" rel="nofollow noreferrer">it's at least an <code>int</code></a> (4 bytes on my machine);</li>
+<li><code>std::memset</code> takes in an <code>unsigned char</code> value.</li>
+</ul>
+
+<p>For now, since the default value is <code>NOTHING</code>, which itself is defined as <code>0</code>, <code>std::memset</code> fills the array with zero-valued bytes which end up forming coherent <code>NOTHING</code>'s. But if you swap the <code>Objects</code> around inside their <code>enum</code>, or decide to initialise with something else, <code>std::memset</code> will chop off three bytes out of the value, and essentially quadruple the remaining byte, so <code>1</code> becomes <code>16843009</code>. This is not going to end well.</p>
+
+<p>So, prefer <a href="http://en.cppreference.com/w/cpp/algorithm/fill_n" rel="nofollow noreferrer"><code>std::fill_n</code></a>:</p>
+
+<pre><code>std::fill_n(&amp;field_matrix[0][0], WIDTH * HEIGHT, NOTHING);
+</code></pre>
+
+<h3>Freeing the functions</h3>
+
+<p>Both overloads of <code>View::render_texture</code> have no dependency on <code>View</code>'s members, so they can be made static. This is also almost the case for <code>render_font</code>: it only depends on the renderer, which is given to both other functions through a parameter. Let's iron that difference out and have all three be <code>static</code>.</p>
+
+<p>But why stop here? These functions are also <code>private</code>: they are pure implementation details -- let's go one step further and remove them from <code>View.h</code> completely. Now that they are <code>static</code>, this is easy: just remove their declarations, and wrap them in an <a href="http://en.cppreference.com/w/cpp/language/namespace" rel="nofollow noreferrer">anonymous namespace</a> inside <code>View.cpp</code>.</p>
+
+<pre><code>namespace {
+    void render_texture(SDL_Renderer *ren, SDL_Texture *tex, int x, int y, int w, int h) {/* ... */}
+
+    void render_texture(SDL_Renderer *ren, SDL_Texture *tex, int x, int y) {/* ... */}
+
+    SdlTexPtr render_font(SDL_Renderer *ren, const std::string &amp;file, const std::string &amp;msg, SDL_Color color, int font_size) {/* ... */}
+}
+</code></pre>
+
+<h3>Landmine debugging</h3>
+
+<p>In <code>View::draw_end_screen</code> there's a peculiar sight: if the function is called without a winner, "I AM ERROR" is displayed instead. Really the function should either handle the case in a sensible way (displaying "Tie" for example), or do some actual error reporting. In its current state, the game doesn't handle ties: if both players collide head-on, Red wins. In fact, the <code>Team</code> enum only has <code>RED</code> and <code>GREEN</code>, so a <code>Team</code> variable holding a value that is neither <code>RED</code> nor <code>GREEN</code> is <em>really</em> fishy. So let's consider reporting an error.</p>
+
+<p>Unlike the various possible resource loading errors from earlier, ending up displaying the Game Over screen without a winner is not an exceptional, but expectable condition: it's a <em>bug</em>. If this happens, then the program is broken -- please attach a debugger and dive in! That is what the <a href="http://en.cppreference.com/w/cpp/error/assert" rel="nofollow noreferrer"><code>assert</code></a> function -- a macro, really -- is for: <code>assert</code> what <em>has</em> to be true, and it will diligently blow up in your face if reality turns out to be wrong. Additionally, since this is for debugging purposes only, all <code>assert</code>s will vanish if you compile your release version with <code>-NDEBUG</code>.</p>
+
+<p>Adding <code>assert</code> to the simple case of <code>draw_end_screen</code> leads to the code below. Do feel free to pepper the your code with <code>assert</code>s whenever a non-obvious operation has to leave something in a specific state -- the more there are, the sooner bugs are caught. They're a bit like built-in unit tests, in a way.</p>
+
+<pre><code>void View::draw_end_screen(Team winner) {
+    // ...
+    if (winner == RED) {
+        // ...
+    }
+    else if (winner == GREEN) {
+        // ...
+    }
+    else {
+        assert(!"draw_end_screen called with no winner");
+    }
+    // ...
+</code></pre>
+
+<p>... okay, there's a little lie above. Quoting <a href="http://en.cppreference.com/w/cpp/language/enum" rel="nofollow noreferrer">cppreference about converting to an <code>enum</code></a>:</p>
+
+<blockquote>
+  <p>The result is unspecified if the value, converted to the enumeration's underlying type, is out of this enumeration's <em>range</em>.</p>
+</blockquote>
+
+<p>... and the "unspecified" turns into "undefined behaviour" come C++17. So unfortunately, you can't really test whether something broke your enum's value -- the Standard just says "don't break your enum's value". But do use <code>assert</code> when you're not already toasted ;)</p>
+
+<h3>Splitting up concerns</h3>
+
+<p>Let's have a look at the <code>Controller::control</code> function. As it is now, it contains a handful of things:</p>
+
+<ul>
+<li>The events consumption</li>
+<li>The reaction to the quit event</li>
+<li>The key mapping for both players</li>
+<li>The players' rotation logic</li>
+</ul>
+
+<p>That last bullet point looks strongly out-of-place -- player physics in input-handling code ? This should definitely be somewhere with the <code>Player</code> class instead, as is further hinted at by the code repetition: both halves of the input handling code are completely identical, except for which player they operate on. In fact, my pinky tells me you've copied and pasted it -- or maybe it's the bug on line 62, where you've forgotten to replace <code>p1</code> with <code>p2</code> ;)</p>
+
+<p>So let's extract this code and put it inside member functions of <code>Player</code>:</p>
+
+<pre><code>void Player::turnLeft() {
+    switch (getDirection()) {
+        case UP:    changeDirection(LEFT); break;
+        case DOWN:  changeDirection(RIGHT); break;
+        case LEFT:  changeDirection(DOWN); break;
+        case RIGHT: changeDirection(UP); break;
+    }
+}
+</code></pre>
+
+<p><code>Player::turnRight</code> is as you'd expect. Now the input handling looks like this:</p>
+
+<pre><code>if (current_event.type == SDL_KEYDOWN) {
+    switch(current_event.key.keysym.sym) {
+        case SDLK_LEFT:  p1_pointer-&gt;turnLeft(); break;
+        case SDLK_RIGHT: p1_pointer-&gt;turnRight(); break;
+        case SDLK_a:     p2_pointer-&gt;turnLeft(); break;
+        case SDLK_d:     p2_pointer-&gt;turnRight(); break;
+    }
+}
+</code></pre>
+
+<p>While we're looking at event handling, there's no reason for the <code>SDL_event</code> to be kept as a member -- it is overwritten by <code>SDL_PollEvent</code>, so a local variable is fine.</p>
+
+<h3>Quitting cleanly</h3>
+
+<p>As mentioned above, the <code>std::exit</code> function brings your program to quite a brutal stop. Let's find a cleaner way to handle the <code>SDL_QUIT</code> event from <code>Controller::control</code>: <code>Model</code> already takes care of one exit condition, that is the end-of-game state. <code>Controller</code> does not know <code>Model</code>, but it already knows both of its <code>Player</code>s, so changing this isn't a big stretch. So <code>Controller</code> now holds a <code>Model*</code>, and <code>Model</code> acquires three new functions, <code>player1()</code>, <code>player2()</code> and <code>quit()</code>. A bit more logic to distinguish between a player win and a quit event, and avoid displaying the winner screen in the latter case, and we can exit cleanly!</p>
+
+<h3>Splitting up more concerns</h3>
+
+<p><code>Model::collision_detection</code> has several problems:</p>
+
+<ul>
+<li>For unknown reasons, it handles not only the collision detection, but <em>also</em> the wrapping of the player across the field.</li>
+<li>The wrapping is handled <em>last</em>... but if the player has to wrap, this means he is <em>outside</em> the field, and all of the previous code has worked with out-of bound coordinates, while the player was in an invalid state.</li>
+</ul>
+
+<p>To solve this, we'll move the wrapping code together with the <code>Player</code> movement code inside <code>tick()</code>. That way, the player handles its own motion, wrapping included, and cannot be left outside the field.</p>
+
+<p>While I'm looking at the <code>Player</code> class: you really don't want that default constructor -- that would construct a player whose <code>team</code> attribute's value is indeterminate. Using it anywhere would then be UB. Same remark for the default constructor of <code>Coords</code>, which doesn't initialise the coordinates.</p>
+
+<h3>Code repetition</h3>
+
+<p><code>Model::update_matrix</code> can be very quickly de-duplicated by having the same structure as <code>collision_detection</code>: acting on a single player, and getting called twice. </p>
+
+<h3>Unused stuff</h3>
+
+<p>There's a couple of things that aren't used anywhere:</p>
+
+<ul>
+<li><code>Trail::team</code>. It's initialised, but never read. That makes <code>Trail</code> itself a bit redundant, as only the position is used. Making <code>Player::tick()</code>, the only use of <code>Trail</code>, return a <code>Coord</code> instead works fine.</li>
+<li>The <code>(Coord, Team)</code> overload of <code>Player</code>'s constructor.</li>
+</ul>
+
+<h3>Adjusting names</h3>
+
+<p>Naming is important, so here are some renaming suggestions:</p>
+
+<ul>
+<li><code>Controller::control</code> → <code>Controller::handleEvents</code> (signaling that it empties the SDL event queue)</li>
+<li><code>Field::field_matrix</code> → <code>Field::matrix</code> (no need to repeat oneself)</li>
+<li><code>Model::update_matrix</code> → <code>Model::updatePlayer</code></li>
+<li><code>Model::isGame_over_flag</code> → <code>Model::isGameOver</code></li>
+<li><code>Model::collision_detection</code> → <code>Model::checkCollision</code> (renamed to a verb)</li>
+<li><code>Player::tick</code> → <code>Player::step</code> (slightly more descriptive)</li>
+<li><code>View::field_ptr</code> → <code>View::field</code> (no need to repeat the type in the variable's name)</li>
+</ul>
+
+<h3>The top-level design</h3>
+
+<p>You visibly intend to follow the Model-View-Controller pattern. There are, however, a few points that puzzle me. As I am not really familiar with the MVC pattern myself, I will leave these as open questions.</p>
+
+<p><strong>Polymorphism?</strong></p>
+
+<p>One of the big arguments I heard in favour of MVC is the ability to swap out its different pieces, particularly the view. In your code, the <code>View</code> is a concrete class, whose instance is allocated directly inside the <code>Model</code> object. It cannot be replaced.</p>
+
+<p><strong>Why does <code>Model</code> contain everything?</strong></p>
+
+<p>I was a bit surprised to see only <code>Model</code> inside <code>main</code>: everything else, including the <code>View</code> and the <code>Controller</code>, is inside. Usual MVC implementation instanciate the three parts in the same place (e.g. in <code>main</code>) and wire them together before running the program.</p>
+
+<p><strong>Is MVC actually adequate?</strong></p>
+
+<p>Unless the goal of this program is to learn about MVC, of course. But in its current state, it looks like MVC doesn't bring much to the table.</p>
+
+<p>The <code>Controller</code>, once pruned from the physics code that sneaked in, is no more than a <code>void handleEvents(Model *)</code> function bent into a class. Which, in turn, looks closely like a <code>Model::handleEvents()</code> function.</p>
+
+<p>The <code>Model</code> itself is a bit crowded already. Apart from the <code>View</code> and <code>Controller</code>, it contains the players and field, the state of the game, the FPS capping, and a pretty complicated bit of timing logic (which is also duplicated between the "controls" and the "movement").<br>
+It looks like everything that should, according to MVC, go "in the Model" litterally went into the <code>Model</code> class. Maybe what you should do is design your classes independently, <em>then</em> group them inside a <code>model</code> namespace.</p>
+
+<h2>Wrapping up!</h2>
+
+<p>Well, I hope I didn't ramble too far. That <em>is</em> a pretty long review (okay, that is a <strong>huge</strong> review), but with any luck it will actually be useful! Do let me know if something is unclear, incomplete, or anything else.</p>
+
+<p>Happy coding :)</p>
+    </div>

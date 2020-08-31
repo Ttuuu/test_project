@@ -1,0 +1,83 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>One problem that immediately jumps out at me is the loop-carried dependency through <code>addps</code>, which has a latency of either 3 or 4 (depending on the processor) while there are not nearly enough instructions there to fill all that time, so it's lost throughput. The typical solution is unrolling and using multiple accumulators. There's too much stuff there for me to comfortably write the actual code, but the general idea is something like this:</p>
+
+<pre><code>acc0 = _mm_setzero_ps();
+acc1 = acc0;
+acc2 = acc0;
+acc3 = acc0;
+for (...; ...; ... += 4) {
+    acc0 = _mm_add_ps(acc0, _mm_mul_ps(...));
+    acc1 = _mm_add_ps(acc1, _mm_mul_ps(...));
+    acc2 = _mm_add_ps(acc2, _mm_mul_ps(...));
+    acc3 = _mm_add_ps(acc3, _mm_mul_ps(...));
+}
+sum = _mm_add_ps(_mm_add_ps(acc0, acc1), _mm_add_ps(acc2, acc3));
+</code></pre>
+
+<p>How much you should unroll by depends a lot on the precise code and the actual processor. For example on Haswell the initial target performance would be 2 FMAs per cycle (so unrolling by a factor of 10), but that would mean the kernel cannot come from memory since both available loads are needed for the image, limiting the performance to half the target performance.</p>
+
+<p>Getting to 50% of the goal isn't great, but there is hope: after unrolling, multiple iterations can share the same load from the kernel. That load can be a wide load, and instead of <code>set1</code> the appropriate element for the iteration can be shuffled into all lanes. This alone can reduce the number loads from the kernel to a quarter of the original (or an eighth, with AVX).</p>
+
+<p>And there is more: unrolling a different way. If multiple <em>unrelated</em> convolutions (different rows) are interleaved, the load from the kernel can be re-used for each of them. If you do 4 of these, you could try doing an in-register transpose (there is <code>_MM_TRANSPOSE4_PS</code> for that, which is more of macro than a proper intrinsic) and then just using 4 wide stores. That transpose is fairly ugly, weighing in at 4 unpacks and 4 movelh/hl's for a total of 8 µops to port 5, but it turns 16 scalar stores into 4 wide stores so that looks like a decent trade.</p>
+
+<p>With all this unrolling it's easy to go too far, running out of registers and spilling to the stack in the inner loop would just murder the performance so definitely avoid that - always check the assembly (you don't have to write it, just read). Unrolling by a total factor of 8 or 10 is probably OK, both in terms of being enough to reach (or get close to) the latency-throughput product and in not exceeding the number of available registers. So for example 4 rows and 2 iterations of the inner loop makes a factor of 8.</p>
+
+<p>Unrolling the inner loop depends on the kernel being a nice size, if it isn't then part of the last iteration is wasted work since it's partially multiplying data by the kernel-padding. So unrolling rows may work out better in general.</p>
+
+<hr>
+
+<p>This implements the "unrolling a different way" idea, working on 4 rows at once:</p>
+
+<pre><code>for (ii = 0; ii + 3 &lt; numRows; ii += 4) {
+    for (jj = rowSseKernelRadius; jj &lt; (numCols - rowSseKernelRadius); jj += 4) {
+        __m128 s0 = _mm_setzero_ps(), s1 = _mm_setzero_ps(), s2 = _mm_setzero_ps(), s3 = _mm_setzero_ps();
+        for (kk = 0; kk &lt; rowKernelLength; kk++) {
+            pxShift = kk - rowKernelRadius;
+            kernelWeight = _mm_set1_ps(vRowKernel[kk]);
+            s0 = _mm_add_ps(s0, _mm_mul_ps(kernelWeight, _mm_loadu_ps(&amp;mI[(ii * numCols) + jj + pxShift])));
+            s1 = _mm_add_ps(s1, _mm_mul_ps(kernelWeight, _mm_loadu_ps(&amp;mI[((ii + 1) * numCols) + jj + pxShift])));
+            s2 = _mm_add_ps(s2, _mm_mul_ps(kernelWeight, _mm_loadu_ps(&amp;mI[((ii + 2) * numCols) + jj + pxShift])));
+            s3 = _mm_add_ps(s3, _mm_mul_ps(kernelWeight, _mm_loadu_ps(&amp;mI[((ii + 3) * numCols) + jj + pxShift])));
+        }
+
+        _MM_TRANSPOSE4_PS(s0, s1, s2, s3);
+        _mm_storeu_ps(&amp;mTmp[((jj + 0) * numRows) + ii], s0);
+        _mm_storeu_ps(&amp;mTmp[((jj + 1) * numRows) + ii], s1);
+        _mm_storeu_ps(&amp;mTmp[((jj + 2) * numRows) + ii], s2);
+        _mm_storeu_ps(&amp;mTmp[((jj + 3) * numRows) + ii], s3);
+    }
+}
+</code></pre>
+
+<p>Naturally this may leave up to 3 rows to do with the normal 1-row-at-the-time implementation.</p>
+
+<p>As a quick benchmark, on my PC (4770K) and compiled with MSVC with OpenMP not enabled, I get these results. Plotting flops/cycle so higher is better. "U: 4" means the <code>ii</code> loops is unrolled by 4, in the manner shown above (U: 1 is normal, not unrolled). K is the size of the kernel.</p>
+
+<p><a href="https://i.stack.imgur.com/GaZkG.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/GaZkG.png" alt="timing"></a></p>
+
+<p>It also helps a bit (at least when compiled with MSVC) to track the load address across loop iterations instead of recalculating it. The recalculation is actually non-trivial and includes a sign-extension. Compilers should learn to do this.. Anyway, like this before the loop:</p>
+
+<pre><code>float *rowptr = &amp;mI[(ii * numCols) + jj - colKernelRadius];
+</code></pre>
+
+<p>Then just use it four times and increment at the end of the loop body:</p>
+
+<pre><code>s3 = _mm_add_ps(s3, _mm_mul_ps(kernelWeight, _mm_loadu_ps(rowptr + numCols * 3)));
+rowptr++;
+</code></pre>
+
+<p>But this is basically to work around MSVC not optimizing that, not a fundamental change.</p>
+
+<hr>
+
+<p>Adding some light tiling also seems to help. It's not the nicest kind of tiling, it doesn't "connect" tiles between the horizontal and vertical passes (which I don't know how to do) so the vertical pass still takes a ton cache misses to read the temporary data, but at least writing back the results happens in more of a tile instead of a column. It's still nowhere near as fast as a matrix multiplication. Implementation is pretty simple, just add two more loops around the main computation to chop it into tiles along both axes:</p>
+
+<pre><code>for (int ib = 0; ib &lt; numRows; ib += ibsize) {
+    int imax = min(ib + ibsize, numRows);
+    for (int jb = rowSseKernelRadius; jb &lt; numCols - rowSseKernelRadius; jb += jbsize) {
+        int jmax = min(jb + jbsize, numCols - rowSseKernelRadius);
+        for (ii = ib; ii &lt; imax; ii += 4) {
+            for (jj = jb; jj &lt; jmax; jj += 4) {
+                main body
+</code></pre>
+    </div>

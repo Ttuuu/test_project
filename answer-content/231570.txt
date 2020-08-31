@@ -1,0 +1,84 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Lies, damned lies, ... and <code>iterator_category</code></h1>
+<p>This line from <code>ZipIter</code> is a big lie:</p>
+<pre><code>    using iterator_category = typename std::iterator_traits&lt;FirstTypeOf&lt;IT...&gt;&gt;::iterator_category;
+</code></pre>
+<p>Why? Because it unequivocally expands the capabilities of the first iterator type to all the other ones.</p>
+<p>This has some bad consequences: Some operations (e.g. <code>std::sort</code>) require at least some specific iterator category to work.</p>
+<p>Example:</p>
+<pre><code>auto a = std::vector&lt;std::string&gt;{ "A", "B", "C", "A" };
+auto b = std::forward_list&lt;int&gt;{ 4, 3, 2, 1 };
+
+auto zip = Zip(a, b);
+std::sort(zip.begin(), zip.end()); // This cannot succeed
+</code></pre>
+<p>In this case, <code>std::sort</code> requires random access iterators, which <code>std::vector</code> does provide. However, <code>std::forward_list</code> doesn't (it only provides forward iterators). But <code>ZipIter</code> promises that it is a random access iterator, even though random access operations are not supported on some contained iterators.</p>
+<p>Ok, <code>ZipIter::iterator_category</code> is a lie, but why is it so damning?</p>
+<p>Because <code>iterator_category</code> is an easy to use feature check (with strong constraints mandated by the standard). So many algorithm implementations just check for <code>iterator_category</code>. If you're lucky, they will still fail at compile time, but in some subtler cases you just silently run into undefined behavior.</p>
+<p>How to fix this?</p>
+<p>Instead of using the first available <code>iterator_category</code>, use the minimal <code>iterator_category</code> of all provided iterators:</p>
+<pre><code>    using iterator_category = std::common_type_t&lt;typename std::iterator_traits&lt;IT&gt;::iterator_category...&gt;;
+    // this works since more powerful iterator categories inherit from less powerful ones
+    // thus the common ancestor tag is supported by all
+</code></pre>
+<p>But wait a moment...</p>
+<p>Remember when I said that the standard mandates strong constraints for certain iterator categories?</p>
+<p>Well, if an iterator wants to be categorized as forward iterator or above, among <a href="https://en.cppreference.com/w/cpp/named_req/ForwardIterator" rel="nofollow noreferrer">other constraints</a> the following must be true:</p>
+<blockquote>
+<p><code>reference</code> must be either <code>value_type&amp;</code> or <code>const value_type&amp;</code>.</p>
+</blockquote>
+<p>Based on this constraint, the most powerful legal <code>iterator_category</code> for this iterator is actually <code>std::input_iterator_tag</code>. (Which in turn means that <code>std::sort</code> won't work at all, as it requires random access iterators.)</p>
+<blockquote>
+<p>There are arguments to be made why the standard is overly restrictive with this clause, but as of C++17 these are the given requirements and shall not be violated. This is why <code>boost::zip_iterator</code> cannot be used with algorithms like <code>std::sort</code>: There is no legally possible way to meet all requirements under all circumstances.</p>
+<p>Fun fact: <code>std::vector&lt;bool&gt;::iterator</code> has the same issue.</p>
+</blockquote>
+<h1>Constant pain</h1>
+<p>There are some issues with regard to <code>const</code>ness.</p>
+<pre><code>auto a = std::vector&lt;int&gt;{ 1, 2, 3, 4 };
+auto b = std::vector&lt;std::string&gt;{ "A", "B", "C", "D" };
+const auto c = b;
+
+auto zip_one = Zip(a, b);
+auto zip_two = Zip(a, c);
+
+for(auto&amp;&amp; value : zip_one) std::cout &lt;&lt; value &lt;&lt; "\n"; // this works
+for(auto&amp;&amp; value : zip_two) std::cout &lt;&lt; value &lt;&lt; "\n"; // this fails to compile
+</code></pre>
+<p>What happened? <code>c</code> is an exact copy of <code>b</code> - the only difference being a small <code>const</code>. But the consequences are dire: Compilation failure!</p>
+<p>What changed? Since <code>c</code> is constant, <code>c.begin()</code> and <code>c.end()</code> only return <code>const_iterator</code>s, since elements within should also not change.</p>
+<p>How to fix? The culprit in this case is the definition for <code>ZipIter::reference</code>:</p>
+<pre><code>    using reference         = ZipRef&lt;typename std::iterator_traits&lt;IT&gt;::value_type ...&gt;;
+</code></pre>
+<p>Using a different definition that takes into account the actual iterator <code>reference</code> fixes this:</p>
+<pre><code>    using reference         = ZipRef&lt;std::remove_reference_t&lt;typename std::iterator_traits&lt;IT&gt;::reference&gt;...&gt;;
+</code></pre>
+<p>But the trouble with <code>const</code> doesn't end here: Once any type of the template type parameters of <code>ZipRef</code> is <code>const</code>, some operations of <code>ZipRef</code> won't work anymore: assignment fails (<code>const</code> values cannot be reassigned) and <code>swap</code> fails (same reason). And there is no easy fix for this!</p>
+<h1>To the end of the universe... and beyond!</h1>
+<pre><code>auto a = std::vector&lt;std::string&gt;(10, "A");
+auto b = std::vector&lt;std::string&gt;(2, "C");
+
+auto zip = Zip(a, b);
+std::distance(zip.begin(), zip.end()); // uh oh
+</code></pre>
+<p>How many zipped elements should <code>zip</code> contain?</p>
+<p>Logically, there should at most be two, as there aren't any values in <code>b</code> to continue any further.</p>
+<p>Instead, the current implementation gives undefined behavior:</p>
+<pre><code>auto endReached = std::next(zip.begin(), 2);
+assert(endReached != zip.end());
+</code></pre>
+<p><code>endReached</code> is the <code>ZipIter</code> pointing just at <code>b.end()</code>, i.e. where the iteration should stop. But the check against <code>zip.end()</code> fails, since not all iterators have yet reached their corresponding end iterator.</p>
+<p>And this is where undefined behavior happens: <code>++endReached</code> advances a past-the-end-iterator, and after that nothing can be trusted anymore.</p>
+<p>How can this be fixed?</p>
+<p>The most common approach is to use a sentinel value as end iterator so that any <code>ZipIter</code> compares <code>true</code> if any (instead of all) of its contained iterators matches the corresponding end iterator.</p>
+<h1>Licensed trouble (or freedom?)</h1>
+<pre><code>// Still unsure about the licence, but something in the line of just providing attribution
+</code></pre>
+<p>When posting the code on this site, you have already released it under the CC-BY-SA 4.0 license. You can of course release it under another license model (you're free to do so as the license holder).</p>
+<h1>Other issues</h1>
+<p>I won't repeat much of <a href="/a/231546/75307">Toby Speight's answer</a>, but some additional notes:</p>
+<ul>
+<li><code>ZipRef::swap</code> is modelled on <code>std::iter_swap</code>, not <code>std::swap</code>. Maybe the name should be adjusted to reflect this?</li>
+<li><code>ZipIter::difference_type</code> has the same issue as <code>ZipIter::reference</code>: It only uses the <code>difference_type</code> of the first iterator. (Usually not much of a deal, since most iterators use <code>std::ptrdiff_t</code>. Still, beware of the edge case!)</li>
+<li><code>ZipRef</code>s <code>operator std::tuple&lt;T...&gt;()</code> is unlikely to work in generic context as intended (conversions are excluded when matching templated arguments, e.g. <code>std::get&lt;1&gt;(zipRef)</code> doesn't work). It works in specialized contexts (<code>void f(std::tuple&lt;std::string, int&gt;); f(zipRef);</code>, but this might cause unexpected issues.</li>
+</ul>
+    </div>

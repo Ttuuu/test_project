@@ -1,0 +1,100 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Congratulations to you for finding a major bottleneck yourself. There are a few more to get rid of.</p>
+
+<hr>
+
+<p>Generally speaking it's quite a performance killer to convert data between Python and numpy repeatedly. And you do that a lot. You even do it to determine the number of iterations for some loops, e.g. in <code>for j in range(np.array(alphas).shape[1]):</code>. Since <code>alphas</code> is created beforehand and not expanded again, the first step would be to convert it into a numpy array <strong>once</strong>. But there is no real need to query its shape, since you know exactly how the shape of <code>alphas</code> is, it's exactly <code>(range_of_i, range_of_m)</code>. So you convert <span class="math-container">\$255 \times 100\$</span> elements to numpy just to get <code>range_of_m</code> as an answer. Not really efficient, isn't it?</p>
+
+<p>In addition, Python is also often not really fast at loops. There is a great talk from Jake VanderPlas from PyCon 2015 titled "Losing your Loops - Fast Numerical Computing with NumPy" (to be found on <a href="https://www.youtube.com/watch?v=EEUXKG97YRw" rel="nofollow noreferrer">YouTube</a>) on that topic. I highly recommend watching it!</p>
+
+<hr>
+
+<p>After the general remarks, let's start from the beginning:</p>
+
+<hr>
+
+<p>When you generate <code>alphas</code>, you draw samples from <code>no_distributions</code> distributions, and then discard all but one value if I'm not terribly mistaken. So why not choose the distribution beforehand, and sample that one?</p>
+
+<pre><code>alphas = np.empty((range_of_i, range_of_m))
+dist_idxs = list(range(no_distributions))
+sigma = np.sqrt(sigma_squared)
+for i in range(range_of_i):
+    idxs = rnd.choices(dist_idxs, weights=weights, k=range_of_m)
+    alphas[i, :] = [rnd.gauss(mu[idx], sigma[idx]) for idx in idxs]
+</code></pre>
+
+<p>This code snippet also includes the idea to have <code>alphas</code> as numpy array directly. You could also keep the original approach to have a list of lists and then convert that, but this helps you to save some variables. I also opted to remove the inner loop in favor of a list comprehension. Maybe there is even a clever way to get rid of the outer loop (without using a list comprehension!), but I'll leave that as an exercise to you.</p>
+
+<hr>
+
+<p>Next up on the list is the expectation step. Again, funny mix-up of Python and numpy/scipy code here. And although I have the strong feeling that there has to be a better solution, the following is the best I could come up with at the moment:</p>
+
+<pre><code>sigma_initial = np.sqrt(initial_parameters[1, :])
+
+# ... other code ...
+
+# Expectation step
+indicator_normalized = np.empty((range_of_i, no_distributions, range_of_m))
+for i in range(range_of_i):
+    indicator = np.array([
+        pi_initial[l] * norm.pdf(alphas[i], mu_initial[l], sigma_initial[l])
+        for l in range(no_distributions)
+    ])
+    indicator_normalized[i, ...] = indicator / indicator.sum(axis=0)
+
+indicator_normalized = indicator_normalized.transpose(0, 2, 1)
+# summing over multiple axis needs numpy &gt;= 1.7
+indicator_sum = indicator_normalized.sum(axis=(0, 1))
+</code></pre>
+
+<hr>
+
+<p>Next up on the list: maximization.</p>
+
+<p>Let's get rid of some loops here. A first step in that direction might look as follows:</p>
+
+<pre><code># Maximization step
+for i in range(range_of_i):
+    for j in range(range_of_m):
+        mu_updated += indicator_normalized[i, j, :] * alphas[i, j] / indicator_sum
+        pi_updated += indicator_normalized[i, j, :] / (range_of_i * range_of_m)
+
+# same for loop again needed because we want to use the complete mu_vector to calculate sigma_squared
+for i in range(range_of_i):
+    for j in range(range_of_m):
+        sigma_squared_updated += \
+            indicator_normalized[i, j, :] * (alphas[i, j] - mu_updated)**2 \
+                / indicator_sum
+</code></pre>
+
+<p>But we can do better! Enter numpy broadcasting and slicing!</p>
+
+<pre><code># Maximization step
+mu_updated = np.sum(
+    indicator_normalized * alphas[..., np.newaxis] / indicator_sum,
+    axis=(0, 1)
+)
+pi_updated = np.sum(
+    indicator_normalized / (range_of_i * range_of_m), axis=(0, 1)
+)
+
+# same for loop again needed because we want to use the complete mu_vector to calculate sigma_squared
+sigma_squared_updated = np.sum(
+    indicator_normalized * (alphas[..., np.newaxis] - mu_updated)**2
+    / indicator_sum,
+    axis=(0, 1)
+)
+</code></pre>
+
+<p>Explaining the full beauty of this would be beyond the scope of what I can do here. I highly recommend reading the chapter <a href="https://jakevdp.github.io/PythonDataScienceHandbook/02.07-fancy-indexing.html" rel="nofollow noreferrer">"Fancy Indexing"</a> from the <em>Python Data Science Handbook</em> by Jake VanderPlas if you want to learn more. What this does in essence is to move those pesky loops into the numpy's C back end. You can check that those results really match by pasting both pieces of code into the same file and check with <code>np.allclose(...)</code>.</p>
+
+<hr>
+
+<p><strong>Results</strong><br></p>
+
+<p>So what did we win be jumping through all those hoops and losing all those loops?</p>
+
+<p>Your proposed solution that moved the <code>sum(sum(...))</code> out of the loop takes around <span class="math-container">\$5s\$</span> to converge here on my machine. With the code above in its most loop-reduced form the algorithm finishes in about <span class="math-container">\$0.2s\$</span> to <span class="math-container">\$0.25 s\$</span> with the same result (not exactly the same cause the random numbers also have a little impact here). That's a speed-up of 20-25x. I can live with that for the moment ;-). <br>(<strong>Note:</strong> The timing results only cover the content of the <code>while</code> loop, not the initialization.)</p>
+
+<p>I'm actually not a 100% sure the implementation is fully correct, but the new implementation is at least as correct as the original one. If you find an error here in my code, it already existed in the original solution because I tested for agreement between your and my solution ;-)</p>
+    </div>

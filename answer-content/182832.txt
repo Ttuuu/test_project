@@ -1,0 +1,178 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>As pointed out by Alex Hall, there are many places the above code could be improved:    </p>
+
+<ul>
+<li>Exception handling is nonexistent for <code>requests</code>, which tends to create lots of errors. </li>
+<li>The <code>ResponseSummary</code> class is a monster: it doesn't raise any exceptions, but simply prints messages. In Python, exceptions are much better than error codes. Replace that class with a simpler response-handler that simply returns data, or raise an exception.</li>
+<li>Instead of feeding <code>requests.get</code> the secret key every time, you should use a <code>session</code> and set the secret key to persist over the whole session.</li>
+<li>Instead of displaying errors with <code>print</code>, use a logger. This gives you much more flexibility over what will be displayed, and under what conditions.    </li>
+</ul>
+
+<p>Below is a new and improved version that fixes all those problems. Tthere is room for improvement, mainly in the exception handling. That turned out to be the most challenging part of this code, and I am still learning.</p>
+
+<pre><code>import os
+import requests
+import json
+import logging
+
+
+BASE_URL = 'https://bungie.net/Platform/Destiny2/'
+BASE_URL_GROUP = 'https://bungie.net/Platform/GroupV2/'
+
+"""
+Set up logger: for now just print everything to stdout.
+"""
+logging.basicConfig(level = logging.INFO,
+                    format = '%(asctime)s - %(levelname)s - %(message)s',
+                    datefmt =' %m/%d/%y %H:%M:%S')
+logger = logging.getLogger(__name__)
+
+
+"""
+CORE CODE
+Make requests, and extract data from response
+"""
+class BungieError(Exception):
+    """Raise when ErrorCode from Bungie is not 1"""
+
+
+def make_request(url, session):
+    try:
+        response = session.get(url)
+        if not response.ok:
+            response.raise_for_status()
+    except requests.exceptions.RequestException as requestException:
+        raise
+    else:
+        return response
+
+
+def process_bungie_response(response):
+    """Examines response from d2 if you got status_code 200, throws
+    exception of type BungieException if bungie ErrorCode is not 1. For list of error
+    codes, see:
+        https://bungie-net.github.io/multi/schema_Exceptions-PlatformErrorCodes.html#schema_Exceptions-PlatformErrorCodes
+    """
+    response_url = response.url    #If you oops sent it something that can't be json'd
+    try:
+        response_json = response.json()
+    except json.JSONDecodeError as jsonError:
+        msg1 = f"JSONDecodeError in process_bungie_response().\n"
+        msg2 = "Response does not contain json data.\n"
+        msg3 = f"URL: {response_url}.\nError: '{jsonError}'"
+        msg = msg1 + msg2 + msg3
+        raise BungieError(msg) from jsonError
+
+    try:
+        data = response_json['Response']
+    except KeyError as keyError:
+        error_code = response_json['ErrorCode']
+        error_status = response_json['ErrorStatus']
+        error_message = response_json['Message']
+        msg1 = f"KeyError in process_bungie_response.\nURL: {response_url}.\n"
+        msg2 = f"Error code {error_code}: {error_status}.\nMessage: {error_message}.\n"
+        msg = msg1 + msg2
+        raise BungieError(msg) from keyError
+    else:
+        return data
+
+
+def destiny2_api_handler(url, session):
+    response = make_request(url, session)
+    return process_bungie_response(response)
+
+
+"""
+URL GENERATORS
+"""
+def search_destiny_player_url(user_name):
+    """Get user's info card:
+        https://bungie-net.github.io/multi/operation_get_Destiny2-SearchDestinyPlayer.html
+      Note for this example it's constrained to ps4 (platform = 2)
+    """
+    return BASE_URL + 'SearchDestinyPlayer/2/' + user_name + '/'
+
+
+def get_members_of_group_url(group_id):
+    """
+    Pull all members of a clan.
+        https://bungie-net.github.io/multi/operation_get_GroupV2-GetMembersOfGroup.html
+    """
+    return BASE_URL_GROUP + group_id + '/Members/?currentPage=1'
+
+
+"""
+HELPER FUNCTIONS
+"""
+def generate_clan_list(member_data):
+    """
+    Using GetMembersOfGroup end point, create list of member info for clan members.
+        Each elt is a dict with username. id, join date. Filters out people not on psn.
+    """
+    member_data = member_data['results']
+    clan_members_data = []
+    for member in member_data:
+        clan_member = {}
+        clan_member['membership_type'] = member['destinyUserInfo']['membershipType']
+        if clan_member['membership_type'] == 2:
+            clan_member['name'] = member['destinyUserInfo']['displayName']
+            clan_member['id'] = member['destinyUserInfo']['membershipId']
+            clan_member['date_joined']  = member['joinDate']
+            clan_members_data.append(clan_member)
+    return clan_members_data
+
+
+def print_clan_roster(clan_members_data):
+    """Print name, membership type, id, and date joined."""
+    if clan_members_data:
+        name_list = [clanfolk['name'] for clanfolk in clan_members_data]
+        col_width = max(len(word) for word in name_list)
+        for clan_member in clan_members_data:
+            memb_name = clan_member['name']
+            length_name = len(memb_name)
+            num_spaces = col_width - length_name
+            memb_name_extended = memb_name + " "*num_spaces
+            print("{0}\tMembership type: {1}\t Id: {2}\tJoined: {3}".format(memb_name_extended, \
+                  clan_member['membership_type'], clan_member['id'], clan_member['date_joined']))
+    else:
+       print("print_clan_roster: roster is empty")
+
+
+def get_environment_variable(var_name):
+    """get environmental variable, or return exception"""
+    try:
+        return os.environ.get(var_name)
+    except KeyError:
+        error_msg = 'KeyError in get_environment_variable: {}.'.format(var_name)
+        logger.error(error_msg)
+        raise
+
+if __name__ == "__main__":
+    #Set constants
+    D2_KEY = get_environment_variable('D2_KEY')
+    D2_HEADERS = {"X-API-Key": D2_KEY}
+    CLAN_ID = '623172'
+    USER = 'cortical_iv'
+
+    #Make the requests
+    with requests.Session() as session:
+        session.headers.update(D2_HEADERS)
+
+        logging.info(f"Retrieving info about {USER}")
+        search_player_url = search_destiny_player_url(USER)
+        try:
+            user_data = destiny2_api_handler(search_player_url, session)
+        except Exception as e:
+            logging.exception(f"Error getting user data for {USER}.\nException: {e}.")
+
+        logging.info(f"Retreiving info about all members of clan {CLAN_ID}")
+        get_members_url = get_members_of_group_url(CLAN_ID)
+        try:
+            members_data = destiny2_api_handler(get_members_url, session)
+        except Exception as e:
+            logging.exception(f"Error getting user data for {USER}.\nException: {e}.")
+        else:
+            clan_members_data = generate_clan_list(members_data)
+            print_clan_roster(clan_members_data)
+</code></pre>
+    </div>

@@ -1,0 +1,124 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I see a number of things that may help you improve your code.</p>
+
+<h2>Hide implementation details</h2>
+
+<p>It was surprising to me to find so many lines of more or less raw <code>curses</code> code in <code>main</code>.  The <a href="http://en.wikipedia.org/wiki/Model%E2%80%93view%E2%80%93controller" rel="nofollow noreferrer">Model-View-Controller</a> design pattern is often useful for programs like this. The model is the internal state of the game that's mostly already within your <code>Game</code> class, the view is currently split between <code>main</code> and various parts of the <code>Game</code> class and the controller is essentially just the <code>game.controls()</code> function.  Separating the I/O from the game logic will help you write cleaner code and also assist if you were to decide to port the game to some other platform. </p>
+
+<h2>Understand <code>random</code></h2>
+
+<p>The <code>get_next_block</code> member function of <code>Game</code> is currently this:</p>
+
+<pre><code>int Game::get_next_block() {
+    int val;
+    while (true) {
+        std::random_device generator;
+        std::uniform_int_distribution&lt;int&gt; distribution(0,4);
+
+        if((val = distribution(generator)) != prev_block)
+            return val;
+    }
+}
+</code></pre>
+
+<p>There are a few problems with this.  First, and most importantly, you should generally <strong>not</strong> use the <code>std::random_device</code> except to seed another random number generator such as <code>mt19937</code>.  The reason for this is that <code>std::random_device</code> is sometimes very slow and sometimes hardware based.  It tends to slow down a lot if the underlying entropy of the device is low.  The second problem is that the generator should probably be <code>static</code> so that the distribution is pulling from the same random number generator every time instead of creating a new one.   I'd rewrite it like this:</p>
+
+<pre><code>int Game::get_next_block() {
+    static std::mt19937 generator(std::random_device{}());
+    std::uniform_int_distribution&lt;int&gt; distribution(0,4);
+    int val;
+    for (val = distribution(generator); val == prev_block; val = distribution(generator)) 
+    { }
+    return val;
+}
+</code></pre>
+
+<h2>Prefer <code>const</code> variables to <code>#define</code></h2>
+
+<p>Since you're using C++, there is little reason to use <code>#define</code> to define a numerical constant.  Instead of this:</p>
+
+<pre><code>#define DEFAULT_SPEED 300
+</code></pre>
+
+<p>Use this:</p>
+
+<pre><code>constexpr int default_speed{300};
+</code></pre>
+
+<p>Note that I've also changed that from all capital letters (which is the convention for macros) to a regular variable name according to whichever convention you're using.</p>
+
+<h2>Use <code>const</code> where practical</h2>
+
+<p>There are a number of places in the code where variables could be declared <code>const</code> such as in <code>Game.h</code>:</p>
+
+<pre><code>static const cCoord struct_coords[][MAX_COORDINATES + 1];
+static const cCoord struct_origins[MAX_COORDINATES + 1];
+</code></pre>
+
+<h2>Avoid the use of global variables</h2>
+
+<p>I see that <code>s</code> (which is a poor name, by the way) is a global variable.  It's generally better to explicitly pass variables your function will need rather than using the vague implicit linkage of a global variable.  In this case, I think it would make more sense to have this be the <code>Game</code> object and have a separate <code>Screen</code> object as the Model and View classes of a Model-View-Controller.</p>
+
+<h2>Write member initializers in declaration order</h2>
+
+<p>The <code>Structure</code> class has this constructor</p>
+
+<pre><code>Structure::Structure(const Structure &amp;s) : struct_type(s.struct_type), origin(s.origin), coords(s.coords), color(s.color) {}
+</code></pre>
+
+<p>That looks fine, but in fact, <code>coords</code> will be initialized <em>after</em> <code>color</code> because members are always initialized in <em>declaration</em> order and <code>color</code> is declared before <code>coords</code> in this class. To avoid misleading another programmer, you should swap the order of those such that it says instead:</p>
+
+<pre><code>Structure::Structure(const Structure &amp;s) : 
+    struct_type(s.struct_type), 
+    origin(s.origin), 
+    color(s.color),
+    coords(s.coords)
+{}
+</code></pre>
+
+<p>This way the initialization actually proceeds from left to right as one might expect at first glance.</p>
+
+<h2>Be careful with signed and unsigned</h2>
+
+<p>In several cases, the code compares an <code>int</code> <code>i</code> with an unsigned <code>std::size_t</code> <code>coords.size()</code>.  It would be better to declare <code>i</code> to also be <code>std::size_t</code>.</p>
+
+<h2>Pass object references where needed</h2>
+
+<p>It doesn't really make much sense for the collision detector functions to be static since they need the current game state to actually operate correctly.  Instead, make them regular member functions and then pass a reference to the <code>Game</code> object for all of the various <code>Structure</code> functions that call one of the collision functions.  Doing so will help you eliminate the ugly global variable as mentioned above.</p>
+
+<h2>Rethink your classes</h2>
+
+<p>The <code>cCoord</code> class is not doing anything except cluttering the code.  This isn't Java, and the "getters and setters" idiom used there is not generally acceptable in modern C++.  Instead. your cCoord class could simply be a simple <code>struct</code> since anything can set or read it anyway.  Similarly, the <code>Block</code> class is also doing very little and doesn't benefit containing a <code>cCoord</code> -- it could be much simpler to have an <code>x</code> and <code>y</code> directly as part of the <code>Block</code> class.  Also, it would make more sense if the <code>Block</code> class actually represented a <code>Block</code> (with the associated coordinates and origin currently stored in <code>Game</code>) and handled its own rotation and reported its minimum and maximum coordinates for use in collision detection.</p>
+
+<h2>Understand the libraries you use</h2>
+
+<p>The <code>mvinch()</code> curses function returns a <code>chtype</code> and not a <code>char</code>.  The existing code attempts to deal with that using a static cast, but that's not really correct.  Instead, I'd recommend changing the <code>blockChar</code> constant to be of type <code>chtype</code>.</p>
+
+<h2>Avoid floating point where practical</h2>
+
+<p>The current <code>rotate_point</code> within <code>Structure</code> uses <code>sin</code> and <code>cos</code> to rotate the blocks, but the blocks are only ever rotated by +90 or -90 degrees.  It would make more sense to simply precompute the <code>sin</code> and <code>cos</code> values of those angles and use those directly, which would be much faster.</p>
+
+<h2>Think of the user</h2>
+
+<p>The game doesn't currently show a score, the boundaries of the playing field or any hint as to which keys do what to control the game.  Each of these would definitely enhance the user's experience.</p>
+
+<h2>Omit <code>return 0</code></h2>
+
+<p>When a C or C++ program reaches the end of <code>main</code> the compiler will automatically generate code to return 0, so there is no need to put <code>return 0;</code> explicitly at the end of <code>main</code>.  </p>
+
+<p><strong>Note:</strong> when I make this suggestion, it's almost invariably followed by one of two kinds of comments:  "I didn't know that." or "That's bad advice!"  My rationale is that it's safe and useful to rely on compiler behavior explicitly supported by the standard.  For C, since C99; see ISO/IEC 9899:1999 section 5.1.2.2.3:</p>
+
+<blockquote>
+  <p>[...] a return from the initial call to the <code>main</code> function is equivalent to calling the <code>exit</code> function with the value returned by the <code>main</code> function as its argument; reaching the <code>}</code> that terminates the <code>main</code> function returns a value of 0.</p>
+</blockquote>
+
+<p>For C++, since the first standard in 1998; see ISO/IEC 14882:1998 section 3.6.1:</p>
+
+<blockquote>
+  <p>If control reaches the end of main without encountering a return statement, the effect is that of executing return 0;</p>
+</blockquote>
+
+<p>All versions of both standards since then (C99 and C++98) have maintained the same idea.  We rely on automatically generated member functions in C++, and few people write explicit <code>return;</code> statements at the end of a <code>void</code> function.  Reasons against omitting seem to boil down to <a href="https://stackoverflow.com/questions/2581993/what-the-reasons-for-against-returning-0-from-main-in-iso-c/2582015#2582015">"it looks weird"</a>.  If, like me, you're curious about the rationale for the change to the C standard <a href="https://stackoverflow.com/questions/31394171/what-was-the-rationale-for-making-return-0-at-the-end-of-main-optional">read this question</a>.  Also note that in the early 1990s this was considered "sloppy practice" because it was undefined behavior (although widely supported) at the time.  </p>
+
+<p>So I advocate omitting it; others disagree (often vehemently!)  In any case, if you encounter code that omits it, you'll know that it's explicitly supported by the standard and you'll know what it means.</p>
+    </div>

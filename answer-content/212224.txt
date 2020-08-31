@@ -1,0 +1,148 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>template&lt;
+    typename T,
+    typename _TMtx,
+</code></pre>
+
+<p>Get off the standard library's lawn! <code>_Ugly</code> names are reserved to the implementation.</p>
+
+<pre><code>    template&lt;typename&gt; class _TLock,
+    template&lt;typename&gt; class _TMutLock
+&gt;
+class lock_wrap_impl {
+
+    template&lt;typename W&gt;
+    using mimic_unique = typename std::conditional&lt;
+        std::is_move_constructible&lt;W&gt;::value,
+        W,
+        std::unique_ptr&lt;W&gt;
+    &gt;::type;
+</code></pre>
+
+<p>You tagged C++14, so <code>std::conditional_t</code>.</p>
+
+<pre><code>    using mutex_type        = std::unique_ptr&lt;_TMtx&gt;;
+    using lock_type         = mimic_unique&lt;_TLock&lt;_TMtx&gt; &gt;;
+    using mutable_lock_type = mimic_unique&lt;_TMutLock&lt;_TMtx&gt; &gt;;
+
+
+    template&lt;bool M, typename W&gt;
+    using mimic_const = typename std::conditional&lt;M, W, const W&gt;::type;
+
+    template&lt;typename L&gt;
+    using is_mutable = typename std::is_same&lt;L, mutable_lock_type&gt;;
+</code></pre>
+
+<p>This is a pointless <code>typename</code>.</p>
+
+<pre><code>    template&lt;bool M=true&gt;
+    using ptr_type = const std::shared_ptr&lt;mimic_const&lt;M, T&gt; &gt;;
+</code></pre>
+
+<p>A more descriptive name for <code>M</code> may be a good idea. There's no reason to make this top-level <code>const</code> either.</p>
+
+<pre><code>    public:
+        template&lt;typename L&gt;
+        class proxy {
+            public:
+                ptr_type&lt;is_mutable&lt;L&gt;::value &gt; operator-&gt;() { return obj_; }
+</code></pre>
+
+<p>This should be a <code>const</code> member.</p>
+
+<pre><code>                proxy(proxy&lt;L&gt;&amp;&amp; other) :
+                    obj_(other.obj_),
+                    lock_(std::move(other.lock_))
+                {}
+</code></pre>
+
+<p>This does nothing beyond what a defaulted move constructor does. Just default it. Also, use the injected-class-name: <code>proxy(proxy&amp;&amp;) = default;</code></p>
+
+<pre><code>            private:
+                friend lock_wrap_impl&lt;T, _TMtx, _TLock, _TMutLock&gt;;
+
+                proxy(ptr_type&lt;&gt; obj, L&amp;&amp; lock) :
+                    obj_(obj),
+                    lock_(std::move(lock))
+                {}
+
+                ptr_type&lt;&gt; obj_;
+                L          lock_;
+        };
+
+        lock_wrap_impl(T&amp;&amp; obj) :
+            obj_(&amp;obj),
+            mtx_(mutex_type(new _TMtx))
+        {}
+</code></pre>
+
+<p><code>obj_(&amp;obj)</code> is badly wrong. You are making a <code>shared_ptr</code> to some random rvalue.</p>
+
+<pre><code>        template&lt;typename ...Args&gt;
+        lock_wrap_impl(Args&amp;&amp; ...args) :
+            obj_(new T(std::forward&lt;Args&gt;(args)...)),
+            mtx_(mutex_type(new _TMtx))
+        {}
+</code></pre>
+
+<p>This needs to be constrained. Also can use <code>make_shared</code>.</p>
+
+<pre><code>        lock_wrap_impl(lock_wrap_impl&lt;T, _TMtx, _TLock, _TMutLock&gt;&amp;&amp; other) :
+            obj_(std::move(other.obj_)),
+            mtx_(std::move(other.mtx_))
+        {}
+</code></pre>
+
+<p>This again is just a defaulted move constructor. Additionally, since you made <code>obj_</code> const, the first <code>move</code> is just a copy. Again, there's no need to make it <code>const</code>.</p>
+
+<pre><code>        /**
+         * For types that ARE move constructible
+         * e.g std::shared_lock
+         */
+
+        template&lt;typename Q = _TLock&lt;_TMtx&gt; &gt;
+        proxy&lt;lock_type&gt; get(typename std::enable_if&lt;std::is_move_constructible&lt;Q&gt;::value&gt;::type* = 0) {
+            return proxy&lt;lock_type&gt;(obj_, lock_type(*mtx_));
+        }
+
+        template&lt;typename Q = _TMutLock&lt;_TMtx&gt; &gt;
+        proxy&lt;mutable_lock_type&gt; get_mutable(typename std::enable_if&lt;std::is_move_constructible&lt;Q&gt;::value&gt;::type* = 0) {
+            return proxy&lt;mutable_lock_type&gt;(obj_, mutable_lock_type(mtx_));
+        }
+
+
+        /**
+         * For types that aren't move constructible
+         */
+
+        template&lt;typename Q = _TLock&lt;_TMtx&gt; &gt;
+        proxy&lt;lock_type&gt; get(typename std::enable_if&lt;!std::is_move_constructible&lt;Q&gt;::value&gt;::type* = 0) {
+            return proxy&lt;lock_type&gt;(obj_, lock_type(new Q(*mtx_)));
+        }
+
+        template&lt;typename Q = _TMutLock&lt;_TMtx&gt; &gt;
+        proxy&lt;mutable_lock_type&gt; get_mutable(typename std::enable_if&lt;!std::is_move_constructible&lt;Q&gt;::value&gt;::type* = 0) {
+            return proxy&lt;mutable_lock_type&gt;(obj_, mutable_lock_type(new Q(*mtx_)));
+        }
+</code></pre>
+
+<p>This whole business of wrapping immovable locks in <code>unique_ptr</code> is excessively costly and not useful in practice. If someone chose to use <code>lock_guard</code>, it's because they don't want to pay the difference between <code>unique_lock</code> and <code>lock_guard</code>, which is a stored <code>bool</code> and a branch in the destructor. That's far, far less than the cost of a trip to the heap.</p>
+
+<pre><code>    private:
+        ptr_type&lt;&gt;  obj_;
+        mutex_type  mtx_;
+};
+</code></pre>
+
+<p>There does not appear to be any reason why this class need to be movable, and your move constructor leaves it in an unusable "emptier-than-empty" state.</p>
+
+<hr>
+
+<p>Additional comments:</p>
+
+<ul>
+<li>Detecting mutable locks by <em>type</em> presupposes that the shared and mutable locks are not the same. There's no need to have that limitation, since your <code>proxy</code> can just be templated directly on something like <code>bool Mutable</code> instead.</li>
+<li>There's no reason to construct a lock and then move it into the proxy. Just pass the mutex and have the proxy's constructor construct the lock directly. You save a temporary, and it also plays well with C++17 by giving you support for immovable locks for free.</li>
+<li>There's also no reason to use a <code>shared_ptr</code> at all. The pointer obtained from <code>-&gt;</code> cannot safely outlive the proxy (because you'd be accessing the object while not holding the lock) and the proxy cannot safely outlive the wrapper object (or you'd be destroying a locked mutex and then unlocking a destroyed mutex; both are UB). Just store the object directly.</li>
+</ul>
+    </div>

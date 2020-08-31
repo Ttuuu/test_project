@@ -1,0 +1,99 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Overall, the code is quite clean and easy to understand. You did a good job of subdividing the work into small and easily digestible submethods.</p>
+<p>I did notice a few other things though, which I'll list below.</p>
+<hr>
+<p><strong>Tasks vs threads</strong></p>
+<p>Right now, it seems you're using <code>Task.WhenAll</code> and <code>Task.Run</code> as an async wrapper to emulate different concurrent threads. That's not what asynchronous code is for. While asynchronous code often does use multiple cores/threads, that's not a guarantee. You can run asynchronous logic on a single-core machine with a single thread, where there's no possible way of executing logic concurrently.</p>
+<p>Do I think that you're working on a single-core machine with a single thread? No. But the point remains that you're currently conflating two different concepts that have <em>some</em> but not complete overlap.</p>
+<p>I'm not saying your way of doing it doesn't work right now, but to ensure that this code works on all machines I would suggest that you use threads for this, not tasks. That way, you enforce concurrent logic instead of hoping that it works out.</p>
+<p>Then again, if this is a small short-lived test app that will be discarded in the near future, it doesn't quite matter (but then a code review wouldn't really matter either, I guess).</p>
+<p><em>I would generally expect <code>WebApiService</code> to have async methods, which you could be using here. However, it's possible that <code>WebApiService</code> doesn't have async methods and that you are unable/unwilling to implement them on <code>WebApiService</code>, which would be fair enough since this test application isn't trying to redevelop the service implementation but rather test the existing one.</em></p>
+<p><strong>Constructor spam</strong></p>
+<p>Right now you're creating a <code>new WebApiService()</code> 300 times (100 loops, 3 tasks each). Is that by intention, or could this be done using a single service object?</p>
+<p>I suspect (though I cannot guarantee) you can reuse the same object without issues here, which means you could shift that instantiation outside of the loops and either pass it as a parameter or use an static variable (since everything else is static anyway).</p>
+<pre><code>private static WebApiService _svc = new WebApiService();
+
+private static async Task GetLoanByLoanId(string loanNumber)
+{
+    await Task.Run(() =&gt; {
+        var msg1 = _svc.GetLoanByLoanId(loanNumber);
+        if (string.IsNullOrWhiteSpace(msg1)) return;
+        Console.WriteLine($"GL {loanNumber}: {msg1.Length}");
+    });
+}
+</code></pre>
+<p>The same goes for the other two tasks. If you instead wish to pass it as a method parameter, simply instantiate it in <code>Main()</code> and then thread it through your method calls all the way down to the <code>GetLoanByLoanId</code> method (and the other two tasks).</p>
+<p>Since everything here is static anyway, I'd use a static class field here because it's simpler and doesn't really cause any issues in your already exclusively static code.</p>
+<p><strong>If return</strong></p>
+<p>This is quite unidiomatic:</p>
+<pre><code>if (string.IsNullOrWhiteSpace(msg1)) return;
+Console.WriteLine($"GEFL {loanNumber}: {msg1.Length}");
+// end of void method
+</code></pre>
+<p>You could simply invert the if instead of returning one line early:</p>
+<pre><code>if(!String.IsNullOrWhiteSpace(msg1))
+    Console.WriteLine($"GEFL {loanNumber}: {msg1.Length}");
+</code></pre>
+<p>This way, you don't need an eary <code>return</code>. Early returns have their uses when they can skip a whole lot of performance-draining steps, but when that <code>if return</code> is the last block of the method body, there's no futher logic (i.e. after the <code>if</code>) to skip.</p>
+<p><strong>Logging</strong></p>
+<p>It's weird that you're choosing to not log a message when an empty result was retrieved. You already don't quite seem to care about the received message since you're only logging its length, so I surmise that you're using these messages as for progress tracking.</p>
+<p>I'm unsure why you're specifically not logging 0 length (or null) results. If the logging is to keep track of the progress, then those null-or-empty results are still progress and should be logged.</p>
+<p>If you wrote this check to avoid null reference exceptions, there's better ways of avoiding those, e.g. null propagation:</p>
+<pre><code>Console.WriteLine($"GEFL {loanNumber}: {msg1?.Length}");
+</code></pre>
+<p>This way, you always get a message, regardless of what <code>msg1</code> contains.</p>
+<p><strong>Reusable task logic</strong></p>
+<p>All three tasks have pretty much the exact same method body, except for two small differences:</p>
+<pre><code>private static async Task AnyTask(string loanNumber)
+{
+    await Task.Run(() =&gt; {
+        var svc = new WebApiService();
+        var msg1 = svc.THISMETHODISDIFFERENT(loanNumber);                      // &lt;- here
+        if (string.IsNullOrWhiteSpace(msg1)) return;
+        Console.WriteLine($"THISNAMEISDIFFERENT {loanNumber}: {msg1.Length}"); // &lt;- here
+    });
+}
+</code></pre>
+<p>But each of these methods you use always follows the same <code>string MyMethod(string)</code> pattern, and the log message is really just an arbitrary string value. You can therefore easily abstract this method call in a way that the rest of the task body can be reused:</p>
+<pre><code>private static async Task GetLoanByLoanId(string loanNumber)
+{
+    PerformJob($"GL {loanNumber}", svc =&gt; svc.GetLoanByLoanId(loanNumber));
+}
+
+private static async Task GetLoanDataByLoanId(string loanNumber)
+{
+    PerformJob($"GLD {loanNumber}", svc =&gt; svc.GetLoanDataByLoanId(loanNumber));
+}
+
+private static async Task GetEnvelopesForLoan(string loanNumber)
+{
+    PerformJob($"GEFL {loanNumber}", svc =&gt; svc.GetEnvelopesForLoan(loanNumber));
+}
+
+private static async Task PerformJob(string jobName, Func&lt;WebApiService, string&gt; getMessage)
+{
+    return Task.Run(() =&gt; {
+        var svc = new WebApiService();
+        var msg1 = getMessage(svc);
+        if (string.IsNullOrWhiteSpace(msg1)) return;            
+        Console.WriteLine($"{jobName}: {msg1.Length}");            
+    });            
+}
+</code></pre>
+<p>There are two things to remark here:</p>
+<ul>
+<li>The three job methods have become so trivial that you could arguably remove them and just call <code>PerformJob("xxx", svc =&gt; svc.xxx(loanNumber));</code> directly from the calling code. I think this is a subjective call whether you prefer to wrap it nicely or would rather avoid one liner methods.</li>
+<li>If you follow the improvements I suggested in earlier points, the method body of <code>PerformJob</code> becomes trivial as well. But I wouldn't suggest removing this method even though it's trivial, since that would force you to copy/paste the log message format all over the place.</li>
+</ul>
+
+<pre><code>private static async Task PerformJob(string jobName, Func&lt;WebApiService, string&gt; getMessage)
+{
+    // Verbosely:
+    var msg = getMessage(svc);
+    Console.WriteLine($"{jobName}: {msg?.Length}");
+
+    // Or as a one-liner:
+    Console.WriteLine($"{jobName}: {getMessage(svc)?.Length}");          
+}
+</code></pre>
+    </div>

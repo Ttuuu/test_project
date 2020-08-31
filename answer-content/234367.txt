@@ -1,0 +1,164 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Really cool idea for allocator, but style is awful</p>
+
+<hr>
+
+<h1>1) Comments/documentation</h1>
+
+<p>Memory stuff is perhaps the most complicated part of processes to understand. Please, don't leave your successors just idly looking at this code in terror, not knowing what follows what.</p>
+
+<p>While function names are good, reasoning behind execution flow is hard to guess from first read.</p>
+
+<h1>2) <code>throw</code> vs <code>noexcept</code></h1>
+
+<p>As allocators are part of that fringe between C and C++ API, it is extremely important to decide straight away on what side of the debate you are.</p>
+
+<p>If you support "no exceptions" side, you must:<br>
+1) <code>noexcept</code>-qualify <strong>every</strong> function, and<br>
+2) return indication of error to the caller in all cases when that happens.</p>
+
+<p>Your <code>AllocatePool</code> function returns bool indicating failure, but <em>your constructor doesn't do anything to show it to caller</em><br>
+The moment it happens in production, caller will have absolutely no idea why nothing works</p>
+
+<p>If you support "yes exceptions" side, you must:<br>
+1) use RAII<br>
+2) throw the moment error happens</p>
+
+<p>So, I suggest instead of  </p>
+
+<pre><code>if (mMemory == nullptr) return false;
+</code></pre>
+
+<p>just use  </p>
+
+<pre><code>if (mMemory == nullptr) throw /*bad-alloc exception?*/;
+</code></pre>
+
+<p>As a reminder:<br>
+the <code>noexcept</code> side will allow everyone to use this allocator (and I'd prefer that if it's going to be left as memory-only), while<br>
+<code>throw</code> side will allow you to accept throwing constructors when your plans to support objects will happen</p>
+
+<p>You might want to leave this as noexcept memory-only allocator as internal static member for exception-based object allocator built on top.</p>
+
+<h1>3) <code>reinterpret_cast</code>, <code>uintptr_t</code></h1>
+
+<p><code>reinterpret_cast</code> is an easy "code smell" - if you're using it, you understood something wrong.</p>
+
+<p>In this case, you're misusing <code>uintptr_t</code> - in <code>AllocatePool</code> function:  </p>
+
+<pre><code>const auto endAddress = reinterpret_cast&lt;uintptr_t&gt;(freeMemoryList) + (elementSize * numElements);
+</code></pre>
+
+<p><code>elementSize</code> is about size in <strong>bytes</strong>, while it is quite possible that <code>reinterpret_cast&lt;uintptr_t&gt;(freeMemoryList)</code> will be address number in <strong>bits</strong>.</p>
+
+<p>You should use <code>static_cast&lt;byte*&gt;</code> to increment in bytes.</p>
+
+<p>And in other instances, it should be just changed to <code>static_cast</code></p>
+
+<h1>4) Bad names</h1>
+
+<p>Bad names are the main problem both for debugging and for maintaining.  </p>
+
+<p>Currently, you have good names for <em>input variables</em>: mPoolSize, mElementSize, mAlignment. (and even then you need to add somewhere that last 2 are in bytes)<br>
+But everything else does not represent what it is:<br>
+- mMemory is address of a Pool, not "just memory". indicate that<br>
+- mHead is address of Head of <strong>available memory</strong>. indicate that<br>
+- in <code>Allocate</code> you use pHead, pBlock, pNext - instead of explaining <em>what</em> those variables do, you're using hungarian notation to show type that we already see right beside them</p>
+
+<h1>5) Small stuff</h1>
+
+<pre><code>mPoolSize = (mElementSize * numElements) + alignment;
+mMemory = aligned_alloc(mAlignment, mElementSize * numElements);
+</code></pre>
+
+<p>You allocate your pool, but you set your poolSize to be a bit bigger?</p>
+
+<pre><code>AllocatePool(const std::size_t elementSize, const std::size_t numElements, const std::size_t alignment)
+  mElementSize = elementSize;
+  mAlignment = alignment;
+</code></pre>
+
+<p>You push parameters from constructor into pool allocating function, which just takes parameters and puts them into member variables...<br>
+Have you never heard about <a href="https://www.learncpp.com/cpp-tutorial/8-5a-constructor-member-initializer-lists/" rel="nofollow noreferrer">member initializer list</a> ?<br>
+This will even allow you to make variables constant and public (instead of private and with Getter).</p>
+
+<p>In <code>Deallocate</code>:</p>
+
+<pre><code>Deallocate(void* pBlock)
+...
+void ** pHead = mHead.load(std::memory_order_relaxed);
+...
+else {
+    void ** ppReturnedBlock = pHead;
+    void ** pPrev = reinterpret_cast&lt;void **&gt;(pBlock);
+    *pHead = reinterpret_cast&lt;void *&gt;(ppReturnedBlock);
+    mHead.compare_exchange_weak(pHead, pPrev);
+</code></pre>
+
+<p>From what I deduced about the design, it is returning block that should be pointing to old Head, not the other way around</p>
+
+<p>And FOR THE SAKE OF READABILITY, please add <code>return;</code> into your void-returning functions...</p>
+
+<h1>6) Trying to be clever is dumb. Part 1: <code>memory_order</code></h1>
+
+<p><code>memory_order</code> is a bag of worms. Simplest rule is to never use anything other than <code>seq_cst</code> with rare <code>acq_rel</code>. If you use it, if it appears in code, you <strong>must</strong> explain and prove <strong>EXTREMELY</strong> well that it is ok to not use default maximum synchronization.</p>
+
+<p>Currently, you use <code>memory_order_relaxed</code> for allocation and deallocation. That pretty much means that <strong>state of atomic variable does not represent any process that uses non-atomic variables</strong>.<br>
+Do you already recognize why it is bad for memory allocator?</p>
+
+<p>In short, right now it is possible for optimizer to reorder <code>allocate-&gt;do_smth_with_ptr-&gt;deallocate</code> into <code>allocate-&gt;deallocare-&gt;do_wtevr</code> with another thread (or even same one!) allocating same address.</p>
+
+<p>And all that will be not only runtime, but build-time dependent!</p>
+
+<p>And worst part? Even with all that cleverness, at best you'll get no benefits, because hardware vendors already more or less switched to <code>seq_cst</code> where it matters.</p>
+
+<h1>7) Trying to be clever is dumb. Part 2: <code>compare_exchange_weak</code> vs <code>compare_exchange_strong</code></h1>
+
+<p>You <strong>must</strong> know instruments that you're using.</p>
+
+<p>Both <code>compare_exchange</code> variants guarantee that they return <code>true</code> only if they succeeded. Strong one guarantees that if it returns <code>false</code> then change to atomic [made by another thread] has definitely happened. Weak one exchanges that guarantee for ability to work faster <strong>on certain architectures</strong>.</p>
+
+<p>By default prefer Strong version as it will always do what it explains.</p>
+
+<p>Right now you just use them as if you're always right and they will always succeed... Which reminds me:</p>
+
+<h1>8) <code>Allocate</code> can give same slot infinite amount of times. <code>Deallocate</code> can drop infinite amount of slots</h1>
+
+<p>You don't use return of <code>compare_exchange</code>.<br>
+You don't loop over compare_exchange.</p>
+
+<p>In <code>Allocate</code>:</p>
+
+<pre><code>void ** pHead = mHead.load(); //million threads acquire same Head at the same time
+if (pHead != nullptr) {
+    void * pBlock = reinterpret_cast&lt;void *&gt;(pHead); //million threads compute same address
+    void ** pNext = static_cast&lt;void **&gt;(*pHead);
+    mHead.compare_exchange_strong(pHead, pNext); //one thread writes new Head, million-minus-one threads fail
+
+    return pBlock; //million threads return with same address
+</code></pre>
+
+<p>in <code>Deallocate</code>:</p>
+
+<pre><code>Deallocate( void* pBlock) //million threads come in with their blocks
+
+void ** pHead = mHead.load();//million threads get same Head at the same time
+
+if (pHead == nullptr) { 
+  void ** pPrev = reinterpret_cast&lt;void **&gt;(pBlock);
+  *pPrev = nullptr; //million threads change their slots to point to nullptr
+  mHead.compare_exchange_strong(pHead, pPrev); //one thread pushes its slot. million-minus-one threads fail
+  return; //million threads return to caller, leaving their slots behind
+</code></pre>
+
+<h1>9) Is there any need to be dynamic?</h1>
+
+<p>As I'm looking at this code, I don't see anything (other than use-case) that can stop this code from being a template on <code>ElementSize</code> and, optionally, on <code>numElements</code>.<br>
+Also I don't see that big of a bonus in performance as long as you dynamically allocate with malloc on heap, instead of compile-time-known size on stack (although you do get some bonus due to locality).</p>
+
+<p>Just making a class with <code>std::array&lt;std::allocated_storage&lt;ElementSize&gt;, numElements&gt;</code> would give quite a speed up.</p>
+
+<hr>
+
+<p>So far you have a lot to fix. But idea is cool and I guess it can work.</p>
+    </div>

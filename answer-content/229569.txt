@@ -1,0 +1,196 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>Task task;
+while (m_enabled)
+{
+    {
+        std::unique_lock&lt;std::mutex&gt; lg{ m_mu };
+        while (m_tasks.empty() &amp;&amp; m_enabled)
+            m_cond.wait(lg);
+    }
+    if (!m_tasks.empty())
+    {// there is a task available
+        std::unique_lock&lt;std::mutex&gt; lg{ m_mu };
+        task = std::move(m_tasks.front());
+        m_tasks.pop();
+        task();
+    }
+}// while threadPool is enabled
+</code></pre>
+
+<p>This all seems a bit dodgy.</p>
+
+<ul>
+<li>We acquire a lock for waiting, and checking if tasks is empty (ok).</li>
+<li>Then when a task appears in the queue we dispose of the lock (?).</li>
+<li>We then check for emptiness without a lock (!!), and acquire a new lock. The queue could well become empty between checking for emptiness, and acquiring the new lock (and more importantly the subsequent unchecked call to <code>front()</code>).</li>
+<li>Then we take the task off the queue, and execute it while still holding the lock (!). So we are effectively executing tasks in a single-threaded fashion.</li>
+</ul>
+
+<p>I'd expect it to look something like:</p>
+
+<pre><code>while (true)
+{
+    std::unique_lock&lt;std::mutex&gt; lg{ m_mu };
+    m_cond.wait(lg, [&amp;] () { return !m_enabled || !m_tasks.empty(); });
+
+    if (!m_enabled)
+        break;
+
+    //assert(!m_tasks.empty());
+
+    auto task = std::move(m_tasks.front());
+    m_tasks.pop();
+
+    lg.unlock();
+
+    task();
+}
+</code></pre>
+
+<hr>
+
+<pre><code>std::atomic&lt;bool&gt; m_enabled = false;
+</code></pre>
+
+<p>This directly contradicts the default argument in the constructor.</p>
+
+<hr>
+
+<pre><code>    : m_nthreads{ nthreads },
+    m_enabled{ enabled }
+</code></pre>
+
+<p>Make sure to specify the members in the same order as they are declared in the body of the class (since that is the order they will actually be initialized in). Your compiler should warn you about this.</p>
+
+<hr>
+
+<p>The current logic for when to <code>run()</code> or <code>stop()</code> seems to be faulty. It looks like we call <code>run()</code> in the constructor, whether or not the thread pool is <code>enabled</code>.</p>
+
+<p><code>run()</code> may then be called a second time in <code>start()</code>, which will add another <code>nthreads</code> to the thread pool.</p>
+
+<p>Similarly, after <code>stop()</code> is called, we still have threads in the pool (and in the vector), even if they have been joined.</p>
+
+<hr>
+
+<p>Besides the lifetime issues pointed out by L.F., taking the arguments to the packaged task and forwarding them is quite complicated. The user can already manage arguments themselves with <code>std::bind</code> or lambda capture, so there's probably no need for another method. We can just take a single callable object.</p>
+
+<p>Perhaps <code>std::promise</code> might be a better choice than <code>std::packaged_task</code>. We don't need the capabilities of launching a new thread with a <code>packaged_task</code>, and we are effectively handling the packaging of the task ourselves.</p>
+
+<hr>
+
+<p>There's not really any need for <code>m_enabled</code> to be atomic. The only place where we would need a lock for it is in the stop function.</p>
+
+<hr>
+
+<p>Suggested modifications:</p>
+
+<pre><code>#include &lt;cassert&gt;
+#include &lt;condition_variable&gt;
+#include &lt;cstddef&gt;
+#include &lt;functional&gt;
+#include &lt;future&gt;
+#include &lt;queue&gt;
+#include &lt;thread&gt;
+#include &lt;vector&gt;
+
+class ThreadPool final
+{
+public:
+
+    explicit ThreadPool(std::size_t nthreads = std::thread::hardware_concurrency()):
+        m_enabled(true),
+        m_pool(nthreads)
+    {
+        run();
+    }
+
+    ~ThreadPool()
+    {
+        stop();
+    }
+
+    ThreadPool(ThreadPool const&amp;) = delete;
+    ThreadPool&amp; operator=(const ThreadPool&amp;) = delete;
+
+    template&lt;class TaskT&gt;
+    auto enqueue(TaskT task) -&gt; std::future&lt;decltype(task())&gt;
+    {
+        using ReturnT = decltype(task());
+        auto promise = std::make_shared&lt;std::promise&lt;ReturnT&gt;&gt;();
+        auto result = promise-&gt;get_future();
+
+        auto t = [p = std::move(promise), t = std::move(task)] () mutable { execute(*p, t); };
+
+        {
+            std::lock_guard&lt;std::mutex&gt; lock(m_mu);
+            m_tasks.push(std::move(t));
+        }
+
+        m_cv.notify_one();
+
+        return result;
+    }
+
+private:
+
+    std::mutex m_mu;
+    std::condition_variable m_cv;
+
+    bool m_enabled;
+    std::vector&lt;std::thread&gt; m_pool;
+    std::queue&lt;std::function&lt;void()&gt;&gt; m_tasks;
+
+    template&lt;class ResultT, class TaskT&gt;
+    static void execute(std::promise&lt;ResultT&gt;&amp; p, TaskT&amp; task)
+    {
+        p.set_value(task()); // syntax doesn't work with void ResultT :(
+    }
+
+    template&lt;class TaskT&gt;
+    static void execute(std::promise&lt;void&gt;&amp; p, TaskT&amp; task)
+    {
+        task();
+        p.set_value();
+    }
+
+    void stop()
+    {
+        {
+            std::lock_guard&lt;std::mutex&gt; lock(m_mu);
+            m_enabled = false;
+        }
+
+        m_cv.notify_all();
+
+        for (auto&amp; t : m_pool)
+            t.join();
+    }
+
+    void run()
+    {
+        auto f = [this] ()
+        {
+            while (true)
+            {
+                std::unique_lock&lt;std::mutex&gt; lock{ m_mu };
+                m_cv.wait(lock, [&amp;] () { return !m_enabled || !m_tasks.empty(); });
+
+                if (!m_enabled)
+                    break;
+
+                assert(!m_tasks.empty());
+
+                auto task = std::move(m_tasks.front());
+                m_tasks.pop();
+
+                lock.unlock();
+                task();
+            }
+        };
+
+        for (auto&amp; t : m_pool)
+            t = std::thread(f);
+    }
+};
+</code></pre>
+    </div>

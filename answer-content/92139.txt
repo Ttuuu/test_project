@@ -1,0 +1,96 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>1. Introduction</h3>
+
+<p>There's quite a bit of code here, so I'm just going to review one of your functions (<code>get_width</code>). You'll see that there's plenty here for one answer. Maybe some other reviewers will look at some of the rest of your code.</p>
+
+<pre><code># uses os.popen to get the terminal size.
+def get_width():
+    global width
+    try:
+        width = os.popen('stty size', 'r').read().split()[1]
+        supported=True
+    except IndexError as error:
+        width = 50
+        supported=False
+    width = int(width)
+    return supported
+</code></pre>
+
+<h3>2. Review</h3>
+
+<ol>
+<li><p>The name of the function is ambiguous: get the width of what? Something like <code>terminal_width</code> would be better.</p></li>
+<li><p>There's a comment but it would be better if this were a docstring: then you could read it using <code>help(get_width)</code> from the interactive interpreter.</p></li>
+<li><p>The comment says:</p>
+
+<pre><code># uses os.popen to get the terminal size.
+</code></pre>
+
+<p>but this is misleading. Someone who just read the comment might think that <code>get_width</code> <em>returned</em> the terminal width, but in fact the function stores the terminal width in a global variable and returns something else.</p></li>
+<li><p>It's not clear what the "something else" is. The variable name is <code>supported</code>. But what is it that's supported or not?</p></li>
+<li><p>It's a bad idea to use global variables to pass state around — it's all too easy to forget whether or not you've updated them. I presume that you're doing this because <code>get_width</code> has two pieces of information to return (the terminal width, and whether something or other is supported). But in Python, functions can return multiple values using a tuple, like this:</p>
+
+<pre><code>return supported, width
+</code></pre></li>
+<li><p>The code says:</p>
+
+<pre><code>except IndexError as error:
+</code></pre>
+
+<p>but <code>error</code> is not used, so write:</p>
+
+<pre><code>except IndexError:
+</code></pre></li>
+<li><p>There's no need to call <code>int(width)</code> in the <code>IndexError</code> case, as the code has already set <code>width = 50</code>.</p></li>
+<li><p>If <code>stty</code> fails for some reason, for example:</p>
+
+<pre class="lang-none prettyprint-override"><code>stty: stdin isn't a terminal
+</code></pre>
+
+<p>then <code>int(width)</code> will raise <code>ValueError</code>. This needs to be handled.</p></li>
+<li><p><code>stty size</code> reports <code>0 0</code> if it can't determine the terminal size. This needs to be handled.</p></li>
+<li><p>The <em>mode</em> argument to <a href="https://docs.python.org/3/library/os.html#os.popen"><code>os.popen</code></a> defaults to <code>'r'</code>, so there's no need to specify it.</p></li>
+<li><p>The code opens a pipe using <a href="https://docs.python.org/3/library/os.html#os.popen"><code>os.popen</code></a> but does not close it. It happens to be the case that CPython automatically closes files when the reference count of the associated file object goes to zero, but this is not something you want to get into the habit of relying on because other Python implementations have different behaviour. Use the <code>with</code> statement to ensure that the pipe is closed:</p>
+
+<pre><code>with os.popen('stty size') as f:
+    try:
+        width = int(f.read().split()[1])
+        # etc.
+</code></pre></li>
+<li><p><a href="https://docs.python.org/3/library/os.html#os.popen"><code>os.popen</code></a> runs a subprocess using a shell. This wastes a process (you don't need any shell features, you only want to run <code>stty</code>) and is a bad habit to get into because the shell has to parse the command you give it, and in more complicated situations that can be a security risk. It would be better to use <a href="https://docs.python.org/3/library/subprocess.html#subprocess.check_output"><code>subprocess.check_output</code></a> to run <code>stty</code> directly, bypassing the shell.</p></li>
+<li><p>Instead of calling the external process <code>stty</code>, why not interrogate the terminal directly? The idea is to use the <a href="http://man7.org/linux/man-pages/man4/tty_ioctl.4.html"><code>ioctl</code></a> (I/O device control) system call via the Python interface <a href="https://docs.python.org/3/library/fcntl.html#fcntl.ioctl"><code>fnctl.ioctl</code></a>, passing the <code>TIOCGWINSZ</code> ("terminal I/O control: get window size") command, which returns a pair of <code>unsigned short</code> (16-bit) values that can be decoded using <a href="https://docs.python.org/3/library/struct.html#struct.unpack"><code>struct.unpack</code></a>.</p>
+
+<pre><code>rows, cols = unpack('hh', ioctl(sys.stdout, TIOCGWINSZ, '0000'))
+</code></pre>
+
+<p>This is exactly what the <code>stty size</code> command does, except that you are avoiding the extra process.</p></li>
+<li><p>If you can't determine the terminal size via the <code>ioctl</code> call, it's a good idea to fall back to consulting the environment. Some shells set the <code>LINES</code> and <code>COLUMNS</code> environment variables.</p></li>
+<li><p>To make the function more generally usable, why not return the rows as well as the columns? You have the value in your hand, so why not return it?</p></li>
+<li><p>You use the <code>supported</code> flag to decide what kind of progress bar to draw. Presumably what you actually want to know is whether the standard output is connected to a terminal? But in that case you should just use the built-in <a href="https://docs.python.org/2/library/os.html#os.isatty"><code>os.isatty</code></a>.</p></li>
+</ol>
+
+<h3>3. Revised code</h3>
+
+<pre><code>from struct import unpack
+from fcntl import ioctl
+import os
+import sys
+from termios import TIOCGWINSZ
+
+def terminal_size(fd=sys.stdout, default=(25, 80)):
+    """Return the size of the terminal attached to fd, as a tuple (rows,
+    columns). If the size can't be determined, return default.
+
+    """
+    def fallback(value, key, default):
+        if value &gt; 0:
+            return value
+        try:
+            return int(os.environ.get(key, default))
+        except ValueError:
+            return default
+
+    size = unpack('hh', ioctl(fd, TIOCGWINSZ, '0000'))
+    return tuple(map(fallback, size, ('LINES', 'COLUMNS'), default))
+</code></pre>
+    </div>

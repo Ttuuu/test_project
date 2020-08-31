@@ -1,0 +1,220 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First some general remarks about the code, and then an alternative way to go about this.</p>
+
+<ul>
+<li><p>Underscores have a special meaning in VB. They indicate event procedures and implementations of an interface. You should remove them from your namings. It's a bit confusing to look at. Particularly this.</p>
+
+<blockquote>
+<pre><code> Private Sub Form_Current()
+    mCustom_FormCurrent Me
+End Sub
+</code></pre>
+</blockquote>
+
+<p>It really looks like you're calling an event procedure that resides in the form, but that's not what is actually happening.</p></li>
+<li><p>Also naming issues, I don't like the <code>p_</code> prefix you're using for parameters. They're locally scoped, so there's no need to prefix them. As a VBA dev, I've come to expect that kind of prefix to mean it's module scoped, like your <code>m_</code> prefix. </p></li>
+<li><p>The use of <code>On Error GoTo 0</code> doesn't do anything in this code. That statement disables the error handler in a routine, but you use it directly before exiting. Thus, it doesn't do anything and can be safely removed.</p></li>
+<li><p>In the <code>EventHandlerManager</code> class, you don't declare a type for <code>ctl</code>. </p>
+
+<blockquote>
+<pre><code>Public Sub initFormHandlers(p_form As Form)
+
+    Dim ctl
+</code></pre>
+</blockquote>
+
+<p>This means it's being implicitly declared as a variant. It would be better to declare it as an <code>Access.Control</code>. (But stop what you're thinking, <code>Control</code> doesn't support events...)</p></li>
+<li><p>Script Labels are (necessarily) scoped to their procedure. So, there's no need to spell them out like you have. </p>
+
+<blockquote>
+<pre><code>On Error GoTo m_cboBox_Change_Error
+</code></pre>
+</blockquote>
+
+<p>This would work just as well and be less clutter. </p>
+
+<pre><code>On Error GoTo ErrorHandler
+</code></pre>
+
+<p>Also, if they're standard, you can write code to insert these snippets for you.</p></li>
+<li><p>I don't like how you're trying to <code>Resume</code> in your error handlers. I mean, it's okay if it's working for you, but it would be better to take note of the specific error that needs to be retried for and only retry if it's that particular error. You may want to add more behavior later where it wouldn't be a good thing to simply retry.</p>
+
+<p>Also, you should rename <code>i</code> to something like <code>errorCount</code> and declare it much closer to where you're using it. Also note that there's no need to set the value to zero. An integer's default value is already zero.</p>
+
+<pre><code>Private Sub mTextBox_AfterUpdate()
+
+    On Error GoTo ErrorHandler
+
+    mParentForm.Recordset.Edit
+    mParentForm.Recordset.Update
+
+    Exit Sub
+
+ErrorHandler:
+    'This resolves an error which happens sometimes - not sure why Resume works but it fixes the .Update causing errors ???
+    Dim errorCount As Long
+    If errorCount = 0 Then
+        errorCount = errorCount + 1
+        Resume
+    Else
+        sendErrorEmail "mTextBox_AfterUpdate for " &amp; mTextBox.Name, Err.Description, Err.Number, ERROR_DEBUG
+    End If
+
+End Sub
+</code></pre></li>
+<li><p><a href="https://stackoverflow.com/a/26409520/3198973">There is zero benefit to ever declaring an Integer type in VBA</a>. Use a <code>long</code> type instead.</p></li>
+</ul>
+
+<hr>
+
+<p>Okay, now let's talk about a better way to do this. </p>
+
+<blockquote>
+  <p>Ideally, the form controls would all be inherited from a
+  BaseFormControl class (I made the name up) I could override the
+  AfterUpdate for in a generic sense, and then apply to all form
+  objects. This does not seem to exist though.</p>
+</blockquote>
+
+<p>You're absolutely right. Inheritance would be an ideal way to deal with this. Unfortunately, in VBA we can either have inheritance, via interfaces, or events. We can't have them both. So, we'll need another option. Being that you're goal is to not have to create a class for each different type of Access control, I took the following approach. It does have it's cons however. This works only under the assumption that you want all controls to behave exactly the same. Personally, I like your original approach, as it allows you to create controls that react differently to the same events.</p>
+
+<ol>
+<li>I created an <code>EhControl</code> class and copied all of the logic from your two existing control classes. This removed some duplication in declaring the <code>Evented</code> constant and parent form class variable.</li>
+<li>I created a private initialize routine for each type of access control.</li>
+<li>Create a public initialize control that takes in an <code>Access.Control</code> instead of a <code>TextBox</code> or <code>ComboBox</code>. </li>
+<li>Move the <code>Select Case</code> logic into the public <code>Initialize</code> method.</li>
+</ol>
+
+<p><strong>EhControl.cls</strong></p>
+
+<pre><code>Option Compare Database
+Option Explicit
+
+Private Const Evented As String = "[Event Procedure]"
+
+Private mParentForm As Access.Form
+Private WithEvents mTextBox As Access.TextBox
+Private WithEvents mComboBox As Access.ComboBox
+
+Public Sub Initialize(ByRef source As Control, ByRef parentForm As Access.Form)
+
+    Set mParentForm = parentForm
+
+    Select Case source.ControlType
+        Case acTextBox:
+            InitializeTextBox source
+        Case acComboBox:
+            InitializeComboBox source
+        Case Default:
+            'do nothing
+    End Select
+
+End Sub
+
+Private Sub InitializeTextBox(ByRef source As TextBox)
+    Set mTextBox = source
+    mTextBox.OnExit = Evented
+    mTextBox.OnChange = Evented
+    mTextBox.BeforeUpdate = Evented
+    mTextBox.AfterUpdate = Evented
+End Sub
+
+Private Sub InitializeComboBox(ByRef source As ComboBox)
+    Set mComboBox = source
+    mComboBox.OnChange = Evented
+End Sub
+
+Private Sub mTextBox_AfterUpdate()
+
+    On Error GoTo ErrorHandler
+
+    mParentForm.Recordset.Edit
+    mParentForm.Recordset.Update
+
+    Exit Sub
+
+ErrorHandler:
+    'This resolves an error which happens sometimes - not sure why Resume works but it fixes the .Update causing errors ???
+
+    Dim errorCount As Long
+    If errorCount = 0 Then
+        errorCount = errorCount + 1
+        Resume
+    Else
+        'sendErrorEmail "mTextBox_AfterUpdate for " &amp; mTextBox.Name, Err.Description, Err.Number, ERROR_DEBUG
+        MsgBox "Textbox AfterUpdateError"
+    End If
+
+End Sub
+
+Private Sub mComboBox_Change()
+
+    On Error GoTo ErrorHandler
+
+    Application.Echo False
+
+    mParentForm.Recordset.Edit
+    mParentForm.Recordset.Update
+
+    Application.Echo True
+
+    Exit Sub
+
+ErrorHandler:
+    'This resolves an error which happens sometimes - not sure why Resume works but it fixes the .Update causing errors ???
+
+    Dim errorCount As Long
+    If errorCount = 0 Then
+        errorCount = errorCount + 1
+        Resume
+    Else
+        'sendErrorEmail "mTextBox_AfterUpdate for " &amp; mTextBox.Name, Err.Description, Err.Number, ERROR_DEBUG
+        MsgBox "Textbox AfterUpdateError"
+    End If
+End Sub
+</code></pre>
+
+<p><em>Note that there is now an opportunity to extract a subroutine for your error handlers. I have not done this.</em></p>
+
+<ol>
+<li>Next I created a new <code>ControlEventRegister</code> class. (<code>EventHandlerManager</code> was a bit much for my taste.)</li>
+<li>As I stated earlier, the logic in the select case has been removed, so this class is responsible for nothing more than looping through the form that gets passed to <code>InitializeEventHandlers</code> initializing and adding them to a single <code>mControls</code> collection.</li>
+</ol>
+
+<p><strong>ControlEventRegister.cls</strong></p>
+
+<pre><code>Option Compare Database
+Option Explicit
+
+Private mControls As Collection
+
+Public Sub IntializeEventHandlers(parentForm As Form)
+
+     Set mControls = New Collection
+
+     Dim eventedControl As EhControl
+
+     Dim ctl As Control
+     For Each ctl In parentForm.Controls
+        Set eventedControl = New EhControl
+        eventedControl.Initialize ctl, parentForm
+        mControls.Add eventedControl
+     Next ctl
+End Sub
+</code></pre>
+
+<p>Lastly, I wasn't a fan of the sub you had in a regular module to call the <code>EventHandlerManager</code>. I think you could run into some bugs if more than one form was open at a time. I'm not sure, but I don't think it's too much of a burden to add the following code to your forms.</p>
+
+<p><strong>Form Code Behind</strong></p>
+
+<pre><code>Option Compare Database
+Option Explicit
+
+Private mEventManager As ControlEventRegister
+
+Private Sub Form_Current()
+    Set mEventManager = New ControlEventRegister
+    mEventManager.IntializeEventHandlers Me
+End Sub
+</code></pre>
+    </div>

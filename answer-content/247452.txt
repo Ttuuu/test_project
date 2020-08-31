@@ -1,0 +1,85 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'll try to answer your two questions first, then I'll add some general comments.</p>
+<blockquote>
+<ul>
+<li>I dont like that the client has to Box the closure. I would prefer to pass the closure in directly.</li>
+</ul>
+</blockquote>
+<p>This is actually fairly easy, you just need to change <code>TQIFunc</code> to</p>
+<pre class="lang-rust prettyprint-override"><code>type TQIFunc = fn() -&gt; ();
+</code></pre>
+<p>and fix whatever fails to compile.</p>
+<p>The original version is specifying a <code>Box</code> to a type object, but since type objects have no size at compilation time it has to be held in some kind of reference object. However, <code>fn() -&gt; ()</code> is a function pointer which does have a known size, and thus you can hold it directly in <code>TimerQueueItem</code>.</p>
+<blockquote>
+<ul>
+<li>I would like to return a 'handle' to my caller so they can tell if there task has finished. The c++ code returns a std::future. Cant work out the equivalent for rust.</li>
+</ul>
+</blockquote>
+<p>Without opening the <code>async</code> can of worms, we can come up with a relatively simple first draft of a solution by using a mutex and condition variable:</p>
+<pre class="lang-rust prettyprint-override"><code>struct TimerQueueItem {
+    when: Instant,  // when it should run
+    name: String,   // for trace only
+    what: TQIFunc,  // what to run
+    handle: TimerQueueHandle,
+}
+
+#[derive(Clone)]
+pub struct TimerQueueHandle {
+    handle: Arc&lt;(Mutex&lt;bool&gt;, Condvar)&gt;,
+}
+
+impl TimerQueueHandle {
+    fn new() -&gt; Self {
+        Self {
+            handle: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    pub fn join(&amp;self) {
+        let (lock, cv) = &amp;*self.handle;
+        let mut finished = lock.lock().unwrap();
+        while !*finished {
+            finished = cv.wait(finished).unwrap();
+        }
+    }
+    
+    fn kill(&amp;self) {
+        let (lock, cv) = &amp;*self.handle;
+        let mut finished = lock.lock().unwrap();
+        *finished = true;
+        cv.notify_all();
+    }
+}
+</code></pre>
+<p>Now we can update the <code>queue</code> function</p>
+<pre class="lang-rust prettyprint-override"><code>pub fn queue(&amp;self, f: TQIFunc, n: String, when: Instant) -&gt; TimerQueueHandle {
+    trace!(target:"TimerQueue", "queued {0}", &amp;n);
+    let handle = TimerQueueHandle::new();
+    let qi = TimerQueueItem {
+        what: f,
+        name: n,
+        when: when,
+        handle: handle.clone(),
+    };
+
+    // &lt;snip&gt;...
+    handle
+}
+</code></pre>
+<p>After this, you just need to call <code>kill</code> and <code>join</code> in the appropriate places. I'll talk about how this can be improved below.</p>
+<h3>Additional thoughts</h3>
+<ul>
+<li>Inserting into a vector and then sorting will work fine as long as the queue size actually is small, but it's not going to scale well. On the plus side you don't actually need vector semantics here, but rather priority queue semantics. Take a look at <code>std::collections::binary_heap</code>.</li>
+<li>Consider using sentinel values instead of a boolean flag for the queue status, e.g.</li>
+</ul>
+<pre class="lang-rust prettyprint-override"><code>enum QueueInstruction {
+    Do(TimerQueueItem),
+    Stop,
+}
+</code></pre>
+<p>with <code>queue: Vec&lt;QueueInstruction&gt;</code>. I find that unifying control flow in this way is much easier to reason about asynchronously. By specializing <code>PartialOrd</code> and adding data fields to the <code>Stop</code> variant, you can also achieve pretty fine-grained control of queue shutdown. Speaking of asynchronous reasoning though...</p>
+<ul>
+<li>Don't use <code>Arc</code> and <code>Mutex</code> at all. Use a <code>std::sync::mpsc</code> channel to communicate with enqueueing threads. Bear in mind that <code>mpsc</code> is a FIFO queue so you'll have to treat it as an intermediate structure and flush it into your priority queue every iteration.</li>
+<li>You can also use an <code>mpsc</code> as the basis for your task handles, instead of the mutex/cv approach. The code for this is left as an exercise, but I think it'll be much friendlier than what I wrote above.</li>
+</ul>
+    </div>

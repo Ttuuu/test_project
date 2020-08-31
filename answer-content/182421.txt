@@ -1,0 +1,186 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Get rid of unnecessary nested and combined <code>if</code>s</h2>
+
+<p>While here it goes to no extreme, it's advisable to check for errors first, and to do that one by one - if possible, which is exactly this case.</p>
+
+<h2>Do some extra checks</h2>
+
+<ul>
+<li><p>Only in case of 0 arguments, the script should output usage message.</p></li>
+<li><p>This script does not support multiple arguments, so if given more than 1, inform the user.</p></li>
+<li><p>The script only checks for existence of the file, but what if it's not readable by the user.</p></li>
+</ul>
+
+<h2>Use <code>tput</code> for handling text colors instead of escape sequences</h2>
+
+<p>Those escape sequences are non-portable and the fact it works in <code>dash</code> does not mean it would do the job in Cygwin for instance; <code>tput</code> is clearly more portable.</p>
+
+<pre><code>bold=$(tput bold)
+red=$(tput setaf 1)
+yellow=$(tput setaf 3)
+nocolor=$(tput sgr0)
+
+bold_red=${bold}${red}
+bold_yellow=${bold}${yellow}
+</code></pre>
+
+<h2>Write a function for handling errors</h2>
+
+<pre><code>print_error_and_exit()
+{
+    echo "${bold_red}$1 Exit code = $2.${nocolor}"
+    exit "$2"
+}
+</code></pre>
+
+<h2>Shorten test commands, since there are only <code>if</code> ... <code>then</code></h2>
+
+<pre><code>[ "$#" -eq 0 ] \
+&amp;&amp; print_error_and_exit "One argument needs to be given. Both relative, and absolute file paths are supported." 1
+</code></pre>
+
+<h2>Declare and initialize variables just before they're used</h2>
+
+<p>The following declarations:</p>
+
+<blockquote>
+<pre><code>input_filename="$1"
+filepath=$(dirname "$1")
+filename_extracted_from_path=$(basename "$1")
+filename_without_enc_extension="${filename_extracted_from_path%.enc}"
+</code></pre>
+</blockquote>
+
+<p>Should be split in order not to declare / initialize variables the script may not use in event of a failure.</p>
+
+<h2>Use <code>exit</code> return codes</h2>
+
+<p>The script should give the system feedback for example for automated processing. And be sure to use different <code>exit</code> codes in every failure event.</p>
+
+<h2>Root account check is unnecessary</h2>
+
+<p>The following test:</p>
+
+<blockquote>
+<pre><code>[ "$(id -u)" -ne 0 ]
+</code></pre>
+</blockquote>
+
+<p>Does not serve the intended purpose and should be omitted.</p>
+
+<h2>Comment code, that is not self-explanatory</h2>
+
+<p>The following code:</p>
+
+<blockquote>
+<pre><code>if [ "$filename_extracted_from_path" = "$filename_without_enc_extension" ]
+then
+    output_filename="$filepath/$filename_extracted_from_path".dec
+else
+    output_filename="$filepath/$filename_without_enc_extension"
+fi
+</code></pre>
+</blockquote>
+
+<p>May be a little unclear, so a short comment is advisable.</p>
+
+<h2>The script should give feedback to the user too</h2>
+
+<p>The core code:</p>
+
+<blockquote>
+<pre><code>pv --wait "$input_filename" | openssl enc -aes-256-cbc -d -salt -out "$output_filename"
+</code></pre>
+</blockquote>
+
+<p>Should say something like:</p>
+
+<blockquote>
+<pre><code>Decryption failed / successful.
+</code></pre>
+</blockquote>
+
+<h2>Clean after failed decryption</h2>
+
+<p>In the event of failed decryption, there is an empty output file present.</p>
+
+<h2>(Optional) The decryption status message could use some colors</h2>
+
+<p>In the end, if the decryption fails, it shows something similar to:</p>
+
+<blockquote>
+<pre><code>bad decrypt
+140673166227096:error:06065064:digital envelope routines:EVP_DecryptFinal_ex:bad decrypt:evp_enc.c:529:
+</code></pre>
+</blockquote>
+
+<p>Though it might suffice to say the above mentioned message, some users might prefer it in color.</p>
+
+<hr>
+
+<h2>Based on the above code, I would re-write it as follows:</h2>
+
+<pre><code>#!/bin/sh
+
+bold=$(tput bold)
+red=$(tput setaf 1)
+yellow=$(tput setaf 3)
+nocolor=$(tput sgr0)
+
+bold_red=${bold}${red}
+bold_yellow=${bold}${yellow}
+
+print_error_and_exit()
+{
+    echo "${bold_red}$1 Exit code = $2.${nocolor}"
+    exit "$2"
+}
+
+[ "$#" -eq 0 ] \
+&amp;&amp; print_error_and_exit "One argument needs to be given. Both relative, and absolute file paths are supported." 1
+
+[ "$#" -gt 1 ] \
+&amp;&amp; print_error_and_exit "Multiple arguments are not supported." 2
+
+[ ! -f "$1" ] \
+&amp;&amp; print_error_and_exit "The given argument is not an existing file." 3
+
+input_filename="$1"
+
+[ ! -r "$input_filename" ] \
+&amp;&amp; print_error_and_exit "Input file is not readable by you." 4
+
+input_filepath=$(dirname "$input_filename")
+
+[ ! -w "$input_filepath" ] \
+&amp;&amp; print_error_and_exit "Destination directory is not writable by you." 5
+
+filename_extracted_from_path=$(basename "$input_filename")
+filename_without_enc_extension="${filename_extracted_from_path%.enc}"
+
+if [ "$filename_extracted_from_path" = "$filename_without_enc_extension" ]
+then
+    # the file has a different than .enc extension or no extension at all
+    # what we do now, is that we append .dec extention to the file name
+    output_filename="$input_filepath/$filename_extracted_from_path".dec
+else
+    # the file has the .enc extension
+    # what we do now, is that we use the file name without .enc extension
+    output_filename="$input_filepath/$filename_without_enc_extension"
+fi
+
+[ -f "$output_filename" ] \
+&amp;&amp; print_error_and_exit "Destination file exists." 6
+
+if ! pv -W "$input_filename" | openssl enc -aes-256-cbc -md sha256 -salt -out "$output_filename" -d 2&gt; /dev/null
+then
+    [ -f "$output_filename" ] &amp;&amp; rm "$output_filename"
+
+    print_error_and_exit "Decryption failed." 7
+else
+    echo "${bold_yellow}Decryption successful.${nocolor}"
+
+    exit 0
+fi
+</code></pre>
+    </div>

@@ -1,0 +1,511 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>TL;DR</h1>
+
+<pre class="lang-py prettyprint-override"><code>import numpy as np
+import pandas as pd
+import math
+import scipy.special
+from functools import reduce
+from itertools import permutations, combinations, zip_longest
+import matplotlib.pyplot as plt
+import time
+from operator import mul
+
+##########
+##Starting a Clock
+##########
+t0a = time.clock()
+t0b = time.time()
+
+n = 6
+
+loc_1d = np.array(range(n))
+
+# I'm not declaring that DataFrame yet, you'll see why later
+data_col = ['sample_mean','sample_stddev','seating']
+
+size = reduce(lambda x, y: x*y, loc_1d.shape)
+
+step_count = 0
+
+def dist(locarray):
+    """
+    It's easy to convert this to a generator, just yield the
+    result from abs(b-a)
+    """
+    for a, b in locarray:
+        yield abs(b - a)
+
+
+# You only use uar and layout_init once, so they are easy candidates
+# for generators
+def create_uar(n):
+    for i in range(n):
+        # yield tuples, they give you a memory benefit over the mutable
+        # list types
+        yield (f'u{i}', int(np.random.rand(1)*70+30))
+
+
+def create_layout(uar):
+    for a, b in zip_longest(uar, range(size), fillvalue='empty'):
+        yield a
+
+# this iterable will be consumed by the permutations function
+uar = create_uar(n)
+
+# this is now just an iterator, much smaller in memory, and we haven't done
+# any looping yet
+loc_space = permutations(create_layout(uar), size)
+
+# More constants
+loc_space_size = math.factorial(n)
+pop_size = loc_space_size
+unique_diff_size = int(math.factorial(n)/(math.factorial(2) * math.factorial(n-2)))
+max_steps = loc_space_size * unique_diff_size
+
+# this will be used to create the dataframe
+def create_pop_data(perm, loc_1d):
+    """
+    Again, no need to pre-allocate the array with None's, 
+    simply append to a new list
+    """
+    for test_set in perm:
+        force_vec = []
+        # zip these together for easier tracking, you don't need the
+        # indices, though we need to call the functions so that the 
+        # generators are not consumed on the first iteration
+        for (a, b), dst in zip(combinations(loc_1d, 2), 
+                               dist(combinations(loc_1d, 2))):
+            val = test_set[a][1] * test_set[b][1]
+            val /= dst**2
+            force_vec.append(np.array(val))
+
+        # so you can iterate over it without waiting for the whole process
+        # to complete
+        yield [np.average(force_vec), np.std(force_vec), test_set]
+
+
+pop_sorted_mean = pd.DataFrame([x for x in create_pop_data(loc_space, loc_1d)],
+                               columns=data_col).sort_values(by='sample_mean')
+
+subset_low = pop_sorted_mean[0:size*2]['seating'].apply(pd.Series).reset_index(drop=True) #lowest means
+subset_high = pop_sorted_mean[pop_size-size*2-1:pop_size-1]['seating'].apply(pd.Series).reset_index(drop=True) #Highest means
+
+
+plt.figure(figsize=(10,5))
+scrim2 = []
+y_pos = np.arange(size)
+
+for m in range(len(subset_low)):
+    worker_a = subset_low.loc[m]
+    scrim1 = []
+    # Again, for i in range(len(iterable)) isn't pythonic
+    # but I will leave this one for you
+    for n in range(len(worker_a)):
+        worker_b = np.array(worker_a[n][1])
+        # just append, don't use np.append, it's unnecessary
+        scrim1.append(worker_b)
+
+    # No need to append to scrim2, you can just add the bar plot here
+    plt.bar(y_pos, scrim1, alpha=0.08)
+
+print('Process time: ',time.clock()-t0a)
+print('Wall time: ',time.time()-t0b)
+print('\nRaw Results: ', uar)
+</code></pre>
+
+<h2>original script</h2>
+
+<p>I skipped the plotting part on both, as well as commented out printing in the loop so that the test wasn't influenced by writing to stdout.</p>
+
+<pre class="lang-bsh prettyprint-override"><code># n = 6
+python file.py
+Process time:  1.8510939999999998
+Wall time:  2.018064022064209
+
+Raw Results:  [['u0', 30], ['u1', 80], ['u2', 34], ['u3', 79], ['u4', 51], ['u5', 83]]
+
+# n = 7
+python file.py
+Process time:  9.259665
+Wall time:  9.459089994430542
+
+Raw Results:  [['u0', 93], ['u1', 32], ['u2', 77], ['u3', 35], ['u4', 61], ['u5', 82], ['u6', 50]]
+</code></pre>
+
+<h2>refactored results</h2>
+
+<pre class="lang-bsh prettyprint-override"><code># n = 6
+python file.py
+Process time:  0.7463569999999999
+Wall time:  0.9110708236694336
+
+Raw Results:  [('u0', 46), ('u1', 99), ('u2', 89), ('u3', 75), ('u4', 40)]
+
+# n = 7
+python file.py
+Process time:  1.090624
+Wall time:  1.2630760669708252
+
+Raw Results:  [('u0', 57), ('u1', 81), ('u2', 76), ('u3', 45), ('u4', 31), ('u5', 74)]
+</code></pre>
+
+<p>There's a whole lot going on here, so I'll try and go from top to bottom</p>
+
+<h1>iteration over collections of data</h1>
+
+<p>It is considered an anti-pattern to iterate over a collection using <code>for i in range(len(iterable))</code>. If you need an index, use <code>enumerate</code>, otherwise, just use <code>for item in iterable</code>. It's cleaner and faster:</p>
+
+<pre class="lang-py prettyprint-override"><code>python -m timeit -s 'somelist = [x for x in range(100000)]' 'for i in range(len(somelist)): somelist[i]*2'
+100 loops, best of 3: 6.74 msec per loop
+
+python -m timeit -s 'somelist = [x for x in range(100000)]' 'for i in somelist: i*2'
+100 loops, best of 3: 3.39 msec per loop
+</code></pre>
+
+<p>Second, there is rarely a need to pre-allocate a <code>list</code> of <code>N</code> items using <code>[None] * N</code>. You can build your list using a list comprehension instead. Your <code>diff</code> function can be modified to look like:</p>
+
+<pre class="lang-py prettyprint-override"><code>def dist(locarray):
+    """
+    This pre-allocation doesn't need to occur, and it's better to pass
+    an iterator over locarray here, no need to use range
+    """
+    temp_ar = [abs(b - a) for a, b in locarray]
+    return temp_ar
+</code></pre>
+
+<p>Where <code>locarray</code> is a collection of <code>tuples</code> that can be unpacked in this fashion. Plus, by doing <code>x = [None] * N; for i in range(N): x[i] = ...</code> you are almost iterating twice. I say almost because it's not <em>quite</em> the same, as the binary multiplication of the list of <code>None</code> is quite a bit faster than, say <code>[None for i in range(N)]</code>, but you lose speed regardless:</p>
+
+<pre class="lang-py prettyprint-override"><code># file.py
+def f(N):
+    x = [None] * N
+    for i in range(N):
+        x[i] = i
+
+def g(N):
+    x = [i for i in range(N)]
+</code></pre>
+
+<pre class="lang-py prettyprint-override"><code>python -m timeit -s 'from file import f, g; N = 100000' 'f(N)'
+100 loops, best of 3: 3.75 msec per loop
+
+python -m timeit -s 'from file import f, g; N = 100000' 'g(N)'
+100 loops, best of 3: 2.9 msec per loop
+</code></pre>
+
+<p>You do the same thing when defining <code>uar</code>:</p>
+
+<pre class="lang-py prettyprint-override"><code># Go from this
+uar = [None]*no_students
+
+for i in range(no_students):
+    uar[i] = ['u'+str(i), int(np.random.rand(1)*70+30)]
+
+# to this (the f-string is an addition in python 3.5+)
+uar = [[f'u{i}', int(np.random.rand(1)*70+30)] 
+       for i in range(no_students)]
+</code></pre>
+
+<h1><a href="https://docs.python.org/3/library/itertools.html#itertools.zip_longest" rel="nofollow noreferrer"><code>zip_longest</code></a></h1>
+
+<p>When trying to fill out a collection by iterating over something of unequal size, <code>itertools.zip_longest</code> is your friend. It allows you to specify what your missing value is, so you can again avoid the pre-allocation before iteration problem, as well as skipping the <code>try/except</code>:</p>
+
+<pre class="lang-py prettyprint-override"><code># go from this
+layout_init = [None] * size
+for loc_id in range(size):
+    try:
+        layout_init[loc_id] = uar[loc_id]
+    except IndexError:
+        layout_init[loc_id] = 'empty'
+
+# to this
+layout_init = [a for a, b in zip_longest(uar, range(size), fillvalue='empty')]
+</code></pre>
+
+<p>A quick demo of how that works:</p>
+
+<pre class="lang-py prettyprint-override"><code>from itertools import zip_longest
+x = list(range(10)) # shorter than the range(15) I use later
+for a, b in zip_longest(x, range(15), fillvalue='empty'):
+    print(a, b)
+
+0 0
+1 1
+2 2
+3 3
+4 4
+5 5
+6 6
+7 7
+8 8
+9 9
+empty 10
+empty 11
+empty 12
+empty 13
+empty 14
+</code></pre>
+
+<h1>Combinations and Permutations</h1>
+
+<p>The huge benefit of <code>itertools</code> is that the functions within that module return <em>generators</em>. The benefit here is that they are not aggregating all of your results into memory, which is fast and efficient. Take this example:</p>
+
+<pre class="lang-py prettyprint-override"><code># This will run for a very, very long time, but will continue processing
+for i in range(100000000000000):
+    print(i)
+
+# This will crash before it gets to the print statement because
+# list(range(x)) must be evaluated first and fit into memory, which it won't
+for i in list(range(100000000000000):
+    print(i)
+</code></pre>
+
+<p>With that in mind, don't do <code>list(permutations)</code> or <code>list(combinations)</code>, it defeats the point. Now, to build your <code>distance</code> vector, if you do <code>unique_diff = combinations(loc_1d, 2); distance = dist(unique_diff)</code> you will consume <code>unique_diff</code> and will have to build another one. No matter, though, it costs you effectively nothing in memory to store another generator:</p>
+
+<pre class="lang-py prettyprint-override"><code>unique_diff = combinations(loc_1d, 2)
+distance = dist(combinations(loc_1d, 2))
+</code></pre>
+
+<p>Because it just produces values, rather than aggregating them all. We will come back to another optimization to this later, but just keep that in mind for now.</p>
+
+<h2>No lists... what about <code>len</code>?</h2>
+
+<p>Since you have now avoided aggregating the combinations and permutations into memory, you don't have access to <code>len</code> when doing</p>
+
+<pre class="lang-py prettyprint-override"><code># that and the NameError on num_surr
+n_unique = int(math.factorial(size)/(math.factorial(num_surr)*math.factorial(size-num_surr))) #QC step for unique_diff combos
+unique_diff = list(combinations(loc_1d,2))
+</code></pre>
+
+<p>The number of permutations is simply <code>factorial(n)</code> since you are choosing <code>n</code> from <code>n</code> and you've calculated the number of combinations already, so:</p>
+
+<pre class="lang-py prettyprint-override"><code>n = no_students # just so I don't have to type this out a ton
+loc_space_size = math.factorial(n)
+unique_diff_size = int(math.factorial(n)/(math.factorial(2) * 
+                       math.factorial(n-2)))
+max_steps = loc_space_size * unique_diff_size
+</code></pre>
+
+<h1>Loops</h1>
+
+<p>Ok, starting with the first loop, you don't need the index <code>a</code> at all. You only use it to get <code>test_set</code>, so just iterate over the permutations directly:</p>
+
+<pre class="lang-py prettyprint-override"><code>for test_set in perm:
+    # rest of loop
+</code></pre>
+
+<p>Furthermore, unique_diff appears to be the same length as <code>distance</code>, so you should be able to <code>zip</code> them together for easier iteration:</p>
+
+<pre class="lang-py prettyprint-override"><code>for test_set in perm:
+    # set your force vector here
+    force_vec = []
+
+    # unique diff is a collection of two-element tuples, so you can 
+    # unpack them, too
+    for (a, b), dst in zip(unique_diff, distance):
+        # Break this into multiple steps, it helps with readability
+        val = test_set[a][1] * test_set[b][1]
+        val /= dst**2
+        force_vec.append(np.array(val))
+</code></pre>
+
+<p>As a quick example of that unpacking:</p>
+
+<pre class="lang-py prettyprint-override"><code>&gt;&gt;&gt; x = [(i, i*2) for i in range(10)]
+&gt;&gt;&gt; y = [i**3 for i in range(10)]
+&gt;&gt;&gt; for (a, b), c in zip(x, y):
+...     print(a,b,c)
+...
+0 0 0
+1 2 1
+2 4 8
+3 6 27
+4 8 64
+5 10 125
+6 12 216
+7 14 343
+8 16 512
+9 18 729
+</code></pre>
+
+<h1>Reducing Copies of Data</h1>
+
+<p>Now, one of the larger problems of this code is that everything stays in scope, so you carry around all of your temp variables and unused values. This chews up memory and impacts performance. You will want to wrap your loops in functions, this will clean up temp variables, as they will drop out of scope when the function ends if they are not explicitly returned.</p>
+
+<p>If you examine the variables you use, you will see that most of them are used once, and only once. So we can make them generators so that the for loops execute as a stream rather than one after the other. The first obvious place to implement this is in the first for loop:</p>
+
+<pre class="lang-py prettyprint-override"><code>def create_pop_data(perm, unique_diff, distance):
+    """
+    Again, no need to pre-allocate the array with None's, 
+    simply append to a new list
+    """
+    for test_set in perm:
+        force_vec = []
+        # zip these together for easier tracking, you don't need the
+        # indices
+        for (a, b), dst in zip(unique_diff, distance):
+            val = test_set[a][1] * test_set[b][1]
+            val /= dst**2
+            force_vec.append(np.array(val))
+
+        # so you can iterate over it without waiting for the whole process
+        # to complete
+        yield [np.average(force_vec), np.std(force_vec), test_set]
+</code></pre>
+
+<p>Now, where does <code>distance</code> come from? Well, it too is produced by a <code>for</code> loop:</p>
+
+<pre class="lang-py prettyprint-override"><code>def dist(locarray):
+    """
+    It's easy to convert this to a generator, just yield the
+    result from abs(b-a)
+    """
+    for a, b in locarray:
+        yield abs(b - a)
+</code></pre>
+
+<p>The only issue being that you iterate over <code>distance</code> multiple times, so it might actually be better to call that generator function inside the loop, as you have done before. Since both use <code>loc_1d</code> to create themselves, just set that as the argument of the function and don't create <code>unique_diff</code> and <code>distance</code> yet.
+You would call these functions like so:</p>
+
+<pre class="lang-py prettyprint-override"><code>import numpy as np
+import pandas as pd
+import math
+import scipy.special
+from functools import reduce
+from itertools import permutations, combinations, zip_longest
+import matplotlib.pyplot as plt
+import time
+from operator import mul
+
+##########
+##Starting a Clock
+##########
+t0a = time.clock()
+t0b = time.time()
+
+n = 6
+
+uar = [[f'u{i}', int(np.random.rand(1)*70+30)] for i in range(n)]
+loc_1d = np.array(range(n))
+
+# I'm not declaring that DataFrame yet, you'll see why later
+data_col = ['sample_mean','sample_stddev','seating']
+
+size = reduce(lambda x, y: x*y, loc_1d.shape)
+
+step_count = 0
+
+# You only use uar and layout_init once, so they are easy candidates
+# for generators
+def create_uar(n):
+    for i in range(n):
+        # yield tuples, they give you a memory benefit over the mutable
+        # list types
+        yield (f'u{i}', int(np.random.rand(1)*70+30))
+
+
+def create_layout(uar):
+    for a, b in zip_longest(uar, range(size), fillvalue='empty'):
+        yield a
+
+# this iterable will be consumed by the permutations function
+uar = create_uar(n)
+
+# this is now just an iterator, much smaller in memory, and we haven't done
+# any looping yet
+loc_space = permutations(create_layout(uar), size)
+
+# More constants
+loc_space_size = math.factorial(n)
+unique_diff_size = int(math.factorial(n)/(math.factorial(2) * math.factorial(n-2)))
+max_steps = loc_space_size * unique_diff_size
+
+# this will be used to create the dataframe
+def create_pop_data(perm, loc_1d):
+    """
+    Again, no need to pre-allocate the array with None's, 
+    simply append to a new list
+    """
+    for test_set in perm:
+        force_vec = []
+        # zip these together for easier tracking, you don't need the
+        # indices, though we need to call the functions so that the 
+        # generators are not consumed on the first iteration
+        for (a, b), dst in zip(combinations(loc_1d, 2)), 
+                               dist(combinations(loc_1d, 2))):
+            val = test_set[a][1] * test_set[b][1]
+            val /= dst**2
+            force_vec.append(np.array(val))
+
+        # so you can iterate over it without waiting for the whole process
+        # to complete
+        yield [np.average(force_vec), np.std(force_vec), test_set]
+
+</code></pre>
+
+<p>Now the reason I didn't create that <code>DataFrame</code> is that you can use the <code>create_pop_data</code> function to create the dataframe with a list comprehension, and then transform that in the same line to get your <code>pop_sorted_mean</code> without dragging two dataframes around in memory:</p>
+
+<pre class="lang-py prettyprint-override"><code># This is the first time we have done any loops
+pop_sorted_mean = pd.DataFrame([x for x in create_pop_data(loc_space, loc_1d)],
+                               columns=data_col).sort_values(by='sample_mean')
+</code></pre>
+
+<p>This is where you will save most of your time, because now all of those loops are executing simultaneously, rather than waiting for one after another:</p>
+
+<pre class="lang-py prettyprint-override"><code> def f():
+     return [i for i in range(1000000)]
+
+ def g():
+     return [a*2 for a in f()]
+
+python -m timeit -s 'from file import f, g' 'g()'
+2 loops, best of 5: 113 msec per loop
+
+# versus generators
+ def f():
+     yield from range(1000000)
+
+ def g():
+     return [a*2 for a in f()]
+
+python -m timeit -s 'from file import f, g' 'g()'
+5 loops, best of 5: 89.2 msec per loop
+</code></pre>
+
+<p>It's not massive in this example (~20%), but it's definitely something. If you extend this to multiple loops, you aren't having to wait for <code>f()</code> to complete before you start <code>g()</code>, because the loop in <code>g</code> will call <code>next(f)</code>, and the loops continue together.</p>
+
+<p>Now, we've already defined <code>pop_size</code>, it's <code>loc_space_size</code>, remember? To keep your naming the same:</p>
+
+<pre class="lang-py prettyprint-override"><code>pop_size = loc_space_size # this just adds another name referring to the value of loc_space_size, it doesn't duplicate the variable
+</code></pre>
+
+<h1>Plotting</h1>
+
+<p>The only other major optimization I can see is that, again, you are iterating more times than you need to:</p>
+
+<pre class="lang-py prettyprint-override"><code>plt.figure(figsize=(10,5))
+scrim2 = []
+y_pos = np.arange(size)
+
+for m in range(len(subset_low)):
+    worker_a = subset_low.loc[m]
+    scrim1 = []
+    # Again, for i in range(len(iterable)) isn't pythonic
+    # but I will leave this one for you
+    for n in range(len(worker_a)):
+        worker_b = np.array(worker_a[n][1])
+        # just append, don't use np.append, it's unnecessary
+        scrim1.append(worker_b)
+
+    # No need to append to scrim2, you can just add the bar plot here
+    plt.bar(y_pos, scrim1, alpha=0.08)
+
+plt.show()
+
+##Time everything took
+print('Process time: ',time.clock()-t0a)
+print('Wall time: ',time.time()-t0b)
+print('\nRaw Results: ', uar)
+<span class="math-container">```</span>
+</code></pre>
+    </div>

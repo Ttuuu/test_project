@@ -1,0 +1,152 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Don't like this:</p>
+
+<pre><code>    if(i &gt; preroll) {
+        t += duration_cast&lt;duration&lt;double&gt;&gt;(high_resolution_clock::now()-start).count();
+
+    }
+</code></pre>
+
+<p>The call to finish the clock is inside the <code>if</code> statement. Thus you are timing branch failure successes.</p>
+
+<pre><code>    auto end = high_resolution_clock::now();
+    if(i &gt; preroll) {
+        t += duration_cast&lt;duration&lt;double&gt;&gt;(end - start).count();
+    }
+</code></pre>
+
+<p>I think the number of iterations is way too low:</p>
+
+<pre><code>const int M = 10000;    // hard to rule out noise.
+const int runs = 12;    // Maybe a couple of million calls.
+
+
+const int preroll = 2;  // I suppose this helps in getting caches warm.
+                        // But I would simply prefer to run it a lot times.
+</code></pre>
+
+<p>To make sure is no effect on memory because of one test helping the other I would run the test in both orders and average the results.</p>
+
+<pre><code>#ifndef REVERSE_TEST_ORDER
+
+std_function_perf();
+func_vec_perf();
+
+#else
+
+func_vec_perf();
+std_function_perf();
+
+#endif
+</code></pre>
+
+<p>Also I note that the average you print is the average over the number of runs. But each run executes all the numbers <code>M</code> times.</p>
+
+<pre><code>vector&lt;function&lt;void()&gt;&gt; average time: 0.058752 seconds
+func_vec&lt;&gt; average time:               0.025793 seconds
+</code></pre>
+
+<p>So we really need to divide these numbers by another <code>10,000</code>!</p>
+
+<pre><code>vector&lt;function&lt;void()&gt;&gt; average time: 0.0000058752 seconds
+func_vec&lt;&gt; average time:               0.0000025793 seconds
+</code></pre>
+
+<p>Then there is 10 functions per vector. So we need to divide that by another 10.</p>
+
+<pre><code>vector&lt;function&lt;void()&gt;&gt; average time: 0.00000058752 seconds
+func_vec&lt;&gt; average time:               0.00000025793 seconds
+</code></pre>
+
+<p>So .2 micro seconds against .5 micro seconds per call.</p>
+
+<h2>Bug</h2>
+
+<p>I thikn this is a bug:</p>
+
+<pre><code>// Replace the end object with our callable.
+auto p = _storage+_size-sizeof(end_t);
+
+// Need to destroy the old `end_t` so its lifetime ends before you
+// can call the constructer to create an object over it.
+reinterpret_cast&lt;holder*&gt;(p)-&gt;~holder();
+
+// Now you can write over it.
+new (p) callable&lt;F&gt;(f);
+
+// Add a new end object.
+new (p + sz) end_t;
+</code></pre>
+
+<h2>ReDesign</h2>
+
+<p>I would separate out the resource management and business logic in func_vec. Id did this and replaced the resource management by using std::vector&gt; and simplified the code to:</p>
+
+<pre><code>template&lt;typename... Arguments&gt;
+class func_vec {
+
+    private:
+
+      struct holder {
+        holder(holder* next = nullptr): next(next) {}
+        virtual ~holder() { } 
+        virtual holder* call(Arguments...) = 0;
+        virtual void call_tail(Arguments...) = 0;
+        void setNext(holder* n) {
+            next = n;
+        }   
+        holder* next;
+      };  
+
+      template&lt;class Lambda&gt;
+      struct callable : public holder {
+        Lambda  lambda;
+        callable(Lambda l, holder* next) : holder(next), lambda(l) { } 
+        holder* call(Arguments... args) override {
+          // This call to the lambda should be inlined.
+          lambda(args...);
+          return this-&gt;next;
+        }   
+        void call_tail(Arguments... args) override {
+          lambda(args...);
+          this-&gt;next-&gt;call_tail(args...);
+        }   
+      };  
+
+      struct end_t : public holder {
+        holder* call(Arguments... args) override {
+          return nullptr; // terminate iteration
+        }   
+        void call_tail(Arguments... args) override {
+          // Terminate tail recursion.
+        }   
+      };  
+      std::vector&lt;std::unique_ptr&lt;holder&gt;&gt;  data;
+      end_t                                 end;
+    public:
+      // Add a callable.
+      template&lt;class F&gt;
+      void push_back(F f) {
+        std::unique_ptr&lt;callable&lt;F&gt;&gt;  next(std::make_unique&lt;callable&lt;F&gt;&gt;(f,&amp;end));
+        if (!data.empty()) {
+            data.back()-&gt;setNext(next.get());
+        }
+        data.push_back(std::move(next));
+      }
+
+      // Run our chain of functions.
+      void execute(Arguments... args) {
+        holder* h = data.front().get();
+        while(h != nullptr) {
+            h = h-&gt;call(args...);
+        }
+      }
+
+      // Run with tail recursion.
+      void exec_tail(Arguments... args) {
+        data.front()-&gt;call_tail(args...);
+      }
+
+};
+</code></pre>
+    </div>

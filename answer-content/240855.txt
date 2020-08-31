@@ -1,0 +1,144 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Not sure whether this site is the best place to ask this question, but the answer is quite simple. I'll answer the question, give a few alternatives, pro's and con's and some actual code-review on the little snippet you provided.</p>
+
+<blockquote>
+  <p>Do not communicate by sharing memory; instead, share memory by communicating</p>
+</blockquote>
+
+<p>This is the main idea behind channels. When talking about communicating and sharing memory, it's obvious we're talking about concurrency. The example you have isn't really dealing with concurrency all that much. Such an artificial example will almost always be fairly limit in explaining the mechanisms/concepts behind something that is, effectively, a weapon in the armoury of concurrent programming. Either way, worth checking out the <a href="https://golang.org/doc/effective_go.html#concurrency" rel="nofollow noreferrer">effective go</a> document for more on this.</p>
+
+<hr>
+
+<h2>To answer your question:</h2>
+
+<p>Looking at the <a href="https://golang.org/ref/spec#Select_statements" rel="nofollow noreferrer"><code>select</code> spec</a>:</p>
+
+<blockquote>
+  <p>A "select" statement chooses which of a set of possible send or receive operations will proceed.</p>
+</blockquote>
+
+<p>Then, from the steps that a select statement executes, there's 2 steps to pay attention to:</p>
+
+<blockquote>
+  <ol start="2">
+  <li>one or more of the communications can proceed, a single one that can proceed is chosen via a uniform pseudo-random selection. Otherwise, if there is a default case, that case is chosen. If there is no default case, the "select" statement blocks until at least one of the communications can proceed.</li>
+  </ol>
+</blockquote>
+
+<p>And:</p>
+
+<blockquote>
+  <ol start="5">
+  <li>The statement list of the selected case is executed.</li>
+  </ol>
+</blockquote>
+
+<p>This means that, even if both channels are ready to be read/received from, the <code>select</code> statement will only ever read from a single channel. Which channel that is, is not specified (other than the channel is chosen via a uniform pseudo-random selection).</p>
+
+<p>If you'd have:</p>
+
+<pre><code>errs := make(chan error, 1)
+success := make(chan struct{}, 1)
+defer func() {
+    close(errs)
+    close(success)
+}()
+errs &lt;- errors.New("some error")
+success &lt;- struct{}{}
+
+select {
+case err := &lt;-errs:
+    fmt.Printf("Receiver error: %+v\n", err)
+case &lt;-success:
+    fmt.Println("Success received")
+}
+</code></pre>
+
+<p>You would have no way of knowing which channel you'd read from.</p>
+
+<hr>
+
+<h2>Some code review:</h2>
+
+<p>You may have noticed, too, that I've changed a couple of things. This being a code-review site and all, here's why I made the changes I did:</p>
+
+<ol>
+<li><code>Success</code> or <code>done</code> channels are either unbuffered (indicating success/done on close), or are best defined as <code>chan struct{}</code>. A boolean can be false or true, indicating that the value does have a meaning to its receiver. Again as per spec, a type <code>struct{}</code> is defined as 0 bytes in size (slightly more optimised than <code>bool</code>), and clearly indicates the channel serves to signal something, rather than communicate something.</li>
+<li><code>errors.New("Some error")</code>  should be <code>"some error"</code>. Error values should start with a lower-case letter. Check <a href="https://github.com/golang/go/wiki/CodeReviewComments#error-strings" rel="nofollow noreferrer">golang CodeReviewComments</a> for details. There's a lot of conventions there, and overall the community seems to have adopted them.</li>
+<li>I added a <code>defer func(){}()</code> to close the channels. It's bad form to not close channels...</li>
+</ol>
+
+<p>Either way, the double select statements are there to ensure both channels are read.</p>
+
+<hr>
+
+<h3>More details</h3>
+
+<p>Be that as it may, having a quick look at the linked post, seeing as a waitgroup is used in the accepted answer, I'd probably prefer something more like this:</p>
+
+<pre><code>errs := make(chan error) // not buffered
+success := make(chan struct{}) // not buffered
+go func() {
+    errs &lt;- errors.New("some error")
+}()
+go func() {
+    success &lt;- struct{}{}
+}()
+err := &lt;-errs
+fmt.Printf("Received error: %+v\n", err)
+close(errs) // we're done with this channel
+&lt;-success
+close(success) // all done
+fmt.Println("Success")
+</code></pre>
+
+<p>The trade-off being: You will always wait for the error channel before reading the success channel. The advantage: no waitgroup required, no verbose <code>select</code> statement...</p>
+
+<p>Should you want to maintain the random-like output (having success and error printed out in a random order), you can easily replace the ordered reads from the channels 2 select statements, or use a waitgroup and <em>read</em> from the channels in routines:</p>
+
+<pre><code>func main() {
+    errs := make(chan error) // not buffered
+    success := make(chan struct{}) // not buffered
+    wg := sync.WaitGroup{}
+    // start reading from channels in routines
+    wg.Add(2)
+    go readRoutine(&amp;wg, errs)
+    go readRoutine(&amp;wg, success)
+    // routines are needed because the channels aren't buffered, writes are blocking...
+    go func() {
+        errs &lt;- errors.New("some error")
+    }()
+    go func() {
+        success &lt;- struct{}{}
+    }()
+    wg.Wait() // wait for reads to have happened
+    close(errs) // close channels
+    close(success)
+}
+
+func readRoutine(wg *sync.WaitGroup, ch &lt;-chan interface{}) {
+    defer wg.Done()
+    v := &lt;-ch
+    if err, ok := v.(error); ok {
+        fmt.Printf("Received error: %+v\n", err)
+        return
+    }
+    fmt.Println("Received success")
+}
+</code></pre>
+
+<p>Now we're almost there... The rule of thumb is that the routine <em>creating</em> the channels should also be responsible for closing the channels. However, we know that the anonymous routines are the only 2 that are writing to the channels, and they are created and spawned by <code>main</code>, and they even access its scope. There's 2 changes we can make, therefore:</p>
+
+<pre><code>go func() {
+    errs &lt;- errors.New("some error")
+    close(errs) // we can close this channel
+}()
+go func() {
+    close(success) // we don't even have to write to this channel
+}()
+wg.Wait()
+// channels are already closed
+</code></pre>
+
+<p>Hope this answered your question, provided some useful links to resources that can help you answer future questions, and maybe gave you a few ideas of how to use channels.</p>
+    </div>

@@ -1,0 +1,133 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'll first go through the different section and outline possible improvements, then give some general comments at the end. I am not checking the algorithm for correctness, as I don't know it.</p>
+
+<pre><code>Img=imread('input.jpg');
+[rows, columns, numberOfColorChannels] = size(Img);
+[L,N] = superpixels(Img,250);
+
+%Identifying neighborhood relationships
+glcms = graycomatrix(L,'NumLevels',N,'GrayLimits',[1,N],'Offset',  [0,1;1,0]); %Create gray-level co-occurrence matrix from image
+glcms = sum(glcms,3);    % add together the two matrices
+glcms = glcms + glcms.'; % add upper and lower triangles together, make it symmetric
+glcms(1:N+1:end) = 0;    % set the diagonal to zero, we don't want to see "1 is neighbor of 1"
+</code></pre>
+
+<p>You need to have defined <code>idx</code> by now, but you haven't, so the code doesn't run. Based on the <code>superpixels</code> documentation, you need to add <code>idx = label2idx(L);</code></p>
+
+<pre><code>data = zeros(N,3);
+for labelVal = 1:N
+    redIdx = idx{labelVal};
+    greenIdx = idx{labelVal}+numRows*numCols;
+    blueIdx = idx{labelVal}+2*numRows*numCols;
+    data(labelVal,1) = mean(Img(redIdx));
+    data(labelVal,2) = mean(Img(greenIdx));
+    data(labelVal,3) = mean(Img(blueIdx));
+end    
+</code></pre>
+
+<p>This is fine, it probably is fine to just write <code>data(labelVal,1) = mean(Img(idx{1:N}))</code>, etc. but the performance should be similar.</p>
+
+<pre><code>Euc = zeros(N);
+% Euclidean Distance
+for i=1:N
+    for j=1:N
+        if glcms(i,j)~=0
+            Euc(i,j)=sqrt(((data(i,1)-data(j,1))^2)+((data(i,2)-data(j,2))^2)+((data(i,3)-data(j,3))^2));
+        end
+    end
+end
+</code></pre>
+
+<p>This can be replaced by <code>Euc = pdist2(data,data).*(glcms~=0);</code></p>
+
+<pre><code>W=zeros(N);
+W_num=zeros(N);
+
+W_den=zeros(N);
+OMG1=0.1;
+for i=1:N
+    for j=1:N
+        if(Euc(i,j)~=0)
+         W_num(i,j)=exp(-OMG1*(Euc(i,j)));
+         W_den(i,i)=W_num(i,j)+W_den(i,i);
+        end
+    end
+end
+</code></pre>
+
+<p>This can be replaced by <code>W_num = exp(-OMG1*Euc).*(Euc~=0);</code> and <code>W_den = sum(W_num);</code> (here <code>W_den</code> is a vector, not a matrix, but that's what you want because you were only using diagonal elements of your <code>W_den</code> matrix).</p>
+
+<pre><code>for i=1:N
+    for j=1:N
+         if(Euc(i,j)~=0)
+             W(i,j)=(W_num(i,j))/(W_den(i,i));   % Connectivity Matrix W
+         end
+    end
+end
+</code></pre>
+
+<p>This can be replace by <code>W = W_num./W_den.';</code> and <code>W(isnan(W)) = 0;</code>.</p>
+
+<pre><code>s_star_temp=zeros(N);   %temporary variable for geodesic distance measurement
+W_sparse=zeros(N);
+W_sparse=sparse(W);
+for i=1:N
+    for j=1:N
+        if W(i,j)==0 &amp; i~=j;
+            s_star_temp(i,j)=graphshortestpath(W_sparse,i,j); % Geodesic Distance
+        end
+    end
+end
+</code></pre>
+
+<p>Here you define <code>W_sparse</code> twice, you don't need to initialise it with <code>zeros(N)</code>. This part is finding all shortest paths, and there is a builtin for that (which is probably a lot more efficient that generating the paths independently). Replace this whole section with <code>s_star_temp = graphallshortestpaths(W).*(W==0);</code> This seems to speed it up from ~15 seconds to 0.005 seconds.</p>
+
+<hr>
+
+<p>So this is how I would write your algorithm</p>
+
+<pre><code>Img = imread('input.jpg');
+[rows, columns, numberOfColorChannels] = size(Img);
+[L,N] = superpixels(Img,250);
+
+idx = label2idx(L);
+
+%Identifying neighborhood relationships
+glcms = graycomatrix(L,'NumLevels',N,'GrayLimits',[1,N],'Offset',  [0,1;1,0]); %Create gray-level co-occurrence matrix from image
+glcms = sum(glcms,3);    % add together the two matrices
+glcms = glcms + glcms.'; % add upper and lower triangles together, make it symmetric
+glcms(1:N+1:end) = 0;    % set the diagonal to zero, we don't want to see "1 is neighbor of 1"
+
+data = zeros(N,3);
+for labelVal = 1:N
+    data(labelVal,1) = mean(Img(idx{labelVal}));
+    data(labelVal,2) = mean(Img(idx{labelVal}+rows*columns));
+    data(labelVal,3) = mean(Img(idx{labelVal}+2*rows*columns));
+end
+
+Euc = sparse(pdist2(data,data).*(glcms~=0));
+
+OMG1 = 0.1;
+
+W_num = exp(-OMG1*Euc).*(Euc~=0);
+W_den = sum(W_num);
+
+W = W_num./W_den.';
+W(isnan(W)) = 0;
+
+s_star_temp = graphallshortestpaths(W).*(W==0);
+</code></pre>
+
+<p>Notice that I made <code>Euc</code> a sparse matrix. This makes the resulting matrices (<code>W_num</code>, <code>W_den</code>, <code>W</code>) also sparse. Your original code left them as full matrices, which was unnecessary. This code runs in about 1.3 seconds on my machine, compared to about 16 for your original code (with the picture I used).</p>
+
+<hr>
+
+<p>Minor general comments on your code:</p>
+
+<ul>
+<li>Use spaces around your <code>=</code> signs, it makes things easier to read</li>
+<li>Try to avoid very long lines, for example the <code>graycomatrix</code> line with its comment will go over the end of the window and be lost</li>
+<li>Write more comments</li>
+<li>Matlab best practice is to avoid using <code>i</code> and <code>j</code> for loop variables, prefer <code>ii</code> and <code>jj</code>. It's not very important, but <code>i</code> and <code>j</code> can also mean the imaginary unit.</li>
+</ul>
+    </div>

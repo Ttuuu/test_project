@@ -1,0 +1,34 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>As discussed in the comments, this isn't cryptographically secure. The most obvious reason is that the optimizer may choose to do any number of things. The most likely to be concerning are a change in order of operations, or a change in join methodology. If <code>math.RangeInt</code> does any kind of table access (I assume this gives you a numbers table equivalent) then table access type could affect it as well.</p>
+
+<p>Additionally, the bail-early for inequal length exposes information if this assumption isn't met (from comments):</p>
+
+<blockquote>
+  <p>[I] wrote the code under an assumption that doesn't hold in general: that the strings being compared are hashes and thus the length is public knowledge</p>
+</blockquote>
+
+<p>Ignoring comments regarding cryptographic security, I think the implementation is straightforward and makes sense. To try and address the cryptography I have a few ideas, but I am not an expert and do not endorse rolling your own security and cryptography algorithms/libraries (or using my suggestions, ever, in production).</p>
+
+<p><a href="http://www.moserware.com/2009/09/stick-figure-guide-to-advanced.html" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/UHPDW.png" alt="http://www.moserware.com/2009/09/stick-figure-guide-to-advanced.html"></a>
+(click <a href="https://i.stack.imgur.com/UHPDW.png" rel="nofollow noreferrer">here</a> to see the image on imgur, otherwise click the image to read the original informative and entertaining comic).</p>
+
+<p>Now that we have that out of the way, I think to even come close to accomplishing this, we would need to do the following:</p>
+
+<ol>
+<li>Stop using a table valued function - we're going to need several hints to ensure that this performs consistently, which we can't add to a TVF and auditing all uses of this would be too difficult. In particular, <code>OPTION( FORCE ORDER, RECOMPILE, MAXDOP 1, OPTIMIZE FOR @x = 0x00, @y = 0x00 )</code> will be necessary.</li>
+<li>Instead of <code>CROSS APPLY math.RangeInt</code>, I think you'll need to join to a materialized numbers table (see below)</li>
+<li>You're going to have to remove the length check, and pad the two values to an even 8000 (this is tedious but not hard, and I think should be doable in constant time)</li>
+</ol>
+
+<p>I picked those hints because we want to ensure that it always joins in the order we specify, and doesn't get clever. We want to prohibit parallelism as well so it behaves consistently. Optimizing for those constant values prevents it from getting smart with parameter sniffing. We may not need to recompile; in my gut I think we want it, but I don't have a great reason for this. We may want to set a min/max grant percentage to be the same, so we get consistent behavior based on memory grant. It might also be valuable to use the <code>USE PLAN</code> hint, which lets you hardcode the plan to use. This might be the best way to get a consistent execution.</p>
+
+<p>We're also going to have to add join and table access hints; assuming that <code>dbo.Numbers</code> exists with a clustered index on the first (and only) column, we might be able to do this:</p>
+
+<pre><code>FULL OUTER LOOP JOIN dbo.Numbers WITH ( INDEX(0), FORCESCAN )
+  ON Numbers.Number = [@xLength].n
+</code></pre>
+
+<p>This should run in the same amount of time no matter the length of the string, and the query will always use the same join and table access pattern.</p>
+
+<p>Overall, I think this is a lot of reasons why implementing something cryptographically secure in SQL is a bad idea; I would guess there are a lot of things I'm missing that still prevent this from being "safe".</p>
+    </div>

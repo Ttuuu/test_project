@@ -1,0 +1,244 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I opened your code in CLion. The first thing it marked was:</p>
+
+<pre><code>#define ALLOCATION_ERROR 1
+</code></pre>
+
+<p>It's unused.</p>
+
+<p>Other than that, there were no warnings, which is already quite good.</p>
+
+<p>Next I compiled your code using both GCC and CLang:</p>
+
+<pre><code>$ gcc -Wall -Wextra -Os -c bfgen.c
+$ clang -Wall -Weverything -Os -c bfgen.c
+bfgen.c:5:9: warning: macro is not used [-Wunused-macros]
+#define ALLOCATION_ERROR 1
+        ^
+1 warning generated.
+</code></pre>
+
+<p>That's also good. You prepared your code quite well for this code review by fixing the compiler warnings (if there had been any).</p>
+
+<p>Now to the human part of the code review.</p>
+
+<p>I would remove the <code>inline</code> from the function definitions. Trust the compiler to do the right thing here.</p>
+
+<p>The word <code>get</code> in the function name <code>get_file_pointer</code> makes it sound as if this function had no side effects. This assumption is wrong. The function should have a better name. It is typical for these error-checking wrapper functions to be prefixed with <code>x</code>. You will find many implementations of <code>xmalloc</code>, <code>xrealloc</code>, <code>xopen</code>, and so on in other projects.</p>
+
+<p>In the <code>get_file_pointer</code> function, you should include the kind of error in the <code>fprintf</code> output:</p>
+
+<pre><code>fprintf(stderr, "Error: failed to open file '%s': %s\n", filename, strerror(errno));
+</code></pre>
+
+<p>The function <code>int_to_brainfuck</code> has a bad name. It's clear from the function signature that it takes an int, therefore the function name should rather describe what that int means. It's a difference, but there is no documentation about what differs. After reading the whole code of the function I know that it's the difference between the previous character and the next character. This information should be encoded in the function name.</p>
+
+<p>Calling <code>strlen</code> repeatedly is a waste of time. At each point in the code you know exactly how long the string is, therefore it is more efficient to just store the current end of the <code>brainfuck_code</code> in a pointer and always <code>strcpy</code> to that pointer:</p>
+
+<pre><code>size_t code_len = number_of_tens + loop_body_length + number_of_ones + 2;
+char *brainfuck_code = calloc(code_len, sizeof *brainfuck_code);
+char *code = brainfuck_code;
+
+if (number_of_tens &gt; 0) {
+    *code++ = '&gt;';
+    memset(code, '+', number_of_tens);
+    code += number_of_tens;
+    strcpy(code, "[&lt;");
+    code += 3;
+    memset(code, character_in_loop, 10);
+    code += 10;
+    strcpy(code, "&gt;-]&lt;");
+    code += 4;
+}
+
+memset(code, character_in_loop, number_of_ones);
+code += number_of_ones;
+*code++ = '.';
+
+assert(brainfuck_code + code_len == code);
+
+return brainfuck_code;
+</code></pre>
+
+<p>I added the <code>assert</code> at the end because these explicit length calculations can always go wrong. If the compiler is smart enough, it will find out that this assertion always succeeds and may even eliminate it. And in case you forgot a character to change the code later, you will quickly get a crash dump instead of undefined behavior because of a buffer overflow.</p>
+
+<p>I suspected you had already calculated the length wrong because I couldn't find the first character in the formula. Instead, there's a magic number 2 in that formula. You should make the formula correspond to the actual code by writing it like this:</p>
+
+<pre><code>size_t code_len = 1 + number_of_tens + 3 + 10 + 4 number_of_ones + 1;
+</code></pre>
+
+<p>This allows you to quickly compare it to the code.</p>
+
+<p>Even better would be if you would not need this whole calculation at all. Since you are writing the output to a file anyway, you don't need to allocate the memory yourself. I'm thinking of two functions like these:</p>
+
+<pre><code>typedef struct {
+    FILE *out;
+} bfgen;
+
+static void bfgen_emit_str(bfgen *gen, const char *code) {
+    ...
+}
+
+static void bfgen_emit_repeat(bfgen *gen, char code, size_t n) {
+    ...
+}
+</code></pre>
+
+<p>Then you can simply write:</p>
+
+<pre><code>static void
+bfgen_emit_difference(bfgen *gen, int difference) {
+    if (difference == 0) {
+        bfgen_emit_str(".");
+        return;
+    }
+
+    char character_in_loop = difference &gt; 0 ? '+' : '-';
+    unsigned int abs_diff = difference &gt; 0 ? difference : -difference;
+    unsigned int number_of_tens = abs_diff / 10;
+
+    if (number_of_tens &gt; 0) {
+        bfgen_emit_str(gen, "&gt;");
+        bfgen_emit_repeat(gen, '+', number_of_tens);
+        bfgen_emit_str(gen, "[&lt;");
+        bfgen_emit_repeat(gen, character_in_loop, 10);
+        bfgen_emit_str(gen, "&gt;-]&lt;");
+    }
+
+    bfgen_emit_repeat(gen, character_in_loop, abs_diff % 10);
+    bfgen_emit_str(gen, ".");
+}
+</code></pre>
+
+<p>This code looks much clearer. Now that you don't have to think about all this annoying buffer size calculation anymore, it becomes much easier to add new optimizations, such as avoiding the loop when <code>number_of_tens</code> is exactly 1. In the previous version of the code I wouldn't have added this feature out of laziness and fear of breaking things.</p>
+
+<p>Based on this example, you can see that the functions <code>bfgen_emit_str</code> and <code>bfgen_emit_repeat</code> are really useful, and implementing them is easy.</p>
+
+<pre><code>static void bfgen_emit_str(bfgen *gen, const char *code) {
+    fputs(code, gen-&gt;out);
+}
+
+static void bfgen_emit_repeat(bfgen *gen, char code, size_t n) {
+    for (size_t i = 0; i &lt; n; i++) {
+        fputc(code, gen-&gt;out);
+    }
+}
+</code></pre>
+
+<p>Looking at <code>bfgen_emit_difference</code> again, that function doesn't do what its name says. It doesn't only emit code to calculate the difference, it also emits code to print the resulting character. It shouldn't do that. The call to <code>bfgen_emit_str(gen, ".")</code> belongs in <code>bfgen_generate_code</code> instead.</p>
+
+<hr>
+
+<p>It doesn't matter anymore, but your original version of <code>int_to_brainfuck</code> was essentially:</p>
+
+<pre><code>static char *
+int_to_brainfuck(...) {
+    if (condition) {
+        return ".";
+    } else {
+        return allocated_string;
+    }
+}
+</code></pre>
+
+<p>You must never write such a function since the caller cannot know whether they should <code>free</code> the string or not. This leads either to memory leaks or to undefined behavior. You don't want either of these.</p>
+
+<hr>
+
+<p>In the <code>main</code> function, you should open the input file in binary mode and the output file in text mode. Currently it's the other way round.</p>
+
+<hr>
+
+<p>The main takeaway from this code review is that it makes sense to define your own data structures and the corresponding functions. Make these functions as easy as possible to use. Free the caller from any unnecessary tasks such as calculating buffer sizes or managing memory, which are really boring and error-prone.</p>
+
+<p>An idea for further work is to make the generated code more efficient by keeping track of the actual memory contents. This can now be easily done in the <code>struct bfgen</code>. Then you can look which memory cell has currently the closest value and use that instead of just using a single memory cell.</p>
+
+<p>The rewritten and restructured code is:</p>
+
+<pre><code>#include &lt;errno.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+
+#define FILE_ERROR 2
+#define OTHER_ERROR 3
+
+static FILE *
+xfopen(const char *filename, const char *mode) {
+    FILE *file_pointer = fopen(filename, mode);
+    if (file_pointer == NULL) {
+        fprintf(stderr, "Error: failed to open file '%s': %s\n",
+                filename, strerror(errno));
+        exit(FILE_ERROR);
+    }
+    return file_pointer;
+}
+
+typedef struct {
+    FILE *out;
+} bfgen;
+
+static void
+bfgen_emit_str(bfgen *gen, const char *code) {
+    fputs(code, gen-&gt;out);
+}
+
+static void
+bfgen_emit_repeat(bfgen *gen, char code, size_t n) {
+    for (size_t i = 0; i &lt; n; i++) {
+        fputc(code, gen-&gt;out);
+    }
+}
+
+static void
+bfgen_emit_difference(bfgen *gen, int difference) {
+    if (difference == 0) {
+        return;
+    }
+
+    char character_in_loop = difference &gt; 0 ? '+' : '-';
+    unsigned int abs_diff = difference &gt; 0 ? difference : -difference;
+    unsigned int number_of_tens = abs_diff / 10;
+
+    if (number_of_tens &gt; 0) {
+        bfgen_emit_str(gen, "&gt;");
+        bfgen_emit_repeat(gen, '+', number_of_tens);
+        bfgen_emit_str(gen, "[&lt;");
+        bfgen_emit_repeat(gen, character_in_loop, 10);
+        bfgen_emit_str(gen, "&gt;-]&lt;");
+    }
+
+    bfgen_emit_repeat(gen, character_in_loop, abs_diff % 10);
+}
+
+static void
+bfgen_generate_code(bfgen *gen, FILE *input_file) {
+    int current_char, last_char = 0;
+    while ((current_char = fgetc(input_file)) != EOF) {
+        bfgen_emit_difference(gen, current_char - last_char);
+        bfgen_emit_str(gen, ".\n");
+        last_char = current_char;
+    }
+}
+
+static void
+parse_args(int argc) {
+    if (argc != 3) {
+        puts("Usage: bfgen &lt;input&gt; &lt;output&gt;");
+        exit(OTHER_ERROR);
+    }
+}
+
+int
+main(int argc, char **argv) {
+    parse_args(argc);
+    FILE *input_file = xfopen(argv[1], "rb");
+    FILE *output_file = xfopen(argv[2], "w");
+    bfgen gen = {output_file};
+    bfgen_generate_code(&amp;gen, input_file);
+    fclose(output_file);
+    fclose(input_file);
+    return 0;
+}
+</code></pre>
+    </div>

@@ -1,0 +1,171 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You define several helper functions out of which some are unused and some seem only related to your personal usage, so not really part of a library: <code>qvm</code> and <code>bell_state</code> should be better directly integrated into the <code>QRandom</code> constructor.</p>
+
+<p>I’m also not found of your <code>test_quantum_connection</code>; at least let the user decide if they want to run it or not. And since you’re not doing anything with the exception you are catching, you'd be better off removing the <code>try</code> completely.</p>
+
+<hr>
+
+<p>Your <code>_test_generator</code> function feels really wrong, to me. At the very least, use <a href="https://docs.python.org/3/library/time.html#time.perf_counter" rel="nofollow noreferrer"><code>time.perf_counter</code></a> instead of <code>time.time</code>. But ultimately you should switch to <a href="https://docs.python.org/3/library/timeit.html" rel="nofollow noreferrer"><code>timeit</code></a>.</p>
+
+<p>Speaking of which, read the <a href="https://docs.python.org/3/library/timeit.html#timeit.Timer.repeat" rel="nofollow noreferrer">note about timing repeated tests</a>:</p>
+
+<blockquote>
+  <p><strong>Note:</strong> It’s tempting to calculate mean and standard deviation from the result vector and report these. However, this is not very useful. In a typical case, the lowest value gives a lower bound for how fast your machine can run the given code snippet; higher values in the result vector are typically not caused by variability in Python’s speed, but by other processes interfering with your timing accuracy. So the min() of the result is probably the only number you should be interested in. After that, you should look at the entire vector and apply common sense rather than statistics.</p>
+</blockquote>
+
+<p>I, however, would remove this function entirely and perform timing tests from the command line directly:</p>
+
+<pre class="lang-bsh prettyprint-override"><code>$ python3 -m timeit -s 'from qrandom import random' 'random()'
+</code></pre>
+
+<hr>
+
+<p>Your various conversion methods seems unefficient: <code>arr_to_int</code> for instance feeds strings to <code>int</code> rather than performing simple additions and bit shifts. Compare:</p>
+
+<pre><code>&gt;&gt;&gt; def stringifier(arr):
+...   return int(''.join([str(i) for i in arr]), 2)
+... 
+&gt;&gt;&gt; def mapper(arr):
+...   return int(''.join(map(str, arr)), 2)
+... 
+&gt;&gt;&gt; def adder(arr):
+...   return sum(v &lt;&lt; i for i, v in enumerate(reversed(arr)))
+... 
+&gt;&gt;&gt; from functools import reduce
+&gt;&gt;&gt; def add_bit(number, bit):
+...   return (number &lt;&lt; 1) + bit
+... 
+&gt;&gt;&gt; def reducer(arr):
+...   return reduce(add_bit, arr, 0)
+... 
+&gt;&gt;&gt; for name in ['stringifier', 'mapper', 'adder', 'reducer']:
+...   elapsed = timeit.repeat('{}(lst)'.format(name), 'from __main__ import {}; lst=[1,0,1,0,1,0,1,1,1,0,0,0,1,1,0,1,0]'.format(name), repeat=10)
+...   print(name, ':', min(elapsed))
+... 
+stringifier : 2.625876844045706
+mapper : 2.1048526159720495
+adder : 1.908082987065427
+reducer : 1.8361501740291715
+</code></pre>
+
+<p>Your are also performing too much conversions in <code>random</code> since you ask for bytes just to convert them to integers right away. Why don't you convert directly to integer then? Besides, this should be the return type of <code>getrandbits</code> anyway; I see little gain in adding the "select your return type" overhead and complexity.</p>
+
+<hr>
+
+<p>Proposed improvements:</p>
+
+<pre><code>"""
+Random variable generator using quantum machines
+"""
+
+import random
+from functools import reduce
+
+from pyquil.quil import Program
+from pyquil.api import get_qc
+from pyquil.gates import H, CNOT
+
+
+__all__ = ["QRandom", "random", "randint", "randrange", "getstate", "setstate", "getrandbits"]
+
+
+BPF = 53        # Number of bits in a float
+RECIP_BPF = 2**-BPF
+
+
+class QRandom(random.Random):
+    """Quantum random number generator
+
+        Generates a random number by collapsing bell states on a
+        quantum computer or quantum virtual machine.
+    """
+
+    def __init__(self):
+        super().__init__(self, computer_name='9q-square-qvm', check_connection=False)
+        self.p = Program(H(0), CNOT(0, 1))
+        self.qc = get_qc(computer_name)
+        if check_connection:
+            test_quantum_connection()
+
+    def random(self):
+        """Get the next random number in the range [0.0, 1.0)."""
+        return (self.getrandbits(56) &gt;&gt; 3) * RECIP_BPF
+
+    def getrandbits(self, k, x='int'):
+        """getrandbits(k) -&gt; x. generates an integer with k random bits"""
+        if k &lt;= 0:
+            raise ValueError("Number of bits should be greater than 0")
+
+        trials = int(k)
+        if k != trials:
+            raise ValueError("Number of bits should be an integer")
+
+        bitfield = self.qc.run_and_measure(self.p, trials=trials)[0]
+        result = reduce(_add_bits, bitfield, 0)
+
+        if x.lower() in ('int', 'i'):
+            return result
+        elif x.lower() in ('bytes', 'b'):
+            return result.to_bytes((result.bit_length() + 7) // 8, 'big')
+        else:
+            raise ValueError(str(x) + ' not a valid type (int, bytes)')
+
+
+# Create one instance, seeded from current time, and export its methods
+# as module-level functions.  The functions share state across all uses
+#(both in the user's code and in the Python libraries), but that's fine
+# for most programs and is easier for the casual user than making them
+# instantiate their own QRandom() instance.
+
+_inst = QRandom()
+#seed = _inst.seed
+random = _inst.random
+randint = _inst.randint
+randrange = _inst.randrange
+getstate = _inst.getstate
+setstate = _inst.setstate
+getrandbits = _inst.getrandbits
+
+
+def _add_bit(number, bit):
+    return (number &lt;&lt; 1) + bit
+
+
+def test_quantum_connection():
+    """
+    Tests the connection to the quantum virtual machine.
+    attempts to start the virtual machine if possible
+    """
+    import vm
+    import psutil
+
+    qvm_running = False
+    quilc_running = False
+
+    while True:
+        for proc in psutil.process_iter():
+            name = proc.name().lower()
+            if 'qvm' in name:
+                qvm_running = True
+            elif 'quilc' in name:
+                quilc_running = True
+        if not qvm_running or not quilc_running:
+            vm.start_servers()
+        else:
+            break
+
+
+def _test_generator(function_name, *arguments, amount=1000000):
+    import timeit
+    return min(timeit.repeat(
+            '{}{}'.format(function_name, arguments),
+            'from {} import {}'.format(__name__, function_name),
+            number=amount))
+
+
+if __name__ == '__main__':
+    _test_generator('random')
+</code></pre>
+
+<p>I kept <code>_test_generator</code> and the bottom half of <code>getrandbits</code> for completeness but I still advise to remove them if you plan on releasing it as a library.</p>
+    </div>

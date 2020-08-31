@@ -1,0 +1,167 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>A couple of small things here. My bigger thought is in the comment on the original question.</p>
+
+<p><strong>One:</strong></p>
+
+<p>Empty collections are nice if <code>null</code>s show their ugly faces:</p>
+
+<pre><code>internal ImmutableUpdate(IEnumerable&lt;(PropertyInfo Property, object Value)&gt; updates)
+{
+    _updates = updates ?? Enumerable.Empty&lt;(PropertyInfo Property, object Value)&gt;();
+}
+</code></pre>
+
+<p><strong>Two:</strong></p>
+
+<pre><code>    var immmutableUpdateCtor =
+        typeof(T)
+            .GetConstructor(new[] { typeof(ImmutableUpdate) });
+</code></pre>
+
+<p>is never used. I'd rewrite that little block as:</p>
+
+<pre><code>var immmutableUpdateCtor = ImmutableUpdateConstructor(typeof(T));
+
+if (immutableUpdateCtor == null)
+{
+    return obj;
+}
+
+var updates =
+    from property in obj.ImmutableProperties()
+    let getsUpdated = property.Name == selectedProperty.Name
+    select
+    (
+        property,
+        getsUpdated ? newValue : property.GetValue(obj)
+    );
+
+return (T)immutableUpdateCtor.Invoke(new object[] { new ImmutableUpdate(updates) });
+</code></pre>
+
+<p>I'll addend more if I think of anything.</p>
+
+<p><strong>Three:</strong></p>
+
+<p>The caching of constructor information as was commented in the code:</p>
+
+<pre><code>    private static readonly ConcurrentDictionary&lt;Type, ConstructorInfo&gt; _ImmutableConstructors =
+        new ConcurrentDictionary&lt;Type, ConstructorInfo&gt;();
+
+    private static ConstructorInfo ImmutableUpdateConstructor(Type type)
+    {
+        if (!_ImmutableConstructors.TryGetValue(type, out var constructor))
+        {
+            constructor = type.GetConstructor(new[] { typeof(ImmutableUpdate) });
+            _ImmutableConstructors.TryAdd(type, constructor);
+        }
+
+        return constructor;
+    }
+</code></pre>
+
+<p><strong>Four:</strong></p>
+
+<p>Here are the builder pieces:</p>
+
+<p>In <code>ImmutableUpdater</code> class:</p>
+
+<pre><code>public static UpdateBuilder&lt;T&gt; With&lt;T, TMember&gt;(this T obj, Expression&lt;Func&lt;T, TMember&gt;&gt; memberSelector, TMember newValue)
+{
+    ConstructorInfo immutableUpdateCtor = ImmutableUpdateConstructor(typeof(T));
+
+    return new UpdateBuilder&lt;T&gt;(obj, immutableUpdateCtor).With(memberSelector, newValue);
+}
+
+public static UpdateBuilder&lt;T&gt; With&lt;T, TMember&gt;(this UpdateBuilder&lt;T&gt; obj, Expression&lt;Func&lt;T, TMember&gt;&gt; memberSelector, TMember newValue)
+{
+    if (!(memberSelector.Body is MemberExpression memberExpression))
+    {
+        throw new ArgumentException($"You must select a member. Affected expression '{memberSelector}'.");
+    }
+
+    if (!(memberExpression.Member is PropertyInfo selectedProperty))
+    {
+        throw new ArgumentException($"You must select a property. Affected expression '{memberSelector}'.");
+    }
+
+    if (selectedProperty.GetSetMethod() != null)
+    {
+        throw new ArgumentException(
+            $"You must select a readonly property. Affected expression '{memberSelector}'.");
+    }
+
+    if (selectedProperty.Name.GetBackingField&lt;T&gt;() == null)
+    {
+        throw new ArgumentException(
+            $"You must select a pure readonly property (not a computed one). Affected expression '{memberSelector}'.");
+    }
+
+    var updates =
+        from property in obj.ImmutableProperties()
+        where property.Name == selectedProperty.Name
+        select
+            (
+                property, (object)newValue
+            );
+
+    return obj.Add(updates);
+}
+
+private static IEnumerable&lt;PropertyInfo&gt; ImmutableProperties&lt;T&gt;(this UpdateBuilder&lt;T&gt; obj)
+{
+    return
+        typeof(T)
+            .GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Where(propertyInfo =&gt; propertyInfo.GetSetMethod() is null);
+}
+</code></pre>
+
+<p>and finally, the <code>UpdateBuilder&lt;T&gt;</code> class:</p>
+
+<pre><code>using System.Linq;
+using System.Reflection;
+
+using IEnumerablePropertyValue = System.Collections.Generic.IEnumerable&lt;(System.Reflection.PropertyInfo Property, object Value)&gt;;
+using PropertyValueList = System.Collections.Generic.List&lt;(System.Reflection.PropertyInfo Property, object Value)&gt;;
+
+public sealed class UpdateBuilder&lt;T&gt;
+{
+    private readonly PropertyValueList _updates = new PropertyValueList();
+
+    private readonly ConstructorInfo _immutableUpdateCtor;
+
+    public UpdateBuilder(T obj, ConstructorInfo immutableUpdateCtor)
+    {
+        this.Object = obj;
+        this._immutableUpdateCtor = immutableUpdateCtor;
+    }
+
+    public T Object { get; }
+
+    public UpdateBuilder&lt;T&gt; Add(IEnumerablePropertyValue updates)
+    {
+        foreach (var update in updates ?? Enumerable.Empty&lt;(PropertyInfo Property, object Value)&gt;())
+        {
+            this._updates.Add(update);
+        }
+
+        return this;
+    }
+
+    public static implicit operator T(UpdateBuilder&lt;T&gt; updateBuilder)
+    {
+        if (updateBuilder == null)
+        {
+            return default(T);
+        }
+
+        if (updateBuilder._immutableUpdateCtor == null)
+        {
+            return updateBuilder.Object;
+        }
+
+        return (T)updateBuilder._immutableUpdateCtor.Invoke(new object[] { new ImmutableUpdate(updateBuilder._updates) });
+    }
+</code></pre>
+    </div>

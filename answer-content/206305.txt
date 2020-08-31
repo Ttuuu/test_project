@@ -1,0 +1,79 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The general structure seems fine to me. However, some things can still be improved!</p>
+<h1>Iterator requirements</h1>
+<p><a href="https://en.cppreference.com/w/cpp/named_req/Iterator" rel="nofollow noreferrer">Iterators</a> are required to satisfy the <a href="https://en.cppreference.com/w/cpp/named_req/Swappable" rel="nofollow noreferrer">Swappable</a> and <a href="https://en.cppreference.com/w/cpp/named_req/CopyAssignable" rel="nofollow noreferrer">CopyAssignable</a> named requirements, but the current implementation doesn't. (This is also why the <code>std::back_inserter</code> implementation you looked at used pointers instead of references, the latter cannot be reseated.)</p>
+<p>And from a design perspective, this provides an interesting dilemma: Do you want to support assignment from different underlying container types? For example, like this:</p>
+<pre><code>std::deque&lt;int&gt; copy1{};
+std::list&lt;int&gt; copy2{};
+
+auto out = stx::back_inserter(copy1, copy2);
+// out is of type stx::back_inserter_iterator&lt;std::deque&lt;int&gt;, std::list&lt;int&gt;&gt;
+
+std::vector&lt;int&gt; copy3{};
+
+out = stx::back_inserter(copy2, copy3, copy1);
+// assignment from stx::back_inserter_iterator&lt;std::list&lt;int&gt;, std::vector&lt;int&gt;, std::deque&lt;int&gt;&gt;
+</code></pre>
+<p>If no, the solution is easy: Change the container references to pointers (to make assignment possible), add assignment operator overloads, and either use <code>std::swap</code>s default implementation or write your own <code>swap</code> function for <code>stx::back_inserter_iterator</code>.</p>
+<blockquote>
+<p>This is the easy way, but in reality likely not very useful, since assignment only allows for the exact same container types.</p>
+</blockquote>
+<p>If yes, the solution becomes more complicated, as the actual container types need to be abstracted away. One idea for this is using inheritance in an external storage class (rough idea):</p>
+<pre><code>template&lt;typename ValueType&gt;
+class container_storage_base {
+public:
+    virtual ~container_storage_base() {}
+    virtual void push_back(const ValueType&amp;) = 0;
+    virtual void push_back(ValueType&amp;&amp;) = 0;
+};
+
+template&lt;typename Container, typename... Containers&gt;
+class container_storage : container_storage_base&lt;typename Container::value_type&gt; {
+    std::tuple&lt;Container&amp;, Containers&amp;...&gt; containers; // can use references here
+
+public:
+    void push_back(const typename Container::value_type&amp; value) override { ... }
+    void push_back(typename Container::value_type&amp;&amp; value) override { ... }
+};
+</code></pre>
+<p>Inside of <code>stx::back_inserter_iterator</code>, you could then simply store a <code>std::shared_ptr&lt;container_storage_base&lt;ValueType&gt;&gt;</code>, thus freely allowing assignment between different <code>stx::back_inserter_iterator&lt;ValueType&gt;</code> instances (as long as <code>ValueType</code> remains the same).</p>
+<blockquote>
+<p>Why <code>std::shared_ptr</code>?</p>
+<p>We need some indirection in order to allow for virtual dispatch to work, and using a pointer seems to be the easiest solution for that. However, we also need to release the <code>container_storage</code> object once we no longer need it, and for that, smart pointer come in very handy.</p>
+<p>But: Iterators need to be copyable, and that isn't something supported by <code>std::unique_ptr</code> (only allowing for a unique owner), thus <code>std::shared_ptr</code> was chosen.</p>
+</blockquote>
+<h1>Other Nitpicks</h1>
+<ul>
+<li>Most functions could be marked <code>noexcept</code> (even if only conditionally).</li>
+</ul>
+<h1>Q &amp; A</h1>
+<ul>
+<li>
+<blockquote>
+<p>does the operator= method with the r-value work as intended or do I need to pass the value differently to the lambda?</p>
+</blockquote>
+<p>Works as intended.</p>
+<p>Well, mostly. With the expansion, <code>value</code> will be moved from for every container, i.e. every container but the first will move from an already moved-from value. To get the initial value to all containers, copies will need to be made.</p>
+</li>
+<li>
+<blockquote>
+<p>do I need an extra static_assert to check that each Container supports the same value_type or at least some that are convertible to avoid overloading the user with template errors in case they are different?</p>
+</blockquote>
+<p>Do you need to? Not necessarily.</p>
+<p>Would it be nice for users of the implementation? Absolutely!</p>
+</li>
+<li>
+<blockquote>
+<p>is there another solution where I could let the user provide and optional argument for execution policy, for example <code>std::execution::par</code></p>
+</blockquote>
+<p>I'm confused: Execution policies are for algorithms, not iterators themselves.</p>
+<p>Of course, you can always add a data member to store a value if you want to, but I fail to see how storing an execution policy would be helpful here, as there aren't any calls to algorithms internally (and just adding an execution policy to data doesn't accomplish anything).</p>
+</li>
+<li>
+<blockquote>
+<p>the original std::back_inserter saves the container as pointer - is there any advantage versus my inserter which saves them per reference?</p>
+</blockquote>
+<p>See above, you cannot reassign references.</p>
+</li>
+</ul>
+    </div>

@@ -1,0 +1,90 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>It's difficult to comment exactly on performance without benchmarks as @BenSteffan points out, but in your case things are pretty straightforward.</p>
+
+<p>It looks like you're trying to count the longest contiguous group of 0 bits in an <code>int</code>.</p>
+
+<p><em>side note:</em> I don't know the exact specs of your problem, but you should be careful with your current solution, because it may produce incorrect answers. Specifically, assuming <code>int</code> is 32-bits, the number <code>1</code> will have 31 leading <code>0</code>s. Your current solution would not count those because dividing by <code>2</code> makes <code>N = 0</code>, which causes you to stop searching. Always unit test your functions! This is critical for benchmarking and performance tweaking, because as you tweak to improve performance you want to be sure that you aren't breaking your function for some inputs. To substantiate this, I recognized this problem before writing up my solution, and even still I made a mistake that improperly handled this case in another way. Tests are important!</p>
+
+<p>Your stack will only have 3 <code>int</code>s and a <code>bool</code> on it and you don't call out to any other functions (well, technically speaking if we're being hardware aware, on older ARM without hardware div/mod, <code>/</code> and <code>%</code> will call out to some libc ABI and this is much more expensive than a single instruction--but we'll see later this doesn't matter). So, largely cache misses, page faults, memory hierarchy, and data locality are going to be irrelevant here. Your data (stack) is already very local, there is no hierarchy (it's all flat), everything surely fits in a page (so faults and cache misses are unlikely barring external factors).</p>
+
+<p>I suspect the only relevant concerns for you are branch prediction and pipelining. And even branch prediction won't do too much either, because which branch is taken  (specifically looking at the <code>switch</code> statement) is data dependent. Assuming a distribution over inputs <code>N</code>, then a <code>0</code> or <code>1</code> bit are equally likely. If there is a bias in the inputs the CPU's branch prediction may help you here, but you can't really account for that in any meaningful way (unless you know for example that the inputs come from some non-uniform distribution).</p>
+
+<p>A good first consult for performance things is godbolt: <a href="https://godbolt.org/g/1N2WuN" rel="nofollow noreferrer">https://godbolt.org/g/1N2WuN</a>. I've compiled your code with recent clang and gcc with <code>-O3</code>.</p>
+
+<p>Reading the produced assembly reveals the first obvious optimization. You can use bit shifts (<code>&gt;&gt; 1</code>) and bitwise anding (<code>&amp; 1</code>) instead of dividing by 2 and modulo. But, the compiler is smart enough to figure this out for you, so if it's clearer in code to leave things as is, then you're free to do so.</p>
+
+<p>The fact that the compiler optimized to bit operations suggests that there may be room for improvement, though. Specifically, looping over every bit will likely be slower than considering word-sized chunks. Most modern CPUs have instructions for finding the lowest set bit:</p>
+
+<p><a href="https://stackoverflow.com/a/758056/568785">https://stackoverflow.com/a/758056/568785</a></p>
+
+<p>So with this in mind, I'd try iteratively using <code>ffs</code> (finds the index of the lowest set bit) to find the width of the next "gap" (and keeping track of the largest one found yet). You can then right shift the number by the size of that "gap" and continue applying <code>ffs</code>. Something like:</p>
+
+<pre><code>#include &lt;algorithm&gt;
+#include &lt;cstddef&gt;
+#include &lt;strings.h&gt;
+
+// Pedantics, but size you are counting you should be returning a size_t
+// I also prefer this name to "solution," because it's more informative
+size_t widest_zero_bit_gap(int input) {
+    size_t widest_gap = 0;
+    ssize_t bits_left = 8 * sizeof(input);
+
+    // Until we have considered every bit of input
+    while (bits_left &gt; 0) {
+        // Index of the next set bit is the width of the current gap
+        // If input == 0, all bits_left are 0's
+        size_t current_gap = input == 0 ? bits_left : ffs(input) - 1;
+
+        // Shift, so we can consider the next gap on the next iteration
+        input &gt;&gt;= (current_gap + 1);
+        bits_left -= current_gap + 1;
+
+        widest_gap = std::max(widest_gap, current_gap);
+    }
+
+    return widest_gap;
+}
+</code></pre>
+
+<p><a href="https://godbolt.org/g/Hj4hvm" rel="nofollow noreferrer">Looking at this in godbolt</a>, we see some promising optimizations by both gcc and clang. Both are able to replace the <code>ffs</code> with <code>bsf</code> and the <code>std::max</code> with some conditional moves on amd64. Both are also able to greatly reduce the branches used (when compared to all the branches in the original). Extrapolating that, I suspect this loop will on average be faster than your loop, because it doesn't consider each bit individually and instead considers runs of <code>0</code> bits together.</p>
+
+<p><em>edit:</em> You could (as I just saw @vnp links the same quesiton) use de Bruijn hashing, but you'd need to benchmark it to be sure. I'd guess that if the instruction is available <code>ffs</code> is likely faster. A hybird approach (use <code>ffs</code> if it compiles to a single instruction, fallback to de Bruijn hashing otherwise) may even more portably performant, but I suspect <code>ffs</code> falls fack to something fairly performant in the absence of an instruction.</p>
+
+<p>As an unrelated note: your use of brace initializers for primitive types is a little strange. Prefer, <code>int longestSizeGap = 0</code>, for example.</p>
+
+<p><strong>edit:</strong> This piqued my interest so I threw together a quick unit test and benchmark suite for these three solutions (yours, @vnp's suggestion, and <code>ffs</code>). You can reproduce and contribute results here: <a href="https://gist.github.com/baileyparker/401d8c9e0e4124024320f249cd534b1a" rel="nofollow noreferrer">https://gist.github.com/baileyparker/401d8c9e0e4124024320f249cd534b1a</a></p>
+
+<p>On my machine, I got the following:</p>
+
+<h3>Widest 0-bit Gap</h3>
+
+<pre><code>|             CPU + Compiler             | Original  | de Bruijn |   `ffs`   |
+|----------------------------------------|----------:|----------:|----------:|
+| 3.2 GHz Core i7 - gcc 8.1.0            |   2058 µs |   1013 µs |    689 µs |
+| 3.2 GHz Core i7 - clang 6.0.1          |    866 µs |    985 µs |    579 µs |
+| 1 GHz ARMv7l - gcc 8.2.0               |   9539 µs |   5509 µs |   4194 µs |
+| 3.4 GHz i7-4770 - gcc 7.3.1            |   1787 µs |    952 µs |    671 µs |
+| 3.4 GHz i7-4770 - clang 5.0.1          |   1206 µs |    993 µs |    757 µs |
+</code></pre>
+
+<h3>Pure de Bruijn vs <code>ffs</code></h3>
+
+<pre><code>|             CPU + Compiler             | de Bruijn |   `ffs`   |
+|----------------------------------------|----------:|----------:|
+| 3.2 GHz Core i7 - gcc 8.1.0            |     17 µs |     51 µs |
+| 3.2 GHz Core i7 - clang 6.0.1          |     17 µs |     54 µs |
+| 1 GHz ARMv7l - gcc 8.2.0               |    556 µs |    396 µs |
+| 3.4 GHz i7-4770 - gcc 7.3.1            |     17 µs |     59 µs |
+| 3.4 GHz i7-4770 - clang 5.0.1          |     18 µs |     42 µs |
+</code></pre>
+
+<p>Overall, my solution appears to be fastest. With gcc, it is over 3x faster than yours and 2x faster than de Bruijn hashing. With clang it's a little closer, but mine is still 1.5x faster than both your original and de Bruijn hashing.</p>
+
+<p>Since my machine has a <code>bsf</code> instruction, it's no surprise that <code>ffs</code> outperforms de Bruijn hashing. This is likely because of the indirection of needing to hit (hopefully, and most likely) the cache to do the hash lookup. What's perhaps a little surprising is just testing <code>ffs</code> vs de Bruijn in isolation reveals the opposite. de Brujin would appear 3x faster than a <code>bsf</code> instruction. <strike>Keep in mind, this is in a tight loop, so that probably gives credence to my cache argument (in the tight loop, the hash lookup will probably be cached, but in context of real usage the cache is used for other things).</strike></p>
+
+<p><strong>edit:</strong> A friend of mine points out in the tight loop you probably run into a bottleneck trying to run <code>bsf</code>, where the multiple instructions needed for de Bruijn pipeline well.</p>
+
+<p><strike>I'll try on a Raspberry Pi to see how an arch without a bsf performs.</strike></p>
+
+<p><strong>edit:</strong> The Pi benchmark largely confirms what my amd64 machine suggested. <code>ffs</code> appears fastest for this use case (although on the Pi it is only about 1.3x faster than de Bruijn). Interestingly enough, considered alone, de Brujin is about 1.4x slower than <code>ffs</code>.</p>
+    </div>

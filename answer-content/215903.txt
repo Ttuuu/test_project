@@ -1,0 +1,74 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Threading structure</h1>
+<p>I rather dislike the overall structure of the code. Rather than having two threads contending over a single location where the current estimate of <span class="math-container">\$\pi\$</span> is stored, I'd rather have the calculator thread compute successive approximations, and write them to a queue. The display thread would then wait on value to show up in the queue, display it, and repeat. The locking and such should be in the queue itself.</p>
+<p>You've also created not just one, but two secondary threads. There's no real point in this. You started with the process' primary thread, then all it does is create two other threads, then wait for them to finish. It might as well do something useful, and only create one other thread.</p>
+<h1>Formula</h1>
+<p>It seems to me that if you're going to try to make it faster, you could at least do a minor improvement to the formula. One that's quite a bit faster, and still utterly trivial (in fact, arguably simpler than the plain Leibniz formula) is:</p>
+<p><span class="math-container">\$ {\pi \over 4} = {\sum_{n=0}^{\infty} {2 \over (4n+1)(4n+3)}}\$</span></p>
+<h1>Summation</h1>
+<p>This does have one interesting twist: if you just use a naive summation over this formula, you'll find that it "gets stuck"--with a typical double, no matter how many iterations you do, it will only ever get about 8 digits correct.</p>
+<p>The problem is that you have a number of relatively large magnitude, and you're trying to add numbers of relatively small magnitude to it. Each of them individually is too small to affect the larger number, so it remains constant.</p>
+<p>In this case, there's a pretty simple cure: start from the <em>smallest</em> numbers, and work your way toward larger numbers. That way, the sum you have and the amount you're adding to it each time have closer to the same magnitude, so more terms continue to improve the overall result.</p>
+<p>For this particular program, that has a bit of a problem though: since we're trying to display the approximation as it gets better over time, we want approximations that actually do get better over time--and if we start from the smallest, and sum toward the largest, our approximation is truly terrible for almost the entire time, then at the very end, the last few iterations suddenly make it a <em>lot</em> better in a hurry.</p>
+<p>As a compromise, we can take a middle ground: work from beginning to end, but work in "chunks" of (say) 10'000'000 terms, so we have an overall estimate, and we have a temporary sum of only the most recent terms. At the beginning of each iteration of the inner loop, we start over from a value of 0.0, so we don't have a drastically larger term dominating when we do the addition. Then when we've added those terms together, we add the result to the overall estimate.</p>
+<p>This also works nicely with updating the display--each time we add an intermediate value to our overall estimate, we can send the result out to be displayed.</p>
+<h1>Portability</h1>
+<p>I've left out the asynchronous keyboard reading, so the code can be portable. I'd rather use an even better formula than just let one that converges extremely slowly run for weeks on end (and then add non-portable code to let them quit more easily when they get bored).</p>
+<h1>Code</h1>
+<p>So, doing things this way, we could end up with code on this general order:</p>
+<pre><code>#include &lt;iostream&gt;
+#include &lt;iomanip&gt;
+#include &lt;deque&gt;
+#include &lt;mutex&gt;
+#include &lt;thread&gt;
+#include &lt;condition_variable&gt;
+
+namespace concurrent {
+    template&lt;class T&gt;
+    class queue {
+        std::deque&lt;T&gt; storage;
+        std::mutex m;
+        std::condition_variable cv;
+    public:
+        void push(T const &amp;t) {
+            std::unique_lock&lt;std::mutex&gt; L(m);
+            storage.push_back(t);
+            cv.notify_one();
+        }
+
+        // This is not exception safe--if copying T may throw,
+        // this can/will lose data.
+        T pop() {
+            std::unique_lock&lt;std::mutex&gt; L(m);
+            cv.wait(L, [&amp;] { return !storage.empty(); });
+            auto t = storage.front();
+            storage.pop_front();
+            return t;
+        }
+    };
+}
+
+int main() { 
+    concurrent::queue&lt;double&gt; values;
+
+    auto t = std::thread([&amp;] {
+        double pi4 = 0.0;
+        for (double n = 0.0; n &lt; 8'000'000'000.0; n += 10'000'000) {
+            double temp = 0.0;
+            for (double i = 0; i &lt; 10'000'000; i++)
+                temp += 2.0 / ((4.0 * (n + i) + 1.0) * (4.0 * (n + i) + 3.0));
+            pi4 += temp;
+            values.push(4.0 * pi4);
+        }
+        values.push(-1.0);
+    });
+
+    double pi;
+    while ((pi=values.pop())&gt; 0.0)    
+        std::cout &lt;&lt; "\r" &lt;&lt; std::setw(11) &lt;&lt; std::setprecision(11) &lt;&lt; std::fixed &lt;&lt; pi;
+    t.join();
+}
+</code></pre>
+<p>On my machine, this calculates Pi to 10 places in about 45 seconds. Unless your computer is quite old/slow (like mine is) it'll probably run faster than that for you.</p>
+<p>On the other hand, for watching the value converge, this does have kind of the opposite problem: it finds around six or seven digits nearly instantly, then grinds for a long time to a few more. Visually, some might find the Leibniz formula more appealing for the fact that it goes first above, then below, then back above, below again, and so on as it approaches the true value of Pi (though that's more apparent if you draw a graph rather than just printing out the values).</p>
+    </div>

@@ -1,0 +1,210 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>How to resolve the output size issue (many GB in memory and console) is highly specific to your overall setting, i.e. how you want to use the data further, so I restrict my answer to look into possible performance gains.</p>
+
+<h2>Performance baseline</h2>
+
+<p>I determine the baseline by restricting you original loop logic to the first 20 pairs:</p>
+
+<pre class="lang-py prettyprint-override"><code>t0=res.tolist()
+t0=[tuple(x) for x in t0]
+t1=Pairs
+t2=mod
+
+def run_loop_original(limit=20):
+    # Make substitions
+    result = []
+    for i_pair, (v1, v2) in enumerate(zip(t1, t2)):
+        if i_pair &gt;= limit:
+            break
+        out = []
+        for i in t0:
+            common = set(v1).intersection(i)
+            if set(v1) == common:
+                out.append(tuple(list(set(i) - common) + [v2]))
+            else:
+                out.append(tuple(i))
+        result.append(out)
+    return result
+</code></pre>
+
+<pre><code>    &gt;&gt;&gt; %timeit run_loop_original(20)
+    1 loops, best of 3: 1.33 s per loop
+</code></pre>
+
+<h2>Performance Sinks</h2>
+
+<p>As far as I can tell, those are:</p>
+
+<ul>
+<li>type conversion of string arrays</li>
+<li>repeated string comparisons to identify the pairs within tuples</li>
+<li>large nested list construction by double for-loop</li>
+</ul>
+
+<h2>Container Type Conversions</h2>
+
+<p>Here I simply leave out the tuple conversion in the nested list construction. Your code does not indicate that order of ingredients matters, so the information is equivalent, whether it is a list, tuple, or set.</p>
+
+<pre class="lang-py prettyprint-override"><code>t0=res.tolist()
+t0=[tuple(x) for x in t0]
+t1=Pairs
+t2=mod
+
+def run_loop_non_tuple(limit=20):
+    # Make substitions
+    result = []
+    for i_pair, (v1, v2) in enumerate(zip(t1, t2)):
+        if i_pair &gt;= limit:
+            break
+        out = []
+        for i in t0:
+            common = set(v1).intersection(i)
+            if set(v1) == common:
+                out.append(set(i) - common)
+                out[-1].add(v2)
+            else:
+                out.append(i)
+        result.append(out)
+    return result
+</code></pre>
+
+<pre><code>    &gt;&gt;&gt; %timeit run_loop_non_tuple(20)
+    1 loops, best of 3: 1.09 s per loop
+</code></pre>
+
+<p>This is not all, as the conversion of the individual tuples/lists to sets for the pair finding can be done outside the loop:</p>
+
+<pre class="lang-py prettyprint-override"><code>t0=[set(i) for i in res.tolist()]
+t1=Pairs
+t2=mod
+
+def run_loop_sets(limit=20):
+    # Make substitions
+    result = []
+    for i_pair, (v1, v2) in enumerate(zip(t1, t2)):
+        if i_pair &gt;= limit:
+            break
+        v1 = set(v1)
+        out = []
+        for i in t0:
+            common = v1.intersection(i)
+            if v1 == common:
+                out.append(i - common)
+                out[-1].add(v2)
+            else:
+                out.append(i)
+        result.append(out)
+    return result
+</code></pre>
+
+<pre><code>    &gt;&gt;&gt; %timeit run_loop_sets(20)
+    1 loops, best of 3: 460 ms per loop
+</code></pre>
+
+<h2>Repeated String Comparisons</h2>
+
+<p>Two things might help speeding up:</p>
+
+<ul>
+<li>instead of comparing strings individually, an index can be built to find the relevant entries</li>
+<li>there is a very limited amount of words overall, so they can be mapped to integers for faster matching</li>
+</ul>
+
+<p>Let's start with a word mapping:</p>
+
+<pre class="lang-py prettyprint-override"><code>from itertools import chain
+all_words = np.array(list(set(chain(*t0))))
+word_mapping = {word: i for i, word in enumerate(all_words)}
+</code></pre>
+
+<pre><code>    &gt;&gt;&gt; len(all_words)
+    381
+</code></pre>
+
+<p>There is no need to convert everything beforehand. Just go directly for creating an index. This can be realized as a numpy 2D-array, where we have a row per  element of <code>t0</code> and a column per <code>all_words</code>. The values are just True/False values as uint8 (1 Byte per value).</p>
+
+<pre class="lang-py prettyprint-override"><code>word_index = np.zeros(shape=(len(t0), len(all_words)), dtype=np.uint8)
+for i_row, row in enumerate(t0):
+    for word in row:
+        word_index[i_row, word_mapping[word]] = 1
+</code></pre>
+
+<pre><code>    &gt;&gt;&gt; word_index.shape, word_index.sum()
+    ((48983, 381), 416041)
+</code></pre>
+
+<p>You can now lookup which rows have a pair of words by using the <code>&amp;</code> operator:</p>
+
+<pre><code>    &gt;&gt;&gt; word_index[:, word_mapping[Pairs[0][0]]] &amp; word_index[:, word_mapping[Pairs[0][1]]]
+    array([0, 0, 0, ..., 0, 0, 0], dtype=uint8)
+</code></pre>
+
+<p>So we rebuild the loop with this advantage:</p>
+
+<pre class="lang-py prettyprint-override"><code>t0=[set(i) for i in res.tolist()]
+t1=[set(x) for x in Pairs]
+t2=mod
+
+def run_loop_indexed(limit=20):
+    # Make substitions
+    result = []
+    for i_pair, (v1, v2) in enumerate(zip(t1, t2)):
+        if i_pair &gt;= limit:
+            break
+        i1 = [word_mapping[x] for x in v1]
+        ix_contain_pair = word_index[:, i1[0]] &amp; word_index[:, i1[1]]
+        out = []
+        for row, contains_pair in zip(t0, ix_contain_pair):
+            if contains_pair:
+                out.append(row - v1)
+                out[-1].add(v2)
+            else:
+                out.append(row)
+        result.append(out)
+    return result
+</code></pre>
+
+<pre><code>    &gt;&gt;&gt; %timeit run_loop_indexed(20)
+    1 loops, best of 3: 216 ms per loop
+</code></pre>
+
+<h2>Double for Loop</h2>
+
+<p>It would still help to avoid the nested list construction via the double loop. What helps there is, that the nested lists are identical to <code>t0</code> if the pair is missing, and it is missing in the majority of cases. So we first construct a copy of <code>t0</code> and then replace the rows that contain the pair.</p>
+
+<p>To get the indices in <code>t0</code>, flatten and use <code>np.nonzero</code>:</p>
+
+<pre><code>    &gt;&gt;&gt; np.ravel(np.nonzero(word_index[:, word_mapping[Pairs[0][0]]] &amp; word_index[:, word_mapping[Pairs[0][1]]]))
+    array([ 1915,  1987,  8062, 10593, 10614, 10663, 10879, 11235, 12021,
+   12096, 13445, 13805, 14630, 17658, 17701, 18865, 20712, 22560,
+   23573, 23840, 25379, 25487, 27338, 27690, 28630, 32266, 33259,
+   33884, 34309, 34412, 35430, 35463, 35968, 36326, 36977, 39477,
+   40292, 42138], dtype=int64)
+</code></pre>
+
+<pre class="lang-py prettyprint-override"><code>t0=[set(i) for i in res.tolist()]
+t1=[set(x) for x in Pairs]
+t2=mod
+
+def run_loop_indexed_2(limit=20):
+    # Make substitions
+    result = []
+    for i_pair, (v1, v2) in enumerate(zip(t1, t2)):
+        if i_pair &gt;= limit:
+            break
+        i1 = [word_mapping[x] for x in v1]
+        ix_contain_pair = np.ravel(np.nonzero(word_index[:, i1[0]] &amp; word_index[:, i1[1]]))
+        out = t0[:]
+        for i in ix_contain_pair:
+            out[i] = out[i] - v1
+            out[i].add(v2)
+        result.append(out)
+    return result
+</code></pre>
+
+<pre><code>    &gt;&gt;&gt; %timeit run_loop_indexed_2(20)
+    10 loops, best of 3: 43.1 ms per loop
+</code></pre>
+
+<p>I still expect you to run into memory limits on the full set and/or to crash your notebook connection trying to print the results.</p>
+    </div>

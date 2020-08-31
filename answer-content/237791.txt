@@ -1,0 +1,140 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I think you can DRY this up pretty well by refactoring.</p>
+
+<p>This feels like a “ifs are evil” code smell to me. There are three “if” statements within that whereHas. They are packed in fairly tightly, and it makes that part of the code more difficult to read. Trying to refactor that as much as possible can resolve the duplication along the way, and ultimately make things much more readable and manageable. </p>
+
+<ul>
+<li><p>Try to give every “if” it’s own method, if for no other reason than the opportunity to give it a very concise name explaining what it does. This greatly improves code readability. </p></li>
+<li><p>The “if"s being repeated is a good indicator that you can flip the control around. Try to find a way to visit each “if” once and do all the things you need to do based on the results in one place. In this case, that means breaking the construction of the query into a couple of pieces. </p></li>
+<li><p>“if"s are decision points. They are apt to be the focus in future debugging efforts. Push these decision points to as early in the process as you can, and obsess over making that code as simple and as readable as possible. </p></li>
+<li><p><code>Auth::guard( 'supplier' )-&gt;user()</code> gets resolved a number of times. Instead, resolve it once as early as possible and catch the results in a class attribute or parameter.</p></li>
+<li><p>The “if/elseif” is overreaching; much of the content is the same. Narrow the scope to just resolving the required supplier id, encapsulate it in a method, and call that within the required context.  Furthermore, this looks to be a second important variable which gets used multiple times, so resolve this as early as possible as well and get it into an attribute or parameter.</p></li>
+<li><p>Inline role ids is a bad idea. It’s possible that the database will change, or a problem will occur on data recover or seeding on deploy to a new environment, leaving different role to id mapping. Even a short exposure to this problem will mean non-admins could be logged in as admins. Further, using the full name inline instead of ids helps improve code readability as it tells more of a story. “This happens for admins” instead of “this happens for some user role, I could look in the database to know which...” Using the name adds a bit of overhead, but it can be eager loaded with the user and makes the code a lot more readable. </p></li>
+<li><p>No need to load the accountant user record as we only need the id, which we have account_id anyway. Referencing that directly will save a query here, or more as this block is repeated. </p></li>
+<li><p>Database field names can be used to help improve readability, too. $user-&gt;role_id would help identify that it’s a foreign key rather than a string. Likewise, putting ‘is_’ or ‘has_’ on the front of booleans helps make them quickly obvious, such as $user-&gt;is_superuser. Along with that, setting <code>$casts = [‘us_superuser’ =&gt; ‘boolean’,]</code> ; in the models lets you compare it against true/false instead of 1 or 0, which is a lot more readable. </p></li>
+<li><p><code>whereNotNull(‘order_state_id’)</code> is slightly more readable than <code>where(‘order_state_id’, ‘!=’, null)</code>. This can be applied to a number of the where() clauses</p></li>
+<li><p>Refactor this query builder into a “plain old php” class.  Call it a repository if you think it fits, but don’t get too hung up on the name. It could be as easy as a new app/Queries/OrderList.php folder and class.  That new class can be injected into the controller. Make it fluent, and abstract decisions out of it. The class should do the lifting, but be dumb. The calling entity should encapsulate the decision making and directing, and only that. </p></li>
+<li><p>Replace eloquent with whereHas with query builder, joins, and where clauses. The eloquent and whereHas approach can certainly still work and be much cleaner than it currently is, but I find query builder to be much more readable and consistent across different models and needs when the queries start to get complicated. Perhaps this one is down to a personal preference. </p></li>
+</ul>
+
+<p>With all of that in mind, here’s where I would land given my understanding of the posted code. </p>
+
+<p>app/Queries/OrderList: </p>
+
+<pre><code>&lt;?php
+
+namespace App\Queries;
+
+use App\Models\OrderList;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
+
+class OrderLists
+{
+    protected $query;
+
+    public function buildQuery(int $idLimitation): self
+    {
+        $this-&gt;query = DB::table('order_lists')
+            -&gt;select([
+                'order_lists.id as id',
+                //etc
+            ])
+            -&gt;whereNotNull('order_state_id')
+            -&gt;whereNotNull('address_id')
+            -&gt;whereNotNull('user_id')
+            -&gt;where('id', '&gt;', $idLimitation);
+
+        return $this;
+    }
+
+    protected function applyNonSuperUserClauses(int $requiredSupplierId):self
+    {
+        $this-&gt;query-&gt;leftJoin('order_details', 'order_lists.id', '=', 'order_details.order_list_id');
+        $this-&gt;query-&gt;where('order_details.supplier_id', '=', $requiredSupplierId);
+
+        //Other  join and where clauses as appropriate
+
+        return $this;
+    }
+
+    protected function fetchResults():Collection{
+
+        return $this-&gt;query-&gt;get();
+    }
+</code></pre>
+
+<p>controller: </p>
+
+<pre><code> public function index(OrderList $orderListQuery)
+    {
+        $user = Auth::guard('supplier')-&gt;user();
+
+        $idLimitation = $this-&gt;fetchIdLimitation();
+
+        if ($this-&gt;isSuperUser($user)) {
+            return view('your.view', [
+                'orderList' =&gt; $orderListQuery
+                    -&gt;buildQuery($idLimitation)
+                    -&gt;fetchResults(),
+            ]);
+        }
+
+       //More secured version is the default behavior.
+        return view('your.view', [
+            'orderList' =&gt; $orderListQuery
+                -&gt;buildQuery($idLimitation)
+                -&gt;applyNonSuperUserClauses($this-&gt;getRequiredSupplierIdByRole($user))
+                -&gt;fetchResults(),
+        ]);
+
+    }
+
+ protected function isSuperUser($user): bool
+    {
+        return $user-&gt;is_super_user;
+    }
+
+ protected function getRequiredSupplierIdByRole($user): ?int
+    {
+        if ($this-&gt;hasAdminRole()) {
+            return $user-&gt;id;
+        }
+
+        if ($this-&gt;hasLimitedUserRole()) {
+            return $user-&gt;accountant_id;
+        }
+        return null;
+    }
+
+ //'Admin' and 'LimitedUser' based on assumptions about role ids 1,2,3,4.
+    // Change these to be as concise as possible.
+    protected function hasAdminRole($user): bool
+    {
+        return (in_array($user-&gt;role-&gt;name, $this-&gt;getAdminRoles()));
+    }
+
+    protected function getAdminRoles(): array
+    {
+        return [
+            'Admin',
+        ];
+    }
+
+    protected function hasLimitedUserRole($user): bool
+    {
+        return (in_array($user-&gt;role-&gt;name, $this-&gt;getLimitedRoles()));
+    }
+
+    protected function getLimitedRoles(): array
+    {
+        return [
+            'Middle Manager',
+            'Secretary',
+            'Janitor',
+        ];
+    }
+</code></pre>
+
+<p>This turned into a long reply. Hopefully something here helps!</p>
+    </div>

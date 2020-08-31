@@ -1,0 +1,73 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Dispose the scheduler gracefully</h2>
+
+<p>As you mentioned, you lack proper disposal functionality.</p>
+
+<blockquote>
+<pre><code>void Run() {
+    while (!m_disposed) {
+        var task = m_taskQueue.Take();
+        Debug.Assert(TryExecuteTask(task));
+    }
+}
+</code></pre>
+</blockquote>
+
+<p>The first issue is that <code>bool m_disposed</code> is not marked as <em><a href="https://docs.microsoft.com/en-us/dotnet/csharp/language-reference/keywords/volatile" rel="nofollow noreferrer">volatile</a></em>. This means that this variable is subject to optimisations that could render its usage invalid for your scenario. If optimized, the value will be cached once, and never re-read in the same ongoing method call, causing an infinite loop.</p>
+
+<p>The second issue is that you can't abort waiting a new task using <code>Take()</code>. But there is a simple alternative <code>Take(CancellationToken ct)</code>; Keep track of a <code>CancellationTokenSource</code> in your task scheduler, pass its <code>Token</code> to <code>Take(token)</code>; on disposal of the instance, flag it by calling <code>Cancel()</code>.</p>
+
+<p>I would also verify how <code>Debug.Assert(TryExecuteTask(task))</code> gets optimized in production code. And whether this could introduce unwanted side effects.</p>
+
+<h3>Revised</h3>
+
+<pre><code>class SequentialScheduler : TaskScheduler, IDisposable {
+    readonly BlockingCollection&lt;Task&gt; m_taskQueue = new BlockingCollection&lt;Task&gt;();
+    readonly Thread m_thread;
+    readonly CancellationTokenSource m_cancellation; // CR comment: field added
+    volatile bool m_disposed;  // CR comment: volatile added
+
+    public SequentialScheduler() {
+        m_cancellation = new CancellationTokenSource();
+        m_thread = new Thread(Run);
+        m_thread.Start();
+    }
+
+    public void Dispose() {
+        m_disposed = true;
+        m_cancellation.Cancel(); // CR comment: cancellation added
+    }
+
+    void Run() {
+        while (!m_disposed) {
+            // CR comment: dispose gracefully
+            try
+            {
+                var task = m_taskQueue.Take(m_cancellation.Token);
+                // Debug.Assert(TryExecuteTask(task));
+                TryExecuteTask(task); // CR comment: not sure about the Debug.Assert here
+            }
+            catch (OperationCanceledException)
+            { 
+                Debug.Assert(m_disposed);
+            }
+        }
+    }
+
+    protected override IEnumerable&lt;Task&gt; GetScheduledTasks() {
+        return m_taskQueue;
+    }
+
+    protected override void QueueTask(Task task) {
+        m_taskQueue.Add(task);
+    }
+
+    protected override bool TryExecuteTaskInline(Task task, bool taskWasPreviouslyQueued) {
+        if (Thread.CurrentThread == m_thread) {
+            return TryExecuteTask(task);
+        }
+        return false;
+    }
+}
+</code></pre>
+    </div>

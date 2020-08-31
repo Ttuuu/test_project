@@ -1,0 +1,250 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Welcome to code review.</p>
+
+<p><strong>Avoid using writable instance variables</strong></p>
+
+<p>Using writable instance variables in various methods should be avoided if possible, because the code becomes very fast complex.</p>
+
+<p>For example the property 'Chartvalues' will be set in 'constructor' and in method 'ChartOnDataClick' and used in other methods.</p>
+
+<p>This desing can be simply improved by using a read-only property:</p>
+
+<pre><code>public ChartValues&lt;ObservablePoint&gt; Chartvalues =&gt; (ChartValues&lt;ObservablePoint&gt;)SeriesCollection[0].Values
+</code></pre>
+
+<p>and changing the initialization like:</p>
+
+<pre><code>public MainWindow()
+{
+    ....
+    var lineSeries = new LineSeries
+    {
+        Title = "Line 1",
+        Values = new ChartValues&lt;ObservablePoint&gt;(GetInitialPoints()),
+        StrokeThickness = 4,
+        ....
+}
+
+private IEnumerable&lt;ObservablePoint&gt; GetInitialPoints() //plot the values of the chart
+{
+    double[] xvals = { 0, 2, 3, 4, 5, 6, 7, 8, 9 };
+    double[] yvals = { 0, 1, 2, 3, 1, 2, 3, 1, 2 };
+
+    for (int i = 0; i &lt; xvals.Length; i++)
+    {
+        yield new ObservablePoint { X = xvals[i], Y = yvals[i] };
+    }
+}
+</code></pre>
+
+<p><strong>Use Keyboard.Modifiers instead of checking modifier keys seperatly</strong></p>
+
+<ul>
+<li>Instead of <code>Keyboard.IsKeyDown(Key.LeftCtrl) || Keyboard.IsKeyDown(Key.RightCtrl)</code> the simpler form <code>(Keyboard.Modifiers &amp; ModifierKeys.Control) != 0</code> can be used.</li>
+</ul>
+
+<p><strong>Keep it simple</strong></p>
+
+<ul>
+<li><code>shiftclick</code> is actually not necessary. You can remove the variable and lots of code with it.</li>
+</ul>
+
+<p><strong>Name event handlers like event handlers</strong></p>
+
+<ul>
+<li>It is a good style to name event handler like event handler and extract functional code to methods.</li>
+</ul>
+
+<p>For example:</p>
+
+<pre><code>private void MouseClickedEventHandler(object sender, MouseButtonEventArgs e)
+{
+    if (e.ChangedButton == MouseButton.Left)
+    {
+        var newPoint = diagram.ConvertToChartValues(e.GetPosition(diagram));
+        AddPoint(newPoint);
+    }
+}
+
+private void AddPoint(Point newPoint)
+{
+    var addedPoint = new ObservablePoint(Math.Round(newPoint.X, roundedNumber), Math.Round(newPoint.Y, roundedNumber));
+    Chartvalues.Add(addedPoint);
+
+    SortChartValues();
+    highlightedIndex.Clear();
+
+    for (int i = 0; i &lt; Chartvalues.Count; i++) 
+    {
+        if (addedPoint.X == Chartvalues[i].X) // adds the clicked point to the list
+        {
+            highlightedIndex.Add(i);
+            i = Chartvalues.Count;
+        }
+    }
+}
+</code></pre>
+
+<p><strong>When complexity increases, use object oriented design to keep it maintainable</strong></p>
+
+<p>The problem with writing all that event handling code in one class with global states (writable instance variables) is, that it does not scale. For your use case it may work... but adding new use cases will very likly break exiting functionality and code becomes unmaintainable.</p>
+
+<p>Fortunately, we are working with a programming language supporting advanced object oriented design, so why not using it.</p>
+
+<p>We have a chart that we want to interact with. At any given time, we are in a certain <em>logical state</em> (e.g.: Idle, Point selected, Moving selection rectangle, ...) and incoming events can change the current <em>logical state</em> to another one.</p>
+
+<p>Instead of having one global state (all writable instance variables) where the <em>logical state</em> can be derived from, why not designing the <em>logical states</em> directly? This design is already known as <a href="https://en.wikipedia.org/wiki/State_pattern" rel="nofollow noreferrer">state pattern</a>.</p>
+
+<p>In your case, state diagram may look like:
+<a href="https://i.stack.imgur.com/SOj0M.png" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/SOj0M.png" alt="enter image description here"></a></p>
+
+<p>Corresponding implementation of the state pattern may look like:</p>
+
+<pre><code>internal interface IChartContext
+{
+    ChartPoint AddPoint(Point position);
+    void Select(ChartPoint chartPoint);
+    void ToggleSelection(ChartPoint chartPoint);
+    void ExtendSelection(ChartPoint chartPoint);
+    void ChangeState(State state);
+}
+
+internal abstract class State
+{
+    protected State(IChartContext ctx)
+    {
+        this.Ctx = ctx;
+    }
+
+    public virtual void OnLeftMouseUp(MouseButtonEventArgs e) { }
+    public virtual void OnLeftMouseDown(MouseButtonEventArgs e) { }
+    public virtual void OnMouseMove(MouseEventArgs e) { }
+
+    internal IChartContext Ctx { get; }
+}
+
+internal class IdleState : State
+{
+    public IdleState(IChartContext ctx) : base(ctx) { }
+
+    public override void OnLeftMouseDown(MouseButtonEventArgs e)
+    {
+        var point = e.GetPosition(this.Ctx.DrawingArea);
+        var point = this.Ctx.AddPoint(point);
+        this.Ctx.ChangeState(new PointMovingState(this.Ctx, point));
+    }
+
+    public override void OnMouseMove(MouseEventArgs e)
+    {
+        var point = e.GetPosition(this.Ctx.DrawingArea);
+        var chartPoint = this.Ctx.GetChartPoint(point);
+        if (chartPoint != null)
+        {
+            this.Ctx.ChangeState(new MouseOverPoint(this.Ctx, chartPoint));
+        }
+    }
+}
+
+internal class PointMovingState : State
+{
+    private readonly ChartPoint chartPoint;
+
+    public PointMovingState(IChartContext ctx, ChartPoint chartPoint) : base(ctx) 
+    {
+        this.chartPoint = chartPoint;
+    }
+
+    public override void OnMouseMove(MouseEventArgs e)
+    {
+        var point = e.GetPosition(this.Ctx.DrawingArea);
+        this.chartPoint.X = point.X;
+        this.chartPoint.Y = point.Y;
+    }
+
+    public override OnLeftMouseUp(MouseButtonEventArgs e)
+    {
+        this.Ctx.ChangeState(new MouseOverPoint(this.Ctx, point));
+    }
+}
+
+internal class MouseOverPoint : State
+{
+    private readonly ChartPoint chartPoint;
+
+    public MouseOverPoint(IChartContext ctx, ChartPoint chartPoint) : base(ctx)
+    {
+        this.chartPoint = chartPoint;
+    }
+
+    public override void OnMouseMove(MouseEventArgs e)
+    {
+        var point = e.GetPosition(this.Ctx.DrawingArea);
+        var chartPoint = this.Ctx.GetChartPoint(point);
+        if (chartPoint == null)
+        {
+            this.Ctx.ChangeState(new IdleState(this.Ctx));
+        }
+        if (chartPoint != this.chartPoint)
+        {
+            this.Ctx.ChangeState(new MouseOverPoint(this.Ctx, chartPoint));
+        }
+    }
+
+    public override OnLeftMouseDown(MouseButtonEventArgs e)
+    {
+        if (Keyboard.Modifiers &amp; ModifierKeys.Control != 0)
+        {
+            this.Ctx.ToggleSelection(this.chartPoint);
+        }
+        else if (Keyboard.Modifiers &amp; ModifierKeys.Shift != 0)
+        {
+            this.Ctx.ExtendSelection(this.chartPoint);
+        }
+        else
+        {
+            this.Ctx.Select(this.chartPoint);
+        }
+
+        this.Ctx.ChangeState(new PointMovingState(this.Ctx, point));
+    }
+}
+
+
+public partial class MainWindow : Window, IChartContext
+{
+    private State state;
+
+    public MainWindow()
+    {
+        InitializeComponent();
+
+        // initialization logic     
+        this.state = new IdleState(this);
+    }
+
+    public ChartPoint AddPoint(Point position) {
+        // add logic for adding point       
+    }
+    void Select(ChartPoint chartPoint) {
+        // add logic for select single point
+    }
+    void ToggleSelection(ChartPoint chartPoint) {
+        // add logic for toggle selection
+    }
+    void ExtendSelection(ChartPoint chartPoint) {
+        // add logic for extend selection
+    }
+    void ChangeState(State state) {
+        this.state = state;
+    }
+
+    private void ChartOnMouseLeftButtonUp(object sender, MouseButtonEventArgs e) =&gt; this.state.OnLeftMouseUp(e);    
+    private void ChartOnMouseLeftButtonDown(object sender, MouseButtonEventArgs e) =&gt; this.state.OnLeftMouseDown(e);    
+    private void ChartOnMouseMove(object sender, MouseEventArgs e) =&gt; this.state.OnMouseMove(e);
+}
+</code></pre>
+
+<p>Even if there is a lot of structual code, that design allows complex chart interaction and will scale with complexity. Therefore it is possible to add more use cases (states and transistions) without touching (and break) existing functionality.</p>
+
+<p>For very simple use cases it may be over-engineered, but in your case I would think about using that pattern.</p>
+    </div>

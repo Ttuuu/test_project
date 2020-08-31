@@ -1,0 +1,164 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<ul>
+<li>use a logger as EBrown said</li>
+<li>FileInfo will shorten some expressions</li>
+<li>EventArgs should be readonly (Except return parameter which are not present)</li>
+<li>use EventaArgs.Empty instead of newing up an instance every time</li>
+<li>EventArgs can calculate other Properties so the download method will get shorter</li>
+<li>the 3 lines which create the filestream can be reduced to 1 when it is delayed to the actual use</li>
+<li>the using will take care of Disposing and stream Dispose calls Flush
+
+<ul>
+<li>FileMode.Create will Take care of removing the outdated file in case of non resumable download</li>
+</ul></li>
+<li>IMO Prefixing the events is not nessesary because the class name and the varable name it contains should indicate its a downloader.complete (instead of duplicate downloader.DownloadComplete)</li>
+<li>Stopwatch.StartNew() is shorter than <code>new Stopwatch()</code> and <code>Start()</code></li>
+</ul>
+
+<p>complete refactored code</p>
+
+<pre><code>public interface ILogger
+{
+    void Log(string format, params object[] args);
+    void Log(object message);
+}
+
+public class Downloader
+{
+    public Downloader(ILogger logger)
+    {
+        _logger = logger;
+    }
+
+    public event EventHandler&lt;DownloadStatusChangedEventArgs&gt; ResumablityChanged;
+    public event EventHandler&lt;DownloadProgressChangedEventArgs&gt; ProgressChanged;
+    public event EventHandler Completed;
+
+    public bool stop = true; // by default stop is true
+    private ILogger _logger;
+
+    public void DownloadFile(string downloadLink, string path)
+    {
+        stop = false; // always set this bool to false, everytime this method is called
+
+        var fileInfo = new FileInfo(path);
+        long existingLength = 0;
+        if (fileInfo.Exists)
+            existingLength = fileInfo.Length;
+
+        var request = (HttpWebRequest)HttpWebRequest.Create(downloadLink);
+        request.Proxy = null;
+        request.AddRange(existingLength);
+
+        try
+        {
+            using (var response = (HttpWebResponse)request.GetResponse())
+            {
+                long fileSize = existingLength + response.ContentLength; //response.ContentLength gives me the size that is remaining to be downloaded
+                bool downloadResumable; // need it for sending empty progress
+
+                if (response.StatusCode == HttpStatusCode.PartialContent)
+                {
+                    downloadResumable = true;
+                }
+                else // sometimes a server that supports partial content will lose its ability to send partial content(weird behavior) and thus the download will lose its resumability
+                {
+                    _logger.Log("Resume Not Supported");
+                    existingLength = 0;
+                    downloadResumable = false;
+                }
+                OnResumabilityChanged(new DownloadStatusChangedEventArgs(downloadResumable));
+
+                using (var saveFileStream = fileInfo.Open(downloadResumable ? FileMode.Append : FileMode.Create, FileAccess.Write))
+                using (var stream = response.GetResponseStream())
+                {
+                    byte[] downBuffer = new byte[4096];
+                    int byteSize = 0;
+                    long totalReceived = byteSize + existingLength;
+                    var sw = Stopwatch.StartNew();
+                    while (!stop &amp;&amp; (byteSize = stream.Read(downBuffer, 0, downBuffer.Length)) &gt; 0)
+                    {
+                        saveFileStream.Write(downBuffer, 0, byteSize);
+                        totalReceived += byteSize;
+
+                        var currentSpeed = totalReceived / sw.Elapsed.TotalSeconds;
+                        OnProgressChanged(new DownloadProgressChangedEventArgs(totalReceived, fileSize, (long)currentSpeed));
+                    }
+                    sw.Stop();
+                }
+            }
+            if (!stop)
+                OnCompleted(EventArgs.Empty);
+        }
+        catch (WebException e)
+        {
+            _logger.Log(e);
+        }
+    }
+
+    public void StopDownload()
+    {
+        stop = true;
+    }
+
+    protected virtual void OnResumabilityChanged(DownloadStatusChangedEventArgs e)
+    {
+        var handler = ResumablityChanged;
+        if (handler != null)
+        {
+            handler(this, e);
+        }
+    }
+
+    protected virtual void OnProgressChanged(DownloadProgressChangedEventArgs e)
+    {
+        var handler = ProgressChanged;
+        if (handler != null)
+        {
+            handler(this, e);
+        }
+    }
+
+    protected virtual void OnCompleted(EventArgs e)
+    {
+        var handler = Completed;
+        if (handler != null)
+        {
+            handler(this, e);
+        }
+    }
+}
+
+public class DownloadStatusChangedEventArgs : EventArgs
+{
+    public DownloadStatusChangedEventArgs(bool canResume)
+    {
+        ResumeSupported = canResume;
+    }
+    public bool ResumeSupported { get; private set; }
+}
+
+public class DownloadProgressChangedEventArgs : EventArgs
+{
+    public DownloadProgressChangedEventArgs(long totalReceived, long fileSize, long currentSpeed)
+    {
+        BytesReceived = totalReceived;
+        TotalBytesToReceive = fileSize;
+        CurrentSpeed = currentSpeed;
+    }
+    public long BytesReceived { get; private set; }
+    public long TotalBytesToReceive { get; private set; }
+    public float ProgressPercentage { get { return ((float)BytesReceived / (float)TotalBytesToReceive) * 100; } }
+    /// &lt;summary&gt;in Bytes&lt;/summary&gt;
+    public long CurrentSpeed { get; private set; }
+    public TimeSpan TimeLeft
+    {
+        get
+        {
+            var bytesRemainingtoBeReceived = TotalBytesToReceive - BytesReceived;
+            return TimeSpan.FromSeconds(bytesRemainingtoBeReceived / CurrentSpeed);
+        }
+    }
+}
+</code></pre>
+    </div>

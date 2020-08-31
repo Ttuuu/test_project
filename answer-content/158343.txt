@@ -1,0 +1,73 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Maikel covered some issues, but since title says "reinventing <em>std::optional</em>", I'll assume that you want full blown <a href="http://en.cppreference.com/w/cpp/utility/optional" rel="nofollow noreferrer">std::optional</a> (which is quite hard to get right, but not as hard as <a href="https://codereview.stackexchange.com/questions/141004/custom-basic-stdvariant">std::variant</a>). I want to add that your code as it stands probably is good for your needs already. I'll also try to answer some of the questions you mentioned in the comments.</p>
+
+<p><strong>edit:</strong> <a href="https://codereview.stackexchange.com/users/188857/l-f">@L.F.</a> noticed that placement new is not <code>constexpr</code> friendly. For possibilities of getting that feature please have a look at <a href="https://stackoverflow.com/q/53084703/4593721">this question</a> and it's accepted answer.</p>
+
+<p><strong>Container:</strong></p>
+
+<p>Currently value is stored in the variable of its own type. To make it more robust (such as handling non default constructible types, or types that are expensive to construct), it is possible to store the value in the byte array. Yes, it might sound scary, but it is the easiest approach in my opinion.</p>
+
+<pre><code>using byte = unsigned char;
+alignas(T) byte[sizeof(T)] container;
+</code></pre>
+
+<p>Then it is possible to use <a href="http://en.cppreference.com/w/cpp/language/new" rel="nofollow noreferrer">placement new</a> to construct the value. Now we control when object will be constructed.</p>
+
+<p>To access the value already stored in it, <code>reinterpret_cast&lt;&gt;</code> is needed. I know this starts sounding dangerous, but it is the way it should be.</p>
+
+<pre><code>T&amp; get() noexcept
+{
+    return *reinterpret_cast&lt;T*&gt;(&amp;container[0]);
+}
+
+const T&amp; get() const noexcept
+{
+    return *reinterpret_cast&lt;T*&gt;(&amp;container[0]);
+}
+</code></pre>
+
+<p>The destructor will need to be changed then:</p>
+
+<pre><code>~Optional()
+{
+    reinterpret_cast&lt;T*&gt;(&amp;container[0])-&gt;~T();
+}
+</code></pre>
+
+<p><strong>noexcept</strong></p>
+
+<p><code>noexcept</code> means that the function promises that it won't throw, and if it will, <code>std::terminate</code> is called. It is good because people will know that they can call the function without worrying that it will throw. For example, they could use it in destructors, exception handlers, where throwing again would call <code>std::terminate</code>.</p>
+
+<p>As a side note, if there is any member variable that has throwing destructor, the destructor of the enclosing class will be marked as <code>noexcept(false)</code> (<a href="http://en.cppreference.com/w/cpp/language/noexcept_spec" rel="nofollow noreferrer">link</a>, see the explanation part), which might get into trouble in generic code. </p>
+
+<p><strong>emplace construction:</strong></p>
+
+<p>With current interface users will have to <em>construct the value and then copy it into the optional</em>, which is wasteful. One way is to create move constructor, the other way is to create conversion constructor (there is no real agreement on how those are called).</p>
+
+<pre><code>template &lt;typename ... ArgTypes&gt;
+Optional(std::in_place_t&lt;T&gt;, ArgTypes ... args)
+{
+    new (&amp;container[0]) T(std::forward&lt;ArgTypes&gt;(args)...);  
+}
+</code></pre>
+
+<p>Notice how I used <code>std::in_place_t&lt;T&gt;</code>. It is there because compiler will treat every call to constructor as conversion constructor. The reason is that <code>ArgTypes...</code> can be anything, which includes <code>bool</code>, <code>int</code>, <code>SomeTypeThatHasNothingToDoAboutIt</code> and <code>Optional&lt;T&gt;&amp;</code>. <code>std::in_place_t&lt;T&gt;</code> will disambiguate that. As an example:</p>
+
+<pre><code>Optional&lt;int&gt; opt(2);
+Optional&lt;int&gt; anotherOpt(opt); 
+//                       ^^ ArgTypes is T&amp;, not const T&amp;,
+//                        so conversion constructor will be called
+//                        which is plain wrong.
+</code></pre>
+
+<p>The way to work around that would be:</p>
+
+<pre><code>Optional&lt;int&gt; anotherOpt(std::as_const(opt));
+</code></pre>
+
+<p>But it is almost the same typing as <code>std::in_place_t&lt;T&gt;</code>.</p>
+
+<p><strong>assignment:</strong></p>
+
+<p>The class would benefit from implementing <code>operator=(...)</code>. Move assigning would also be great. Additionally, there is no way to assign one <code>Optional</code> to another <code>Optional</code>, which would be great to have.</p>
+    </div>

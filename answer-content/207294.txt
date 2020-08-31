@@ -1,0 +1,1124 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I found a number of compilation issues using GCC 8 (with <code>-std=c++2a</code>).  I'm guessing you're using an older or less-conformant compiler.  Here's what I had to change.</p>
+
+<hr>
+
+<p>The <code>typename</code> keyword isn't wanted here (where it knows that <code>Iterator&lt;&gt;</code> is a type):</p>
+
+<blockquote>
+<pre><code>    using iterator = typename Iterator&lt;T, dims, size_type,
+        difference_type, 0, 0&gt;;
+</code></pre>
+</blockquote>
+
+<p>Removing the unnecessary keyword makes this bit happy.</p>
+
+<hr>
+
+<p>Next, it complains that <code>Row::ArrayBase</code> is used without its template parameters here:</p>
+
+<blockquote>
+<pre><code>    using ArrayBase::arr;
+    using ArrayBase::sizes;
+    using ArrayBase::rowsize;
+</code></pre>
+</blockquote>
+
+<p>We can either write the class name in full, or move the definition of <code>base</code> a bit earlier, and use that (I'll choose the latter).</p>
+
+<p>We also need <code>using ArrayBase::tot_size;</code> here, to access it without qualification.</p>
+
+<p>There's a similar issue in <code>View</code> and in <code>Array</code>, but here, <code>base</code> is already declared early enough to use in place of <code>ArrayBase</code>.</p>
+
+<hr>
+
+<p>We need to add <code>typename</code> here (perhaps we can use one of the rescued ones from the beginning of this review?):</p>
+
+<pre><code>    template &lt;class...U,
+        typename = typename std::enable_if&lt;dims == sizeof...(U)&gt;::type&gt;
+                 //^^^^^^^^\\
+</code></pre>
+
+<hr>
+
+<p>A simple typo here:</p>
+
+<blockquote>
+<pre><code>        if (std::allocator_traits(
+            Allocator)::propagate_on_container_copy_assignment::value
+</code></pre>
+</blockquote>
+
+<p>Should be <code>std::allocator_traits&lt;Allocator&gt;propagate_on_container_copy_assignment::value</code>, of course (I'm surprised this even compiles on your system!)</p>
+
+<hr>
+
+<p>The specialization of <code>getXElt()</code> is illegally placed within the <code>Iterator</code> definition; it needs to be external.  It's really hard to get the nested template syntax right there (and even harder to read and understand), so I'd prefer to combine the implementations using <code>if constexpr</code>:</p>
+
+<pre><code>    template&lt;bool x=false&gt;
+    reference getXElt(difference_type i) {
+        if constexpr(x) {
+            return getConstElt(arr - rowsize * (rev ? 1 : 0), sizes, rowsize, i);
+        } else {
+            return getElt(arr - rowsize * (rev ? 1 : 0), sizes, rowsize, i);
+        }
+    }
+</code></pre>
+
+<p>If that's not available to you, you could use <code>std::enable_if</code> as for other methods in this class.</p>
+
+<hr>
+
+<p><code>ArrayBase</code> needs to use <code>this-&gt;getElt</code> to access its dependent base class:</p>
+
+<pre><code>    reference operator[](size_type i) noexcept {
+        return this-&gt;getElt(arr, sizes, rowsize, i);
+    }
+    const reference operator[](size_type i) const noexcept {
+        return this-&gt;getConstElt(arr, sizes, rowsize, i);
+    }
+</code></pre>
+
+<hr>
+
+<p>The <code>constIter</code> test wouldn't compile because <code>for (auto&amp; it1 : dynarray)</code> attempts to bind non-const lvalue reference of type <code>DynArray::Row&lt;int, 2, long unsigned int, long int&gt;&amp;</code> to an rvalue of type <code>DynArray::Iterator&lt;int, 3, long unsigned int, long int, false, false&gt;::reference</code> {aka <code>DynArray::Row&lt;int, 2, long unsigned int, long int&gt;</code>}.</p>
+
+<p>The <code>rowSwap</code> test won't compile for a similar reason (attempt to bind an lvalue reference to rvalue in <code>swap()</code>)</p>
+
+<hr>
+
+<p>Here's what I ended up with when I'd made the minimal changes to compile, and converted to GTest (since your choice of test framework isn't available in Debian):</p>
+
+<pre><code>#include &lt;type_traits&gt;
+#include &lt;algorithm&gt;
+#include &lt;exception&gt;
+#include &lt;stdexcept&gt;
+#include &lt;memory&gt;
+#include &lt;utility&gt;
+#include &lt;iterator&gt;
+#include &lt;array&gt;
+#include &lt;vector&gt;
+
+/********************************
+This intends to provide a general use multi dimensional view over a
+1-D array. Public API classes:
+
+template &lt;class T, int dims, class Allocator = allocator&lt;T&gt; &gt;
+class Array: public ArrayBase&lt;T, dims,
+        typename allocator_traits&lt;Allocator&gt;::size_type,
+        typename allocator_traits&lt;Allocator&gt;::difference_type&gt;
+This is a quasi container in the sense that it holds the internal array in
+a member vector. But it is only a proxy container because it pretends that
+its elements are Row objects
+Array can be initialized from a raw array along with its dimensions, and
+it will hold a copy of the original data. It supports copy/move/swap semantics
+from another Array or copy semantics from any ArrayBase
+
+template &lt;class T, int dims, class size_type = size_t,
+class difference_type = ptrdiff_t&gt;
+class View : public ArrayBase&lt;T, dims, size_type, difference_type&gt; {
+This a a View over an external raw array which is expected to have a lifetime
+at least as long as the view. It will also pretends that its elements are Row
+objects.
+View can be initialized from a raw array and its dimensions, and will only
+keep a raw pointer over the original array. It supports copy semantics from
+any ArrayBase. Views are swappable, but this only change where each view
+points to
+
+template &lt;class T, int dims, class size_type, class difference_type&gt;
+class Row : public ArrayBase&lt;T, dims, size_type, difference_type&gt;
+This class represents a subarray of an Array, a View or another Row. It can
+only be created as an element of its parent. Rows can be copied, or moved
+from any ArrayBase. Rows are swappable. Operator &amp; on a row returns an iterator.
+
+template &lt;class T, int dims, class size_type, class difference_type&gt;
+class ArrayBase: ElementAccessor&lt;T, size_type, difference_type,
+size_type, dims&gt;
+ArrayBase is the base class of Array, View and ArrayBase. It contains all
+the logic of element access and iteration. Its iterators pretend to be
+random access iterators, but are only proxy iterators. That is quite enough 
+for for loops with container syntax, and iterator arithmetics, but usage with
+standard algorithms (sort, shuffle, etc.) cannot be guaranteed
+
+template &lt;class T, class Allocator = std::allocator&lt;T&gt; &gt;
+class ArrayBuilder;
+This is only a utility class that knows how to build Array of View objects.
+It can save some boiler plate template declaration by declaring the types 
+once at builder initialization, mainly when using not default allocators,
+size_type or difference_type.
+********************************/
+namespace DynArray {
+
+    using std::allocator;
+    using std::allocator_traits;
+
+    //Forward declarations
+    template &lt;class T, int dims, class size_type, class difference_type,
+        bool cnst = false, bool rev=false&gt; class Iterator;
+
+    template &lt;class T, int dims, class size_type, class difference_type&gt;
+    class Row;
+
+    namespace {
+        /* private utility class to allow specialization of element access
+        through operator[] or operator *
+        */
+        template &lt;class T, class size_type, class difference_type,
+            class index_type, int dims&gt; class ElementAccessor {
+        protected:
+            Row&lt;T, dims - 1, size_type, difference_type&gt; getElt(T* arr,
+                size_type *sizes, size_type rowsize, index_type i) {
+                Row&lt;T, dims - 1, size_type, difference_type&gt; child(
+                    arr + rowsize * i,
+                    sizes + 1, rowsize / sizes[1]);
+                return child;
+            }
+            const Row&lt;T, dims - 1, size_type, difference_type&gt; getConstElt(T* arr,
+                size_type *sizes, size_type rowsize, index_type i) {
+                Row&lt;T, dims - 1, size_type, difference_type&gt; child(
+                    arr + rowsize * i,
+                    sizes + 1, rowsize / sizes[1]);
+                return child;
+            }
+        };
+        // specialization for dims == 1: elements are actual T
+        template &lt;class T, class size_type, class difference_type,
+            class index_type&gt; class ElementAccessor&lt;T, size_type,
+            difference_type, index_type, 1&gt; {
+        protected:
+            T&amp; getElt(T* arr, size_type *, size_type,
+                index_type i) {
+                return arr[i];
+            }
+            const T&amp; getConstElt(T* arr, size_type *,
+                size_type, index_type i) {
+                return arr[i];
+            }
+        };
+    }
+
+    // Base: contains the data and types and manages access to elements
+    // and sub arrays
+
+    template &lt;class T, int dims, class size_type, class difference_type&gt;
+    class ArrayBase: ElementAccessor&lt;T, size_type, difference_type,
+        size_type, dims&gt; {
+    public:
+        using iterator = Iterator&lt;T, dims, size_type,
+            difference_type, 0, 0&gt;;
+        using const_iterator = Iterator&lt;T, dims, size_type,
+            difference_type, 1, 0&gt;;
+        typedef typename std::conditional&lt;dims == 1, T,
+            Row&lt;T, dims - 1, size_type, difference_type&gt;&gt;::type value_type;
+        typedef typename std::conditional&lt;dims == 1, T&amp;,
+            value_type&gt;::type reference;
+        // reference is indeed a proxy to real data when dims != 1
+        using reverse_iterator = Iterator&lt;T, dims, size_type,
+            difference_type, 0, 1&gt;;
+        using const_reverse_iterator = Iterator&lt;T, dims, size_type,
+            difference_type, 1, 1&gt;;
+
+    protected:
+        T* arr;                      // underlying array for the data
+        size_type *sizes;            // array of dimensions of the nD array
+        size_type rowsize;           // cached size of a top level row
+
+        // protected ctor called from subclasses
+        ArrayBase(T* arr, size_type* sizes, size_type rowsize)
+            : arr(arr), sizes(sizes), rowsize(rowsize) {}
+
+        // pseudo-assignment from subclasses
+        void load(T* arr, size_type *sizes, size_type rowsize) {
+            this-&gt;arr = arr;
+            this-&gt;sizes = sizes;
+            this-&gt;rowsize = rowsize;
+        }
+
+    public:
+        virtual ~ArrayBase() = default;
+
+        // access to member
+        reference operator[](size_type i) noexcept {
+            return this-&gt;getElt(arr, sizes, rowsize, i);
+        }
+        const reference operator[](size_type i) const noexcept {
+            return this-&gt;getConstElt(arr, sizes, rowsize, i);
+        }
+        // access to internal data, arr and sizes and number of dimensions
+        size_type size(size_type i) const {
+            if (i &gt;= dims) {
+                throw std::out_of_range("Illegal dimension");
+            }
+            return sizes[i];
+        }
+        size_type size() const noexcept {
+            return sizes[0];
+        }
+        size_type tot_size() const noexcept {
+            return sizes[0] * rowsize;
+        }
+        T* data() noexcept {
+            return arr;
+        }
+        const T* data() const noexcept {
+            return arr;
+        }
+        constexpr int getdims() const noexcept {
+            return dims;
+        }
+
+        // iterators
+        iterator begin() {
+            return iterator(arr, sizes, rowsize);
+        }
+        iterator end() {
+            iterator tmp = begin();
+            tmp += sizes[0];
+            return tmp;
+        }
+        const_iterator begin() const {
+            return cbegin();
+        }
+        const_iterator end() const {
+            return cend();
+        }
+        const_iterator cbegin() const {
+            return const_iterator(arr, sizes, rowsize);
+        }
+        const_iterator cend() const {
+            const_iterator tmp = cbegin();
+            tmp += sizes[0];
+            return tmp;
+        }
+        reverse_iterator rbegin() {
+            reverse_iterator tmp = rend();
+            tmp -= sizes[0];
+            return tmp;
+        }
+        reverse_iterator rend() {
+            return reverse_iterator(arr, sizes, rowsize);
+        }
+        const_reverse_iterator rbegin() const {
+            return rcbegin();
+        }
+        const_reverse_iterator rend() const {
+            return rcend();
+        }
+        const_reverse_iterator rcbegin() const {
+            const_reverse_iterator tmp = rend();
+            tmp -= sizes[0];
+            return tmp;
+        }
+        const_reverse_iterator rcend() const {
+            return const_reverse_iterator(arr, sizes, rowsize);
+        }
+    };
+
+    // Row represents a sub-array. Handles copying, moving and swapping rows
+    // can only be created by an ElementAccessor
+    template &lt;class T, int dims, class size_type, class difference_type&gt;
+    class Row : public ArrayBase&lt;T, dims, size_type, difference_type&gt; {
+    public:
+        using base = ArrayBase&lt;T, dims, size_type, difference_type&gt;;
+
+    protected:
+        using base::arr;
+        using base::sizes;
+        using base::rowsize;
+        using base::tot_size;
+
+        Row(T* arr, size_type* sizes, size_type rowsize)
+            : base(arr, sizes, rowsize) {}
+
+    public:
+        /* copy/move assignment (construction can only be from an ElementAccessor)
+        Programmers must use a view or a reference to point to a row, or an
+        Array to get a copy.
+        Swap operation is also possible */
+        Row&amp; operator=(const base&amp; src) {
+            if (tot_size() != src.tot_size()) {
+                throw std::logic_error("Wrong sizes");
+            }
+            for (size_type i = 0; i &lt; tot_size(); i++) {
+                arr[i] = src.data()[i];
+            }
+            return *this;
+        }
+        Row&amp; operator=(base&amp;&amp; src) {
+            if (tot_size() != src.tot_size()) {
+                throw std::logic_error("Wrong sizes");
+            }
+            for (size_type i = 0; i &lt; tot_size(); i++) {
+                arr[i] = std::move(src.data()[i]);
+            }
+            return *this;
+        }
+
+        Iterator&lt;T, dims + 1, size_type, difference_type, 0, 0&gt; operator&amp;() {
+            return Iterator&lt;T, dims + 1, size_type,difference_type,
+                0, 0&gt;(arr, sizes - 1, sizes[0] * rowsize);
+        }
+        Iterator&lt;T, dims + 1, size_type, difference_type, 1, 0&gt; operator&amp;() const {
+            return Iterator&lt;T, dims + 1, size_type, difference_type,
+                1, 0&gt;(arr, sizes - 1, sizes[0] * rowsize);
+        }
+        // 1 argument swap allows the other member to be any ArrayBase
+        void swap(base&amp; other) {
+            if (tot_size() != other.tot_size()) {
+                throw std::logic_error("Wrong sizes");
+            }
+            for (size_type i = 0; i &lt; tot_size(); i++) {
+                swap(arr[i], other.data()[i]);
+            }
+        }
+        friend class ElementAccessor&lt;T, size_type, difference_type,
+            size_type, dims + 1&gt;;
+        friend class ElementAccessor&lt;T, size_type, difference_type,
+            difference_type, dims + 1&gt;;
+    };
+
+    // 2 arguments swap between Rows
+    template &lt;class T, int dims, class size_type, class difference_type&gt;
+    void swap(Row&lt;T, dims, size_type, difference_type&gt;&amp; first,
+        Row&lt;T, dims, size_type, difference_type&gt;&amp; second) {
+        first.swap(second);
+    }
+
+    namespace {
+        template &lt;class size_type, class...U&gt;
+        size_type calc_size(size_type *dest, U...sizes)
+        {
+            if (dest) {
+                ((*dest++ = sizes) , ...);
+            }
+            return (sizes * ...);
+        }
+
+    }
+
+    // View is a top-level nD array over an existing raw array - no ownership
+    template &lt;class T, int dims, class size_type = size_t,
+        class difference_type = ptrdiff_t&gt;
+    class View : public ArrayBase&lt;T, dims, size_type, difference_type&gt; {
+    public:
+        using base = ArrayBase&lt;T, dims, size_type, difference_type&gt;;
+    private:
+        using base::arr;
+        using base::sizes;
+        using base::rowsize;
+
+        // private array to hold the actual dimensions
+        // constraint: sizes shall point to _sizes
+        size_type _sizes[dims];
+
+    public:
+        /* public ctors, assignment operators and swap.
+        Only copy semantics, because assignment only changes where the
+        view points to, not the underlying data */
+        template &lt;class...U,
+            typename = typename std::enable_if&lt;dims == sizeof...(U)&gt;::type&gt;
+        View(T* arr, U...sz): base(arr, _sizes, 0) {
+            size_t tot = calc_size&lt;size_type&gt;(sizes, sz...);
+            rowsize = tot / sizes[0];
+        }
+        View(const base&amp; other) :
+            ArrayBase&lt;T, dims, size_type, difference_type&gt;(other) {
+            std::copy(sizes, sizes + dims, _sizes);
+            sizes = _sizes;
+        }
+        View(const View&amp; other) :
+            ArrayBase&lt;T, dims, size_type, difference_type&gt;(other) {
+            std::copy(sizes, sizes + dims, _sizes);
+            sizes = _sizes;
+        }
+        View&amp; operator=(const base&amp; other) {
+            base::operator=(other);
+            std::copy(sizes, sizes + dims, _sizes);
+            sizes = _sizes;
+        }
+        void swap(View&amp; other) {
+            using std::swap;
+
+            swap(_sizes, other._sizes);
+            T *tmparr = arr;
+            size_type tmprs = rowsize;
+            base::operator=(other);
+            other.load(tmparr, sizes, tmprs);
+            sizes = _sizes;
+        }
+    };
+
+    template &lt;class T, int dims, class size_type = size_t,
+        class difference_type = ptrdiff_t&gt;
+        void swap(View&lt;T, dims, size_type, difference_type&gt;&amp; first,
+            View&lt;T, dims, size_type, difference_type&gt;&amp; second) {
+        first.swap(second);
+    }
+
+    // Full array, holds (a copy of) the underlying data
+    template &lt;class T, int dims, class Allocator = allocator&lt;T&gt; &gt;
+    class Array : public ArrayBase&lt;T, dims,
+        typename allocator_traits&lt;Allocator&gt;::size_type,
+        typename allocator_traits&lt;Allocator&gt;::difference_type&gt; {
+
+    public:
+        using size_type = typename allocator_traits&lt;Allocator&gt;::size_type;
+        using difference_type =
+            typename allocator_traits&lt;Allocator&gt;::difference_type;
+
+    private:
+        using base = ArrayBase&lt;T, dims,
+            typename allocator_traits&lt;Allocator&gt;::size_type,
+            typename allocator_traits&lt;Allocator&gt;::difference_type&gt;;
+        using base::arr;
+        using base::sizes;
+        using base::rowsize;
+
+        Allocator alloc;      // internal allocator
+
+        size_type _sizes[dims];
+        std::vector&lt;T, Allocator&gt; _arr;
+
+        template&lt;class...U&gt;
+        void init(size_type first, U... others) {
+            base::sizes = _sizes;
+            size_t tot = calc_size&lt;size_type&gt;(sizes, first, others...);
+            base::rowsize = tot / sizes[0];
+            if (arr == nullptr) {
+                _arr.assign(tot, T());
+            }
+            else {
+                _arr.assign(arr, arr + tot);
+            }
+            this-&gt;arr = _arr.data();
+        }
+    public:
+
+        template&lt;class...U,
+            typename = typename std::enable_if&lt;sizeof...(U)+1 == dims&gt;::type&gt;
+            Array(T* arr, Allocator alloc, size_type first, U... others)
+            : base(arr, nullptr, 0), alloc(alloc), _arr(this-&gt;alloc) {
+            init(first, others...);
+        }
+        template&lt;class...U,
+            typename = typename std::enable_if&lt;sizeof...(U)+1 == dims&gt;::type&gt;
+            Array(T* arr, size_type first, U... others)
+            : base(arr, nullptr, 0), _arr(this-&gt;alloc) {
+            init(first, others...);
+        }
+        template&lt;class...U,
+            typename = typename std::enable_if&lt;sizeof...(U)+1 == dims&gt;::type&gt;
+            Array(Allocator alloc, size_type first, U... others)
+            : base(nullptr, nullptr, 0), alloc(alloc), _arr(this-&gt;alloc) {
+            init(first, others...);
+        }
+        template&lt;class...U,
+            typename = typename std::enable_if&lt;sizeof...(U)+1 == dims&gt;::type&gt;
+            Array(size_type first, U... others)
+            : base(nullptr, nullptr, 0), _arr(this-&gt;alloc) {
+            init(first, others...);
+        }
+        // copy/move ctors and assignment from another array
+
+        // TODO: implement move semantics from an ArrayBase
+        Array(const Array&amp; other)
+            : base(other), alloc(other.alloc),
+            _arr(other._arr) {
+            std::copy(sizes, sizes + dims, _sizes);
+            arr = _arr.data();
+            sizes = _sizes;
+        }
+        Array(Array&amp;&amp; other) : base(other), alloc(other.alloc),
+            _arr(std::move(other._arr)) {
+            std::copy(sizes, sizes + dims, _sizes);
+            arr = _arr.data();
+            sizes = _sizes;
+        }
+        Array(const base&amp; other) : base(other), alloc(),
+            _arr(arr, arr + rowsize * sizes[0]) {
+            std::copy(sizes, sizes + dims, _sizes);
+            arr = _arr.data();
+            sizes = _sizes;
+        }
+        Array&amp; operator=(const Array&amp; other) {
+            load(other);
+            if (std::allocator_traits&lt;
+                Allocator&gt;::propagate_on_container_copy_assignment::value) {
+                alloc = other.alloc;
+            }
+            std::copy(sizes, sizes + dims, _sizes);
+            _arr.assign(other._arr);
+            arr = _arr.data();
+            sizes = _sizes;
+            return *this;
+        }
+        Array&amp; operator=(Array&amp;&amp; other) {
+            base::operator=(other);
+            if (std::allocator_traits&lt;
+                Allocator&gt;::propagate_on_container_move_assignment::value) {
+                alloc = other.alloc;
+            }
+            std::copy(sizes, sizes + dims, _sizes);
+            _arr = std::move(other._arr);
+            arr = _arr.data();
+            sizes = _sizes;
+            return *this;
+        }
+        Array&amp; operator=(const base&amp; other) {
+            base::operator=(other);
+            std::copy(sizes, sizes + dims, _sizes);
+            _arr.assign(arr, arr + sizes[0] * rowsize);
+            arr = _arr.data();
+            sizes = _sizes;
+            return *this;
+        }
+    };
+
+    /* syntactic sugar to help template deduction and avoid some (re-)typing
+    mainly usefull for non default allocators */
+    template &lt;class T, class Allocator = std::allocator&lt;T&gt; &gt;
+    class ArrayBuilder {
+    public:
+        using size_type = typename allocator_traits&lt;Allocator&gt;::size_type;
+        using difference_type
+            = typename allocator_traits&lt;Allocator&gt;::difference_type;
+    private:
+        Allocator alloc;
+
+    public:
+        ArrayBuilder(const Allocator&amp; alloc = Allocator()) : alloc(alloc) {}
+
+        template &lt;class ...U, int dims = sizeof...(U)+1&gt;
+        View&lt;T, dims, size_type, difference_type&gt; dynUseArray(T* arr,
+            size_type first, U...others) {
+            return View&lt;T, dims, size_type, difference_type&gt;(arr, first,
+                others...);
+        }
+        template &lt;class ...U, int dims = sizeof...(U)+1&gt;
+        Array&lt;T, dims, Allocator&gt; dynCopyArray(T* arr,
+            size_type first, U...others) {
+            return Array&lt;T, dims, Allocator&gt;(arr, alloc,
+                first, others...);
+        }
+        template &lt;class ...U, int dims = sizeof...(U)+1&gt;
+        Array&lt;T, dims, Allocator&gt; dynBuildArray(size_type first, U...others) {
+            return Array&lt;T, dims, Allocator&gt;(alloc, first, others...);
+        }
+    };
+
+    // iterator if cnst == 0 or const_iterator if cnst == 1, U is the value_type
+    template &lt;class T, int dims, class size_type,
+        class difference_type, bool cnst, bool rev&gt;
+    class Iterator: public ElementAccessor&lt;T, size_type, difference_type,
+    difference_type, dims&gt;{
+
+    public:
+        using value_type = typename std::conditional&lt;cnst,
+            typename std::conditional&lt;dims == 1, const T,
+            const Row&lt;T, dims-1, size_type, difference_type&gt;&gt;::type,
+            typename std::conditional&lt;dims == 1, T, Row&lt;T, dims - 1, size_type,
+            difference_type&gt;&gt;::type&gt;::type;
+        using reference = typename std::conditional &lt; dims == 1,
+            value_type&amp;, value_type&gt;::type;
+        using iterator_category = std::random_access_iterator_tag;
+
+    private:
+
+        struct Proxy {
+            value_type elt;
+
+            Proxy(value_type&amp;&amp; elt) : elt(elt) {}
+
+            value_type* operator-&gt;() {
+                return std::addressof(elt);
+            }
+        };
+        T* arr;
+        size_type *sizes;
+        size_type rowsize;
+
+        Iterator(T* arr, size_type *sizes, size_type rowsize) :
+            arr(arr), sizes(sizes), rowsize(rowsize) {}
+
+        template&lt;bool x=false&gt;
+        reference getXElt(difference_type i) {
+            if constexpr(x) {
+                return this-&gt;getConstElt(arr - rowsize * (rev ? 1 : 0), sizes, rowsize, i);
+            } else {
+                return this-&gt;getElt(arr - rowsize * (rev ? 1 : 0), sizes, rowsize, i);
+            }
+        }
+        void add(difference_type i) {
+            arr += (rev ? -i : i) * rowsize ;
+        }
+
+        using iterator = Iterator&lt;T, dims, size_type, difference_type, cnst, rev&gt;;
+
+    public:
+        using pointer = Proxy;
+
+        // a default ctor (to mimic standard iterators)
+        Iterator(): arr(nullptr), sizes(nullptr), rowsize(0) {}
+
+        //convert an (non const) iterator to a const_iterator
+        //template &lt;class X = T, typename = typename std::enable_if&lt;cnst == 1&gt;::type&gt;
+        Iterator(const Iterator&lt;T, dims, size_type, difference_type, !cnst, rev&gt;&amp; other)
+            : arr(other.arr), sizes(other.sizes), rowsize(other.rowsize)
+        {
+            static_assert(cnst, "Cannot remove const from iterator");
+        }
+
+        // all operations of an iterator
+        reference operator*() {
+            return getXElt(0) ;
+        }
+        pointer operator-&gt;() {
+            return Proxy(getXElt(0));
+        }
+        const reference operator*() const {
+            return getConstElt(arr - rowsize * (rev ? 1 : 0), sizes, rowsize, 0);
+        }
+        const pointer operator-&gt;() const {
+            return Proxy(getXElt(0));
+        }
+        iterator&amp; operator++() {
+            this-&gt;add(1);
+            return *this;
+        }
+        iterator&amp; operator--() {
+            this-&gt;add(-1);
+            return *this;
+        }
+        iterator operator++(int) {
+            iterator tmp = *this;
+            this-&gt;add(1);
+            return tmp;
+        }
+        iterator operator--(int) {
+            iterator tmp = *this;
+            this-&gt;add(-1);
+            return tmp;
+        }
+        iterator&amp; operator+=(difference_type i) {
+            this-&gt;add(i);
+            return *this;
+        }
+        iterator operator+(difference_type i) {
+            iterator tmp = *this;
+            tmp.add(i);
+            return tmp;
+        }
+        iterator operator-=(difference_type i) {
+            return operator+=(-i);
+        }
+        iterator operator-(difference_type i) {
+            return operator+(-i);
+        }
+
+        value_type operator[](difference_type i) {
+            return *(*this + i);
+        }
+        const value_type operator[](difference_type i) const {
+            return *(*this + i);
+        }
+
+        // comparisons are allowed between const and non const iterators
+        template &lt;bool c&gt;
+        bool operator==(const Iterator&lt;T, dims, size_type,
+            difference_type, c, rev&gt;&amp; other) const {
+            return (arr == other.arr) &amp;&amp; (sizes == other.sizes)
+                &amp;&amp; (rowsize == other.rowsize);
+        }
+        template &lt;bool c&gt;
+        bool operator!=(const Iterator&lt;T, dims, size_type,
+            difference_type, c, rev&gt;&amp; other) const {
+            return !operator==(other);
+        }
+        template &lt;bool c&gt;
+        bool operator&lt;(const Iterator&lt;T, dims, size_type,
+            difference_type, rev, c&gt;&amp; other) const {
+            return arr &lt; other.arr;
+        }
+        template &lt;bool c&gt;
+        bool operator&gt;(const Iterator&lt;T, dims, size_type,
+            difference_type, c, rev&gt;&amp; other) const {
+            return arr &gt; other.arr;
+        }
+        template &lt;bool c&gt;
+        bool operator&lt;=(const Iterator&lt;T, dims, size_type,
+            difference_type, c, rev&gt;&amp; other) const {
+            return !operator&gt;(other);
+        }
+        template &lt;bool c&gt;
+        bool operator&gt;=(const Iterator&lt;T, dims, size_type,
+            difference_type, c, rev&gt;&amp; other) const {
+            return !operator&lt;(other);
+        }
+
+        friend class ArrayBase&lt;T, dims, size_type, difference_type&gt;;
+        friend class Iterator&lt;T, dims, size_type,
+            difference_type, !cnst, rev&gt;;
+        friend class Row&lt;T, dims - 1, size_type, difference_type&gt;;
+    };
+}
+
+
+
+
+#include &lt;gtest/gtest.h&gt;
+
+#define AreEqual EXPECT_EQ
+#define AreSame(a,b) EXPECT_EQ(&amp;(a), &amp;(b))
+#define AreNotSame(a,b) EXPECT_NE(&amp;(a), &amp;(b))
+
+using namespace DynArray;
+
+/* creation of a view shall point to original raw array */
+TEST(DynArray, useArr)
+{
+    ArrayBuilder&lt;int&gt; builder;
+    int arr[60];
+    int l = 0;
+    for (int&amp; i : arr) {
+        i = l++;
+    }
+    auto dynarray = builder.dynUseArray(arr, 3, 4, 5);
+    l = 0;
+    for (int i = 0; i &lt; 3; i++) {
+        for (int j = 0; j &lt; 4; j++) {
+            for (int k = 0; k &lt; 5; k++) {
+                AreSame(dynarray[i][j][k], arr[l++]);
+            }
+        }
+    }
+}
+/* Assignment of a row from a second view */
+TEST(DynArray, rowAssign)
+{
+    int arr[60];
+    int l = 0;
+    for (int&amp; i : arr) {
+        i = l++;
+    }
+    View&lt;int, 3&gt; array {arr, 3, 4, 5};
+
+    int arr2[20];
+    l = 64;
+    for (int&amp;i : arr) {
+        i = l++;
+    }
+    View&lt;int, 2&gt; array2 { arr2, 4, 5 };
+
+    array[1] = array2;
+    /* controls that:
+       - values have been copied
+       - indices still point to original raw array
+    */
+    for (int i = 0; i &lt; 4; i++) {
+        for (int j = 0; j &lt; 5; j++) {
+            AreNotSame(array[1][i][j], array2[i][j]);
+            AreEqual(array[1][i][j], array2[i][j]);
+            AreSame(arr[20 + 5 * i + j], array[1][i][j]);
+        }
+    }
+}
+// swap Rows
+// TEST(DynArray, rowSwap)
+// {
+
+//     int arr[60];
+//     int l = 0;
+//     for (int&amp; i : arr) {
+//         i = l++;
+//     }
+//     View&lt;int, 3&gt; array {arr, 3, 4, 5};
+
+//     swap(array[0], array[2]);
+//     l = 40;
+//     int k = 0;
+//     for (int i = 0; i &lt; 4; i++) {
+//         for (int j = 0; j &lt; 5; j++) {
+//             AreSame(arr[k++], array[0][i][j]);
+//             AreEqual(l++, array[0][i][j]);
+//         }
+//     }
+// }
+//Assignement of a view from a Row or another View
+TEST(DynArray, viewAssign)
+{
+    int arr[60];
+    int l = 0;
+    for (int&amp; i : arr) {
+        i = l++;
+    }
+    View&lt;int, 3&gt; array {arr, 3, 4, 5};
+
+    View&lt;int, 2&gt; arr0 { array[0] };
+    l = 0;
+    for (int i = 0; i &lt; 4; i++) {
+        for (int j = 0; j &lt; 5; j++) {
+            AreSame(arr[l++], arr0[i][j]);
+        }
+    }
+    View&lt;int, 2&gt; arr2 = array[2];
+    arr0 = arr2;
+    l = 40;
+    for (int i = 0; i &lt; 4; i++) {
+        for (int j = 0; j &lt; 5; j++) {
+            AreSame(arr[l++], arr0[i][j]);
+        }
+    }
+}
+// swap views
+TEST(DynArray, viewSwap)
+{
+    int arr[60];
+    int l = 0;
+    for (int&amp; i : arr) {
+        i = l++;
+    }
+    View&lt;int, 3&gt; array {arr, 3, 4, 5};
+
+    View&lt;int, 2&gt; arr0 { array[0] };
+    View&lt;int, 2&gt; arr2 = array[2];
+    swap(arr0, arr2);
+    l = 40;
+    int k = 0;
+    for (int i = 0; i &lt; 4; i++) {
+        for (int j = 0; j &lt; 5; j++) {
+            AreSame(arr[l++], arr0[i][j]);
+            AreSame(arr[k++], arr2[i][j]);
+        }
+    }
+}
+
+TEST(DynArray, copyArr)
+{
+    ArrayBuilder&lt;int&gt; builder;
+    int arr[60];
+    int l = 0;
+    for (int&amp; i : arr) {
+        i = l++;
+    }
+    auto dynarray = builder.dynCopyArray(arr, 3, 4, 5);
+    l = 0;
+    for (int i = 0; i &lt; 3; i++) {
+        for (int j = 0; j &lt; 4; j++) {
+            for (int k = 0; k &lt; 5; k++) {
+                AreEqual(dynarray[i][j][k], arr[l]);
+                AreNotSame(dynarray[i][j][k], arr[l]);
+                l++;
+            }
+        }
+    }
+}
+
+TEST(DynArray, buildArr)
+{
+    ArrayBuilder&lt;int&gt; builder;
+    auto dynarray = builder.dynBuildArray(3, 4, 5);
+    for (int i = 0; i &lt; 3; i++) {
+        for (int j = 0; j &lt; 4; j++) {
+            for (int k = 0; k &lt; 5; k++) {
+                AreEqual(dynarray[i][j][k], 0);
+            }
+        }
+    }
+}
+
+TEST(DynArray, copyCtor)
+{
+    ArrayBuilder&lt;int&gt; builder;
+    int arr[60];
+    int l = 0;
+    for (int&amp; i : arr) {
+        i = l++;
+    }
+    auto dynarray = builder.dynUseArray(arr, 3, 4, 5);
+    Array&lt;int, 3&gt; dyn2 { dynarray };
+    l = 0;
+    for (int i = 0; i &lt; 3; i++) {
+        for (int j = 0; j &lt; 4; j++) {
+            for (int k = 0; k &lt; 5; k++) {
+                AreEqual(dyn2[i][j][k], arr[l]);
+                AreNotSame(dyn2[i][j][k], arr[l]);
+                l++;
+            }
+        }
+    }
+}
+
+TEST(DynArray, moveCtor)
+{
+    ArrayBuilder&lt;int&gt; builder;
+    int arr[60];
+    int l = 0;
+    for (int&amp; i : arr) {
+        i = l++;
+    }
+    auto dynarray = builder.dynCopyArray(arr, 3, 4, 5);
+    int *ix = dynarray.data();
+    auto dyn2 = std::move(dynarray);
+    AreEqual(ix, dyn2.data());
+    l = 0;
+    for (int i = 0; i &lt; 3; i++) {
+        for (int j = 0; j &lt; 4; j++) {
+            for (int k = 0; k &lt; 5; k++) {
+                AreEqual(dyn2[i][j][k], arr[l]);
+                l++;
+            }
+        }
+    }
+}
+
+TEST(DynArray, copyAssign)
+{
+    ArrayBuilder&lt;int&gt; builder;
+    int arr[60];
+    int l = 0;
+    for (int&amp; i : arr) {
+        i = l++;
+    }
+    auto dynarray = builder.dynUseArray(arr, 3, 4, 5);
+    auto dyn2 = builder.dynBuildArray(3, 4, 5);
+    dyn2 = dynarray;
+    l = 0;
+    for (int i = 0; i &lt; 3; i++) {
+        for (int j = 0; j &lt; 4; j++) {
+            for (int k = 0; k &lt; 5; k++) {
+                AreEqual(dyn2[i][j][k], arr[l]);
+                AreNotSame(dyn2[i][j][k], arr[l]);
+                l++;
+            }
+        }
+    }
+}
+
+TEST(DynArray, moveAssign)
+{
+    ArrayBuilder&lt;int&gt; builder;
+    int arr[60];
+    int l = 0;
+    for (int&amp; i : arr) {
+        i = l++;
+    }
+    auto dynarray = builder.dynCopyArray(arr, 3, 4, 5);
+    int *ix = dynarray.data();
+    auto dyn2 = builder.dynBuildArray(3, 4, 5);
+    dyn2 = std::move(dynarray);
+    l = 0;
+    for (int i = 0; i &lt; 3; i++) {
+        for (int j = 0; j &lt; 4; j++) {
+            for (int k = 0; k &lt; 5; k++) {
+                AreEqual(dyn2[i][j][k], arr[l]);
+                l++;
+            }
+        }
+    }
+    AreEqual(ix, dyn2.data());
+}
+
+// TEST(DynArray, nonConstIter)
+// {
+//     ArrayBuilder&lt;int&gt; builder;
+//     int arr[60];
+//     int l = 0;
+//     for (int&amp; i : arr) {
+//         i = l++;
+//     }
+//     auto dynarray = builder.dynUseArray(arr, 3, 4, 5);
+//     l = 0;
+//     for (auto&amp; it1 : dynarray) {
+//         for (auto&amp; it2 : it1) {
+//             for (auto&amp; it3 : it2) {
+//                 AreSame(it3, arr[l]);
+//                 l++;
+//                 it3 = l;             // control it is not const...
+//             }
+//         }
+//     }
+// }
+
+TEST(DynArray, constIter)
+{
+    ArrayBuilder&lt;int&gt; builder;
+    int arr[60];
+    int l = 0;
+    for (int&amp; i : arr) {
+        i = l++;
+    }
+    auto dynarray = builder.dynUseArray(arr, 3, 4, 5);
+    l = 0;
+    for (auto it1 = dynarray.cbegin(); it1 != dynarray.cend(); it1++) {
+        for (auto it2 = it1-&gt;cbegin(); it2 != it1-&gt;cend(); it2++) {
+            for (auto it3 = it2-&gt;cbegin(); it3 != it2-&gt;cend(); it3++) {
+                AreSame(*it3, arr[l]);
+                l++;
+                // *it3 = l;           // does not compile
+            }
+        }
+    }
+}
+
+TEST(DynArray, convConstIterator)
+{
+    ArrayBuilder&lt;int&gt; builder;
+    int arr[60];
+    int l = 0;
+    for (int&amp; i : arr) {
+        i = l++;
+    }
+    auto dynarray = builder.dynUseArray(arr, 3, 4, 5);
+
+    auto it = dynarray.begin();
+    Array&lt;int, 3&gt;::const_iterator cit = it;
+
+    //it = (MDynArray&lt;int, 3&gt;::iterator) cit;  // does not compile
+
+    it += 1;
+    cit += 1;
+    EXPECT_GT(it, dynarray.begin());
+    EXPECT_EQ(it, cit);
+    EXPECT_EQ(cit, it);
+}
+
+TEST(DynArray, revIterator)
+{
+    ArrayBuilder&lt;int&gt; builder;
+    int arr[60];
+    int l = 0;
+    for (int&amp; i : arr) {
+        i = l++;
+    }
+    auto dynarray = builder.dynUseArray(arr, 3, 4, 5);
+    l = 0;
+
+    for (auto it1 = dynarray.rbegin(); it1 != dynarray.rend(); it1++) {
+        for (auto it2 = it1-&gt;rbegin(); it2 != it1-&gt;rend(); it2++) {
+            for (auto it3 = it2-&gt;rbegin(); it3 != it2-&gt;rend(); it3++) {
+                AreSame(*it3, arr[59 - l]);
+                l++;
+                *it3 = l;           // control non constness
+            }
+        }
+    }
+}
+
+TEST(DynArray, rowToIter)
+{
+    ArrayBuilder&lt;int&gt; builder;
+    int arr[60];
+    int l = 0;
+    for (int&amp; i : arr) {
+        i = l++;
+    }
+    auto dynarray = builder.dynUseArray(arr, 3, 4, 5);
+    l = 0;
+
+    auto row = dynarray[1];
+    auto it = &amp;row - 1;
+    AreSame(arr[0], it[0][0][0]);
+
+}
+</code></pre>
+    </div>

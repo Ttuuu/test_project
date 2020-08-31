@@ -1,0 +1,163 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Instead of creating a table via <code>SELECT INTO</code>, I always prefer to create them explicitly. </p>
+
+<pre><code>DROP TABLE IF EXISTS #HoldingTable;
+CREATE TABLE #HoldingTable
+(
+  purchaser   varchar(500) COLLATE DATABASE_DEFAULT NOT NULL,
+  purchaserid varchar(50)  COLLATE DATABASE_DEFAULT NOT NULL,
+  saleid      varchar(50)  COLLATE DATABASE_DEFAULT NOT NULL
+);
+
+INSERT INTO #HoldingTable
+( purchaser, purchaserid, saleid )
+  SELECT DISTINCT
+         D.purchaser,
+         D.purchaserid,
+         D.saleid
+    FROM @Data1 D
+    WHERE D.active = 1;
+</code></pre>
+
+<p>Unless you have a reason to actually order your input before inserting (e.g. it picks a better plan), just remove the <code>ORDER BY</code>.</p>
+
+<p>You have unsupported string aggregation syntax here:</p>
+
+<pre><code>SELECT @SendEmailTo = COALESCE( @SendEmailTo + ';', '' ) + [EmailAddress]
+  FROM @Data1
+  WHERE [purchaserid] = @PurchaserID
+    AND ISNULL( [saleid], '' ) = ISNULL( @SaleID, '' );
+</code></pre>
+
+<p>Instead, you should use <code>STUFF</code>:</p>
+
+<pre><code>SET @SendEmailTo = STUFF(( SELECT N';' + EmailAddress
+                             FROM @Data1
+                             WHERE [purchaserid] = @PurchaserID
+                               AND ( saleid = @SaleID
+                                     OR ( saleid IS NULL
+                                          AND @SaleID IS NULL ))
+                           FOR XML PATH( '' )),
+                         1,
+                         1,
+                         N'' );
+</code></pre>
+
+<p>This also removes the need to initialize it, or to remove trailing semi-colons. I also got rid of the gross <code>ISNULL() = ISNULL()</code>.</p>
+
+<p>Next, some of your other variables I turned into computed columns in your holding table, because it is a bit easier</p>
+
+<pre><code>DROP TABLE IF EXISTS #HoldingTable;
+CREATE TABLE #HoldingTable
+(
+  purchaser    varchar(500) COLLATE DATABASE_DEFAULT NOT NULL,
+  purchaserid  varchar(50)  COLLATE DATABASE_DEFAULT NOT NULL,
+  saleid       varchar(50)  COLLATE DATABASE_DEFAULT NULL,
+  DateToAppend AS REPLACE( CONVERT( char(10), GETDATE(), 101 ), '/', '' ),
+  AI           AS CONCAT( N'C:\', purchaser, N'\AI_', REPLACE( CONVERT( char(10), GETDATE(), 101 ), '/', '' ), N'.csv' ),
+  LI           AS CONCAT( N'C:\', purchaser, N'\LI_', REPLACE( CONVERT( char(10), GETDATE(), 101 ), '/', '' ), N'.csv' ),
+  ChkDirectory AS CONCAT( N'C:\SaveThis\', purchaser, N'\' )
+);
+</code></pre>
+
+<p>From there, I looked at your actual insert statement. From here, I discovered a bug - you have a query of the form</p>
+
+<pre><code>INSERT INTO &lt;&lt;TableName&gt;&gt; (&lt;&lt;InsertList&gt;&gt;)
+SELECT &lt;&lt;SelectList&gt;&gt;
+  FROM &lt;&lt;TableName&gt;&gt; AND
+</code></pre>
+
+<p>That <code>AND</code> isn't valid; I assume you're trying to join something here, but the code isn't there.</p>
+
+<p>You also have security issues here; you should never blindly concatenate a value with dynamic SQL, as you risk SQL injection. This is always the case, even if you think you can trust the input. Instead, you should parameterize your query and use <code>sys.sp_executesql</code>.</p>
+
+<p>You actually don't need this to be dynamic at all, however.</p>
+
+<pre><code>INSERT INTO [LI]
+( [saledate], [trn], [purchaser], [primaryaddress], [secondaryaddress], [city], [state], [zip], [itempurchased], [amtpurchased], [amtshipped], [purchaserid], [saleID] )
+  SELECT [saledate],
+         [trn],
+         [purchaser],
+         [primaryaddress],
+         [secondaryaddress],
+         [city],
+         [state],
+         [zip],
+         [itempurchased],
+         [amtpurchased],
+         [amtshipped],
+         @PurchaserID,
+         CASE WHEN @SaleID &gt;= 1 THEN @SaleID
+              ELSE NULL END
+    FROM seccompliance
+    WHERE crl.pijad = @PurchaserID
+      AND ( @SaleID &gt;= 1
+            OR cag.playja = @SaleID )
+    OPTION( RECOMPILE );
+</code></pre>
+
+<p>Again, I don't know exactly what should be happening in there, but this should be close. A few other notes about this query:  </p>
+
+<ol>
+<li>Don't use a bare <code>SELECT *</code>, use an explicit select list</li>
+<li>Instead of dyanamically including the @SaleId stuff, you can just put the logic in there</li>
+<li>When you have a predicate like <code>CAST( ColumnName AS datatype ) = @ParameterValue</code>, you will get much better performance if you do <code>ColumnName = CAST( @ParameterValue AS datatype )</code> or <code>ColumnName = @ParameterValue</code> where <code>@ParameterValue</code> has already been cast to the appropriate type.</li>
+<li>The use of optional parameters (which is what <code>@SaleID</code> effectively is) can have a significant negative impact on plan choice and performance. You'll either need to recompile the query (what I opted to do) or continue using dynamic SQL to avoid that issue. For your use-case, <code>RECOMPILE</code> should be fine - you're already forcing recompiles of the query every iteration of the loop because it isn't parameterized.</li>
+</ol>
+
+<p>There is nothing novel to say aobut the <code>AI</code> vs <code>LI</code> queries, so I'll move along.</p>
+
+<p>When you create your <code>bcp</code> command, it would be much nicer to just give it a stored procedure, so you can avoid more dynamic SQL.</p>
+
+<p>Lastly, I think a lot of the work you do in the <code>CURSOR</code> could be done in a set-based approach, then just use the <code>CURSOR</code> to send the mail. This will perform much better than your current procedure.</p>
+
+<pre><code>DECLARE @PurchaserList table
+(
+  PurchaserId varchar(50) NOT NULL,
+  SaleId      varchar(50) NULL
+);
+
+INSERT INTO [LI]
+( [saledate], [trn], [purchaser], [primaryaddress], [secondaryaddress], [city], [state], [zip], [itempurchased], [amtpurchased], [amtshipped], [purchaserid], [saleID] )
+OUTPUT Inserted.purchaserid, Inserted.saleid INTO @PurchaserList( PurchaserId, SaleId )
+  SELECT [saledate],
+         [trn],
+         [purchaser],
+         [primaryaddress],
+         [secondaryaddress],
+         [city],
+         [state],
+         [zip],
+         [itempurchased],
+         [amtpurchased],
+         [amtshipped],
+         @PurchaserID [purchaserid],
+         CASE WHEN @SaleID &gt;= 1 THEN @SaleID
+              ELSE NULL END [saleid]
+    FROM seccompliance
+    WHERE crl.pijad = @PurchaserID
+      AND ( @SaleID &gt;= 1
+            OR cag.playja = @SaleID );
+</code></pre>
+
+<p>From there, you are going to <code>CURSOR</code> over distinct purchaser and sale combinations (also, you should include the scope in your cursor definition):</p>
+
+<pre><code>DECLARE cursor1 CURSOR LOCAL READ_ONLY FAST_FORWARD FOR
+  SELECT DISTINCT
+         HoldingTable.purchaserid,
+         HoldingTable.purchaser,
+         HoldingTable.saleid,
+         HoldingTable.AI,
+         HoldingTable.LI,
+         HoldingTable.ChkDirectory
+    FROM #HoldingTable HoldingTable
+      INNER JOIN @PurchaserList PurchaserList
+        ON HoldingTable.purchaserid = PurchaserList.PurchaserId
+          AND ( HoldingTable.saleid = PurchaserList.SaleId
+                OR ( HoldingTable.saleid IS NULL
+                     AND PurchaserList.SaleId IS NULL ))
+    ORDER BY HoldingTable.purchaser ASC;
+</code></pre>
+
+<p>And then the body of your <code>WHILE</code> loop is largely the same, but without the <code>INSERT</code>s into the <code>AI</code> and <code>LI</code> tables        </p>
+    </div>

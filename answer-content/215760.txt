@@ -1,0 +1,181 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p><code>new DBConnection().Connect</code></p>
+</blockquote>
+
+<p>Just curious: from where have you this construct?</p>
+
+<hr>
+
+<p>You should check the input:</p>
+
+<pre><code>if (seasons == null || seasons.Count == 0) return seasons; // or throw?
+</code></pre>
+
+<hr>
+
+<blockquote>
+<pre><code>  using (MySqlConnection connection = new MySqlConnection())
+  {
+    using (MySqlCommand command = new MySqlCommand())
+    {
+      connection.Open();
+      command.Connection = connection;
+      //Get all the ids of the seasons to add or update
+      command.CommandText = "SELECT cs.season_id " +
+          "FROM (SELECT {textToReplace}) cs " +
+          "LEFT JOIN competition_seasons s on s.id = cs.season_id " +
+          "WHERE s.id IS NULL OR " +
+          "s.update_at &lt; DATE_SUB(CURRENT_DATE, INTERVAL 7 DAY) OR s.update_at IS NULL";
+</code></pre>
+</blockquote>
+
+<p>You should open the connection for a short a period as possible and build the command text using a <code>StringBuilder</code> instead.</p>
+
+<pre><code>StringBuilder commandBuilder = new StringBuilder();
+commandBuilder.AppendFormat(...);
+...
+// and the other initialization stuff
+...
+using (MySqlConnection connection = new MySqlConnection())
+{
+  using (MySqlCommand command = new MySqlCommand())
+  {
+    connection.Open();
+    command.Connection = connection;    
+    command.CommandText = commandBuilder.ToString();
+    using (MySqlDataReader reader = command.ExecuteReader())
+    {
+       ...
+</code></pre>
+
+<p>And besides that, concatenating strings in the above manner is considered bad practice and is expensive, because you instantiate a lot more strings than you may think (9 in the example above, I think).</p>
+
+<hr>
+
+<p>In order to generalize the method, you have to consider only three variables: the items in the list, the table name and the name of the id column. The table name and the name of the id column are just strings, so it is easy.</p>
+
+<p>For the items in the list, you can let them derive from the same base class that holds the Id as property, or you could let them implement an interface like:</p>
+
+<pre><code>  public interface IdHolder  // Maybe a descriptive name, but some kind of ugly?
+  {
+    int Id { get; }
+  }
+
+  public class Team : IdHolder
+  {
+    public int Id { get; internal set; }
+  }
+
+  public class Season : IdHolder
+  {
+    public int Id { get; internal set; }
+  }
+
+  public class Player : IdHolder
+  {
+    public int Id { get; internal set; }
+  }
+</code></pre>
+
+<p>Doing so you can make a generic method with a signature like:</p>
+
+<pre><code>public IEnumerable&lt;TItem&gt; GetItemsToAddUpdate&lt;TItem&gt;(IEnumerable&lt;TItem&gt; items, string tableName, string idColumn) where TItem : IdHolder
+</code></pre>
+
+<p>and then the rest is just a question of readjusting the existing string creation in one of the methods, so it all in all could end up like something like this:</p>
+
+<pre><code>public IEnumerable&lt;TItem&gt; GetItemsToAddUpdate&lt;TItem&gt;(IEnumerable&lt;TItem&gt; items, string tableName, string idColumn) where TItem : IdHolder
+{
+  if (items == null || !items.Any())
+  {
+    yield break;
+  }
+
+  StringBuilder commandBuilder = new StringBuilder();
+  commandBuilder.AppendFormat("SELECT idLst.{0} ", idColumn);
+  commandBuilder.Append("FROM (SELECT {textToReplace}) idLst ");
+  commandBuilder.AppendFormat("LEFT JOIN {0} x on x.id = idLst.{1} ", tableName, idColumn);
+  commandBuilder.Append("WHERE x.id IS NULL OR ");
+  commandBuilder.Append("x.update_at &lt; DATE_SUB(CURRENT_DATE, INTERVAL 7 DAY) OR x.update_at IS NULL");
+
+  //Join all the available parameters.
+  StringBuilder unions = new StringBuilder();
+
+  //List of available parameters.
+  List&lt;MySqlParameter&gt; parameters = new List&lt;MySqlParameter&gt;();
+
+  //Add the first parameter.
+  MySqlParameter pr = new MySqlParameter("@first", MySqlDbType.UInt32) { Value = items.First().Id };
+  parameters.Add(pr);
+  unions.AppendFormat(" @first as {0} ", idColumn);
+
+  //Start from one 'cause first param already defined in query.
+  int parameterIndex = 1;
+
+  //Create the parameter for the derived table based on the available seasons
+  foreach (TItem item in items.Skip(1))
+  {
+    string placeholder = "@p" + parameterIndex;
+    unions.Append($" UNION ALL SELECT {placeholder}");
+    pr = new MySqlParameter(placeholder, MySqlDbType.Int32) { Value = item.Id };
+    parameters.Add(pr);
+    parameterIndex++;
+  }
+
+  using (MySqlConnection connection = new MySqlConnection("&lt;ConnectionString?&gt;"))
+  {
+    using (MySqlCommand command = new MySqlCommand())
+    {
+      connection.Open();
+      command.Connection = connection;
+      command.Parameters.AddRange(parameters.ToArray());
+      command.CommandText = commandBuilder.ToString().Replace("{textToReplace}", unions.ToString());
+
+      using (MySqlDataReader reader = command.ExecuteReader())
+      {
+        //Remove all the seasons that doesn't need update.
+        while (reader.Read())
+        {
+          TItem item = items.FirstOrDefault(x =&gt; x.Id == Convert.ToInt32(reader[idColumn]));
+          if (item != null)
+            yield return item;
+        }
+      }
+    }
+  }
+}
+</code></pre>
+
+<p>You can then make dedicated methods for each object type as:</p>
+
+<pre><code>public IEnumerable&lt;Team&gt; GetTeamsToAddUpdate(IEnumerable&lt;Team&gt; teams)
+{
+  return GetItemsToAddUpdate(teams, "team", "team_id");
+}
+</code></pre>
+
+<hr>
+
+<p>If making the types implement a common interface or derive from the same base class is not an option, then you can provide a function as argument for extracting the id from each item:</p>
+
+<pre><code>public IEnumerable&lt;TItem&gt; GetItemsToAddUpdate&lt;TItem&gt;(IEnumerable&lt;TItem&gt; items, Func&lt;TItem, int&gt; idFetcher, string tableName, string idColumn)
+</code></pre>
+
+<p>where <code>idFetcher</code> is called like:</p>
+
+<pre><code>  MySqlParameter pr = new MySqlParameter("@first", MySqlDbType.UInt32) { Value = idFetcher(items.First()) };
+</code></pre>
+
+<p>and the method can be called as:</p>
+
+<pre><code>public IEnumerable&lt;Team&gt; GetTeamsToAddUpdate(IEnumerable&lt;Team&gt; teams)
+{
+  return GetItemsToAddUpdate(teams, (team) =&gt; team.Id, "team", "team_id");
+}
+</code></pre>
+
+<hr>
+
+<p>Disclaimer: I may have overlooked some minor details in the sql strings, that differs from one type to the other.</p>
+    </div>

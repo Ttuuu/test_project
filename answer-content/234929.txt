@@ -1,0 +1,82 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This is an interesting problem, and you've written an interesting solution.</p>
+
+<p>With respect to your inefficient urn "store" -- the mapping of immutable urn references (<code>Urn Natural</code>) to mutable urn contents -- it might be worth considering that because of the nature of your monad, most monadic computations involving urns will scale exponentially in the number of urns anyway, so big-O performance of urn list building and lookups is essentially irrelevant.  You can start thinking about it when people want to use your monad for 100000-urn problems; or you could probably port everything over to a <code>Data.Map Int</code> or <code>Data.IntMap</code> in a few minutes).</p>
+
+<p>The bigger problem, as you've noted, is that because this all has to run in a specific monotyped monad, unless you want to pre-declare the set of urns and their element types as used in a particular computation, you need an ugly, unsafe generic type like <code>[Any]</code> to represent your set of urns.</p>
+
+<p>One method of dealing with this would be to represent the mutable contents of an urn by a set of always-integer indices while packaging the actual elements as part of the immutable <code>Urn</code> reference.  That is, the <code>Urn</code> references you pass around can be represented as:</p>
+
+<pre><code>data Urn s a = Urn { tag :: Key
+                   , labels :: Int -&gt; a }
+type role Urn nominal representational
+</code></pre>
+
+<p>with monotyped mutable state:</p>
+
+<pre><code>data UrnState = UrnState { nextTag :: Key
+                         , urns :: IntMap [Int] }
+</code></pre>
+
+<p>So <code>urns urnState ! tag1</code> is the set of integer indices still in play for that urn, and the actual elements are available by looking up those indices in the <code>labels urnRef</code> map.</p>
+
+<h2>SPOILERS</h2>
+
+<p>A complete code example, which seems to work on your test case is:</p>
+
+<pre><code>{-# LANGUAGE DeriveFunctor, RoleAnnotations, RankNTypes #-}
+import Data.List
+import Control.Monad
+import qualified Data.IntMap as IntMap
+import Data.IntMap (Key, IntMap, (!))
+
+data Urn s a = Urn { tag :: Key
+                   , labels :: Int -&gt; a }
+type role Urn nominal representational
+
+data UrnState = UrnState { nextTag :: Key
+                         , urns :: IntMap [Int] }
+
+newtype Draw s a = Draw { unDraw :: UrnState -&gt; [(a, UrnState)] } deriving (Functor)
+type role Draw nominal representational
+instance Applicative (Draw s) where
+  pure x = Draw (\s -&gt; [(x,s)])
+  (&lt;*&gt;) = ap
+instance Monad (Draw s) where
+  Draw d &gt;&gt;= f = Draw $ \s -&gt; do  -- list monad
+    (a', s') &lt;- d s
+    unDraw (f a') s'
+
+evalDraw :: (forall s. Draw s a) -&gt; [a]
+evalDraw (Draw d) = map fst $ d $ UrnState 0 IntMap.empty
+
+newUrn :: [a] -&gt; Draw s (Urn s a)
+newUrn xs = Draw $ \(UrnState nxttag urs) -&gt;
+  let -- list of labels keyed by indexes [0..n-1]
+      lbls = IntMap.fromAscList (zip [0..] xs)
+      -- new urn has tag "nxttag" and the immutable labelling function
+      u = Urn nxttag (lbls !)
+      -- add urn to state
+      urs' = IntMap.insert nxttag (IntMap.keys lbls) urs
+  in  [(u, UrnState (nxttag+1) urs')]
+
+draws :: [a] -&gt; [(a,[a])]
+draws xs = zipWith3 go (inits xs) xs (tail (tails xs))
+  where go l a r = (a, l++r)
+
+drawFrom :: Urn s a -&gt; Draw s a
+drawFrom (Urn tg lbls) = Draw $ \(UrnState nxttag urs) -&gt;
+  case urs ! tg of
+    [] -&gt; fail "empty urn"
+    xs -&gt; do  -- list monad
+      (a, xs') &lt;- draws xs
+      return $ (lbls a, UrnState nxttag $ IntMap.insert tg xs' urs)
+
+main :: IO ()
+main = print $ evalDraw $ do
+  l &lt;- newUrn [1,2,3,3]
+  x &lt;- drawFrom l
+  y &lt;- drawFrom l
+  return (x, y)
+</code></pre>
+    </div>

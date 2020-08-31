@@ -1,0 +1,204 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Review</h2>
+
+<blockquote>
+  <p>Here's the method I came up with, but it feels inelegant and
+  incomplete. Any improvements, especially ones that can leverage LINQ
+  are welcome.</p>
+</blockquote>
+
+<p>You could write it more elegantly by using recursion for your pair members.</p>
+
+<blockquote>
+<pre><code> if (pair.First is IEnumerable)
+ {
+      Flatten((root as Pair).First, list);
+ }
+ else if (pair.First is Pair)
+ {
+      list.Add(pair.First as Pair);
+ }
+ if (pair.Second is IEnumerable)
+ {
+      Flatten((root as Pair).Second, list);
+ }
+ else if (pair.Second is Pair)
+ {
+      list.Add(pair.Second as Pair);
+ }
+</code></pre>
+</blockquote>
+
+<pre><code>if (root is Pair)
+{   
+    var pair = root as Pair;
+    list.Add(pair);      
+    Flatten(pair.First, list);
+    Flatten(pair.Second, list);
+}
+</code></pre>
+
+<p>You are right that it is incomplete. You are missing:</p>
+
+<ul>
+<li>pairs in dictionaries <code>KeyValuePair&lt;T, Pair&gt;</code></li>
+<li>pairs in complex objects <code>Tuple&lt;T, Pair&gt;</code>, <code>MyPairWrapper</code></li>
+<li>pairs in anonymous objects</li>
+</ul>
+
+<p><em>code</em></p>
+
+<pre><code>public class MyPairWrapper {
+    public Pair Value { get; }
+    // ..
+}
+</code></pre>
+
+<p>Your search strategy expects a tree structure, not a graph. In the following example you will get an infinite cycle.</p>
+
+<pre><code>var pair = new Pair();
+pair.First = pair;
+</code></pre>
+
+<hr>
+
+<h2>Proposed Solution</h2>
+
+<p>I suggest to make a graph traversal walker that is able to deal with:</p>
+
+<ul>
+<li>cyclic graphs as well as trees</li>
+<li>any reference type you want to flatten</li>
+<li>any kind of sequence (<code>Array</code>, <code>IEnumerable</code>, <code>IQueryable</code>, <code>IDictionary</code>, ..)</li>
+<li>anonymous types</li>
+<li>common structs and classes (<code>Tuple&lt;T1,T2,..&gt;</code>, <code>KeyValuePair&lt;TKey,TValue&gt;</code>, ..)</li>
+<li>complex types (traverse public fields and readable properties)</li>
+</ul>
+
+<p><em>Let's start..</em></p>
+
+<p>I adapted the method signature of the extension method and redirected the implementation to <code>ObjectGraphWalker</code>.</p>
+
+<pre><code>public static class LinqExtension
+{
+    public static IEnumerable&lt;T&gt; Flatten&lt;T&gt;(this object root) where T : class {
+        return ObjectGraphWalker.Flatten&lt;T&gt;(root);
+    }
+}
+</code></pre>
+
+<p>The graph walker <code>ObjectGraphWalker</code> traverses any graph (tree, acyclic or cyclic) and keeps track of <code>visited</code> objects to avoid infinite loops. Recursion is used to traverse sequences and complex objects.</p>
+
+<pre><code>public static class ObjectGraphWalker
+{
+    public static IEnumerable&lt;T&gt; Flatten&lt;T&gt;(object root) where T : class {
+        var results = new List&lt;T&gt;();
+        var visited = new ArrayList();
+        FlattenWalk(root, results, visited);
+        return results.ToArray();
+    }
+
+    private static void FlattenWalk&lt;T&gt;(object source, IList&lt;T&gt; results, IList visited) 
+        where T : class 
+    {
+        if (source == null) return;
+        if (visited.Contains(source)) return;
+        visited.Add(source);
+
+        // source is instance of T or any derived class
+        if (typeof(T).IsInstanceOfType(source)) {
+            results.Add((T)source);
+        }
+
+        // source is a sequence of objects
+        if (source is IEnumerable) {
+            // includes Array, IDictionary, IList, IQueryable
+            FlattenWalkSequence((IEnumerable)source, results, visited);
+        }
+
+        // dive into the object's properties
+        FlattenWalkComplexObject(source, results, visited);
+    }
+
+    private static void FlattenWalkSequence&lt;T&gt;(IEnumerable source, 
+        IList&lt;T&gt; results, IList visited) 
+        where T : class 
+    {
+        if (source == null) return;
+        foreach (var element in source) {
+            FlattenWalk(element, results, visited);
+        }
+    }
+
+    private static void FlattenWalkComplexObject&lt;T&gt;(object source, 
+        IList&lt;T&gt; results, IList visited) 
+        where T : class 
+    {
+        if (source == null) return;
+        var type = source.GetType();
+        var properties = type.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+            .Where(x =&gt; x.CanRead &amp;&amp; !x.GetIndexParameters().Any());
+        var fields = type.GetFields(BindingFlags.Public | BindingFlags.Instance);
+        // search its public fields and properties
+        foreach (var field in fields) {
+            FlattenWalk(field.GetValue(source), results, visited);
+        }
+        foreach (var property in properties) {
+            FlattenWalk(property.GetValue(source), results, visited);
+        }
+    }
+}
+</code></pre>
+
+<hr>
+
+<h2>Test Case</h2>
+
+<p>Let's create a derived class <code>Triad</code> and a complex object <code>PairProvider</code> that has a <code>Pair</code> as property.</p>
+
+<pre><code>public class PairProvider
+{
+    public Pair Value;
+}
+
+public class Triad : Pair
+{
+    public object Third;
+}
+
+public class Pair
+{
+    public object First;
+    public object Second;
+}
+</code></pre>
+
+<p>Test method:</p>
+
+<pre><code>public static void Main() {
+
+        var pair1 = new Pair { First = 1, Second = 2 }; // 1
+        var pair2 = new Pair { First = 3, Second = pair1 }; // 2
+        var triad = new Triad { First = "John", Second = "Doe" }; // 3
+        triad.Third = triad;
+
+        var dynamicObject = new {
+            pair = new Pair { // 4
+                First = pair1,
+                Second = new[] { pair1, pair2 }
+            },
+            adapter = new PairProvider { Value = triad },
+            items = new Dictionary&lt;int, IEnumerable&gt; {
+                { 1, new object[] { 1, 2, new Pair { First = 1, Second = triad } } }, // 5
+                { 2, new int[] { 1, 2, 3 } },
+                { 3, new object[] { Tuple.Create&lt;Pair, Pair&gt;(pair2, new Pair()) } } // 6
+            }
+        };
+
+        var flattened = dynamicObject.Flatten&lt;Pair&gt;();
+        var count = flattened.Count(); // = 6
+
+        Console.ReadKey();
+    }
+</code></pre>
+    </div>

@@ -1,0 +1,118 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You want to reduce both computation time and memory allocation. Memory allocation itself takes time, so that's a good place to start -- try to find all the places where you're allocating memory and see if they can be avoided.</p>
+
+<p><code>ArrayPool&lt;byte&gt;.Shared.Rent(16);</code> <em>can</em> avoid an allocation, but not always. Can we do better? Turns out we can; we'll see how.</p>
+
+<p><code>BitConverter.GetBytes(ticksDiff)</code> makes an allocation. <code>ticksDiff</code> is just an integer so it's quite easy to extract its binary representation using binary operators. We'll see how we can use this later on.</p>
+
+<p>But first:</p>
+
+<h1>Profiling</h1>
+
+<p>Profilers are your friend! You should always start the optimization journey by asking "Where are the bottlenecks?", which you can promptly answer with cold hard data from a profiling tool.</p>
+
+<p>As suspected, dotTrace reports that the <code>ArrayPool&lt;byte&gt;.Shared.Rent/Return</code> and <code>BitConverter.GetBytes(ticksDiff)</code> calls take a significant chunk (~21%) of the total running time. Let's get rid of those.</p>
+
+<h1>Guid constructor</h1>
+
+<p>You're using the <code>Guid</code> constructor that takes a <code>byte[]</code>, which has perpetuated an implementation that necessarily allocates a byte array <em>somewhere</em>. You can get clever with this to allocate on the stack instead of the heap (<code>Span&lt;byte&gt;</code> with <code>stackalloc</code>) or to minimize the number of allocations that actually need to happen (<code>ThreadLocal&lt;byte[]&gt;</code>), but the best solution is to <em>not allocate anything at all</em>. To accomplish this, you can use one of the other <code>Guid</code> constructors that takes its values directly, instead of taking a byte array.</p>
+
+<p>There's a constructor overload that takes an <code>int</code>, two <code>short</code>s, and eight <code>byte</code>s. You can pack these values directly (see the <a href="https://github.com/microsoft/referencesource/blob/master/mscorlib/system/guid.cs" rel="noreferrer">reference source</a> for endianness on the <code>int</code> and <code>short</code>s):</p>
+
+<pre><code>int a = ticksDiffBytes[7] | (ticksDiffBytes[6] &lt;&lt; 8) | (ticksDiffBytes[5] &lt;&lt; 16) | (ticksDiffBytes[4] &lt;&lt; 24);
+short b = (short)(ticksDiffBytes[3] | (ticksDiffBytes[2] &lt;&lt; 8));
+short c = (short)(ticksDiffBytes[1] | (ticksDiffBytes[0] &lt;&lt; 8));
+
+var guid = new Guid(
+    a,
+    b,
+    c,
+    (byte)(sequenceNumber &gt;&gt; 8),
+    (byte)(sequenceNumber),
+    macBytes[0],
+    macBytes[1],
+    macBytes[2],
+    macBytes[3],
+    macBytes[4],
+    macBytes[5]);
+</code></pre>
+
+<h1>Binary stuff</h1>
+
+<p>You can extract bits directly from <code>ticksDiff</code> to avoid the call to <code>BitConverter.GetBytes</code>:</p>
+
+<pre><code>var ticksDiff = nowTicks - baseDateTicks;
+
+int a = (int)(
+    ((ticksDiff &gt;&gt; 56) &amp; 0xFF) |
+    ((ticksDiff &amp; 0x00FF000000000000) &gt;&gt; 40) |
+    ((ticksDiff &amp; 0x0000FF0000000000) &gt;&gt; 24) |
+    ((ticksDiff &amp; 0x000000FF00000000) &gt;&gt; 8));
+
+short b = (short)(
+    ((ticksDiff &amp; 0x00000000FF000000) &gt;&gt; 24) |
+    ((ticksDiff &amp; 0x0000000000FF0000) &gt;&gt; 8));
+
+short c = (short)(
+    ((ticksDiff &amp; 0x000000000000FF00) &gt;&gt; 8) |
+    ((ticksDiff &amp; 0x00000000000000FF) &lt;&lt; 8));
+</code></pre>
+
+<p>If you can tolerate a change in endianness, the following is a lot cleaner to read (but provides no measurable change in runtime for me): </p>
+
+<pre><code>var ticksDiff = nowTicks - baseDateTicks;
+
+int a = (int)(ticksDiff);
+short b = (short)(ticksDiff &gt;&gt; 32);
+short c = (short)(ticksDiff &gt;&gt; 48);
+</code></pre>
+
+<h1>Remainder</h1>
+
+<p>You don't need to do a remainder when computing <code>sequenceNumber</code> because we're extracting the remainder bits directly anyhow when we pass <code>(byte)(sequenceNumber &gt;&gt; 8), (byte)(sequenceNumber)</code> to the <code>Guid</code> constructor.</p>
+
+<p>My numbers below make it hard to conclude if this helps at all. This is the kind of thing that might be optimized away by the jitter anyway.</p>
+
+<h1>Benchmarks</h1>
+
+<p>With these changes, my benchmarks look as follows:</p>
+
+<pre><code>|                                    Method |     Mean |   Error |  StdDev | Ratio |  Gen 0 | Gen 1 | Gen 2 | Allocated |
+|------------------------------------------ |---------:|--------:|--------:|------:|-------:|------:|------:|----------:|
+|                          NewGuid_Original | 224.2 ns | 4.37 ns | 4.49 ns |  1.00 | 0.0041 |     - |     - |      20 B |
+|                  NewGuid_WithPackedValues | 153.6 ns | 2.51 ns | 2.35 ns |  1.00 | 0.0041 |     - |     - |      20 B |
+| NewGuid_WithPackedValuesAndNoBitConverter | 148.6 ns | 2.43 ns | 2.28 ns |  1.00 |      - |     - |     - |         - |
+|                NewGuid_WithReorderedBytes | 148.9 ns | 2.92 ns | 3.00 ns |  1.00 |      - |     - |     - |         - |
+|  NewGuid_WithReorderedBytesAndNoRemainder | 146.4 ns | 2.11 ns | 1.98 ns |  1.00 |      - |     - |     - |         - |
+</code></pre>
+
+<p>Final code:</p>
+
+<pre><code>public static Guid NewGuid_WithBinaryOptimizationsAndWithoutRemainder()
+{
+    var nowTicks = DateTime.UtcNow.Ticks;
+    var sequenceNumber = Interlocked.Increment(ref ClockSequenceNumber);
+
+    var ticksDiff = nowTicks - baseDateTicks;
+
+    int a = (int)(ticksDiff);
+    short b = (short)(ticksDiff &gt;&gt; 32);
+    short c = (short)(ticksDiff &gt;&gt; 48);
+
+    var guid = new Guid(
+        a,
+        b,
+        c,
+        (byte)(sequenceNumber &gt;&gt; 8),
+        (byte)(sequenceNumber),
+        macBytes[0],
+        macBytes[1],
+        macBytes[2],
+        macBytes[3],
+        macBytes[4],
+        macBytes[5]);
+
+    return guid;
+}
+</code></pre>
+    </div>

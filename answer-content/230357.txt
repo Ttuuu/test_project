@@ -1,0 +1,408 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Implemented Henrik Hansen's suggested edits:</p>
+
+<ul>
+<li><p>Define an abstract class, <code>PD0Bytefield</code>, to encapsulate how byte fields are specified (<code>PD0Bytefield.StartHexDigitIndex</code> and <code>PD0Bytefield.HexDigitLength</code>) with abstract methods to specify how they should be casted when read from (<code>PD0Bytefield.Extract()</code>) and how they should be written to the underlying string (<code>PD0Bytefield.Insert()</code>). </p>
+
+<p>This allows the indexer of <code>PD0Format</code> to defer implementation details to concrete implementations of <code>PD0Bytefield</code> (namely <code>PD0IntBytefield</code>, <code>PD0FloatBytefield</code>, <code>PD0StringBytefield</code>, <code>PD0LongBytefield</code>). This also makes <code>castop</code> obsolete — which is desirable since the current implementation requires matching keys in both <code>castop</code> and all <code>ByteSpecification</code> dictionaries, which is hard to maintain as the number of keys increases.</p></li>
+<li><p>Define a single dictionary, <code>PD0Format.Categories</code>, to map byte field names to concrete implementations of <code>PD0Bytefield</code>. Because the binary specification doesn't change between instantiations of <code>PD0Format</code>, this dictionary should be made <em><a href="https://docs.microsoft.com/en-us/dotnet/csharp/programming-guide/classes-and-structs/static-classes-and-static-class-members#static-members" rel="nofollow noreferrer">static</a></em>. </p>
+
+<p>Because <code>PD0Format._hasciiData</code> is not a static field, it can't be used in a static context (i.e., we can't pass <code>PD0Format._hasciiData</code> to concrete classes of <code>PD0Bytefields</code> when they're initialized by <code>Categories</code>'s dictionary initializer). This forces us to pass <code>PD0Format._hasciiData</code>, an instance variable, to the abstract methods of <code>PD0Bytefield</code> <a href="https://docs.microsoft.com/en-us/dotnet/csharp/language-reference/keywords/ref#passing-an-argument-by-reference" rel="nofollow noreferrer">by reference</a>. </p></li>
+</ul>
+
+<h2>Code</h2>
+
+<pre><code>using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.Linq;
+using System.Text;
+
+using ByteSpecification = System.Collections.Generic.Dictionary&lt;string, System.Collections.Generic.Dictionary&lt;string, ByteParsing.Bytefield&gt;&gt;;
+
+namespace ByteParsing
+{
+    public class HasciiParser
+    {
+        public static int GetByteSize(string hascii)
+        {
+            return (int)Math.Ceiling(hascii.Length / 2.0);
+        }
+
+        public static string HexToString(string hascii)
+        {
+            byte[] bytes = new byte[hascii.Length / 2];
+            for (int i = 0; i &lt; hascii.Length; i += 2)
+            {
+                bytes[i / 2] = byte.Parse(hascii.Substring(i, 2), NumberStyles.HexNumber);
+            }
+
+            return Encoding.UTF8.GetString(bytes); // Or use Encoding.Default
+        }
+
+        public static string StringToHex(string str, int maxWidth)
+        {
+            byte[] bytes = Encoding.UTF8.GetBytes(str);
+            return string.Join("", bytes.Select(b =&gt; b.ToString("X2"))).PadLeft(maxWidth, '0');
+        }
+
+        public DateTime HexToDatetime(string hascii)
+        {
+            int year = Convert.ToInt32(hascii.Substring(0, 4), 16);
+            int month = Convert.ToInt32(hascii.Substring(4, 2), 16);
+            int day = Convert.ToInt32(hascii.Substring(6, 2), 16);
+            return new DateTime(year, month, day);
+        }
+
+        public static float HexToFloat(string hascii)
+        {
+            // https://stackoverflow.com/a/7903300/3396951
+            uint num = uint.Parse(hascii, System.Globalization.NumberStyles.AllowHexSpecifier);
+            byte[] floatVals = BitConverter.GetBytes(num);
+            return BitConverter.ToSingle(floatVals, 0);
+        }
+    }
+
+    public abstract class Bytefield
+    {
+        protected int StartHexDigitIndex { get; }
+        protected int HexDigitLength { get; }
+        public string BytefieldDescription { get; set; }
+        public int ByteStart =&gt; (StartHexDigitIndex / 2) + 1;
+        public int ByteLength =&gt; HexDigitLength / 2;
+
+        protected Bytefield(int byteStartIndex, int byteLength)
+        {
+            // User provides startIndex, which follows base-1 indexing (to be consistent with convention used in binary specification)
+            // but this constructor converts index to base-0. Indexing, here, refers to the indexing of hex digits (there are 2 hex-digits to a byte)
+            // and NOT the indexing of bytes. 
+            StartHexDigitIndex = (byteStartIndex - 1) * 2;
+            HexDigitLength = byteLength * 2;
+        }
+
+        protected Bytefield(int byteStartIndex, int byteLength, string bytefieldDescription) 
+            : this(byteStartIndex, byteLength)
+        {
+            BytefieldDescription = bytefieldDescription;
+        }
+
+        protected string GetBytes(ref string bytefieldData) =&gt; bytefieldData.Substring(StartHexDigitIndex, HexDigitLength);
+
+        protected void SetBytes(ref string bytefieldData, string hexval)
+        {
+            // If the number of bytes occupied by the assigned value is greater than the byte length specfication of the bytefield,
+            // ArgumentException will be thrown.
+            if (HasciiParser.GetByteSize(hexval) != ByteLength)
+                throw new ArgumentException($"Bytefield length is {ByteLength} bytes. Tried to assign {HasciiParser.GetByteSize(hexval)} bytes.");
+
+            string prefix = bytefieldData.Substring(0, StartHexDigitIndex);
+            string postfix = bytefieldData.Substring(StartHexDigitIndex + HexDigitLength);
+            bytefieldData = $"{prefix}{hexval}{postfix}"; // Potentially inefficient for large number of SetBytes()
+        }
+
+        public abstract void Insert(ref string bytefieldData, object value);
+        public abstract object Extract(ref string bytefieldData);
+    }
+
+    public class UInt16Bytefield : Bytefield
+    {
+        public UInt16Bytefield(int byteStartIndex, int byteLength) : base(byteStartIndex, byteLength)
+        {
+        }
+
+        public UInt16Bytefield(int byteStartIndex, int byteLength, string bytefieldDescription) 
+            : base(byteStartIndex, byteLength, bytefieldDescription)
+        {
+        }
+
+        public override void Insert(ref string bytefieldData, object value) =&gt;
+            SetBytes(ref bytefieldData, ((UInt16) value).ToString($"X{HexDigitLength}"));
+
+        public override object Extract(ref string bytefieldData) =&gt; Convert.ToUInt16(GetBytes(ref bytefieldData), 16);
+    }
+
+    public class Int32Bytefield : Bytefield
+    {
+        public Int32Bytefield(int byteStartIndex, int byteLength) : base(byteStartIndex, byteLength)
+        {
+        }
+
+        public Int32Bytefield(int byteStartIndex, int byteLength, string bytefieldDescription)
+            : base(byteStartIndex, byteLength, bytefieldDescription)
+        {
+        }
+
+        public override void Insert(ref string bytefieldData, object value) =&gt;
+            SetBytes(ref bytefieldData, ((Int32)(value)).ToString($"X{HexDigitLength}"));
+
+        public override object Extract(ref string bytefieldData) =&gt;
+            Convert.ToInt32(GetBytes(ref bytefieldData), 16);
+    }
+
+    public class FloatBytefield : Bytefield
+    {
+        public FloatBytefield(int byteStartIndex, int byteLength) : base(byteStartIndex, byteLength)
+        {
+        }
+
+        public FloatBytefield(int byteStartIndex, int byteLength, string bytefieldDescription) 
+            : base(byteStartIndex, byteLength, bytefieldDescription)
+        {
+        }
+
+        public override void Insert(ref string bytefieldData, object value) =&gt; SetBytes(ref bytefieldData, ((Single) value).ToString($"X{HexDigitLength}"));
+        public override object Extract(ref string bytefieldData) =&gt; HasciiParser.HexToFloat(GetBytes(ref bytefieldData));
+    }
+
+    public class StringBytefield : Bytefield
+    {
+        public StringBytefield(int byteStartIndex, int byteLength) : base(byteStartIndex, byteLength)
+        {
+        }
+
+        public StringBytefield(int byteStartIndex, int byteLength, string bytefieldDescription)
+            : base(byteStartIndex, byteLength, bytefieldDescription)
+        {
+
+        }
+
+        public override void Insert(ref string bytefieldData, object value) =&gt; SetBytes(ref bytefieldData, HasciiParser.StringToHex((string) value, HexDigitLength));
+        public override object Extract(ref string bytefieldData) =&gt; HasciiParser.HexToString(GetBytes(ref bytefieldData));
+    }
+
+    public class ULongBytefield : Bytefield
+    {
+        public ULongBytefield(int byteStartIndex, int byteLength) : base(byteStartIndex, byteLength)
+        {
+        }
+
+        public ULongBytefield(int byteStartIndex, int byteLength, string bytefieldDescription) 
+            : base(byteStartIndex, byteLength, bytefieldDescription)
+        {
+        }
+
+        public override void Insert(ref string bytefieldData, object value) =&gt; SetBytes(ref bytefieldData, ((UInt64) value).ToString($"X{HexDigitLength}"));
+        public override object Extract(ref string bytefieldData) =&gt; Convert.ToUInt64(GetBytes(ref bytefieldData), 16);
+    }
+
+    public class PD0Format
+    {
+        private string _hasciiData;
+
+        public string HasciiData
+        {
+            get =&gt; _hasciiData;
+            set =&gt; _hasciiData = value;
+        }
+
+        public ByteSpecification ByteSpec { get; set; }
+
+        public PD0Format()
+        {
+            HasciiData = new String('0', 70); // binary specification contains 280 bits/35 bytes, which is 70 hex digits
+            ByteSpec = InitializeByteSpecification();
+        }
+
+        public PD0Format(string hasciiData)
+        {
+            _hasciiData = hasciiData;
+            ByteSpec = InitializeByteSpecification();
+        }
+
+        protected ByteSpecification InitializeByteSpecification()
+        {
+            return new ByteSpecification()
+            {
+                {
+                    "date", new Dictionary&lt;string, Bytefield&gt;()
+                    {
+                        {"year", new UInt16Bytefield(1, 2, "Today's four digit-year.")},
+                        {"month", new UInt16Bytefield(3, 1, "Today's four digit-month.")},
+                        {"day", new UInt16Bytefield(4, 1, "Today's four digit-day.")},
+                    }
+                },
+                {
+                    "constants", new Dictionary&lt;string, Bytefield&gt;()
+                    {
+                        {"mathconstant", new FloatBytefield(5, 4, "")},
+                        {"physicsconstant", new FloatBytefield(9, 4, null)},
+                    }
+                },
+                {
+                    "secrets", new Dictionary&lt;string, Bytefield&gt;()
+                    {
+                        {"secretvalue", new Int32Bytefield(13, 4, "Keep this value a secret.")},
+                        {"secretmessage", new StringBytefield(17, 11, "Keep this message a secret")},
+                        {"bigint", new ULongBytefield(28, 8, HasciiData)},
+                    }
+                }
+            };
+        }
+
+        public dynamic this[string category, string fieldname]
+        {
+            get =&gt; ByteSpec[category.ToLower()][fieldname.ToLower()].Extract(ref _hasciiData);
+            set =&gt; ByteSpec[category.ToLower()][fieldname.ToLower()].Insert(ref _hasciiData, value);
+        }
+    }
+
+    class Program
+    {
+        static void Main(string[] args)
+        { }
+    }
+}
+</code></pre>
+
+<h2>Unit Test</h2>
+
+<pre><code>using System;
+using System.Collections.Generic;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using ByteParsing;
+
+using TestHexData = System.Collections.Generic.Dictionary&lt;string, string&gt;;
+
+namespace ByteParsingTests
+{
+    [TestClass]
+    public class ByteParsingTests
+    {
+        public static readonly TestHexData hexdata = new TestHexData()
+        {
+            // string _year = "07E3"; // 2019, 16-bit int
+            // string _month = "0A"; // 10, 8-bit int
+            // string _day = "02"; // 2, 8-bit int
+            // string _pi = "40490FD8"; // 3.141592, IEEE-754 Single Precision Float
+            // string _eulers = "402DF854"; // 2.71828175, IEEE-754 Single Precision Float
+            // string _secretValue = "80000000"; // Decimal -2147483648, 32-bit int
+            // string _secretMsg = "48656C6C6F576F726C6421"; // ASCII string "HelloWorld!"
+            // string _bigInt = "8000000000000000"; // Decimal 9223372036854775808, 64-bit long (uint64)
+            {"PiEuler", "07E30A0240490FD8402df8548000000048656C6C6F576F726C64218000000000000000"},
+            // string _year = "07E3"; // 2019, 16-bit int
+            // string _month = "0A"; // 10, 8-bit int
+            // string _day = "09"; // 9, 8-bit int
+            // string _tau = "40C90E56"; // 6.282999, IEEE-754 Single Precision Float
+            // string _speedOfLight = "4F32D05E"; // 3E9, IEEE-754 Single Precision Float
+            // string _secretValue = "11111111"; // 286331153, 32-bit int
+            // string _secretMsg = "42697A7A7942757A7A2121"; // ASCII string "BizzyBuzz!!"
+            // string _bigInt = "2222222222222222"; // 2459565876494606882,  64-bit long (uint64)
+            {"TauSpeedOfLight", "07E30A0940C90E564F32D05E1111111142697A7A7942757A7A21212222222222222222"},
+            // string _year = "07E3"; // 2019, 16-bit int
+            // string _month = "0A"; // 10, 8-bit int
+            // string _day = "0A"; // 10, 8-bit int
+            // string _root2 = "3FB504D5"; // 1.4142099, IEEE-754 Single Precision Float
+            // string _electronCharge = "203D217B"; // 1.602E-19, IEEE-754 Single Precision Float
+            // string _secretValue = "33333333"; // 858993459, 32-bit int
+            // string _secretMsg = "4F6365616E466C6F6F7221"; // ASCII string "OceanFloor!"
+            // string _bigInt = "4444444444444444"; // 4919131752989213764, 64-bit long (uint64)
+            {"root2Charge", "07E30A0A3FB504D5203D217B333333334F6365616E466C6F6F72214444444444444444" }
+        };
+
+        public static bool NearlyEqual(float a, float b, float epsilon)
+        {
+            return NearlyEqual((double) a, (double) b, (double) epsilon);
+        }
+
+        public static bool NearlyEqual(double a, double b, double epsilon)
+        {
+            // Michael Borgwardt, https://stackoverflow.com/a/3875619/3396951
+            const double MinNormal = 2.2250738585072014E-308d;
+            double absA = Math.Abs(a);
+            double absB = Math.Abs(b);
+            double diff = Math.Abs(a - b);
+
+            if (a.Equals(b))
+            { // shortcut, handles infinities
+                return true;
+            }
+            else if (a == 0 || b == 0 || absA + absB &lt; MinNormal)
+            {
+                // a or b is zero or both are extremely close to it
+                // relative error is less meaningful here
+                return diff &lt; (epsilon * MinNormal);
+            }
+            else
+            { // use relative error
+                return diff / (absA + absB) &lt; epsilon;
+            }
+        }
+
+        [TestMethod, TestCategory("ExceptionalCases")]
+        [ExpectedException(typeof(InvalidCastException))]
+        public void IndexerAssignment_Int16Value_ThrowsInvalidCastException()
+        {
+            PD0Format record = new PD0Format(hexdata["PiEuler"]);
+            Assert.AreEqual((UInt16)2019, record["date", "year"]);
+            record["date", "year"] = (Int16)2020; // Should be casted to (UInt16)
+        }
+
+        [TestMethod, TestCategory("ExceptionalCases")]
+        [ExpectedException(typeof(ArgumentException))]
+        public void IndexerAssignment_UInt16Value_ThrowsInvalidCastException()
+        {
+            PD0Format record = new PD0Format(hexdata["PiEuler"]);
+
+            // This should be ok. 255 isn't a valid month but what determines whether a value can be 
+            // assigned is the range of values the underlying data type can store (0 - 2^16-1, in this case)
+            // and the byte specification. If the number of bytes occupied by the assigned value is greater
+            // than the byte length specfication of the bytefield, ArgumentException should be thrown.
+            record["date", "month"] = (UInt16) 0xFF;
+            Assert.AreEqual((UInt16)255, record["date", "month"]);
+
+            // Values greater than 255 (0xFF) should throw ArgumentException. This is because the "month"
+            // specification is defined to be one byte long. The underlying data type (UInt16, see PD0Format.ByteSpec)
+            // can hold unsigned values that fit within two bytes but the assigned value occupies more bytes than 
+            // defined by the specification.
+            record["date", "month"] = (UInt16) 0x0100;
+        }
+
+        [TestMethod, TestCategory("TypicalUseCase")]
+        public void IndexerAssignment_UInt16MaxValue_SetsCorrectHexbytes()
+        {
+            PD0Format record = new PD0Format(hexdata["PiEuler"]);
+
+            record["date", "year"] = (UInt16) 65535; // 0xFFFF
+            Assert.AreEqual((UInt16)65535, record["date", "year"]);
+            Assert.AreEqual("FFFF", record["date", "year"].ToString("X4"));
+        }
+
+        [TestMethod, TestCategory("TypicalUseCase")]
+        [DataRow("PiEuler", (UInt16)2019, (UInt16)10, (UInt16)2, 3.141592F, 2.71828175F, (Int32)(-2147483648), "HelloWorld!", (UInt64)9223372036854775808)]
+        [DataRow("TauSpeedOfLight", (UInt16)2019, (UInt16)10, (UInt16)9, 6.282999F, 3000000000F, (Int32)(286331153), "BizzyBuzz!!", (UInt64)2459565876494606882)]
+        [DataRow("root2Charge", (UInt16)2019, (UInt16)10, (UInt16)10, 1.4142099F, 1.602000046096E-19F, (Int32)(858993459), "OceanFloor!", (UInt64)4919131752989213764)]
+        public void IndexerAccess_ReturnsCorrectTypesAndValues(string hexdataField, UInt16 year, UInt16 month, UInt16 day, 
+            float mathConstant, float physicsConstants, Int32 secretValue, string secretMessage, ulong bigint)
+        {
+            var record = new PD0Format(hexdata[hexdataField]);
+            Assert.AreEqual(year, record["date", "year"]);
+            Assert.AreEqual(month, record["date", "month"]);
+            Assert.AreEqual(day, record["date", "day"]);
+            Assert.IsTrue(NearlyEqual(mathConstant, record["constants","mathconstant"], .0000001));
+            Assert.IsTrue(NearlyEqual(physicsConstants, record["constants", "physicsconstant"], .0000001));
+            Assert.AreEqual(secretValue, record["secrets","secretvalue"]);
+            Assert.AreEqual(secretMessage, record["secrets", "secretmessage"]);
+            Assert.AreEqual(bigint, record["secrets", "bigint"]);
+        }
+
+        [TestMethod, TestCategory("TypicalUseCase")]
+        public void IndexerAssignment_secretsCategory_SetsCorrectHexbytes()
+        {
+            PD0Format defaultRecord = new PD0Format();
+
+            Assert.AreEqual("0000000000000000000000000000000000000000000000000000000000000000000000", defaultRecord.HasciiData);
+
+            // 35791394 = 0x02222222 = "02222222"
+            // "FooBarBaz" = 0x0000466F6F42617242617A = "0000466F6F42617242617A"
+            // 1229782938247303441 = 0x1111111111111111 = "1111111111111111"
+            defaultRecord["secrets", "secretvalue"] = (Int32) 35791394;
+            defaultRecord["secrets", "secretmessage"] = "FooBarBaz";
+            defaultRecord["secrets", "bigint"] = (UInt64)1229782938247303441;
+
+            Assert.AreEqual("000000000000000000000000022222220000466F6F42617242617A1111111111111111", defaultRecord.HasciiData);
+        }
+    }
+}
+</code></pre>
+    </div>

@@ -1,0 +1,553 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The UserForm implemented here is specifically designed to demonstrate the CFrameSorter class functions.  In doing so, the UI fulfills two roles: The CFrameSorter command initiator, and results viewer.  In the actual system where the CFrameSorter is used, the CFrameSorter would most likely be commanded to Move and Hide Frames by a component other than the UI.  That is a communication sequence something like: </p>
+
+<p>Application object(s)issue Frame manipulation commands ==&gt; CFrameSorter(issues frame position and visibility commands) ==&gt; FrameDisplayUI (View) places and shows Frames in response to CFrameSorter input.  </p>
+
+<p>In the above sequence, the UI does not issue commands going right to left.  The UI in this post (because it is a CFrameSorter tester/demonstrator) is playing the roles of both the Application and View.  To prepare the CFrameSorter for use in your final system, making the visual test tool (the UserForm) better simulate the interactions described above is the theme for the following review.  </p>
+
+<p>The primary comment is this: The UI in the final design should be completely unaware of the concrete object(s) that are manipulating it.  This is also the goal of the TestUI.  Currently, when the UserForm is first created, UserForm_Initialize is called.  The first thing it does is:</p>
+
+<pre><code>Set FrameSorter = New CFrameSorter
+FrameSorter.Initialise Me
+</code></pre>
+
+<p>If these two commands were described in terms of human relationships, it would be the same as the UserForm telling the CFrameSorter, "I know who you are and everything about you.  You are more than a member variable to me.  You...complete me".  In this scenario, interfaces is probaby the best way for the CFrameSorter to break out of this relationship "and still be friends".</p>
+
+<p>We want to remove any awareness of the CFrameSorter class from the View..and, unltimately, any awareness of the View, from the CFrameSorter.  "FrameSorter.Initialise Me" has to go.  We want to do this for a few reasons, but the primary reason is that in the final system, the CFrameSorter will not be taking frame positioning commands from the UI.  It will be issued commands from one or more application objects.  The simplest way to set this up here is to create a StandardModule (FrameSorterTester).  It's job is to simulate the Application.  It will create a CFrameSorter instance as well as the View instance.  Add an entry point to initiate the testing.</p>
+
+<pre><code>Sub TestCFrameSorter()
+    Dim frameSorter As CFrameSorter
+    Set frameSorter = New CFrameSorter
+
+    Dim testView As TestFrameSorterView
+    Set testView = New TestFrameSorterView
+
+    Load testView
+    testView.Show
+End Sub
+</code></pre>
+
+<p>So, how to wire up the system if TestFrameSorterView is not to know anything about CFrameSorter class.  Answer: Interfaces.  Every VBA module that has Public subroutines, functions, or properties defines an interface.  The interface is fundamentally a set of methods that define interactions.  The implicit interface of CFrameSorter is:</p>
+
+<pre><code>    Public Property Get StartPosition() As Long
+    End Property
+
+    Public Property Let StartPosition(Value As Long)
+    End Property
+
+    Public Property Get Spacer() As Long
+    End Property
+
+    Public Property Let Spacer(Value As Long)
+    End Property
+
+    Public Property Get FrameDict() As Dictionary
+    End Property
+
+    Public Sub AddFrame(SourceFrame As Frame)
+    End Sub
+
+    Public Sub RemoveFrame(SourceFrame As Frame)
+    End Sub
+
+    Public Sub MoveUp(SourceFrame As Frame, Optional Position As Long = 1)
+    End Sub
+
+    Public Sub MoveDown(SourceFrame As Frame, Optional Position As Long = 1)
+    End Sub
+
+    Public Sub Move(SourceFrame As Frame, Position As Long)
+    End Sub
+
+    Public Sub Initialise(SourceForm As Object)
+    End Sub
+</code></pre>
+
+<p>As you can see, all that I've done is copied Public methods from CFrameSorter and deleted everything else.  Now, create a new ClassModule "IFrameSorter" with the above empty methods in it...you've just created an interface.  When an object (any object) 'implements' the IFrameSorter interface, it MUST provide logic behind every method of the interface - even if it is to raise an error that says "Public Sub Move not implemented" (for example).  To 'force' CFrameSorter to implement IFrameSorter you add "Implements IFrameSorter" at the top of the CFrameSorter class module.  This defines a set of methods that CFrameSorter MUST implement (it already has the logic).  A simple search on 'Implement an Interface in Excel VBA' will provide the rest of the details to get to the following version of CFrameSorter:</p>
+
+<pre><code>    Option Explicit
+
+    Implements IFrameSorter
+
+
+    Private FrameDictionary As Dictionary
+    Private VisibleFrames As Dictionary
+    Private pStartPosition As Long
+    Private pSpacer As Long
+
+    Private Sub Class_Initialize()
+        Set FrameDictionary = New Dictionary
+        Set VisibleFrames = New Dictionary
+        pStartPosition = 6
+        pSpacer = 10
+    End Sub
+
+    Private Property Let IFrameSorter_Spacer(RHS As Long)
+        pSpacer = RHS
+    End Property
+
+    Private Property Get IFrameSorter_Spacer() As Long
+        IFrameSorter_Spacer = pSpacer
+    End Property
+
+    Private Property Let IFrameSorter_StartPosition(RHS As Long)
+        pStartPosition = RHS
+    End Property
+
+    Private Property Get IFrameSorter_StartPosition() As Long
+        IFrameSorter_StartPosition = pStartPosition
+    End Property
+
+    Private Property Get IFrameSorter_FrameDict() As Scripting.IDictionary
+        Set IFrameSorter_FrameDict = FrameDictionary
+    End Property
+
+    Private Sub IFrameSorter_AddFrame(SourceFrame As MSForms.IOptionFrame)
+        If Not SourceFrame Is Nothing Then
+            If FrameDictionary.Exists(SourceFrame.Name) Then
+                With SourceFrame
+                    If Not VisibleFrames.Exists(.Name) Then
+                        .Visible = True
+                        VisibleFrames.Add .Name, SourceFrame
+                        ArrangeFrames
+                    End If
+                End With
+            End If
+        End If
+    End Sub
+
+    Private Sub IFrameSorter_RemoveFrame(SourceFrame As MSForms.IOptionFrame)
+        If Not SourceFrame Is Nothing Then
+            With SourceFrame
+                If VisibleFrames.Exists(.Name) Then
+                    .Visible = False
+                    VisibleFrames.Remove (.Name)
+                    ArrangeFrames
+                End If
+            End With
+        End If
+    End Sub
+
+    Private Sub IFrameSorter_MoveUp(SourceFrame As MSForms.IOptionFrame, Optional Position As Long = 1&amp;)
+        Dim lPosition As Long
+        lPosition = GetPositionInDict(SourceFrame)
+        If lPosition &gt; 1 Then
+            MoveFrame SourceFrame, lPosition - 1
+            ArrangeFrames
+        End If
+    End Sub
+
+    Private Sub IFrameSorter_Move(SourceFrame As MSForms.IOptionFrame, Position As Long)
+        MoveFrame SourceFrame, Position
+        ArrangeFrames
+    End Sub
+
+    Private Sub IFrameSorter_MoveDown(SourceFrame As MSForms.IOptionFrame, Optional Position As Long = 1&amp;)
+        Dim lPosition As Long
+        lPosition = GetPositionInDict(SourceFrame)
+        If lPosition &gt; 0 And lPosition &lt; VisibleFrames.Count Then
+            MoveFrame SourceFrame, lPosition + 1
+            ArrangeFrames
+        End If
+    End Sub
+
+    Private Sub IFrameSorter_Initialise(SourceForm As Object)
+        Dim ctrl As Control
+        Dim tmpSubSorter As CFrameSorter
+        Dim vSortArray As Variant
+        For Each ctrl In SourceForm.Controls
+            If TypeName(ctrl) = "Frame" Then
+                Select Case TypeName(ctrl.Parent)
+                    Case TypeName(SourceForm)
+                        With FrameDictionary
+                            If Not .Exists(ctrl.Name) Then
+                                .Add ctrl.Name, ctrl
+                            End If
+                        End With
+                    Case "Frame"
+                        'Do nothing yet.
+                End Select
+            End If
+        Next ctrl
+        'Sort the frames contained in the dictionary into
+        'order based on their Top property.
+        vSortArray = FrameDictToArray(FrameDictionary)
+        Sort2DArray vSortArray
+        SortDictByArray vSortArray, FrameDictionary
+        'Create a dictionary of visible frames and then
+        'arrange them on the form in order.
+        GetVisibleFrames
+        ArrangeFrames
+    End Sub
+
+    Private Function GetPositionInDict(SourceFrame As Frame) As Long
+        Dim vItem As Variant
+        Dim x As Long
+        If Not SourceFrame Is Nothing Then
+            If VisibleFrames.Exists(SourceFrame.Name) Then
+                For Each vItem In VisibleFrames.Items
+                    x = x + 1
+                    If SourceFrame.Name = vItem.Name Then
+                        GetPositionInDict = x
+                        Exit For
+                    End If
+                Next vItem
+            Else
+                GetPositionInDict = -1
+            End If
+        End If
+    End Function
+
+    Private Sub GetVisibleFrames()
+        Dim tmpDict As Dictionary
+        Dim vItem As Variant
+        If Not FrameDictionary Is Nothing Then
+            If FrameDictionary.Count &gt; 0 Then
+                Set tmpDict = New Dictionary
+                For Each vItem In FrameDictionary.Items
+                    If vItem.Visible Then
+                        tmpDict.Add vItem.Name, vItem
+                    End If
+                Next vItem
+            End If
+        End If
+        Set VisibleFrames = tmpDict
+    End Sub
+
+    Private Sub MoveFrame(SourceFrame As Frame, Position As Long)
+        Dim tmpDict As Dictionary
+        Dim vItem As Variant
+        Dim x As Long
+        If Not SourceFrame Is Nothing Then
+            Set tmpDict = New Dictionary
+            SourceFrame.Visible = True
+            If Not VisibleFrames.Exists(SourceFrame.Name) Then
+                VisibleFrames.Add SourceFrame.Name, SourceFrame
+            End If
+            If Position &gt; VisibleFrames.Count Then
+                Position = VisibleFrames.Count
+            ElseIf Position &lt; 0 Then
+                Position = 0
+            End If
+            If Position = VisibleFrames.Count Then
+                VisibleFrames.Remove SourceFrame.Name
+                VisibleFrames.Add SourceFrame.Name, SourceFrame
+            Else
+                VisibleFrames.Remove SourceFrame.Name
+                For x = 0 To VisibleFrames.Count - 1
+                    If x = Position - 1 Then
+                        tmpDict.Add SourceFrame.Name, SourceFrame
+                    End If
+                    tmpDict.Add VisibleFrames.Items(x).Name, VisibleFrames.Items(x)
+                Next x
+                Set VisibleFrames = tmpDict
+            End If
+        End If
+    End Sub
+
+    Private Sub ArrangeFrames()
+        Dim vItem As Variant
+        Dim lTopRow As Long
+        If Not VisibleFrames Is Nothing Then
+            If VisibleFrames.Count &gt; 0 Then
+                lTopRow = pStartPosition
+                For Each vItem In VisibleFrames.Items
+                    vItem.Top = lTopRow
+                    lTopRow = lTopRow + vItem.Height + pSpacer
+                Next vItem
+            End If
+        End If
+    End Sub
+
+    Private Sub SortDictByArray(vSortArray As Variant, TargetDict As Dictionary)
+        Dim tmpDict As Dictionary
+        Dim vItem As Variant
+        Dim x As Long
+        If Not TargetDict Is Nothing Then
+            If UBound(vSortArray) = TargetDict.Count - 1 Then
+                Set tmpDict = New Dictionary
+                For x = LBound(vSortArray) To UBound(vSortArray)
+                    tmpDict.Add vSortArray(x, 1), TargetDict.Item(vSortArray(x, 1))
+                Next x
+                Set TargetDict = tmpDict
+            End If
+        End If
+    End Sub
+
+    Private Function FrameDictToArray(SourceDict As Dictionary) As Variant
+        Dim tmpDict As Dictionary
+        Dim x As Long
+        Dim tmpArr As Variant
+        Dim itm As Variant
+        If Not SourceDict Is Nothing Then
+            If SourceDict.Count &gt; 0 Then
+                Set tmpDict = New Dictionary
+                ReDim tmpArr(0 To SourceDict.Count - 1, 0 To 1)
+                For Each itm In SourceDict.Items
+                    tmpArr(x, 0) = itm.Top
+                    tmpArr(x, 1) = itm.Name
+                    x = x + 1
+                Next itm
+                FrameDictToArray = tmpArr
+            End If
+        End If
+    End Function
+
+    Private Sub Sort2DArray(vArray As Variant, _
+        Optional ByVal lLowStart As Long = -1, _
+        Optional ByVal lHighStart As Long = -1)
+
+        Dim vPivot As Variant
+        Dim lLow As Long
+        Dim lHigh As Long
+
+        lLowStart = IIf(lLowStart = -1, LBound(vArray), lLowStart)
+        lHighStart = IIf(lHighStart = -1, UBound(vArray), lHighStart)
+        lLow = lLowStart
+        lHigh = lHighStart
+
+        vPivot = vArray((lLowStart + lHighStart) \ 2, 0)
+        While lLow &lt;= lHigh
+            While (vArray(lLow, 0) &lt; vPivot And lLow &lt; lHighStart)
+                lLow = lLow + 1
+            Wend
+
+            While (vPivot &lt; vArray(lHigh, 0) And lHigh &gt; lLowStart)
+                lHigh = lHigh - 1
+            Wend
+
+            If (lLow &lt;= lHigh) Then
+                Swap vArray, lLow, lHigh
+                lLow = lLow + 1
+                lHigh = lHigh - 1
+            End If
+        Wend
+
+        If (lLowStart &lt; lHigh) Then
+            Sort2DArray vArray, lLowStart, lHigh
+        End If
+        If (lLow &lt; lHighStart) Then
+            Sort2DArray vArray, lLow, lHighStart
+        End If
+
+    End Sub
+
+    Private Sub Swap(vArray As Variant, lItem1 As Long, lItem2 As Long)
+        Dim vTemp0 As Variant
+        Dim vTemp1 As Variant
+        vTemp0 = vArray(lItem1, 0)
+        vTemp1 = vArray(lItem1, 1)
+        vArray(lItem1, 0) = vArray(lItem2, 0)
+        vArray(lItem1, 1) = vArray(lItem2, 1)
+        vArray(lItem2, 0) = vTemp0
+        vArray(lItem2, 1) = vTemp1
+    End Sub
+</code></pre>
+
+<p>In order for the View to work with the interface, we will modify it as follows:
+(old code commented out)</p>
+
+<pre><code>    'Private FrameSorter As CFrameSorter
+    Private frameSorter As IFrameSorter
+
+    Private Sub UserForm_Initialize()
+        'Dim vItem As Variant
+
+        'Set FrameSorter = New CFrameSorter
+        'FrameSorter.Initialise Me
+
+        'Populate the combobox.
+        'For Each vItem In frameSorter.FrameDict.Items
+        '    Me.cmbFrames.AddItem vItem.Name
+        'Next vItem
+
+    End Sub
+
+    Public Sub ApplyFrameSorter(sorter As IFrameSorter)
+        Set frameSorter = sorter
+        frameSorter.Initialise Me
+
+        'Populate the combobox.
+        Dim vItem As Variant
+        For Each vItem In frameSorter.FrameDict.Items
+            Me.cmbFrames.AddItem vItem.Name
+        Next vItem
+    End Sub
+</code></pre>
+
+<p>And the FrameSorterTester module as follows:</p>
+
+<pre><code>    Sub TestCFrameSorter()
+        Dim frameSorter As IFrameSorter '&lt;=== declare the interface
+        Set frameSorter = New CFrameSorter '&lt;== create the implementing object
+
+        Dim testView As TestFrameSorterView
+        Set testView = New TestFrameSorterView
+
+        Load testView
+
+        testView.ApplyFrameSorter frameSorter
+
+
+        testView.Show
+    End Sub
+</code></pre>
+
+<p>Initiating macro TestCFrameSorter will run your code and UI just as it did before.</p>
+
+<p>Although functionally equivalent, an important change has just occurred.  The View no longer creates CFrameSorter.  All that the View knows is that there is now a set of methods (the IFrameSorter interface) that it has access to.  Now the relationship can be described as: (View to IFrameSorter): "I don't know who you are, but you are more than an interface someone gave me.  You...complete me"  </p>
+
+<p>Now, it is time to get rid of "Initialise Me" because is passes a UI element (itself) as the parameter.  So, the task becomes: how to replace the functionality of <code>Initialise</code> without passing a reference to the <code>View</code> in the <code>IFrameSorter</code> interface methods.  </p>
+
+<p>The <code>Initialise</code> subroutine basically looks at all the <code>Frame</code> controls on the <code>View</code> and loads its Dictionaries.  <code>CFrameSorter</code> does not need the <code>UserForm</code> to do this - it only needs a collection of <code>Frame</code> objects.  So, let the <code>View</code> provide a collection of <code>Frame</code> objects by adding a public property (read-only) <code>Frames</code>.</p>
+
+<pre><code>    Public Property Get Frames() As Collection
+        Dim myFrames As Collection
+        Set myFrames = New Collection
+
+        Dim ctrl As Control
+        For Each ctrl In Me.Controls
+            If TypeName(ctrl) = "Frame" Then
+                Select Case TypeName(ctrl.Parent)
+                    Case TypeName(Me)
+                        myFrames.Add ctrl
+                    Case "Frame"
+                        'Do nothing yet.
+                End Select
+            End If
+        Next ctrl
+        Set Frames = myFrames
+    End Property
+</code></pre>
+
+<p>And replace/comment out <code>Initialise</code> on the <code>IFrameSorter</code> interface with a new method - "LoadDictionaries":</p>
+
+<pre><code>    'Remove Initialise from the interface and add LoadDictionaries
+    'Public Sub Initialise(SourceForm As Object)
+    'End Sub
+
+    Public Sub LoadDictionaries(vFrames As Collection)
+    End Sub
+</code></pre>
+
+<p>Removing <code>Initialise</code> from the <code>IFrameSorter</code> means that it can no longer be called from the <code>View</code>.  Method <code>ApplyFrameSorter</code> is the current user of <code>Initialise</code>.</p>
+
+<p>In addition to setting the <code>IFrameSorter</code> variable, <code>ApplyFrameSorter</code> also loads the <code>ComboBox</code> items.  So, a better name might have been "<em>ApplyFrameSorterAndLoadComboBoxItems</em>".  But, that 'better' name betrays the fact that the method is doing two things.  The <em>Single Responsibility Principle</em> (SRP) encourages us to always write methods that 'do one thing' - and the 'one thing' should be identified by the method's name.  So, in the spirit of SRP...Let's add a public Property <code>FrameSorterInterface</code> to the <code>View</code> in order to set/get the <code>IFrameSorter</code> interface - one thing.  And load the <code>ComboBox</code> (the second 'thing') some other way (Note: if we load the ComboBox as part of setting the property <code>FrameSorterInterface</code>, it would be considered an unadvertised <em>side-effect</em> of calling the property - always a good idea to avoid this).  </p>
+
+<p>Loading the ComboBox items: The <code>ComboBox</code> can be loaded by the the <code>View</code>.  There is no need to use the <code>IFrameSorter</code> interface to help do this.  From the moment it is created, the <code>View</code> knows everything it needs (names of all the 'Frame' controls) in order to load the <code>ComboBox</code>.  So, the code that loads the ComboBox items can be moved <em>back</em> into <code>UserForm_Initialize</code>.  </p>
+
+<p>So now, property <code>FrameSorterInterface</code> and subroutine <code>UserForm_Initialize</code> are each doing one thing related to their names, and together, have replaced the functionality lost by removing <code>Initialise</code> from the <code>IFrameSorter</code> interface.  The <code>View</code> code now looks like this:</p>
+
+<pre><code>    'TestFrameSorterView (UserForm) after removing "Initialise" from
+    ' the IFrameSorter interface and adding property FrameSorterInterface
+
+    Private Sub UserForm_Initialize()
+        'Populate the combobox.
+        Dim vItem As Variant
+        For Each vItem In Frames 'frameSorter.FrameDict.Items
+            Me.cmbFrames.AddItem vItem.Name
+        Next vItem
+    End Sub
+
+    Public Property Set FrameSorterInterface(sorter As IFrameSorter)
+        Set frameSorter = sorter
+    End Property
+
+    Public Property Get FrameSorterInterface() As IFrameSorter
+        Set FrameSorterInterface = frameSorter
+    End Property
+</code></pre>
+
+<p>Now let the FrameSorterTester be responsible for managing the initialization transactions between the <code>CFrameSorter</code> and the <code>TestFrameSorterView</code>.  The macro now looks like this:</p>
+
+<pre><code>    Sub TestCFrameSorter()
+        Dim frameSorter As IFrameSorter
+        Set frameSorter = New CFrameSorter
+
+        Dim testView As TestFrameSorterView
+        Set testView = New TestFrameSorterView
+
+        Load testView
+
+        'Provide the View with the IFrameSorterInterface
+        Set testView.FrameSorterInterface = frameSorter
+
+        'Retrieve the Frame objects from the view and provide
+        'them to CFrameSorter so that it can load its dictionaries
+        Dim vFrames As Collection
+        Set vFrames = testView.Frames       
+        frameSorter.LoadDictionaries vFrames
+
+        testView.Show
+    End Sub
+</code></pre>
+
+<p>Again, after all that, from a functional perspective, nothing has changed.  However, any awareness of the CFrameSorter class has been extracted from the View.  It only knows that it can call the IFrameSorter interface and expect the right behavior.  Further, CFrameSorter no longer knows about the TestFrameSorterView - it is handed a collection of Frame controls 'from somewhere' and initializes <em>itself</em>. So now (View to IFrameSorter): "I don't know who you are, you are only an interface someone gave me.  So, don't call me, I'll call you if (and only if) I want something".  The CFrameSorter now operates in a vacuum: "I don't know where these Frame control references are coming from, but I'll do what I'm asked to do".</p>
+
+<p>There is still more that can be done.  The IFrameSorter interface accepts Frame control references in the method signatures.  This means, that if you ever want any object to implement the IFrameSorter interface, it needs to be connected to a UI that will provide actual controls.  This implies that there is no opportunity to test CFrameSorter without using an actual UI.  A better version of the IFrameSorter interface eliminates UI control references.</p>
+
+<p>Removing the UI controls from the interface makes IFrameSorter independent of UI elements.  Writing test code without an actual UI is now possible - and preferred.  So, how to move the Frames without passing a <code>Frame</code> control reference?...again - an interface, but this interface is on the <code>View</code>.  Let's call this new interface <code>IFrameSorterView</code>.</p>
+
+<p>So, the <code>IFrameSorter</code> will look something like:</p>
+
+<pre><code>    Public Sub ShowFrame(frameName As String, IFrameSorterView view)
+    End Sub
+
+    Public Sub HideFrame(frameName As String, IFrameSorterView view)
+    End Sub
+
+    Public Sub MoveUp(frameName As String, IFrameSorterView view, Optional Position As Long = 1)
+    End Sub
+
+    Public Sub MoveDown(frameName As String, IFrameSorterView view, Optional Position As Long = 1)
+    End Sub
+
+    Public Sub Move(frameName As String, IFrameSorterView view, Position As Long)
+    End Sub
+
+    Public Sub LoadDictionaries(frameNames As Collection)
+    End Sub
+</code></pre>
+
+<p>And <code>IFrameSorterView</code> can be something like:</p>
+
+<pre><code>    Public Sub ModifyFramePosition(frameName As String, topValue As Long)
+    End Sub
+
+    Public Sub ModifyFrameVisibility(frameName As String, isVisible As Boolean)
+    End Sub
+</code></pre>
+
+<p>There are a lot of details to sort out to implement these two interfaces.  But the goal is to extract UI and UI controls awareness from <code>CFrameSorter</code>.</p>
+
+<p>Regarding the <code>CFrameSorter</code> code, there are a couple of Dictionaries that are storing position and visibility information.  This replicates what is already stored and available from the <code>View</code>.  So, there is probably an opportunity to eliminate the Dictionaries from <code>CFrameSorter</code> if the <code>IFrameSorterView</code> interface also includes some properties like:</p>
+
+<pre><code>    Public Property Get Top(frameName As String) As Long
+    End Property 
+
+    Public Property Get Height(frameName As String) As Long
+    End Property
+
+    Public Property Get IsVisible(frameName As String) As Boolean
+    End Property 
+</code></pre>
+
+<p>Or, collect them all at once...and let IFrameSorterView act as your dictionaries    </p>
+
+<pre><code>   'Dictionary of Frame names to Top position values
+    Public Property Get FrameNamesToTop() As Dictionary 
+    End Property 
+
+    'Dictionary of Frame names to Visible values
+    Public Property Get FrameNamesToIsVisible() As Dictionary 
+    End Property 
+
+    'Dictionary of Frame names to Height values
+     Public Property Get FrameNamesToHeight() As Dictionary
+     End Property
+</code></pre>
+
+<p>Hope this was helpful.  Good luck!</p>
+
+<p>I am certain that you will find <a href="https://rubberduckvba.wordpress.com/2017/10/" rel="nofollow noreferrer">this</a> useful for your task.</p>
+    </div>

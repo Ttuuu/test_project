@@ -1,0 +1,153 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Implementation issues</h1>
+
+<ul>
+<li><p>There's no way to store a move-only type (or rather any non-copyable type) in the <code>LinkedList</code> (e.g. this means you cannot have a <code>DLL::LinkedList&lt;std::unique_ptr&lt;int&gt;&gt;</code>). Maybe provide overloads that accept a <code>T&amp;&amp;</code>, and/or add an <code>emplace</code> member function that constructs a <code>T</code> in place?</p></li>
+<li><p>Prefer using a member initializer list over assigning inside the constructor body. This allows <code>ListNode::data</code> to be copy-constructed directly, instead of being default-constructed and then copy-assigned. Also, it might provide better optimization opportunities and better exception guarantees (if something inside the constructor throws, already constructed members get properly destructed).</p></li>
+<li><p><code>ListNode</code>s constructor(s) can be marked conditionally <code>noexcept</code>.</p></li>
+<li><p>Also, it might be more convenient to allow setting the <code>next</code> and <code>prev</code> pointers of a <code>ListNode</code> directly inside the <code>ListNode</code> constructor(s) (see later for an example).</p></li>
+</ul>
+
+<blockquote>
+  <p>An <code>ListNode</code> implementation supporting all above mentioned points might look something like this:</p>
+
+<pre><code>struct ListNode {
+    std::unique_ptr&lt;ListNode&gt; next;
+    ListNode* prev;
+    T data;
+
+    ListNode(std::unique_ptr&lt;ListNode&gt; next, ListNode* prev, const T&amp; element) noexcept(std::is_nothrow_copy_constructible_v&lt;T&gt;)
+        : next{std::move(next)}, prev{prev}, data{element} {}
+
+    ListNode(std::unique_ptr&lt;ListNode&gt; next, ListNode* prev, T&amp;&amp; elemente) noexcept(std::is_nothrow_move_constructible_v&lt;T&gt;)
+        : next{std::move(next)}, prev{prev}, data{std::move(element) {}
+
+    template&lt;typename... Args, typename = std::enable_if_t&lt;std::is_constructible_v&lt;T, Args&amp;&amp;...&gt;&gt;
+    ListNode(std::unique_ptr&lt;ListNode&gt; next, ListNode* prev, Args&amp;&amp;... args) noexcept(std::is_nothrow_constructible_v&lt;T, Args&amp;&amp;...&gt;)
+        : next{std::move(next)}, prev{prev}, data{std::forward&lt;Args&gt;(args)...} {}
+};
+</code></pre>
+</blockquote>
+
+<ul>
+<li><p><code>LinkedList</code>s default constructor could be <code>= default</code>, as no actual work is done.</p></li>
+<li><p><code>~LinkedList() {}</code> is problematic: Yes, it does clean up memory, but only until it hits the call stack limits due to recursion. Just try letting a <code>LinkedList</code> with a million (or so) elements destruct (e.g. by letting it fall out of scope).</p>
+
+<blockquote>
+  <p>You might want to rewatch minutes 16:00 to around 26:00 in the video, Herb Sutter explains this problem far better than I could in this limited space.</p>
+  
+  <p>Since an iterative destructor implementation was requested:</p>
+
+<pre><code>~LinkedList() noexcept {
+    while(head) head = std::move(head-&gt;next);
+}
+</code></pre>
+</blockquote></li>
+<li><p>Rule of Five violation: A custom destructor is provided, but no copy-constructor, copy assignment operator, move constructor and move assignment operator.</p>
+
+<blockquote>
+  <p>Move assignment and move construction are pretty easy to implement (actually, they can be <code>= default</code>).</p>
+  
+  <p>However, copy assignment and copy construction aren't quite as easy: They require <code>T</code> to be copy-constructible. If copying a <code>LinkedList</code> isn't important, you could <code>= delete</code> those two special functions.</p>
+</blockquote></li>
+<li><p><code>LinkedList::append(const T&amp;)</code> issues</p>
+
+<ul>
+<li><p>A lot of the calls to <code>std::unique_ptr::get</code> are unnecessary. The only necessary ones are <code>curr = head-&gt;next.get();</code>, <code>curr-&gt;prev = head.get();</code> and <code>curr = tail-&gt;next.get()</code>;</p></li>
+<li><p>The whole <code>else if</code> branch could be remove if <code>tail</code> would be allowed to point to the same node as <code>head</code> (in a <code>LinkedList</code> of size 1).</p></li>
+<li><p>The whole pointer moving business can be simplified using the constructors of <code>ListNode</code> above that take those pointer values.</p></li>
+<li><p>The <code>const T&amp;</code> parameter only works if <code>T</code> itself is copy constructible. This can be checked using type traits, and the function be made unavailable (using SFINAE) if copy-construction is not supported by <code>T</code>.</p></li>
+</ul>
+
+<blockquote>
+  <p>A simplified and cleaned up version could look something like this:</p>
+
+<pre><code>std::enable_if_t&lt;std::is_copy_constructible&lt;T&gt;::value&gt; append(const T&amp; element) {
+    if(!head) {
+        head = std::make_unique&lt;ListNode&gt;(nullptr, nullptr, element);
+        tail = head.get();
+    } else {
+        tail-&gt;next = std::make_unique&lt;ListNode&gt;(nullptr, tail, element);
+        tail = tail-&gt;next.get();
+    }
+}
+</code></pre>
+</blockquote></li>
+<li><p><code>LinkedList::remove(const T&amp;)</code> issues:</p>
+
+<ul>
+<li><p>Is there a specific reason that removing a value from an empty <code>LinkedList</code> returns a different result than removing a non-existent value form a non-empty <code>LinkedList</code>?</p></li>
+<li><p>Speaking about return values: Is it necessary to return one at all?</p></li>
+<li><p>The whole logic of <code>remove</code> could be split into two helper functions: 1) Finding the nodes whose value matches and 2) removing a specific node.</p>
+
+<blockquote>
+  <p>Finding a node (or removing a specific node) are operations that will likely be reused in the future anyways, so this will likely help implementing additional features.</p>
+</blockquote></li>
+<li><p>Again, like in <code>append</code>, some of the removal logic could be simplified if <code>tail</code> were allowed to point to the same node as <code>head</code>.</p></li>
+</ul>
+
+<blockquote>
+  <p>Example fixup:</p>
+
+<pre><code>private:
+    ListNode* find_node(const T&amp; value, ListNode* current) const {
+        while(current) {
+            if(current-&gt;data == value) return current;
+            current = current-&gt;next.get();
+        }
+        return nullptr;
+    }
+
+    void remove_node(ListNode* node) {
+        if(node-&gt;next) {
+            node-&gt;next-&gt;prev = node-&gt;prev;
+        } else {
+            tail = node-&gt;prev;
+        }
+
+        // the assignments below reset the original owner, thus node will be dangling afterwards!
+        if(node-&gt;prev) {
+            node-&gt;prev-&gt;next = std::move(node-&gt;next);
+        } else {
+            head = std::move(node-&gt;next);
+        }
+    }
+
+public:
+    void remove(const T&amp; value) {
+        for(auto node = find_node(head.get()); node; node = find_node(value, node)) {
+            auto temp = node;
+            node = node-&gt;next.get();
+            remove_node(temp);
+        }
+    }
+</code></pre>
+  
+  <p>Much more readable, and easier to reason about, isn't it?</p>
+</blockquote></li>
+<li><p><code>LinkedList::print</code>: While this function might be nice for debugging, it doesn't seem to be in the general scope of the <code>LinkedList</code> class: If there is any way of iteration over the nodes, the <code>print</code> function can easily be implemented outside of <code>LinkedList</code> (if/where needed).</p>
+
+<p>If there really is a need for <code>LinkedList</code> to support text output, try to implement <code>friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp;, const DLL::LinkedList&amp;)</code> instead.</p></li>
+</ul>
+
+<h1>Naming</h1>
+
+<p>The common C++ standard library naming conventions would suggest <code>push_back</code> instead of <code>append</code>.</p>
+
+<h1>Design</h1>
+
+<p>A lot of common linked list operations are missing:</p>
+
+<ul>
+<li><code>push_front</code></li>
+<li><code>emplace_back</code></li>
+<li><p><code>emplace_front</code></p></li>
+<li><p><code>insert</code> (*)</p></li>
+<li><code>emplace</code> (*)</li>
+<li><code>erase</code> (*)</li>
+<li><p><code>find</code> (*)</p></li>
+<li><p>Iterators</p></li>
+</ul>
+
+<p>(*) These functions might be easier to implement (without leaking <code>ListNode*</code>s) or perform better if using iterators.</p>
+    </div>

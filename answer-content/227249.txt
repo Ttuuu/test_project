@@ -1,0 +1,162 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>There are a number of things I'd do differently and the first is a <strong>must</strong>.</p>
+
+<p>First, using <code>md5()</code> to encode a password is universally considered a bad practice. It's been considered too weak for that purpose since at least 2004 if not earlier. Instead, use the PHP function <a href="https://www.php.net/manual/en/function.password-hash.php" rel="nofollow noreferrer">password_hash</a>. </p>
+
+<p>I would encrypt the password in the model. In fact, I'd move almost all the registration logic to the model. Here's my version of <code>Usermodel::register_user()</code></p>
+
+<pre><code>public function register_user()
+{
+    // Get the entire $_POST array with one call then extract what we need
+    $posted = $this-&gt;input-&gt;post();
+
+    $field_list = ['first_name', 'last_name', 'email', 'password'];
+    foreach($field_list as $field){
+        $data[$field] = $posted[$field];
+    }
+
+    $enc_password = password_hash($data['password']);
+
+    // if password_hash fails it's time to bail
+    if( ! $enc_password)
+    {
+        return false;
+    }
+    // update $data with encrypted password
+    $data['password'] = $enc_password;
+
+    // Put additional items in the $data array   
+    $data['register_date'] = date('Y-m-d H:i:s');
+    // CodeIgniter has a method to count records - use it. Remove get_num_rows() from model
+    $data['is_admin'] = $this-&gt;db-&gt;count_all('authors') === 0 ? 1 : 0;
+    $data['active'] = $data['is_admin'];
+
+    if($inserted = $this-&gt;db-&gt;insert('authors', $data) === TRUE)
+    {
+        if($data['is_admin'] === 1)
+        {
+            $msg = "You are now registered as an admin. You can sign in";
+        }
+        else
+        {
+            $msg = "You are now registered. Your account needs the admin's approval before you can sign in.";
+        }
+        $this-&gt;session-&gt;set_flashdata('user_registered', $msg);
+    }
+    return $inserted;
+}
+</code></pre>
+
+<p>With that new method and a little rearranging in the controller, we can make the code a bit more concise</p>
+
+<pre><code>public function index()
+{
+    $this-&gt;form_validation
+        -&gt;set_rules('first_name', 'First name', 'required')
+        -&gt;set_rules('last_name', 'Last name', 'required')
+        -&gt;set_rules('email', 'Email', 'required|trim|valid_email')
+        -&gt;set_rules('password', 'Password', 'required|min_length[6]')
+        -&gt;set_rules('cpassword', 'Confirm password', 'required|matches[password]')
+        -&gt;set_rules('terms', 'Terms and Conditions', 'required',
+            array('required' =&gt; 'You have to accept the Terms and Conditions'))
+        -&gt;set_error_delimiters('&lt;p class="error-message"&gt;', '&lt;/p&gt;');
+
+    if($this-&gt;form_validation-&gt;run())
+    {
+        // If the provided email isn't on record then register user
+        if( ! $this-&gt;Usermodel-&gt;email_exists())
+        {
+            // Register user
+            if($this-&gt;Usermodel-&gt;register_user())
+            {
+                // worked - go to login
+                redirect('login');
+            }
+            // register_user() returned false - set an error message for use in 'auth/register' view
+            $data['registration_error_msg'] = "Registration Failed! Please contact Administrator.";
+        }
+        else
+        {
+            // The user is already registered
+            $this-&gt;session-&gt;set_flashdata('user_registered',
+                "The email you provided already exists in our database. Please login.");
+            redirect('login');
+        }
+    }
+
+    // Validation or registration failed or it's the first load of this page
+    $data = $this-&gt;Static_model-&gt;get_static_data();
+    $data['pages'] = $this-&gt;Pages_model-&gt;get_pages();
+    $data['tagline'] = 'Want to write for '.$data['site_title'].'? Create an account.';
+    $data['categories'] = $this-&gt;Categories_model-&gt;get_categories();
+    $this-&gt;load-&gt;view('partials/header', $data);
+    $this-&gt;load-&gt;view('auth/register');
+    $this-&gt;load-&gt;view('partials/footer');
+}
+</code></pre>
+
+<p>Using <code>password_hash()</code> means the login logic needs to be refactored also and the PHP function <code>password_verify()</code> must be used. <code>password_verify</code> — confirms that a password matches a hash of that password. With that in mind, `Usermodel::user_login might look like this.</p>
+
+<pre><code>public function user_login()
+{
+    $email = filter_var($this-&gt;input-&gt;post('email'), FILTER_SANITIZE_EMAIL);
+
+    if(filter_var($email, FILTER_VALIDATE_EMAIL))
+    {
+        $user = $this-&gt;db
+            -&gt;select('password, user_id, active')
+            -&gt;get_where('authors', ['email' =&gt; $email])
+            -&gt;row();
+
+        if(password_verify($this-&gt;input-&gt;post('password'), $user-&gt;password))
+        {
+            if($user-&gt;active)
+            {
+                return $user-&gt;user_id;
+            }
+            $this-&gt;session-&gt;set_flashdata("login_failure_activation", "Your account has not been activated yet.");
+        }
+        else
+        {
+            $this-&gt;session-&gt;set_flashdata("login_failure_incorrect", "Incorrect email or password.");
+        }
+    }
+    return false;
+}
+</code></pre>
+
+<p>The above is going to mean that the controller's <code>login()</code> method will need to be reworked too.</p>
+
+<p>An unbreakable security rule is <strong>"Never Trust User Input!"</strong></p>
+
+<p>So, any data sent to the server must be sanitized and validated. This is true even for some identifier (like a user_id) that is part of a URL that you put on the screen. With that in mind, you should always (at the very minimum) make sure that any model function that has a <code>$id</code> argument is getting the right datatype.</p>
+
+<p>Let's assume your user_id type is an integer. For instance, the controller method that activates an author might make this kind of check before sending it to the model. </p>
+
+<pre><code>public function activate_author($id)
+{
+    if(filter_var($id, FILTER_VALIDATE_INT)) 
+    {
+        $this-&gt;Usermodel-&gt;activateAuthor($id)
+        // other code 
+    } 
+    else 
+    {
+       //respond in a way that doesn't give a bad-actor too much info
+    }
+
+}
+</code></pre>
+
+<p>While CodeIgniter's validation library is quite good it doesn't go far enough. Particularly when it comes to sanitizing. A serious study of the <a href="https://www.php.net/manual/en/book.filter.php" rel="nofollow noreferrer">PHP docs on Filters</a> is recommended. There are lots of online tutorials on using <code>filter_var</code> too.</p>
+
+<p>Further Reading on PHP Security:</p>
+
+<p><a href="https://paragonie.com/blog/2015/08/gentle-introduction-application-security" rel="nofollow noreferrer">A Gentle Introduction to Application Security</a></p>
+
+<p><a href="https://paragonie.com/blog/2017/12/2018-guide-building-secure-php-software" rel="nofollow noreferrer">The 2018 Guide to Building Secure PHP Software</a></p>
+
+<p><a href="https://paragonie.com/blog/2017/04/checklist-driven-security-considered-harmful" rel="nofollow noreferrer">Checklist-Driven Security Considered Harmful</a></p>
+
+<p><a href="https://paragonie.com/blog/2015/04/secure-authentication-php-with-long-term-persistence" rel="nofollow noreferrer">Implementing Secure User Authentication in PHP Applications with Long-Term Persistence</a> </p>
+    </div>

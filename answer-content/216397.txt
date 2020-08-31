@@ -1,0 +1,99 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Overview</h2>
+<p>You over-allocate the number of child threads. Remember you should save one thread (the main thread for listening for new messages).</p>
+<pre><code>// Remember master thread takes a CPU while listening for connections.
+unsigned n_concThreads = std::thread::hardware_concurrency() - 1;
+</code></pre>
+<p>Using multiple threads to handle incoming connection is not the way to go. The problem here is that the parallelization is limited by the number of threads (which is usually in the single digits low double digits if you are lucky).</p>
+<p>A single thread can handle thousands of connections simultaneously because most of the time is spent waiting for data on the port. Thus your thread will be idle for most of the time it is handling a request waiting for input. If handled correctly, this idle time could be used to handle other requests.</p>
+<p>A good example is the <code>Node.js</code> server. It is single-threaded and will easily handle thousands of incoming connections.</p>
+<p>If you want to do this properly you need to use a library like <code>LibEvent</code> (or you can do it manually with <code>select()</code>, <code>pselect()</code> or <code>ppoll()</code>). This allows you to handle multiple sockets with the same thread.</p>
+<p>But to be blunt. Doing this is not trivial and not for the beginner. I would opt for a server that already does this part of the work for you. <code>Apache</code> for heavyweight, or <code>nginx</code> for lightweight, or if you want to use another language <code>Node.js</code>. All these servers allow you to write your own request handling code but do the complex stuff for you.</p>
+<h2>Code Review</h2>
+<p>Bad form to have global variables.</p>
+<pre><code>std::unordered_map&lt;int, std::string&gt; requestQueue;
+std::mutex requestQueue_mutex;
+std::condition_variable processorsThreadSwitch;
+bool gotNewRequests = false;
+</code></pre>
+<p>Would be much nicer to wrap this in a class and pass a reference to each string. That would make the application much more expandable in the long run.</p>
+<hr>
+<p>OK. This is speculation. But I find it strange that something would throw a <code>std::string</code>! It would be more normal to throw something derived from <code>std::runtime_error</code>.</p>
+<pre><code>    try
+    {
+        app.createServer(pathToSocket);
+    }
+    catch (const std::string &amp; err)
+    {
+        MS::log(SERVICE_NAME, "Failed to start the service. Error: " + err, MS::MessageType::FatalException);
+
+        return -1;
+    }
+</code></pre>
+<p>Also I would not return -1. I would rethrow the exception. This gives the calling function more information about the issue.</p>
+<hr>
+<p>OK. A bit of a hack. But clever way of finding the number of processors.</p>
+<pre><code>    unsigned n_concThreads = std::thread::hardware_concurrency();
+
+    if (!n_concThreads) //if the query failed...
+    {
+        std::ifstream cpuinfo("/proc/cpuinfo");
+
+        n_concThreads = std::count(std::istream_iterator&lt;std::string&gt;(cpuinfo),
+                        std::istream_iterator&lt;std::string&gt;(),
+                        std::string("processor"));
+
+        if (!n_concThreads)
+            n_concThreads = 6; // ~number of CPU cores. TODO: make the number of worker processes/threads configurable using a config file
+    }
+</code></pre>
+<p>But it is OS-specific. So I would wrap it in a function that is OS specific. That way on Linux you can do your clever check. On Windows it defaults to 6 (and the next person can simply replace the Windows version with a Windows specific hack without having to understand your Linux hack).</p>
+<hr>
+<p>Not a fan of detaching the thread.</p>
+<pre><code>    for (int i = 0; i &lt; n_concThreads; ++i)
+    {
+        std::thread t (pullRequests);
+        t.detach();
+    }
+</code></pre>
+<p>You lose all control of the thread. You also lose any warnings when you have a bug in your code and you accidentally shut down while one of the threads is still executing. Using <code>detach()</code> should be a last resource when all neat ways of doing something have been tried and failed.</p>
+<hr>
+<p>The locking in <code>pullRequests()</code> seems highly roundabout. Move all the locking into a separate function. That way your scope lock behaves like it should.</p>
+<p>I would have written it like this:</p>
+<pre><code>std::unordered_map&lt;int, std::string&gt; getNextTask()
+{
+     std::unique_lock&lt;std::mutex&gt; writeLock(requestQueue_mutex);
+
+     // note this can be written more succinctly.
+     // But I am to lazy to look up condition variables at the moment.
+     // The following three lines should be a one liner
+     // with wait taking a lambda
+     while (!gotNewRequests) {
+         processorsThreadSwitch.wait(writeLock);
+     }
+
+     std::unordered_map&lt;int, std::string&gt; result = std::move(requestQueue);
+     return result;
+}
+
+void pullRequests()
+{
+    while(/*test*/)
+    {
+        // STUFF
+        std::unordered_map&lt;int, std::string&gt; queueCopy = getNextTask();
+        // STUFF
+    }
+}
+</code></pre>
+<hr>
+<p>Seems like some repeated code:</p>
+<pre><code>            if (!sendResult.isValid())
+                    MS::log(SERVICE_NAME, "Could not send the response for request: " + queueCopy.begin()-&gt;second, MS::MessageType::Error);
+            }
+
+            if (!uds.closeConnection(queueCopy.begin()-&gt;first))
+                MS::log(SERVICE_NAME, "Could not close the connection.", MS::MessageType::Error);
+</code></pre>
+<p>If you find repeated code then put it in a function.</p>
+    </div>

@@ -1,0 +1,89 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>An issue with that code is that while it tries to pack the data to make efficient use of arithmetic throughput, actually arithmetic throughput is high anyway and it's the shuffles (including horizontal addition which has two shuffles internally) that are relatively expensive. Shuffles don't all have a low latency either, cross-slice shuffles such as <code>vperm2f128</code> take 3 cycles, so it's easy to accidentally build up a large delay that way.</p>
+
+<p>So, as far as I know, efficient single-vector mat4 x vec4 is still based on broadcasting the elements of the vector, multiplying that by columns of the matrix, and adding up the results (compilers tend to merge the add/mul into FMA if allowed). This would cost 4 shuffles pre-AVX or if the vector comes in a register, and potentially <em>zero shuffles</em> with AVX if the vector comes from memory, since a broadcast-from-memory has a "free shuffle" (it's just a load, and broadcasts for free, rather than going to the shuffle unit, though pre-AVX512 a broadcast-load cannot be a memory operand to an arithmetic operation). For example:</p>
+
+<pre><code>__m128 transform4(__m128* mat4, float *vec4) {
+    __m128 x = _mm_set1_ps(vec4[0]);
+    __m128 y = _mm_set1_ps(vec4[1]);
+    __m128 z = _mm_set1_ps(vec4[2]);
+    __m128 w = _mm_set1_ps(vec4[3]);
+
+    __m128 p1 = _mm_mul_ps(x, mat4[0]);
+    __m128 p2 = _mm_mul_ps(y, mat4[1]);
+    __m128 p3 = _mm_mul_ps(z, mat4[2]);
+    __m128 p4 = _mm_mul_ps(w, mat4[3]);
+
+    return _mm_add_ps(_mm_add_ps(p1, p2), _mm_add_ps(p3, p4));
+}
+</code></pre>
+
+<p>With Clang 7, AVX2 enabled:</p>
+
+<pre><code>transform4(float __vector(4)*, float*):                 # @transform4(float __vector(4)*, float*)
+    vbroadcastss    xmm0, dword ptr [rsi]
+    vbroadcastss    xmm1, dword ptr [rsi + 4]
+    vbroadcastss    xmm2, dword ptr [rsi + 8]
+    vbroadcastss    xmm3, dword ptr [rsi + 12]
+    vmulps  xmm0, xmm0, xmmword ptr [rdi]
+    vfmadd231ps     xmm0, xmm1, xmmword ptr [rdi + 16] # xmm0 = (xmm1 * mem) + xmm0
+    vfmadd231ps     xmm0, xmm2, xmmword ptr [rdi + 32] # xmm0 = (xmm2 * mem) + xmm0
+    vfmadd231ps     xmm0, xmm3, xmmword ptr [rdi + 48] # xmm0 = (xmm3 * mem) + xmm0
+    ret
+</code></pre>
+
+<p>This has a decent throughput, one transform every four cycles in the best case as it is, and better in a loop with the loads from the matrix factored out of the loop (hopefully a compiler can do that but better check the asm to make sure). The FMAs are tied together though (by Clang!), so the latency is not the greatest. Therefore it is best to batch transforms as much as reasonably possible, or otherwise latency could be reduced at the cost of an extra addition (and loss of source-level compatibility for pre-FMA processors)</p>
+
+<pre><code>__m128 transform4(__m128* mat4, float *vec4) {
+    __m128 x = _mm_set1_ps(vec4[0]);
+    __m128 y = _mm_set1_ps(vec4[1]);
+    __m128 z = _mm_set1_ps(vec4[2]);
+    __m128 w = _mm_set1_ps(vec4[3]);
+
+    __m128 p1 = _mm_mul_ps(x, mat4[0]);
+    __m128 p2 = _mm_fmadd_ps(y, mat4[1], p1);
+    __m128 p3 = _mm_mul_ps(z, mat4[2]);
+    __m128 p4 = _mm_fmadd_ps(w, mat4[3], p3);
+
+    return _mm_add_ps(p2, p4);
+}
+</code></pre>
+
+<p>These approaches don't scale well to wider SIMD..</p>
+
+<p>With 8 SoA vectors to work with though, we can switch to broadcasting the matrix elements and doing 16 multiplications, which halves the number arithmetic instructions per transform. Since the matrix is being broadcasted from, its format is now free to choose, while this time the vector format is constrained. For example (not tested):</p>
+
+<pre><code>void transformBatch8(float *mat4, float *v) {
+    __m256 m00 = _mm256_set1_ps(mat4[0]);
+    __m256 m01 = _mm256_set1_ps(mat4[1]);
+    __m256 m02 = _mm256_set1_ps(mat4[2]);
+    __m256 m03 = _mm256_set1_ps(mat4[3]);
+    __m256 m10 = _mm256_set1_ps(mat4[4]);
+    __m256 m11 = _mm256_set1_ps(mat4[5]);
+    __m256 m12 = _mm256_set1_ps(mat4[6]);
+    __m256 m13 = _mm256_set1_ps(mat4[7]);
+    __m256 m20 = _mm256_set1_ps(mat4[8]);
+    __m256 m21 = _mm256_set1_ps(mat4[9]);
+    __m256 m22 = _mm256_set1_ps(mat4[10]);
+    __m256 m23 = _mm256_set1_ps(mat4[11]);
+    __m256 m30 = _mm256_set1_ps(mat4[12]);
+    __m256 m31 = _mm256_set1_ps(mat4[13]);
+    __m256 m32 = _mm256_set1_ps(mat4[14]);
+    __m256 m33 = _mm256_set1_ps(mat4[15]);
+    __m256 x = _mm256_load_ps(v);
+    __m256 y = _mm256_load_ps(v + 8);
+    __m256 z = _mm256_load_ps(v + 16);
+    __m256 w = _mm256_load_ps(v + 24);
+    __m256 rx = _mm256_fmadd_ps(_mm256_fmadd_ps(_mm256_fmadd_ps(_mm256_mul_ps(m00, x), m01, y), m02, z), m03, w);
+    __m256 ry = _mm256_fmadd_ps(_mm256_fmadd_ps(_mm256_fmadd_ps(_mm256_mul_ps(m10, x), m11, y), m12, z), m13, w);
+    __m256 rz = _mm256_fmadd_ps(_mm256_fmadd_ps(_mm256_fmadd_ps(_mm256_mul_ps(m20, x), m21, y), m22, z), m23, w);
+    __m256 rw = _mm256_fmadd_ps(_mm256_fmadd_ps(_mm256_fmadd_ps(_mm256_mul_ps(m30, x), m31, y), m32, z), m33, w);
+    _mm256_store_ps(v, rx);
+    _mm256_store_ps(v + 8, ry);
+    _mm256_store_ps(v + 16, rz);
+    _mm256_store_ps(v + 24, rw);
+}
+</code></pre>
+
+<p>Based on the cost of 20 loads, it takes at least 10 cycles per 8 transforms this way. Putting this in a loop and factoring out some loads would help, not all loads need to be factored out (and pre-AVX512 they cannot be, there are not enough registers), at least 4 so that the total number of loads per batch of 8 transforms goes down to 16, bringing down the minimum time down to 8 cycles per 8 transforms (in practice it often helps to reduce loads even further, but only to get closer to that bound of 8 cycles per 8 transforms because the FMAs alone already enforce that lower limit).</p>
+    </div>

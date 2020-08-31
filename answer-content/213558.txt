@@ -1,0 +1,213 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>strlen</h1>
+
+<ol>
+<li><p><strong>Correctness (Return Value):</strong> You are violating the convention for the <code>strlen</code> function, which is documented as returning the number of characters between the beginning of the string and the terminating null character <em>without including the terminating NUL character</em>. Your code includes the terminating NUL, given the position of the <code>inc ebx</code> instruction.</p>
+
+<p>This may be fine if you control both the function's implementation and its usage, but it is confusing because it defies programmers' expectations and will be a recurring source of bugs. If you're going to return a length that includes the terminating NUL, you should consider calling your function something different than <code>strlen</code>.</p></li>
+<li><p><strong>Interface (ABI):</strong> All x86 calling conventions return a function's result in the <code>eax</code> register. Although you have documented your function as returning the result in <code>ebx</code>, this is utterly bizarre and is guaranteed to trip up every programmer who ever uses your code. When writing everything in assembly, you are of course free to define your own custom calling conventions, but you should only do so when there is a good reason (like an optimization possibility). I can't see a good reason here. It would be just as easy for you to arrange for your code to produce the result in <code>eax</code>, right where programmers will expect it to be.</p>
+
+<p>It is also somewhat unusual to pass an argument in the <code>eax</code> register, but calling conventions vary in which registers they use to pass arguments, so this isn't flying in the face of every convention ever and is therefore more excusable. However, when you're writing in assembly and you have the opportunity to make these types of decisions, you should consider your choices carefully: what makes the most sense? what will be the easiest to use? what will be the most flexible? what will be the most efficient? Have a good reason for your choice! In this case, passing a pointer in <code>eax</code> makes little sense, since <code>eax</code> is almost universally used for return values, and pointers are almost never going to be the return value of a function. By choosing <code>eax</code> as the input register, you've virtually guaranteed that every caller will need an extra <code>mov</code> instruction to shuffle the input parameter into the appropriate register. Why create this situation when you don't have to?</p></li>
+<li><p><strong>Style (Indentation):</strong> The way you've indented the code, with the labels at the same level as the instructions, makes it difficult to read because all of the instructions aren't lined up. Instead, consider outdenting the internal labels (branch targets) so that they match the function name (external symbols). That will allow all instructions in the function to be lined up at the same vertical column, and thus allow anyone reading the code to skim it easily.</p>
+
+<p>(The only drawback of this is that it makes it a bit harder to determine what is a function label and what is an internal label. Judicious use of whitespace is the most effective way to combat this. I also use a naming convention that allows me to recognize the difference at a glance.)</p>
+
+<p>Also, use variable numbers of spaces between the opcode and the operands to ensure that all operands line up in vertical columns.</p></li>
+<li><p><strong>Style (Documentation):</strong> Maybe you have extensive external documentation that accompanies these functions, but probably not. Even if you do, documentation <em>right in the code</em> is extremely useful, easier to maintain, and should not be forsaken without a very good reason.</p>
+
+<p>When writing functions in assembly, I use kind of a standard header containing a description, the inputs, the outputs, and the clobbers. If there are any assumptions made by the function, I will also call those out explicitly. So, in this case, following what you had documented in the question (even though I just called it into question), I'd write something like this:</p>
+
+<pre><code>; Determines the length of a C-style NUL-terminated string.
+; 
+; Inputs:   EAX = address of beginning of string buffer
+; Outputs:  EBX = length of the string, including the NUL terminator
+; Clobbers: &lt;none&gt;
+</code></pre>
+
+<p>You should feel free to develop your own style. The important thing is having this information at the ready. <em>Especially</em> when programming in assembly where you can (and should) invent your own per-function custom calling conventions.</p></li>
+<li><p><strong>Optimization (Register Clearing):</strong> There is only one circumstance in which you should use <code>mov reg, 0</code>, and that's when you're trying to avoid clobbering the flags (<em>e.g.</em>, in a sequence that contains a <code>CMOVxx</code> or a <code>SETxx</code>). In all other cases, you should clear a register by XORing it with itself: <code>xor reg, reg</code>. Peter Cordes has written a comprehensive explanation of the reasons why <a href="https://stackoverflow.com/questions/33666617/what-is-the-best-way-to-set-a-register-to-zero-in-x86-assembly-xor-mov-or-and">here</a>, but it's enough to just remember the rule. Basically, it's shorter (and thus faster) and it breaks dependencies (which is sometimes important, and never hurts).</p></li>
+<li><p><strong>Optimization (Reduce Branching):</strong> <a href="https://stackoverflow.com/questions/40991778/an-expensive-jump-with-gcc-5-4-0/40993519#40993519">When you want performance, avoid branching</a>. That means that you should minimize branching as much as possible inside tight inner loops. <code>strlen</code> is the canonical example of a tight loop. You've got two branches inside of the loop, a conditional <code>je</code> and an unconditional <code>jmp</code>. Consider rearranging the code so that you only have one. This is almost always possible. Ideally, you want the common case to fall through and the unusual case to branch, but even if that's not possible, it's still better to have a single branch than several of 'em.</p></li>
+<li><p><strong>Optimization (Elide Repeated Instructions):</strong> You've repeated the <code>inc ebx</code> instruction. Consider how the code can be rearranged to avoid the need to do this. This isn't just the standard <a href="https://en.wikipedia.org/wiki/Don%27t_repeat_yourself" rel="noreferrer">DRY</a> advice, but a potential optimization opportunity. However, sometimes this trades off with the previous advice about reducing branching. Repeating a simple instruction in order to avoid a branch is virtually always worth it. As is arranging code so that you, say, speculatively increment inside of the loop, only to undo it by decrementing outside of the loop.</p></li>
+<li><p><strong>Optimization (Memory Access):</strong> In C terms, your code is maintaining an "index" into the string. That means you have to do a complex load-and-compare (<code>cmp byte [eax+ebx], 0</code>). You could instead maintain a "pointer" into the string, which would allow you to just do <code>cmp byte [eax], 0</code>. This is not only 1 byte shorter, but may execute more quickly.</p></li>
+</ol>
+
+<p>Consider:</p>
+
+<pre><code>; Determines the length of a C-style NUL-terminated string.
+; 
+; Inputs:   EBX = address of beginning of string buffer
+; Outputs:  EAX = length of the string, including the NUL terminator
+; Clobbers: CL, flags
+strlen:
+    lea    eax, [ebx + 1]
+
+strlen_loop:
+    mov    cl, byte [eax]
+    inc    eax
+    test   cl, cl
+    jnz    strlen_loop
+
+    sub    eax, ebx
+    ret
+</code></pre>
+
+<p>This is about the most efficient way of implementing a standard <code>strlen</code> function:</p>
+
+<ul>
+<li>The <code>lea</code> is used as a super-<code>mov</code>, allowing the value in <code>ebx</code> to be copied into <code>eax</code>, while simultaneously incrementing it by 1. (Although <code>mov</code>+<code>inc</code> would have been the same length in terms of bytes, <code>lea</code> might be slightly more efficient on certain processors.) <code>ebx</code> will remain a pointer to the <em>beginning</em> of the string, while <code>eax</code> will be a pointer to the <em>current location</em> in the string.</li>
+<li>Inside of the loop, the CISC-style <code>cmp</code> instruction that took a memory operand has been split up into separate RISC-style <code>mov</code>+<code>test</code> instructions for improved scheduling. In particular, this means we can do an <code>inc</code> of the pointer after loading the value that it pointed to. We couldn't do the <code>inc</code> after the <code>cmp</code>, because the <code>inc</code> would clobber the flags (in particular, the zero flag) that we were going to try and read. In this arrangement, the <code>test</code> can also macro-fuse with the <code>jnz</code> instruction.</li>
+<li>I've written <code>jnz</code> instead of <code>jne</code> even though they result in identical opcodes because I think it's a better mnemonic in this case. We are <code>test</code>ing the value, and then jumping if it is <em>n</em>ot <em>z</em>ero (<em>i.e.</em>, if the current character is not the NUL character).</li>
+<li>Outside of the loop, we do a final <code>sub</code>traction of the current pointer from the starting pointer, which gives us the length of the string, not including the terminating null.</li>
+</ul>
+
+<p>The biggest drawback is that we've introduced the use of an additional register (the 8-bit <code>cl</code>), which expands our "Clobbers" list in the documentation. See why documenting this is important? The only reason why this would be a drawback, of course, is if the caller/consumer of this function needed to preserve the value in <code>cl</code>, as that would require an extra instruction or two. However, those instructions would be outside of the loop, and thus off the critical path, so it's almost certainly worth it for the optimizations gained.</p>
+
+<p>Interestingly, this is basically the same code that Microsoft's C compiler will emit for a <code>strlen</code> operation when you have intrinsics enabled (otherwise, it'll generate a call to the <code>strlen</code> standard library function, which has essentially this same code inside of it).</p>
+
+<p>This is better than <a href="/a/210990">Sep Roland's optimized implementation</a> because it avoids the <a href="https://www.phatcode.net/res/224/files/html/ch21/21-01.html" rel="noreferrer">AGI stall</a> introduced by this sequence of instructions in Sep's code:</p>
+
+<pre><code>inc     ebx
+cmp     byte [eax+ebx-1], 0
+</code></pre>
+
+<p>Sep is being similarly clever here, doing the <code>inc</code> first and then undoing it inside of the <code>cmp</code> to avoid clobbering flags, but modifying <code>ebx</code> immediately before you use it in the addressing operands list for <code>cmp</code> results in a potential stall. Reordering the instructions avoids the stall; even though we had to add one extra instruction, the performance improvement more than makes up for it (unless you're optimizing for size, which you aren't, unless you're code-golfing—it's only a 1-byte difference).</p>
+
+<p>So, this looks pretty good, right? Indeed, it is. As I said, it's about the best you're going to do for a straightforward, literal translation of <code>strlen</code> into assembly. But if you <a href="http://www.jagregory.com/abrash-zen-of-asm/" rel="noreferrer">stretch your mind a bit</a>, you can do better.</p>
+
+<p>The slowest part of this code is the <code>mov  cl, byte [eax]</code> instruction that accesses memory at the beginning of every iteration of the loop. There's nothing we can do about the fact that we have to access memory, but notice that we're only reading 1 byte at a time here. Under the hood, the processor only does DWORD-sized reads, so it's actually reading 4 bytes and then throwing away all but the lowest-order byte. Why don't we just read 4 bytes at a time? Then, we can parallelize the code to actually deal with 4 bytes at a time, effectively unrolling the loop by a factor of 4.</p>
+
+<p>The trick to parallelizing the code is figuring out an efficient way of checking all 4 of the bytes that we load in each iteration of the loop for NUL characters.</p>
+
+<p>One possible attempt is the following (MASM syntax, sorry):</p>
+
+<pre><code>; Determines the length of a C-style NUL-terminated string.
+; 
+; Inputs:   EBX = address of beginning of string buffer
+; Outputs:  EAX = length of the string, including the NUL terminator
+; Clobbers: ECX, flags
+strlen:
+  mov   ecx, ebx
+
+ALIGN 16
+CountChars:
+  mov   eax, DWORD PTR [ecx]   
+
+  test  al,  al                
+  jz    SHORT ReturnLength     
+  inc   ecx
+
+  test  ah,  ah                
+  jz    SHORT ReturnLength     
+  inc   ecx
+
+  test  eax, 0x00FF0000        
+  jz    SHORT ReturnLength     
+  inc   ecx
+
+  test  eax, 0xFF000000        
+  jnz   SHORT CountChars    
+
+ReturnLength:
+  sub   ecx, ebx               
+  mov   eax, ecx  
+  ret             
+</code></pre>
+
+<p>I've introduced an alignment of the branch target (<code>CountChars</code>) because aligned branch targets are more efficient, and it makes a measurable difference here because we're branching to that location a lot (each time we loop). When optimizing for code speed over size, this is a no-brainer.</p>
+
+<p>There are obvious variations on this theme, especially with regard to register assignment. You might ask, why not use <code>eax</code> for the pointer to the current location in the string buffer, as that would eliminate the need for the penultimate <code>mov</code> instruction. There is a good reason I didn't, though: using <code>eax</code> to hold the character being tested inside of the loop makes the latter two <code>test</code> instructions (the ones that use immediate operands) 1 byte shorter than if any other register had been used. (Certain x86 instructions have optimized encodings when <code>eax</code> is the destination register for legacy reasons.) This doesn't normally matter too much, but it can help to ensure that a loop fits entirely within the cache. A 2-byte <code>mov</code> outside of the loop is a small price to pay for a 2-byte size reduction of the code inside the loop.</p>
+
+<p>Details aside, this does get the job done with respect to testing 4 bytes at a time. But is it efficient? It feels like it might not be, because there's so much branching. Indeed, our "avoid branches in inner loops" intuition is right on, as this version is <em>not</em> significantly faster than the original. On modern architectures like Haswell, it's slightly faster; on older architectures, like Pentium 4 (where branch mispredictions are extremely expensive due to extremely long pipelines), it is slightly slower. In either case, the time delta is not even enough to matter. So this appears to be a dead-end. We bought ourselves a little bit of performance by reading a DWORD at a time, instead of a single byte, but any advantage gained is lost to all of the conditional branches that need to be executed each iteration of the loop.</p>
+
+<p>In order to gain a real performance improvement, we need to take a different tack. And it needs to be one that reduces the number of branches. If we can find a branchless way to test all 4 bytes of the DWORD at once to see if any of them are 0 (a NUL byte), then we can reduce the number of branches in all but one iteration of the loop by a factor of 4. As it turns out, there is a solution for this, as described on the <a href="https://graphics.stanford.edu/~seander/bithacks.html#ZeroInWord" rel="noreferrer">Bit Twiddling Hacks</a> page. </p>
+
+<p>Consider the following implementation (again in MASM syntax). It retrieves a DWORD and performs a series of bit manipulations on that value to determine if any of its byte are zero (i.e., contain NUL characters). If not, it branches back to the top and starts over with another DWORD-sized chunk of the string. If so, then it falls through and tests each of the four individual bytes (or, more accurately, three of the individual bytes, since if the low-order three bytes are non-zero, then we know the highest-order byte must be zero).</p>
+
+<pre><code>; Determines the length of a C-style NUL-terminated string.
+; 
+; Inputs:   EBX = address of beginning of string buffer
+; Outputs:  EAX = length of the string, including the NUL terminator
+; Clobbers: ECX, flags
+strlen:
+  mov  ecx, ebx               ; save pointer to beginning of string for later
+
+ALIGN 16
+CountChars:
+  mov  eax, DWORD PTR [ebx]   ; load DWORD value from current offset
+  add  ebx, 4                 ; increment offset by number of bytes processed
+  and  eax, 0x7F7F7F7F        ; mask out highest bit of each byte
+  sub  eax, 0x01010101 
+  test eax, 0x80808080        ; TEST to ensure macro-op fusion with JZ
+  jz   SHORT CountChars       ; if none of these 4 bytes were 0, start again with 4 more
+
+  mov  eax, DWORD PTR [ebx-4] ; load previous 4 bytes (the ones we were just testing),
+                              ;   using an immediate offset to compensate for eager
+                              ;   increment in the loop while avoiding an AGI stall
+
+  test al, al                 ; test low byte for NUL
+  jz   SHORT ReturnLength
+  inc  ebx                    ; wasn't the first byte, so increment byte count
+
+  test ah, ah                 ; test the second byte for NUL
+  jz   SHORT ReturnLength
+  inc  ebx                    ; wasn't the second byte, so increment byte count
+
+  test eax, 0x00FF0000        ; test the third byte for NUL
+  jz   SHORT ReturnLength
+  inc  ebx                    ; wasn't the third byte, so has to be the fourth (high) byte
+
+ReturnLength:
+  lea  eax, [ebx - 4]         ; undo the eager 4-byte increment; put result in EAX
+  sub  eax, ecx               ; subtract starting pointer from current pointer
+  ret
+</code></pre>
+
+<p>As it turns out, this is precisely the parallelization strategy taken by GLIBC (the C standard library implementation used by the GNU project, including the GCC compiler). The relevant code, including extensive descriptive comments, is available <a href="http://tsunanet.net/~tsuna/strlen.c.html" rel="noreferrer">here</a>; see also <a href="http://stackoverflow.com/q/20021066">http://stackoverflow.com/q/20021066</a> and <a href="http://stackoverflow.com/q/11787810">http://stackoverflow.com/q/11787810</a>. This parallelized implementation is <em>significantly</em> faster on all x86 architectures than our previous "best" code—you're looking at around a 2× speedup. </p>
+
+<p>I was pretty proud of this, until I thought some more and realized that there's no need to <em>retest</em> each of the 4 bytes. They were already tested in the initial bit-twiddling, and our answer about which of those 4 bytes contains the 0 is already available in the result of that bit-twiddling—we just need to extract it! This is great, because it eliminates three more branches, the three least likely to be correctly predicted (which of the 4 bytes actually contains the NUL is essentially random), and also the three most likely to enact a performance cost (since they are all back-to-back). It also saves us from having to reload the same 4 bytes again from memory.</p>
+
+<pre><code>; Determines the length of a C-style NUL-terminated string.
+; 
+; Inputs:   EBX = address of beginning of string buffer
+; Outputs:  EAX = length of the string, including the NUL terminator
+; Clobbers: ECX, flags
+strlen:
+  mov  ebx, DWORD PTR [psz]
+  xor  ecx, ecx
+
+ALIGN 16
+CountChars:
+  mov  eax, DWORD PTR [ebx+ecx]
+  add  ecx, 4  
+  and  eax, 0x7F7F7F7F
+  sub  eax, 0x01010101
+  and  eax, 0x80808080 ; must be AND here b/c we need result (but may not fuse)
+  jz   SHORT CountChars
+
+  ; At this point, EAX will contain one of the following values:
+  ;  - 0x80808080 (if the low byte---byte 0---contained the 0)
+  ;  - 0x80808000 (if byte 1 contained the 0)
+  ;  - 0x80800000 (if byte 2 contained the 0)
+  ;  - 0x80000000 (if the high byte, byte 3, contained the 0)
+  bsf  eax, eax        ; find the first set bit, which gives either 7, 15, 23, or 31
+  sub  ecx, 4          ; undo the eager increment by 4 from the loop
+  shr  eax, 3          ; shift right by 3 (7 =&gt; 0, 15 =&gt; 1, 23 =&gt; 2, 31 =&gt; 3),
+                       ;   thus giving the index of the NUL byte
+  add  eax, ecx        ; add that byte index to the length, thus giving total length
+  ret
+</code></pre>
+
+<p>This doesn't actually save a whole lot of time compared to the branching version, since the compare-and-branch sequence only gets executed once for each string. But, it does generally provide a minor performance boost, and it is never slower. This is true for all string lengths; there's no hidden overhead. Most of the cost comes from the relatively-expensive BSF operation. And, note that BSF is slower on AMD processors than Intel, so this code may be slightly less optimal on AMD, especially since AMD tends to use shorter pipelines and thus have less expensive branch mispredictions.</p>
+
+<p>Now, I won't say that this is the fastest possible implementation, because <a href="https://blog.codinghorror.com/there-aint-no-such-thing-as-the-fastest-code/" rel="noreferrer">there ain't no such thing as the fastest code</a>, but it's pretty respectable. I'd even say it's <em>about</em> as good as you're going to get with bog-standard x86 instructions.</p>
+
+<p>There is another frontier, and that is to use SIMD instructions (whether MMX, SSE 2, or SSE 4.2). This makes possible further substantial speed improvements, but my answer is much too long already, so I'll have to leave this stone unturned, since it is even more complicated to explain.</p>
+
+<p>[NOTE: There's a fair amount of hand-waving in this answer with regards to which optimizations are sensible and what the performance differences are. I've actually done <em>extensive</em> benchmarking of this exact code before, on a variety of different x86 family architectures (mostly Intel), but I've left those details out of this answer for brevity (hah!). You'll just have to take my word for it. Or ask a question about it on Stack Overflow.]</p>
+
+<hr>
+
+<h1>strcmp</h1>
+
+<p>Aren't you tired of reading yet?</p>
+    </div>

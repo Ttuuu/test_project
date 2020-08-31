@@ -1,0 +1,130 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>1. Bug</h3>
+
+<p>If the file does not end with the line terminator, then the last line is lost. That's because the code says:</p>
+
+<pre><code>if not data:  # EOF
+    break
+</code></pre>
+
+<p>but at this point there might still be an unterminated line remaining in <code>chunk</code>, so this needs to be:</p>
+
+<pre><code>if not data:  # EOF
+    if chunk:
+        yield chunk
+    break
+</code></pre>
+
+<p>Perhaps in your case the file is required to always end with a line terminator, but if so it would be a good idea to assert this, rather than silently discarding data if the file does not meet the requirement:</p>
+
+<pre><code>if not data:  # EOF
+    if chunk:
+        raise ValueError("file does not end with line terminator")
+    break
+</code></pre>
+
+<h3>2. Separation of concerns</h3>
+
+<p>The code in the post has four concerns:</p>
+
+<ol>
+<li>Opening and closing a file.</li>
+<li>Generating chunks of 100 kilobytes from a file.</li>
+<li>Generating lines from a file with arbitrary line terminator.</li>
+<li>Filtering out blank lines.</li>
+</ol>
+
+<p>The principle of <a href="https://en.wikipedia.org/wiki/Separation_of_concerns" rel="nofollow noreferrer">separation of concerns</a> suggests that these should not be combined into one function. Taking the four concerns in turn:</p>
+
+<ol>
+<li><p>As a general rule, if you have a function that operates on the contents of a file, it's better if the function takes a <em>file-like object</em> (not a filename) and leaves the opening and closing of the file up to the caller. That's because not all file-like objects correspond to named files. The caller might have a pipe from a call to <a href="https://docs.python.org/3/library/subprocess.html#subprocess.Popen" rel="nofollow noreferrer"><code>subprocess.Popen</code></a>, or they might have some data in memory wrapped as a <a href="https://docs.python.org/3/library/io.html#io.StringIO" rel="nofollow noreferrer"><code>io.StringIO</code></a>. If an interface takes a filename and opens the file itself, then it can't be used with these other kinds of file-like object.</p></li>
+<li><p>Reading fixed-size chunks from a file is already implemented by the <a href="https://docs.python.org/3/library/io.html#io.RawIOBase.read" rel="nofollow noreferrer"><code>read</code></a> method.</p></li>
+<li><p>This is fine, but see below for some improvements.</p></li>
+<li><p>Filtering out blank lines might not be needed or wanted, so it should be left to the caller to decide whether to do it. It is in any case easy to implement using an <code>if</code> statement, or a comprehension, or <a href="https://docs.python.org/3/library/functions.html#filter" rel="nofollow noreferrer"><code>filter</code></a>.</p></li>
+</ol>
+
+<h3>3. Other points</h3>
+
+<ol>
+<li><p>There are no docstrings.</p></li>
+<li><p>When you have a class with <code>__init__</code> and one other method, then there is usually no need for a class: what you want is a function. (See Jack Diederich's PyCon 2012 talk "<a href="https://www.youtube.com/watch?v=o9pEzgHorH0" rel="nofollow noreferrer">Stop Writing Classes</a>" for a detailed look at this issue.)</p></li>
+<li><p>100 × 1024 bytes is one hundred kilobytes (not megabytes).</p></li>
+<li><p>Instead of having a keyword argument with default value of <code>None</code>:</p>
+
+<pre><code>def read(..., chunk_size=None):
+</code></pre>
+
+<p>and then later setting it to a particular value if it tests false:</p>
+
+<pre><code>one_hundred_megabytes = 100 * 1024
+chunk_size = chunk_size or one_hundred_megabytes
+</code></pre>
+
+<p>just specify the keyword argument with the default value you want:</p>
+
+<pre><code>def read(..., chunk_size=100 * 1024):
+</code></pre></li>
+<li><p>The code appends to <code>chunk</code> before testing for the line terminator:</p>
+
+<pre><code>chunk += data
+# ...
+elif self._lineterminator in chunk:
+</code></pre>
+
+<p>but we know that if the line terminator appears, then it must appear in the new part of the chunk (that we just read). It can't appear in the old part because then it would have been split on the previous iteration. This means that if multiple chunks need to be read before the line terminator appears, then the initial part of the line gets searched again each time. This leads to quadratic runtime complexity if lines are much longer than the chunk size.</p>
+
+<p>For efficiency, we should test <code>self._lineterminator in data</code> instead.</p></li>
+<li><p>The code tests for the line terminator appearing in the chunk and then splits the chunk if it is found.</p>
+
+<pre><code>elif self._lineterminator in chunk:
+    lines = chunk.split(self._lineterminator)
+</code></pre>
+
+<p>but this has to search the chunk twice, once for the <code>in</code> operator, and again for the <code>split</code>. It would be faster to split first and then see how many pieces there are:</p>
+
+<pre><code>lines = chunk.split(self._lineterminator)
+if len(lines) &gt; 1:
+</code></pre></li>
+<li><p>Combining points 5 and 6 above, we should split <code>data</code> first and append to <code>chunk</code> afterwards:</p>
+
+<pre><code>first, *rest = data.split(self._lineterminator)
+chunk += first
+if rest:
+    yield chunk
+    yield from rest[:-1]
+    chunk = rest[-1]
+</code></pre></li>
+<li><p>I think the names would be clearer if <code>chunk</code> were renamed <code>part</code> (because it is part of a line), and <code>data</code> were renamed <code>chunk</code> (because it is a chunk of text read from the file).</p></li>
+</ol>
+
+<h3>4. Revised code</h3>
+
+<pre><code>def splitlines(file, newline, chunk_size=4096):
+    """Generate lines from file (a file-like object), where a line is
+    followed by the string newline (or the end of the file). Optional
+    argument chunk_size is the size of the chunks read from the file.
+
+    """
+    part = ''
+    while True:
+        chunk = file.read(chunk_size)
+        if not chunk:
+            if part:
+                yield part
+            break
+        first, *rest = chunk.split(newline)
+        part += first
+        if rest:
+            yield part
+            yield from rest[:-1]
+            part = rest[-1]
+</code></pre>
+
+<p>The caller should write something like:</p>
+
+<pre><code>with open(longabstract_file) as f:
+    for line in splitlines(f, "\tl\n"):
+        if line: # ignore blank lines
+            print(line)
+</code></pre>
+    </div>

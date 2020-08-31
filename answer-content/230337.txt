@@ -1,0 +1,138 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You've got some issues with your perfect forwarding and move semantics. You wrote:</p>
+
+<pre><code>template&lt;class T, typename VT = std::decay_t&lt;T&gt;,
+         typename = std::enable_if_t&lt;!std::is_same_v&lt;VT, any&gt;
+                                   &amp;&amp; std::is_copy_constructible_v&lt;VT&gt;&gt;&gt;
+any&amp; operator=(T&amp;&amp; rhs)
+{
+    any tmp(rhs);
+    tmp.swap(*this);
+    return *this;
+}
+</code></pre>
+
+<p>Here <code>T&amp;&amp; rhs</code> is a forwarding reference, so you ought to forward it:</p>
+
+<pre><code>    any tmp(std::forward&lt;T&gt;(rhs));
+</code></pre>
+
+<hr>
+
+<p>And again:</p>
+
+<pre><code>template&lt;class T, typename VT = std::decay_t&lt;T&gt;, class... Args,
+         typename = std::enable_if_t&lt;std::is_copy_constructible_v&lt;VT&gt;
+                                  &amp;&amp; std::is_constructible_v&lt;VT, Args...&gt;&gt;&gt;
+std::decay_t&lt;T&gt;&amp; emplace(Args&amp;&amp;... args)
+{
+    reset();
+    return emplace_impl&lt;VT&gt;(any_is_small&lt;T&gt;{}, std::forward&lt;Args&gt;(args)...);
+}
+</code></pre>
+
+<p>Here you are correctly forwarding <code>Args&amp;&amp;... args</code>; but look closely at your <code>enable_if</code> condition! You're asking whether <code>VT</code> is constructible from <code>Args...</code>. But when you actually pass <code>args...</code> to <code>emplace_impl&lt;VT&gt;</code>, you end up trying to construct <code>VT</code> from <code>Args&amp;&amp;...</code>! So you should be testing</p>
+
+<pre><code>         class = std::enable_if_t&lt;std::is_copy_constructible_v&lt;VT&gt;
+                               &amp;&amp; std::is_constructible_v&lt;VT, Args&amp;&amp;...&gt;&gt;&gt;
+</code></pre>
+
+<p>instead. (And notice that I personally prefer <code>template&lt;class&gt;</code> over <code>template&lt;typename&gt;</code> — it means the same thing, it's just less to write and less to read.)</p>
+
+<hr>
+
+<p>Since <code>enum class any_representation</code> is part of your struct layout and thus part of your ABI, you should add an explicit underlying type so that you know how many bytes it'll take up in your struct.</p>
+
+<pre><code>enum class any_representation : unsigned char { Small, Big };
+</code></pre>
+
+<hr>
+
+<pre><code>template&lt;class T, class... Args&gt;
+void Construct(void* destination, Args&amp;&amp;... args) noexcept
+{
+    new(destination) T(std::forward&lt;Args&gt;(args)...);
+}
+</code></pre>
+
+<p><code>noexcept</code>? Really? What if it throws?
+This is a good argument to never put <code>noexcept</code> anywhere except on move-constructors (to avoid the vector pessimization) and perhaps <code>swap</code>. Certainly you should be very careful every time you apply it; don't just scatter it willy-nilly like <code>constexpr</code>!</p>
+
+<hr>
+
+<pre><code>template&lt;class T&gt;
+any_big any_big_obj = { &amp;any_big::Destroy&lt;T&gt;, &amp;any_big::Copy&lt;T&gt;, &amp;any_big::Type&lt;T&gt; };
+
+template&lt;class T&gt;
+any_small any_small_obj = { &amp;any_small::Destroy&lt;T&gt;, &amp;any_small::Copy&lt;T&gt;, &amp;any_small::Move&lt;T&gt;, &amp;any_small::Type&lt;T&gt; };
+</code></pre>
+
+<p>Why do you have two different layouts for these structs (<code>any_small</code> has 4 function pointers where <code>any_big</code> has only 3)? The whole point of <code>any</code> is that you're type-erasing everything about the original <code>VT</code> except for its affordances. If "small" VTs require different affordances than "big" VTs, you're probably doing something incorrect somewhere.</p>
+
+<hr>
+
+<pre><code>std::type_info* _typeInfo;
+</code></pre>
+
+<p>This field is completely unused, I think. Why is it here? (More importantly, how could you improve your workflow to avoid submitting code reviews for dead code?)</p>
+
+<hr>
+
+<pre><code>typedef std::aligned_storage_t&lt;small_space_size, std::alignment_of_v&lt;void*&gt;&gt; internal_storage_t;
+internal_storage_t storage;
+</code></pre>
+
+<p>I strongly recommend against using <code>std::aligned_storage_t</code> in C++11-and-later; its behavior is <a href="https://github.com/WG21-SG14/SG14/search?q=aligned_storage&amp;type=Commits" rel="noreferrer">not portable</a> from one library to the next. Instead, you can use C++11's built-in support for alignment:</p>
+
+<pre><code>alignas(void*) char storage[small_space_size];
+</code></pre>
+
+<hr>
+
+<pre><code>inline void swap(any&amp; x, any&amp; y) noexcept 
+{
+    x.swap(y);
+}
+</code></pre>
+
+<p>Prefer to use the Hidden Friend idiom here: make this function findable only via ADL.</p>
+
+<hr>
+
+<pre><code>void swap(any&amp; rhs) noexcept
+{
+    any tmp;
+    tmp._storage = rhs._storage;
+    tmp._representation = rhs._representation;
+
+    rhs._storage = _storage;
+    rhs._representation = _representation;
+
+    _storage = tmp._storage;
+    _representation = tmp._representation;
+}
+</code></pre>
+
+<p>First of all, if this code were correct, you should just be using <code>std::swap(_storage, rhs._storage); std::swap(_representation, rhs._representation);</code>, not writing out the three-step dance by hand.</p>
+
+<p>However, this code is utterly wrong. Try it (on libstdc++ or libc++) with</p>
+
+<pre><code>any a1 = std::list&lt;int&gt;{1,2,3};
+any a2 = std::list&lt;int&gt;{4,5,6};
+a1.swap(a2);
+std::list&lt;int&gt; r = any_cast&lt;const std::list&lt;int&gt;&amp;&gt;(a1);
+</code></pre>
+
+<p>You can't just memswap the bytes of two <code>std::list</code>s and expect them to come through unscathed; <code>std::list</code> is not <a href="https://www.youtube.com/watch?v=SGdfPextuAU" rel="noreferrer">trivially relocatable</a>. To move <code>a1</code>'s contents over into <code>a2</code>, and vice versa, you must at some point invoke <code>std::list</code>'s move-constructor. Your code never invokes the move-constructor, so I know it's wrong.</p>
+
+<p><a href="https://godbolt.org/z/1A7HjR" rel="noreferrer">Godbolt</a> seems to show that you've got problems elsewhere in the code, too. I haven't tried to track them down.</p>
+
+<p>This goes to show: you should also write <strong>unit tests</strong> for your code, and test it, before submitting it for review!</p>
+
+<hr>
+
+<pre><code>return make_any(il, std::forward&lt;Args&gt;(args));
+</code></pre>
+
+<p>This line gives an error on Clang, because you forgot the <code>...</code> after <code>(args)</code>.</p>
+    </div>

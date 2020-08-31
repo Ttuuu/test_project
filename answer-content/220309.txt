@@ -1,0 +1,197 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This looks really nice! Here we go:</p>
+
+<blockquote>
+  <p>Is the API well thought and idiomatic?</p>
+</blockquote>
+
+<p>Mostly. For a library as simplistic as this, you probably want to avoid creating a special enum when returning <code>NULL</code> on error will suffice.</p>
+
+<ul>
+<li>For this you could make the <code>QUEUE_initialize()</code> function return a pointer to the <code>queue_t</code> instead of having a <code>queue_t**</code> passed as an argument. If the allocation fails, it can simply return <code>NULL</code> (you may even consider having the end-user allocate the struct and make the function only initialize it). For example:</li>
+</ul>
+
+<pre><code>queue_t *QUEUE_initialize()
+{
+    queue_t *queue = (queue_t*)calloc(1, sizeof(queue_t));
+
+    if (queue == NULL) return NULL;
+
+    queue-&gt;front = NULL;
+    queue-&gt;back = NULL;
+    queue-&gt;size = 0;
+
+    return queue;
+}
+</code></pre>
+
+<p>Alternatively, to provide "mechanism not policy" with respect to how memory is allocated:</p>
+
+<pre><code>void QUEUE_initialize(queue_t *queue)
+{
+    queue-&gt;front = NULL;
+    queue-&gt;back = NULL;
+    queue-&gt;size = 0;
+}
+</code></pre>
+
+<p>As you can see, this greatly simplifies the implementation in addition to providing the user with more flexibility.</p>
+
+<ul>
+<li>If <code>QUEUE_peek()</code> returns the pointer argument on success and <code>NULL</code> on failure, you could get rid of the enum and have fewer lines of code:</li>
+</ul>
+
+<pre><code>void *QUEUE_peek(queue_t* queue, void* data, size_t size)
+{
+    if (queue-&gt;size == 0) return NULL;
+
+    memcpy(data, queue-&gt;front-&gt;data, size);
+    return data;
+}
+</code></pre>
+
+<p>In general, you want to have as few lines of codes as possible, as each line is a potential for bugs.</p>
+
+<blockquote>
+  <p>Does the code look "modern" (i.e. uses modern conventions etc)?</p>
+</blockquote>
+
+<p>Yes, except for the non-standard <code>#pragma once</code> in <code>queue.h</code>. Personally, I would use lowercase function names (<code>queue_size()</code> and not <code>QUEUE_size()</code>, etc.), but this is just personal preference.</p>
+
+<blockquote>
+  <p>Is the code efficient in terms of memory usage?
+  Are the tests well thought?</p>
+</blockquote>
+
+<p>Yes</p>
+
+<blockquote>
+  <p>Is the code free of undefined behavior, memory leaks etc?</p>
+</blockquote>
+
+<p>Some of the functions (<code>QUEUE_peek()</code>, <code>QUEUE_dequeue</code>) have a potential for the user to make mistakes by having the user specify the size separate from the data. You should probably treat the user's pointers as opaque data or add a <code>size_t</code> to the <code>node_t</code> structure. At the same time, I do not believe your library should be responsible for checking for null pointers within e.g. the initialization function. If the user tried to <code>malloc()</code> a struct but didn't check if it was successful, they may have already passed the pointer around to other parts of their program, making this check redundant. However, as @bta mentions, your implementation is vulnerable to a nosy user and shouldn't be using the <code>_t</code> suffix for structs.</p>
+
+<p>Depending on how old your compiler is, you may want to mark the <code>QUEUE_size()</code> function as <code>inline</code> or define it as a macro. While some may argue that <code>QUEUE_size()</code> is redundant and should be removed, the library user should not have to know about the internals of the struct. If you wanted to stay true to C, I would go as far as to remove the typedefs and only reference the structs as <code>struct foo</code>. I would also refrain from adding any function pointers to the struct, as this leads to some unnecessary complexity (read: bloat). If the API needs to be object oriented, then just use C++.</p>
+
+<p>To have a more memory-allocation agnostic <code>free()</code> function, you might want to use a callback function. In addition, your library does not need to know about what kinds of things the user is using the pointers for (what if they just wanted to post message ids instead of actual pointers), nor does the user need to know about how the queue is implemented. To avoid polluting the user's namespace, you might want to place some of the header definitions in the c file to prevent it from being visible outside that translation unit.</p>
+
+<p>Overall, the improved library might look like this(header guards omitted because they are considered bad style by some):</p>
+
+<p><strong>queue.h</strong></p>
+
+<pre><code>#include &lt;stdbool.h&gt;
+
+struct queue;
+
+/* Required behavior: node_alloc returns NULL on failure */
+typedef void *(*node_alloc_fn)(size_t size);
+typedef void (*node_free_fn)(void *node);
+
+void queue_initialize(struct queue *queue);
+inline size_t queue_size(struct queue *queue);
+bool queue_enqueue(struct queue *queue, void *data, node_alloc_fn node_alloc);
+void *queue_peek(struct queue *queue);
+void *queue_dequeue(struct queue *queue, node_free_fn node_free);
+void queue_free_nodes(struct queue *queue, node_free_fn node_free);
+</code></pre>
+
+<p><strong>queue.c</strong></p>
+
+<pre><code>#include "queue.h"
+
+struct node
+{
+    void *data;
+    struct node *next;
+};
+
+struct queue
+{
+    struct node *front;
+    struct node *back;
+    size_t numitems;
+};
+
+
+void queue_initialize(struct queue *queue)
+{
+    queue-&gt;front = NULL;
+    queue-&gt;back = NULL;
+    queue-&gt;numitems = 0;
+}
+
+inline size_t queue_size(struct queue *queue)
+{
+    return queue-&gt;numitems;
+}
+
+bool queue_enqueue(struct queue *queue, void *data, node_alloc_fn node_alloc)
+{
+    /* Not including a default value for node_alloc since malloc() might not exist */
+
+    struct node *node = (struct node*)node_alloc(sizeof(struct node));
+    if (!node) return false;
+
+    node-&gt;data = data;
+    node-&gt;next = NULL;
+
+    if (queue-&gt;size == 0)
+    {
+        queue-&gt;front = node;
+        queue-&gt;back = node;
+    }
+    else
+    {
+        queue-&gt;back-&gt;next = node;
+        queue-&gt;back = node;
+    }
+
+    (queue-&gt;numitems)++;
+    return true;
+}
+
+/* Just get the first value in the queue, the user chooses if it gets copied */
+void *queue_peek(struct queue *queue)
+{
+    if (queue-&gt;numitems == 0) return NULL;
+    return queue-&gt;front-&gt;data;
+}
+
+/* Instead of a data parameter, just return the value */
+void *queue_dequeue(struct queue *queue, node_free_fn node_free)
+{
+    /* Not including a default value for node_free since free() might not exist */
+    if (!queue_peek(queue)) return NULL;
+
+    /* All this function needs to do is unlink the first member.
+       Leave it up to the user to decide if it needs to be freed */
+    struct node *front = queue-&gt;front;
+    if (front == queue-&gt;back)
+    {
+        queue-&gt;front = NULL;
+        queue-&gt;back = NULL;
+    }
+    else
+    {
+        queue-&gt;front = front-&gt;next;
+    }
+
+    (queue-&gt;numitems)--;
+    return front;
+}
+
+void queue_free_nodes(struct queue *queue, node_free_fn node_free)
+{
+    /* Not including a default value for node_free since free() might not exist */
+    struct node *current = queue-&gt;front;
+
+    while (current)
+    {
+        struct node *next = current-&gt;next;
+        node_free(current);
+        current = next;
+    }
+}
+<span class="math-container">```</span>
+</code></pre>
+    </div>

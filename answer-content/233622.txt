@@ -1,0 +1,147 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Providing a possible answer to my own question. Leaving original in tact for the record. </p>
+
+<p>In order to address the performance issues with mariadb++ I wrote a <strong>very</strong> slimline, and zero cost, c++ abstraction around mysql-Connector-C. Uses c++17 features like <code>if () initialiser</code> and <code>std::optional</code>.</p>
+
+<p>Please comment on that abstraction as well as the string munge and mapping stuff which is still here, basically unchanged. Performance is identical to using the plain C mysql.h functions: 128ms or ~3x speed of the php code with mysqld maxed out at 100% CPU, ie it's now the bottleneck. </p>
+
+<p>What does the c++ wrapper add? </p>
+
+<ul>
+<li>simpler, cleaner signatures</li>
+<li>no pointers</li>
+<li>RAII to free resources</li>
+<li>std::optional for "now more rows" and "field value is NULL"</li>
+</ul>
+
+<pre><code>#include "mysql.h"
+#include &lt;string&gt;
+#include &lt;unordered_map&gt;
+#include &lt;vector&gt;
+#include &lt;algorithm&gt;
+#include &lt;iostream&gt;
+
+// Very slimline wrapper around mysql connector-C. Limited features. Zero cost abstraction
+namespace mysqlpp {
+class row {
+public:
+  explicit row(MYSQL_ROW row_) : _row{row_} {}
+
+  // This helps with NULL columns, but does NOT make a copy. That's up to caller.
+  std::optional&lt;const char*&gt; getField(size_t pos) {
+    if (!_row[pos]) return std::nullopt;
+    return std::optional&lt;const char*&gt;(_row[pos]);
+  }
+
+private:
+  MYSQL_ROW _row;
+};
+
+class result {
+public:
+  result(MYSQL_RES* result_) : _result{result_} {}
+  ~result() { mysql_free_result(_result); }  // RAII
+
+  std::optional&lt;row&gt; next() {
+    auto r = mysql_fetch_row(_result);
+    if (!r) return std::nullopt;
+    return std::optional&lt;row&gt;(row(r));
+  }
+
+private:
+  MYSQL_RES* _result;
+};
+
+class conn {
+public:
+  conn(const char* host, const char* user, const char* passwd, const char* db, unsigned int port,
+       const char* unix_socket, unsigned long clientflag) {
+
+    mysql = mysql_init(NULL);
+    if (!mysql_real_connect(mysql, host, user, passwd, db, port, unix_socket, clientflag))
+      show_error();
+  }
+
+  ~conn() { mysql_close(mysql); }  // RAII
+
+  result query(std::string sql) {
+    if (mysql_real_query(mysql, sql.c_str(), sql.length())) show_error();
+    MYSQL_RES* res = mysql_use_result(mysql);
+    if (res == NULL) show_error();
+    return result(res);
+  }
+
+private:
+  void show_error() {
+    std::cerr &lt;&lt; "Error(" &lt;&lt; mysql_errno(mysql) &lt;&lt; ") "
+              &lt;&lt; "[" &lt;&lt; mysql_sqlstate(mysql) &lt;&lt; "] "
+              &lt;&lt; "\"" &lt;&lt; mysql_error(mysql) &lt;&lt; "\"";
+    mysql_close(mysql);
+    exit(EXIT_FAILURE);
+  }
+
+  MYSQL* mysql;
+};
+
+} // end namespace mysqlpp
+
+typedef std::unordered_map&lt;std::string, int&gt; TopNMap;
+typedef std::vector&lt;std::pair&lt;std::string, int&gt;&gt; TopNResult;
+
+TopNResult top_n(const TopNMap&amp; map, int n) {
+  TopNResult top_n(n, {"", 0});
+  std::partial_sort_copy(map.begin(), map.end(), top_n.begin(), top_n.end(),
+                         [](auto&amp; a, auto&amp; b) { return a.second &gt; b.second; });
+  return top_n;
+}
+
+void report(const TopNMap&amp; map, int n, std::string label) {
+  std::cout &lt;&lt; "\n" &lt;&lt; std::to_string(map.size()) &lt;&lt; " unique " &lt;&lt; label &lt;&lt; "\n";
+  TopNResult result = top_n(map, n);
+  std::for_each(result.begin(), result.end(),
+                [](auto&amp; e) { std::cout &lt;&lt; e.first &lt;&lt; ": " &lt;&lt; e.second &lt;&lt; "\n"; });
+}
+
+int main() {
+  mysqlpp::conn mysql("localhost", "...", "...", "...", 0,
+                      "/var/run/mysqld/mysqld.sock", 0);
+
+  TopNMap domains;
+  TopNMap firstnames;
+  TopNMap lastnames;
+  auto result = mysql.query("select email,firstname,lastname from member");
+  while (auto row = result.next()) {
+      if (auto maybe_domain = row-&gt;getField(0)) {
+        std::string domain = maybe_domain.value(); // make that copy!
+        trim(domain);
+        if (size_t pos = domain.find('@'); pos != std::string::npos) {
+            strtolower(domain);
+            domains[domain.substr(pos + 1)]++;
+        }
+      }
+
+      if (auto maybe_firstname = row-&gt;getField(1)) {
+        std::string firstname = maybe_firstname.value();
+        trim(firstname);
+        strtolower(firstname);
+        firstnames[std::move(firstname)]++;
+      }
+
+      if (auto maybe_lastname = row-&gt;getField(2)) {
+        std::string lastname = maybe_lastname.value();
+        trim(lastname);
+        strtolower(lastname);
+        lastnames[std::move(lastname)]++;
+      }
+  }
+
+  const int n = 10;
+  report(domains, n, "domains");
+  report(firstnames, n, "firstnames");
+  report(lastnames, n, "lastnames");
+  return EXIT_SUCCESS;
+}
+
+<span class="math-container">```</span> 
+</code></pre>
+    </div>

@@ -1,0 +1,578 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Packaging floats</h1>
+
+<p>I have implemented some selective sampling that I found on a forum, and I've changed the container for my complex numbers from a <code>pycuda::complex&lt;float&gt;*</code> to a <code>float4*</code>. Both of these things have contributed to a 76% performance increase. Here's the updated code: </p>
+
+<pre><code>import numpy as np
+import pycuda.autoinit
+from pycuda.compiler import SourceModule
+from pycuda.driver import Device
+from pycuda import gpuarray
+import time
+import scipy.misc
+
+code = """
+#include &lt;curand_kernel.h&gt;
+#include &lt;stdio.h&gt;
+
+#define X_MIN -1.5f
+#define X_MAX 1.5f
+#define Y_MIN -3.2f
+#define Y_MAX 2.0f
+#define X_DIM %(XDIM)s
+#define Y_DIM %(YDIM)s
+#define ITERS %(ITERS)s
+
+const int nstates = %(NGENERATORS)s;
+__device__ curandState_t* states[nstates];
+
+extern "C" { __global__ void init_kernel(int seed) {
+
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (idx &lt; nstates) {
+        curandState_t* s = new curandState_t;
+        if (s != 0) {
+            curand_init(seed, idx, 0, s);
+        }
+
+        states[idx] = s;
+    } else {
+        printf("forbidden memory access %%d/%%d\\n", idx, nstates);
+    }
+} }
+
+__device__ void to_pixel(float &amp;px, float &amp;py, int &amp;ix, int &amp;iy) {
+    px -= X_MIN;
+    py -= Y_MIN;
+    px /= X_MAX - X_MIN;
+    py /= Y_MAX - Y_MIN;
+    px *= X_DIM;
+    py *= Y_DIM;
+    ix = __float2int_rd(px);
+    iy = __float2int_rd(py);
+}
+
+__device__
+void write_pixel(int idx, float px, float py, int ix, int iy,
+    float4 *z, unsigned int *canvas) {
+    px = z[idx].y;
+    py = z[idx].x;
+    to_pixel(px, py, ix, iy);
+    if (0 &lt;= ix &amp; ix &lt; X_DIM &amp; 0 &lt;= iy &amp; iy &lt; Y_DIM) {
+        canvas[iy*X_DIM + ix] += 1;
+    }
+}
+
+__device__
+void generate_random_complex(float real, float imag, int idx,
+    float4 *z, float *dists, unsigned int *counts) {
+
+    real *= X_MAX-X_MIN+3;
+    real += X_MIN-2;
+    imag *= Y_MAX-Y_MIN+0;
+    imag += Y_MIN-0;
+
+    z[idx].x = real;
+    z[idx].y = imag;
+    z[idx].z = real;
+    z[idx].w = imag;
+    dists[idx] = 0;
+    counts[idx] = 0;
+}
+
+__device__
+bool check_bulbs(int idx, float4 *z) {
+    float zw2 = z[idx].w*z[idx].w;
+    bool main_card = !(((z[idx].z-0.25)*(z[idx].z-0.25)
+        + (zw2))*(((z[idx].z-0.25)*(z[idx].z-0.25)
+        + (zw2))+(z[idx].z-0.25)) &lt; 0.25* zw2);
+    bool period_2 = !((z[idx].z+1.0) * (z[idx].z+1.0) + (zw2) &lt; 0.0625);
+    bool smaller_bulb = !((z[idx].z+1.309)*(z[idx].z+1.309) + zw2 &lt; 0.00345);
+    bool smaller_bottom = !((z[idx].z+0.125)*(z[idx].z+0.125)
+        + (z[idx].w-0.744)*(z[idx].w-0.744) &lt; 0.0088);
+    bool smaller_top = !((z[idx].z+0.125)*(z[idx].z+0.125)
+        + (z[idx].w+0.744)*(z[idx].w+0.744) &lt; 0.0088);
+    return main_card &amp; period_2 &amp; smaller_bulb &amp; smaller_bottom &amp; smaller_top;
+}
+
+extern "C" {__global__ void buddha_kernel(unsigned int *counts, float4 *z,
+    float *dists, unsigned int *canvas) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    int i, j, ix, iy;
+    float real, imag;//, temp0, temp1;
+
+    if (idx &lt; nstates) {
+
+        curandState_t s = *states[idx];
+        for(i = 0; i &lt; 10000; i++) {
+
+            real = curand_uniform(&amp;s);
+            imag = curand_uniform(&amp;s);
+            generate_random_complex(real, imag, idx, z, dists, counts);
+            if (check_bulbs(idx, z)) {
+                while (counts[idx] &lt; ITERS &amp; dists[idx] &lt; 25) {
+                    counts[idx]++;
+                    real = z[idx].x*z[idx].x - z[idx].y*z[idx].y + z[idx].z;
+                    imag = 2*z[idx].x*z[idx].y + z[idx].w;
+                    z[idx].x = real;
+                    z[idx].y = imag;
+                    dists[idx] = z[idx].x*z[idx].x + z[idx].y*z[idx].y;
+                }
+
+                if (dists[idx] &gt; 25) {
+                    z[idx].x = 0;
+                    z[idx].y = 0;
+                    for (j = 0; j &lt; counts[idx]+1; j++) {
+                        real = z[idx].x*z[idx].x - z[idx].y*z[idx].y + z[idx].z;
+                        imag = 2*z[idx].x*z[idx].y + z[idx].w;
+                        z[idx].x = real;
+                        z[idx].y = imag;
+                        write_pixel(idx, real, imag, ix, iy, z, canvas);
+                    }
+                }
+            }
+        }
+        *states[idx] = s;
+    } else {
+        printf("forbidden memory access %%d/%%d\\n", idx, nstates);
+    }
+} }
+"""
+
+def print_stats(cpu_canvas, elapsed_time, x_dim, y_dim):
+    total_iterations = np.sum(cpu_canvas)
+    max_freq = np.max(cpu_canvas)
+    min_freq = np.min(cpu_canvas)
+    print("\tTotal iterations: %.5e" % total_iterations)
+    print("\tIterations per pixel: %.2f" % (total_iterations / (x_dim*y_dim),))
+    print("\tMaximum frequency: %d" % max_freq)
+    print("\tMinimum frequency: %d" % min_freq)
+    print("\tTotal time: %.2fs" % (elapsed_time,))
+    print("\tIterations per second: %.2e" % (total_iterations / (elapsed_time),))
+
+def format_and_save(cpu_canvas, x_dim, y_dim, threads, iters):
+    cpu_canvas /= np.max(cpu_canvas)
+    cpu_canvas.shape = (y_dim, x_dim)
+    # this just makes the color gradient more visually pleasing
+    cpu_canvas = np.minimum(1.1*cpu_canvas, cpu_canvas*.2+.8)
+
+    file_name = "pycuda_%dx%d_%d_%d.png" % (x_dim, y_dim, iters, threads)
+    print("\n\tSaving %s..." % file_name)
+    scipy.misc.toimage(cpu_canvas, cmin=0.0, cmax=1.0).save(file_name)
+    print("\tImage saved!\n")
+
+def generate_image(x_dim, y_dim, iters):
+
+    threads = 2**8
+    b_s = 2**8
+
+    device = Device(0)
+    print("\n\t" + device.name(), "\n")
+    context = device.make_context()
+
+    formatted_code = code % {
+        "NGENERATORS" : threads*b_s,
+        "XDIM" : x_dim,
+        "YDIM" : y_dim,
+        "ITERS" : iters
+    }
+
+    # generate kernel and setup random number generation
+    module = SourceModule(
+        formatted_code,
+        no_extern_c=True,
+        options=['--use_fast_math', '-O3', '--ptxas-options=-O3']
+    )
+    init_func = module.get_function("init_kernel")
+    fill_func = module.get_function("buddha_kernel")
+    seed = np.int32(np.random.randint(0, 1&lt;&lt;31))
+    init_func(seed, block=(b_s,1,1), grid=(threads,1,1))
+
+    # initialize all numpy arrays
+    samples = gpuarray.zeros(threads*b_s, dtype = gpuarray.vec.float4)
+    dists = gpuarray.zeros(threads*b_s, dtype = np.float32)
+    counts = gpuarray.zeros(threads*b_s, dtype = np.uint32)
+    canvas = gpuarray.zeros(y_dim*x_dim, dtype = np.uint32)
+    t0 = time.time()
+    fill_func(counts, samples, dists, canvas, block=(b_s,1,1), grid=(threads,1,1))
+    context.synchronize()
+    t1 = time.time()
+
+    # fetch buffer from gpu and save as image
+    cpu_canvas = canvas.get().astype(np.float64)
+    context.pop()
+    print_stats(cpu_canvas, t1-t0, x_dim, y_dim)
+    format_and_save(cpu_canvas, x_dim, y_dim, threads, iters)
+
+if __name__ == "__main__":
+
+    x_dim = 1440
+    y_dim = 2560
+    iters = 20
+    generate_image(x_dim, y_dim, iters)
+</code></pre>
+
+<p>And here's some sample output:</p>
+
+<pre><code>GeForce GTX 1050 
+
+Total iterations: 5.83970e+08
+Iterations per pixel: 158.41
+Maximum frequency: 886
+Minimum frequency: 0
+Total time: 2.20s
+Iterations per second: 2.66e+08
+
+Saving pycuda_1440x2560_20_256.png...
+Image saved!
+</code></pre>
+
+<h1>Don't use global memory when you don't have to</h1>
+
+<p>I managed to get another 30% speedup by switching to using thread-local variables instead of global arrays. Now the major bottleneck seems to be the writing to the <code>canvas</code> array, since that has to reside in global memory. I'm still not sure how I should handle those writes as efficiently as possible.</p>
+
+<h1>ALWAYS try to coalesce global memory writes</h1>
+
+<p>I managed to get another 320% speedup, making my final version 7.37 times faster than the original! To achieve this, I removed all arrays except <code>canvas</code> from the global memory, and handled all variables in (what I'm guessing is) shared memory. That provided me with a 50% speedup I think.</p>
+
+<p>What made everything a whole lot faster was my method of memory access coalescing. Since the algorithm is based on choosing random complex numbers, the behavior of each thread is not easily predictable. This leads to terrible branch prediction and global memory access. </p>
+
+<p>By using some logic from <a href="https://stackoverflow.com/questions/11227809/why-is-it-faster-to-process-a-sorted-array-than-an-unsorted-array">this</a> question on Stack Overflow, thought of a method to "sort" the random numbers. </p>
+
+<h2>Grid sampling</h2>
+
+<p>We can visualize the area that the complex numbers are sampled from as a rectangle on the complex plane. For our algorithm to work, we must ensure that every point within the rectangle is equally likely to be chosen. </p>
+
+<p>To ensure this, we split the sampling area into a grid of rectangles, like the image below. We run our algorithm for each cell in the grid, only sampling from the current cell. When we have iterated over all the cells in the grid, then all points across the entire rectangle has had an equal chance of being chosen. </p>
+
+<p><a href="https://i.stack.imgur.com/TcG0i.jpg" rel="nofollow noreferrer"><img src="https://i.stack.imgur.com/TcG0i.jpg" alt="Grid sampling image"></a></p>
+
+<p>The advantage of sampling in grid cells sequentially is that the points within a single grid cell tend to behave similarly. Since they are close to each other, they almost follow the same orbits, which helps both with branch prediction and memory coalescing. </p>
+
+<p>So with this code:</p>
+
+<pre><code>import numpy as np
+import pycuda.autoinit
+from pycuda.compiler import SourceModule
+from pycuda.driver import Device
+from pycuda import gpuarray
+import time
+import scipy.misc
+
+code = """
+#include &lt;curand_kernel.h&gt;
+#include &lt;stdio.h&gt;
+
+#define X_MIN -1.5f
+#define X_MAX 1.5f
+#define Y_MIN -3.2f
+#define Y_MAX 2.0f
+
+#define X_MIN_SAMPLE -2.1f
+#define X_MAX_SAMPLE 1.1f
+#define Y_MIN_SAMPLE -1.8f
+#define Y_MAX_SAMPLE 1.8f
+
+#define X_DIM %(XDIM)s
+#define Y_DIM %(YDIM)s
+#define ITERS %(ITERS)s
+
+const int nstates = %(NGENERATORS)s;
+__device__ curandState_t* states[nstates];
+
+extern "C" {
+__global__
+void init_kernel(int seed) {
+
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (idx &lt; nstates) {
+        curandState_t* s = new curandState_t;
+        if (s != 0) {
+            curand_init(seed, idx, 0, s);
+        }
+
+        states[idx] = s;
+    } else {
+        printf("forbidden memory access %%d/%%d\\n", idx, nstates);
+    }
+}
+}
+
+__device__ void to_pixel(float2 &amp;temp, int &amp;ix, int &amp;iy) {
+    temp.x -= X_MIN;
+    temp.y -= Y_MIN;
+    temp.x /= X_MAX - X_MIN;
+    temp.y /= Y_MAX - Y_MIN;
+    temp.x *= X_DIM;
+    temp.y *= Y_DIM;
+    ix = __float2int_rd(temp.x);
+    iy = __float2int_rd(temp.y);
+}
+
+__device__
+void write_pixel(float2 temp, int ix, int iy,
+    float4 z, unsigned int *canvas) {
+    temp.x = z.y;
+    temp.y = z.x;
+    to_pixel(temp, ix, iy);
+    if (0 &lt;= ix &amp; ix &lt; X_DIM &amp; 0 &lt;= iy &amp; iy &lt; Y_DIM) {
+        atomicAdd(&amp;(canvas[iy*X_DIM + ix]), 1);
+    }
+}
+
+__device__
+void generate_random_complex(float2 temp,
+    float4 &amp;z, float &amp;dist, unsigned int &amp;count) {
+
+    temp.x *= X_MAX_SAMPLE-X_MIN_SAMPLE;
+    temp.x += X_MIN_SAMPLE;
+    temp.y *= Y_MAX_SAMPLE-Y_MIN_SAMPLE;
+    temp.y += Y_MIN_SAMPLE;
+
+    z.x = temp.x;
+    z.y = temp.y;
+    z.z = temp.x;
+    z.w = temp.y;
+    dist = 0;
+    count = 0;
+}
+
+__device__
+bool check_bulbs(float4 z) {
+    float zw2 = z.w*z.w;
+    bool main_card = !(((z.z-0.25)*(z.z-0.25)
+        + (zw2))*(((z.z-0.25)*(z.z-0.25)
+        + (zw2))+(z.z-0.25)) &lt; 0.25* zw2);
+    bool period_2 = !((z.z+1.0) * (z.z+1.0) + (zw2) &lt; 0.0625);
+    bool smaller_bulb = !((z.z+1.309)*(z.z+1.309) + zw2 &lt; 0.00345);
+    bool smaller_bottom = !((z.z+0.125)*(z.z+0.125)
+        + (z.w-0.744)*(z.w-0.744) &lt; 0.0088);
+    bool smaller_top = !((z.z+0.125)*(z.z+0.125)
+        + (z.w+0.744)*(z.w+0.744) &lt; 0.0088);
+    return main_card &amp; period_2 &amp; smaller_bulb &amp; smaller_bottom &amp; smaller_top;
+}
+
+extern "C" {
+__global__
+void buddha_kernel(unsigned int *canvas, int seed) {
+    int idx = blockIdx.x 
+        + threadIdx.x * gridDim.x 
+        + threadIdx.y * gridDim.x * blockDim.x;
+    int i, j, ix, iy;
+    float2 temp, coord;
+    unsigned int count;
+    float4 z;
+    float dist;
+    curandState_t s;
+    curand_init(seed, idx, 0, &amp;s);
+
+    for (coord.x = 0; coord.x &lt; 1; coord.x += 1/(float)blockDim.x) {
+        for (coord.y = 0; coord.y &lt; 1; coord.y += 1/(float)blockDim.x) {
+
+            for(i = 0; i &lt; 1; i++) {
+
+                temp.x = curand_uniform(&amp;s);
+                temp.y = curand_uniform(&amp;s);
+                temp.x /= (float)blockDim.x;
+                temp.y /= (float)blockDim.x;
+                temp.x += coord.x;
+                temp.y += coord.y;
+
+                generate_random_complex(temp, z, dist, count);
+                if (check_bulbs(z)) {
+                    while (count &lt; ITERS &amp; dist &lt; 25) {
+                        count++;
+                        temp.x = z.x*z.x - z.y*z.y + z.z;
+                        temp.y = 2*z.x*z.y + z.w;
+                        z.x = temp.x;
+                        z.y = temp.y;
+                        dist = z.x*z.x + z.y*z.y;
+                    }
+
+                    if (dist &gt; 25) {
+                        z.x = z.z;
+                        z.y = z.w;
+                        for (j = 0; j &lt; count; j++) {
+                            temp.x = z.x*z.x - z.y*z.y + z.z;
+                            temp.y = 2*z.x*z.y + z.w;
+                            z.x = temp.x;
+                            z.y = temp.y;
+                            write_pixel(temp, ix, iy, z, canvas);
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+
+        }
+    }
+
+}
+}
+"""
+
+def print_stats(cpu_canvas, elapsed_time, x_dim, y_dim):
+    total_iterations = np.sum(cpu_canvas)
+    max_freq = np.max(cpu_canvas)
+    min_freq = np.min(cpu_canvas)
+    print("\tTotal iterations: %.5e" % total_iterations)
+    print("\tIterations per pixel: %.2f" % (total_iterations / (x_dim*y_dim),))
+    print("\tMaximum frequency: %d" % max_freq)
+    print("\tMinimum frequency: %d" % min_freq)
+    print("\tTotal time: %.2fs" % (elapsed_time,))
+    print("\tIterations per second: %.2e" % (total_iterations / (elapsed_time),))
+
+def format_and_save(cpu_canvas, x_dim, y_dim, threads, iters):
+    cpu_canvas /= max(1, np.max(cpu_canvas))
+    # cpu_canvas.shape = (y_dim, x_dim)
+    # this just makes the color gradient more visually pleasing
+    cpu_canvas = np.minimum(2.5*cpu_canvas, cpu_canvas*.2+.8)
+
+    file_name = "pycuda_%dx%d_%d_%d.png" % (x_dim, y_dim, iters, threads)
+    print("\n\tSaving %s..." % file_name)
+    scipy.misc.toimage(cpu_canvas, cmin=0.0, cmax=1.0).save(file_name)
+    print("\tImage saved!\n")
+
+def generate_image(x_dim, y_dim, iters):
+
+    threads = 2**4
+    b_s = 2**9
+
+    device = Device(0)
+    print("\n\t" + device.name(), "\n")
+    context = device.make_context()
+
+    formatted_code = code % {
+        "NGENERATORS" : threads*b_s,
+        "XDIM" : x_dim,
+        "YDIM" : y_dim,
+        "ITERS" : iters
+    }
+
+    # generate kernel and setup random number generation
+    module = SourceModule(
+        formatted_code,
+        no_extern_c=True,
+        options=['--use_fast_math', '-O3', '--ptxas-options=-O3']
+    )
+    fill_func = module.get_function("buddha_kernel")
+    seed = np.int32(np.random.randint(0, 1&lt;&lt;31))
+    canvas = gpuarray.zeros((y_dim, x_dim), dtype = np.uint32)
+
+    t0 = time.time()
+    fill_func(canvas, seed, block=(b_s,1,1), grid=(threads,1,1))
+    context.synchronize()
+    t1 = time.time()
+
+    # fetch buffer from gpu and save as image
+    cpu_canvas = canvas.get().astype(np.float64)
+    context.pop()
+    print_stats(cpu_canvas, t1-t0, x_dim, y_dim)
+    format_and_save(cpu_canvas, x_dim, y_dim, threads, iters)
+
+if __name__ == "__main__":
+
+    x_dim = 1440
+    y_dim = 2560
+    iters = 20
+    generate_image(x_dim, y_dim, iters)
+</code></pre>
+
+<p>The code above shows a lot of improvement:</p>
+
+<pre><code>GeForce GTX 1050 
+
+Total iterations: 2.59801e+09
+Iterations per pixel: 704.76
+Maximum frequency: 7873
+Minimum frequency: 0
+Total time: 2.33s
+Iterations per second: 1.12e+09
+
+Saving pycuda_1440x2560_20_16.png...
+Image saved!
+</code></pre>
+
+<p>If anyone has any suggestions for further improvements, I'm happy to test them out and see what works.</p>
+
+<h1>Minor optimizations</h1>
+
+<p>I changed the lines:</p>
+
+<pre><code>for (coord.x = 0; coord.x &lt; 1; coord.x += 1/(float)blockDim.x) {
+    for (coord.y = 0; coord.y &lt; 1; coord.y += 1/(float)blockDim.x) {
+</code></pre>
+
+<p>To instead become:</p>
+
+<pre><code>float gridSize = 1/1024.0f;
+for (coord.x = 0; coord.x &lt; 1; coord.x += gridSize) {
+    for (coord.y = 0; coord.y &lt; 1; coord.y += gridSize) {
+</code></pre>
+
+<p>That way, I could tweak the block sizes and threads independently of the grid structure for sampling. Doing this, and increasing the number of threads, I managed to get another 43% speed increase, but the downside is that it's not possible to run quick benchmarks using this method, since each thread has to perform <span class="math-container">\$2^{20}\$</span> iterations at a minimum.</p>
+
+<pre><code>GeForce GTX 1050 
+
+Total iterations: 2.54575e+11
+Iterations per pixel: 69057.85
+Maximum frequency: 792006
+Minimum frequency: 0
+Total time: 157.91s
+Iterations per second: 1.61e+09
+
+Saving pycuda_1440x2560_20_128.png...
+Image saved!
+</code></pre>
+
+<h1>Realization that the sampling can be made more efficient</h1>
+
+<p>From reading <a href="https://softologyblog.wordpress.com/2011/06/26/buddhabrot-fractals/" rel="nofollow noreferrer">this blog post</a>, I realized that my sampling could be made more effective. Since the mandelbrot set is symmetric on the imaginary axis, I can mirror any orbit to its complex conjugate. This also means that I don't have to sample any points with a negative imaginary part, and I've halved my sampling area. </p>
+
+<p>This was very easy to implement, just by breaking the second part of the orbit calculation into its own function: </p>
+
+<pre><code>__device__ __forceinline__
+void write_to_image(float4 z, float2 temp, int2 ixy, 
+    int count, unsigned int *canvas) {
+    z.x = z.z;
+    z.y = z.w;
+    for (int j = 0; j &lt; count; j++) {
+        temp.x = z.x*z.x - z.y*z.y + z.z;
+        temp.y = 2*z.x*z.y + z.w;
+        z.x = temp.x;
+        z.y = temp.y;
+        write_pixel(temp, ixy, z, canvas);
+    }
+}
+</code></pre>
+
+<p>and then modifying the last part of the main loop to become:</p>
+
+<pre><code>if (dist &gt; 4) {
+    write_to_image(z, temp, ixy, count, canvas);
+    z.w *= -1;
+    write_to_image(z, temp, ixy, count, canvas);                         
+}
+</code></pre>
+
+<p>With some tweaking, this results in a 65% speedup!</p>
+
+<pre><code>GeForce GTX 1050 
+
+Total iterations: 1.69717e+12
+Iterations per pixel: 460385.79
+Maximum frequency: 5277235
+Minimum frequency: 0
+Total time: 639.79s
+Iterations per second: 2.65e+09
+
+Saving pycuda_1440x2560_20_128.png...
+Image saved!
+</code></pre>
+
+<p>With this result, I have gotten my script to run over 17x faster! I'll go ahead and consider that a success, and call it a day.</p>
+
+<p>I guess that the period for review of this question is over, but If you (like me) find yourself tackling this problem, look at <a href="https://github.com/maxbergmark/misc-scripts/blob/master/snippets/pytorch_mandelbrot/buddha_kernel.py" rel="nofollow noreferrer">my current solution</a> to get some pointers on how to make things faster.</p>
+    </div>

@@ -1,0 +1,200 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Design Choice</h2>
+
+<ul>
+<li>At first, your API looked like a convoluted pattern to validate user input. However, since you elaborated that validation is highly configurable by country, implies many backend calculations and requires the reuse of intermediate results, I feel your design is justified. </li>
+<li>I will focus on design decisions that I can't make for you, but I hope you take into consideration for improving your code.</li>
+</ul>
+
+<hr>
+
+<h2>Data Integrity</h2>
+
+<p>You allow consumers of the API to directly change the data, bypassing your code. Is this by design or an unwanted leak of data? If this behavior is not wanted, you should either use a different class for storing the values internally, or clone the data both in <code>SetValues</code> and <code>GetValues</code>.</p>
+
+<blockquote>
+<pre><code>List&lt;ValueViewModel&gt; values = new List&lt;ValueViewModel&gt; {
+     new ValueViewModel() {
+         Key = "radius",
+         Value = 12.0
+     }
+};
+values[0].Value = 0.4;       // &lt;- change data without notifying observers!
+project.SetValues(values);   // &lt;- only now, observers get notified
+</code></pre>
+</blockquote>
+
+<p>When using ValueViewModel as internal type to store the values, would you allow consumers to change all these properties?</p>
+
+<blockquote>
+<pre><code>public class ValueViewModel
+{
+    public string Key { get; set; }     // &lt;- change key, while having a different key in the dictionary
+    public object Value { get; set; }   // &lt;- change value, but perhaps the type is invalid
+    public bool Valid { get; set; }     // &lt;- override validity, even though there might be an error
+    public string Warning { get; set; } // &lt;- are multiple warnings possible?
+    public string Error { get; set; }   // &lt;- are multiple errors possible, can the data be valid even if there is an error?
+}
+</code></pre>
+</blockquote>
+
+<p>You have included convenience methods which enforce some enacapsulation, but the consumer is not forced to use these, and can still bypass them by calling <code>GetValues</code>.</p>
+
+<blockquote>
+<pre><code>  public void SetError(string key, string error) {
+       if (values.ContainsKey(key)) {
+             values[key].Error = error;
+             values[key].Valid = false;
+       }  
+  }
+</code></pre>
+</blockquote>
+
+<hr>
+
+<h2>Consistency</h2>
+
+<p>Consumers can get the values as <code>ValueViewModel</code> by calling <code>GetValues</code>, but observers get a different representation of the data <code>Tuple&lt;string, object&gt;</code>. Your components, being observers, work on both these structures. This introduces unnecessary complexity for consumers of the API.</p>
+
+<blockquote>
+<pre><code>public IDisposable Subscribe(IObserver&lt;Tuple&lt;string, object&gt;&gt; observer) {
+     return new Unsubscriber(observers.Values.ToList()
+         .SelectMany(s =&gt; s).ToList(), observer);
+}
+</code></pre>
+</blockquote>
+
+<hr>
+
+<h2>Interface compatibility</h2>
+
+<p>A component implements <code>IObserver&lt;T&gt;</code>. This means it can be used in any model that works with observers. Models that call <code>OnCompleted</code> will receive a nice exception. Is there a specific reason to throw an error, or could you just leave it empty as you did with <code>OnError</code>?</p>
+
+<blockquote>
+  <p><code>public void OnCompleted() { throw new NotImplementedException();   }</code></p>
+</blockquote>
+
+<hr>
+
+<h2>Single Responsibility</h2>
+
+<p>A project cannot be instantiated with components, instead it requires a norm. A project should not care about the norm, it should care about its components. This would facilitate unit testing. Else you would have to mock <code>FactoryGenerator</code>, while you just need components to work with.</p>
+
+<blockquote>
+<pre><code> public Project(string norm) {
+        components = FactoryGenerator.GetFactory(norm).GetComponents(valueService);
+    }
+</code></pre>
+</blockquote>
+
+<p>I would instead make a project factory to create a project given a norm.</p>
+
+<pre><code>public Project(IEnumerable&lt;GenericComponent&gt; components, ValueService valueService) {
+    // perform arg checks ..
+    this.components = components;
+    this.valueService = valueService;
+}
+
+public static class ProjectFactory {
+    public static Project Create(string norm, ValueService valueService) {
+        return new Project(
+            FactoryGenerator.GetFactory(norm).GetComponents(valueService)
+          , valueService);
+    }
+}
+</code></pre>
+
+<hr>
+
+<h2>Conflict Resolutions</h2>
+
+<p>Since any component can work with any value, you need a good specification on which components are the owner of which values. What if two components want to register a value using the same key?</p>
+
+<ul>
+<li>first one wins: the other uses the value registered by the first</li>
+<li>last one wins: the first one will use the value overriden by the second</li>
+<li>error: make clear there is a flaw in the design</li>
+</ul>
+
+<blockquote>
+<pre><code>public void RegisterValue(string key) {
+        if (!values.ContainsKey(key)) {
+            values.Add(key, new ValueViewModel() {
+                Key = key,
+                Value = null
+            });
+            observers.Add(key, new List&lt;IObserver&lt;Tuple&lt;string, object&gt;&gt;&gt;());
+        }  // &lt;- what else ??
+    }
+</code></pre>
+</blockquote>
+
+<p>I would opt for the first choice. This way, components are independant and flexible. They will only register values that haven't already been registered by another component. There should still be a policy that given a unique key, any component uses the same type and definition for the value.</p>
+
+<hr>
+
+<h2>General Design</h2>
+
+<h3>ValueViewModel</h3>
+
+<ul>
+<li>Decide whether to use this type internally in your API or you use another type with better encapsulation, maybe even immutable.</li>
+</ul>
+
+<h3>ValueService</h3>
+
+<ul>
+<li>Be consistent and use only one internal type, both usable by consumers of the API and observers of the values.</li>
+<li>Determine a strategy for handling conflicts when registering values.</li>
+</ul>
+
+<h3>Component</h3>
+
+<ul>
+<li>Consider creating an interface <code>IComponent</code> for better testability.</li>
+<li>Take into account values might already be registered when registering values.</li>
+<li>Decide which component is responsible for cascading updates of other values when changing a value. <code>radius</code> changed -&gt; change <code>area</code>.</li>
+<li>Ensure two-way cascaded updates don't result in an infinite loop. What if <code>area</code> changed -&gt; update <code>radius</code> is allowed as well?</li>
+</ul>
+
+<h3>Project</h3>
+
+<ul>
+<li>Extract configuration logic and move it to a factory.</li>
+</ul>
+
+<hr>
+
+<h2>Q&amp;A</h2>
+
+<blockquote>
+  <p>When the project continues, the number of components will get quite
+  large, I fear there will be a performance issue if for each request
+  the whole set of components needs to be generated --&gt; should I use
+  LazyLoading?</p>
+</blockquote>
+
+<p>Since your components are passive objects (as opposed to <a href="https://en.wikipedia.org/wiki/Active_object" rel="nofollow noreferrer">active object</a>) that get instantiated on demand given the <em>norm</em>, I don't see the need to implement <em>lazy loading</em> here.</p>
+
+<blockquote>
+  <p>Is the ValueService approach good to share data between the
+  components? Is there a better solution?</p>
+</blockquote>
+
+<p>By using <code>ValueService</code> you have decoupled component logic with the extended state (the value cache) of a project. This is common practice when building <a href="https://en.wikipedia.org/wiki/Finite-state_machine" rel="nofollow noreferrer">state machines</a>.</p>
+
+<blockquote>
+  <p>I still need to implement a specific value-getter, e.g. a user
+  requests the ValueViewModel for a specific key, the components needs
+  to yield an error or warning if not all values were set.</p>
+</blockquote>
+
+<p>I have addressed possible strategies for conflict resolution in the review. You could extend these strategies to your getter and setters as well.</p>
+
+<blockquote>
+  <p>I think "AbstractComponent" is a better name than "GenericComponent",
+  on a side note.</p>
+</blockquote>
+
+<p><code>AbstractComponent</code> is the better name, although it's a typical java name. In C#, it's more common to call this <code>ComponentBase</code>. Some API's would call it <code>ComponentSkeleton</code>.</p>
+    </div>

@@ -1,0 +1,96 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>General practices</h2>
+
+<p>You have some superfluous <strong>imports</strong> (e.g. <code>numpy</code>) and some duplicate imports (e.g. <code>sys</code>).  To help avoid duplication, I suggest that you put the imports in alphabetical order.  Also, <a href="https://www.python.org/dev/peps/pep-0008/#imports" rel="nofollow noreferrer">PEP 8 recommends against importing multiple modules on one line</a>.</p>
+
+<p>The <a href="https://docs.python.org/3/library/optparse.html" rel="nofollow noreferrer"><code>optparse</code> module has been deprecated</a> in favor of <code>argparse</code>.</p>
+
+<p>Your indentation is inconsistent, which is bad in Python, where whitespace is significant.  PEP 8 says to use <a href="https://www.python.org/dev/peps/pep-0008/#indentation" rel="nofollow noreferrer">4 spaces per level</a>.</p>
+
+<p>Avoid <strong>interleaving function definitions</strong> with executable statements.  Function definitions should ideally go first, and the code that calls the functions should appear later, contiguously.  This script is complex enough that I would avoid having any free-floating code at all, and define a <code>main()</code> function.</p>
+
+<p>This code is especially convoluted and confusing:</p>
+
+<blockquote>
+<pre><code>wrapper = ''
+preferredWidth = 75
+def text_format(self,initial):
+    global wrapper
+    wrapper = textwrap.TextWrapper(initial_indent=initial, width=preferredWidth,
+                               subsequent_indent=' '*14)
+    return wrapper
+wrapper = text_format('self','Job')
+</code></pre>
+</blockquote>
+
+<p>Why is <code>wrapper</code> initialized to an empty string, then reassigned twice?  You reassign it once inside the <code>text_format()</code> function (by making <code>wrapper</code> <strong>global</strong> — a very bad practice!), then reassign it again from the return value of <code>text_format()</code>.  Why does the <code>text_format()</code> function need a <code>self</code> parameter at all?  As a result, you pass a silly <code>'self'</code> argument every time you call the function.  In fact, <strong>why do you need a <code>text_format()</code> function at all</strong>?  You should just define a <code>TextWrapper</code> object just once, and use it to format all of your output.</p>
+
+<p>You shouldn't have to validate <code>jobid</code>.  You can just define the relevant parameter as <code>required=True</code> and <code>type=int</code> in the <code>ArgumentParser</code>.</p>
+
+<p>Instead of hard-coding <code>/proj/lsb.events</code> as the filename, I suggest processing either a <a href="https://stackoverflow.com/a/11038508/1157100">file named on the command line or <code>sys.stdin</code></a>.  (If you weren't using <code>optparse</code> or <code>argparse</code>, then the <a href="https://docs.python.org/3/library/fileinput.html" rel="nofollow noreferrer"><code>fileinput</code></a> module would help.)</p>
+
+<h2>Parsing</h2>
+
+<p>I don't think that you are parsing the file correctly.  I see that there are three kinds of fields:</p>
+
+<ul>
+<li>Integers</li>
+<li>Decimals</li>
+<li>Strings, which start with <code>"</code>, end with <code>"</code>, and <strong>may contain spaces</strong> (e.g. <code>"sleep 10"</code>)</li>
+</ul>
+
+<p>Because fields may contain spaces, splitting a line by whitespace is not a viable parsing strategy.  (You certainly shouldn't split each line twice — once to get the <code>match_jobid</code>, and a second time for <code>var</code>.)</p>
+
+<p>You can use a <code><a href="https://docs.python.org/dev/library/csv.html#csv.reader" rel="nofollow noreferrer">csv.reader</a>(args.file, delimiter=' ')</code>, which supports double-quoted fields.</p>
+
+<h2>Formatting</h2>
+
+<p>The handlers for nearly all of the event types have similar code.  The only caveats are:</p>
+
+<ul>
+<li>For <code>JOB_NEW</code> events, we must first print a line which does not have a timestamp like the other lines.</li>
+<li><code>JOB_STATUS</code> events are ignored.</li>
+<li>Each event type involves different fields.</li>
+</ul>
+
+<p>The special requirement for <code>JOB_NEW</code> makes it a challenge to <strong>write a handler for the general case</strong>, but it is possible.  The main trick is to <strong>use <a href="https://docs.python.org/3/library/stdtypes.html#str.format" rel="nofollow noreferrer"><code>str.format()</code></a></strong> instead of performing substitutions using the <code>%</code> operator, which is much less powerful.</p>
+
+<h2>Suggested solution</h2>
+
+<pre><code>import argparse
+import csv
+import sys
+from time import localtime, strftime
+from textwrap import TextWrapper
+
+EVENT_TYPES = {
+    'JOB_NEW': [
+        'Job &lt;{3}&gt;, Job Name &lt;{41}&gt;, User &lt;{11}&gt;, Project &lt;{36}&gt;, Command &lt;{35}&gt;',
+        '{time}: Submitted from host &lt;{25}&gt;, to Queue &lt;{23}&gt;, CWD &lt;{26}&gt;, Output File &lt;{28}&gt;, Requested Resources &lt;{24}&gt;;',
+    ],
+    'JOB_START': ['{time}: Dispatched to &lt;{9}&gt;;'],
+    'JOB_START_ACCEPT': ['{time}: Starting (Pid {4});'],
+    'JOB_EXECUTE': ['{time}: Running with Execution home &lt;{7}&gt;, Execution CWD &lt;{6}&gt;, Execution Pid &lt;{9}&gt; ;'],
+    'JOB_SIGNAL': ['{time}: Signal {5} requested by user or administrator &lt;{4}&gt; ;'],
+}
+
+def main():
+    arg_parser = argparse.ArgumentParser()
+    arg_parser.add_argument('-l', '--longformat', metavar='LONG',
+                            type=int, required=True, dest='long')
+    arg_parser.add_argument('file', nargs='?',
+                            type=argparse.FileType('r'), default=sys.stdin)
+    args = arg_parser.parse_args()
+    job_id = str(args.long)
+
+    wrapper = TextWrapper(width=75, subsequent_indent=' '*14)
+    for fields in csv.reader(args.file, delimiter=' '):
+        if fields[3] == job_id:
+            time = strftime('%a %b %d %H:%M:%S %Y', localtime(int(fields[2])))
+            for fmt in EVENT_TYPES.get(fields[0], []):
+                print(wrapper.fill(fmt.format(*fields, time=time)))
+
+if __name__ == '__main__':
+    main()
+</code></pre>
+    </div>

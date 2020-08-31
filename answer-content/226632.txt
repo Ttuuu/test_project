@@ -1,0 +1,66 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Here is another recent Code Review question that has a lot of similarities to yours: <a href="https://codereview.stackexchange.com/q/225674/47529">Daily SQL job to delete records older than 24 hours</a>.</p>
+
+<p>I think I would recommend three things here:  </p>
+
+<ol>
+<li>Snapshot isolation</li>
+<li>Not using <code>TOP</code></li>
+<li>Doing the work in another table</li>
+</ol>
+
+<hr>
+
+<h2>Snapshot isolation</h2>
+
+<p><a href="https://docs.microsoft.com/en-us/dotnet/framework/data/adonet/sql/snapshot-isolation-in-sql-server" rel="nofollow noreferrer">Snapshot isolation</a> is a really cool tool that effectively prevents most things from blocking readers. As a result, even if your delete is running long, report-writers can still hit your table and they'll see the most recent, valid data. Then once your delete finishes, they'll start seeing the data without your deleted rows. This lets you do whatever you need to do without having to worry as much about end-users. It doesn't make your code faster, but it will somewhat reduce the need for it to be.</p>
+
+<hr>
+
+<h2>Not using <code>TOP</code></h2>
+
+<p>Because you're using <code>TOP</code>, you effectively force all of the data to be re-sorted every time. Additionally, <code>TOP</code> will usually introduce <a href="https://www.sql.kiwi/2010/08/inside-the-optimiser-row-goals-in-depth.html" rel="nofollow noreferrer">row goals</a>. This isn't necessarily a bad thing, but it may choose less-ideal plans in the interest of getting a subset of rows as quickly as possible.</p>
+
+<p>Because your <code>Id</code> column is an indexed <code>IDENTITY</code> column, <strong>and</strong> because we're deleting the oldest data (I'm assuming you don't generally update old data), you can do something like this:</p>
+
+<pre><code>DELETE FROM [Logs]
+  WHERE Id BETWEEN @LowestCurrentIndex AND @HighestCurrentIndex
+    AND CAST([Timestamp] AS date) &lt; CAST(DATEADD( DAY, -7, GETUTCDATE()) AS date);
+</code></pre>
+
+<p>This assumes you can maintain <code>@LowestCurrentIndex</code> and <code>@HighestCurrentIndex</code> as the range of values to currently consider. This will get you nice index accesses as well.</p>
+
+<p>A potential enhancement is to get a separate table that has all potentially affected rows, like so:</p>
+
+<pre><code>SELECT Id
+  INTO #OldData
+  FROM [Logs]
+  WHERE CAST([Timestamp] AS date) &lt; CAST(DATEADD( DAY, -7, GETUTCDATE()) AS date);
+</code></pre>
+
+<p>Then you can just join between the two (and if you have an index on <code>#OldData.Id</code> it'll be a great merge-join) with the same bounds logic.</p>
+
+<pre><code>DELETE [Logs]
+  FROM [Logs]
+    INNER JOIN #OldData OldData
+      ON [Logs].Id = OldData.Id
+  WHERE OldData.Id BETWEEN @LowestCurrentIndex AND @HighestCurrentIndex -- This could be on either table
+</code></pre>
+
+<hr>
+
+<h2>Do the work in another table</h2>
+
+<p>If copying the data is less expensive than deleting it (very possible):</p>
+
+<ol>
+<li>Copy data newer than 7 days into another table</li>
+<li>Rename the original table to something else</li>
+<li>Rename the table from #1 to the original table's name</li>
+<li>Truncate the original (now renamed) table from #2</li>
+</ol>
+
+<p>This likely will have less index maintenance and less likely to hit the transaction log (#1 is minimally logged, #2/3 don't require any transaction space, #4 is minimally logged)</p>
+
+<p>Snapshot isolation works nicely with this approach.</p>
+    </div>

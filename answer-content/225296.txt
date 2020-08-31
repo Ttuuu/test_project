@@ -1,0 +1,227 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Here are some ideas on improvements you can make in the overall code, presented in an example for one of the math functions. The ideas can be applied to all the other functions as well.</p>
+
+<p>My lead-in to the rest of my comments and examples primarily deal with highly repeated logic in all of your functions. A big clue is when you end up copying a section of code into another function, you should STOP and consider creating a single common function. This "functional isolation" of logic makes your code more consistent and greatly helps when changes need to be made to the logic. You only have to make the change in once place.</p>
+
+<p>So my first comments deals with your input range to all your functions. Each function seems to require a two-column range with both values and quantities. This is perfectly fine, but if that's the case then your input range should also be a two-column range. Your example accepts a one-column range and uses <code>Offset</code> to check the quantity value. This is a mis-match between what you <strong>think</strong> is the input range: single-column, but really using two. So bottom line is to make your input range match what the UDF is actually using.</p>
+
+<p>Along those lines, each UDF should perform checks against the input values to ensure they match the expectations of your function. In my example below, I've created an <code>InputCheck</code> function that can be called from each of your UDFs, providing central (and functionally isolated) checks on your input data. My example only shows two quick checks, but you can add any other checks/tests as needed. I highly recommend reading <a href="http://www.cpearson.com/excel/ReturningErrors.aspx" rel="nofollow noreferrer">Chip Pearson's Returning Errors From User Defined Functions In VBA</a> for guidance. Returning errors from UDFs in this manner means that "error handling" won't stop execution or use a pop-up <code>MsgBox</code> -- any error will be indicated in the cell.</p>
+
+<pre><code>Private Function InputCheck(ByRef dataRange As Variant) As Long
+    '--- returns 0 if all checks pass!!
+
+    '--- input must be a range
+    If Not TypeName(dataRange) = "Range" Then
+        InputCheck = xlErrRef
+        Exit Function
+    End If
+
+    '--- input range must be one or two columns ONLY
+    If (dataRange.Columns.Count &lt; 1) Or (dataRange.Columns.Count &gt; 2) Then
+        InputCheck = xlErrRef
+        Exit Function
+    End If
+
+    '--- all cells MUST contain numeric values
+    Dim cell As Variant
+    For Each cell In dataRange
+        If Not IsNumeric(cell) Then
+            InputCheck = xlErrNum
+            Exit Function
+        End If
+    Next cell
+
+    '--- create any other checks for valid input data...
+
+    '--- everything looks good!
+    InputCheck = 0
+End Function
+</code></pre>
+
+<p><em>(You'll notice that I'm sneaking in an extra check I'll show later. But basically it's if the UDF is called with a single column of data everything will still work.)</em></p>
+
+<p>Now you can create a common block at the beginning of each of your UDFs that will return a valid error code to the worksheet cell:</p>
+
+<pre><code>    Dim checkResult As Long
+    checkResult = InputCheck(dataRange)
+    If checkResult &lt;&gt; 0 Then
+        QtyMean = CVErr(checkResult)
+        Exit Function
+    End If
+</code></pre>
+
+<p>Your next section of common logic builds an array of values from the input data, including repeating values based on the quantity indicator. I've also moved this logic into its own isolated function.</p>
+
+<p>One step in speed improvement is to perform most of your logic in memory-based arrays instead of directly interacting with the worksheet or range object. So the first thing to do is move the input range to an array. You can then make a quick check and if it's a single-column, then you're all done. If there are two columns, the logic proceeds almost identically to your original code. Note that you can pre-determine the size of your return array by summing the quantities in the second column. This avoids the expense of <code>ReDim Preserve</code> during code execution.</p>
+
+<pre><code>Private Function GetDataArray(ByRef srcRange As Variant) As Variant
+    Dim theSourceData As Variant
+    theSourceData = srcRange.Value
+    If srcRange.Columns.Count = 1 Then
+        '--- only one column, so we're done!
+        GetDataArray = theSourceData
+        Exit Function
+    End If
+
+    '--- we're building a single array and (possibly) repeating values
+    '    based on the quantity indicator in the second column, so...
+
+    '--- size the results array first...
+    Dim resultsSize As Long
+    Dim n As Long
+    For n = LBound(theSourceData, 1) To UBound(theSourceData, 1)
+        resultsSize = resultsSize + theSourceData(n, 2)
+    Next n
+
+    Dim resultArray() As Variant
+    ReDim resultArray(0 To resultsSize)
+
+    '--- ... now build the array and repeat values as necessary
+    Dim i As Long
+    Dim j As Long
+    For n = LBound(theSourceData, 1) To UBound(theSourceData, 1)
+        If theSourceData(n, 2) &gt; 1 Then
+            '--- repeat values in the array
+            For i = 0 To theSourceData(n, 2) - 1
+                resultArray(j + i) = theSourceData(n, 1)
+            Next i
+            j = j + i
+        ElseIf theSourceData(n, 2) = 1 Then
+            '--- only a single value
+            i = 0
+            resultArray(j + i) = theSourceData(n, 1)
+            j = j + 1
+        End If
+    Next n
+    GetDataArray = resultArray
+End Function
+</code></pre>
+
+<p>Since this function returns a well-crafted array of values, the only thing left is the math logic. So my example UDF for calculating the Mean is</p>
+
+<pre><code>Public Function QtyMean(ByRef dataRange As Variant) As Double
+    '--- accepts a one- or two-column range where column 1 holds the
+    '    values and (the optional) column 2 holds the quantities
+    Dim checkResult As Long
+    checkResult = InputCheck(dataRange)
+    If checkResult &lt;&gt; 0 Then
+        QtyMean = CVErr(checkResult)
+        Exit Function
+    End If
+
+    Dim dataWithQty As Variant
+    dataWithQty = GetDataArray(dataRange)
+
+    If IsArray(dataWithQty) Then
+        QtyMean = Application.WorksheetFunction.Average(dataWithQty)
+    Else
+        QtyMean = CVErr(xlErrValue)
+    End If
+End Function
+</code></pre>
+
+<p>Some end notes on the example code:</p>
+
+<ul>
+<li>Most parameters are passed as <code>Variant</code> because it forces (reminds) me to perform all input error checking in my UDF and supporting functions. Excel will convert some inputs for you, but can't always know exactly what you're expecting and which appropriate error should be raised.</li>
+<li>Use more descriptive names for your variables. It makes the code more readable and self-documenting. As an example, your <code>Arr</code> array variable is not hard to figure out but when I use <code>resultArray</code> it makes more sense when "reading" the code.</li>
+<li>Each of your functions consistently sets up a worksheet variable <code>ws</code> but never uses it. I can recommend a tool such as <a href="http://rubberduckvba.com/" rel="nofollow noreferrer">Rubberduck</a> that can help with code quality checks like this. (Disclaimer:  I have nothing to do with Rubberduck, just a satisfied user)</li>
+</ul>
+
+<p>Here's the whole example module:</p>
+
+<pre><code>Option Explicit
+
+Public Function QtyMean(ByRef dataRange As Variant) As Double
+    '--- accepts a one- or two-column range where column 1 holds the
+    '    values and (the optional) column 2 holds the quantities
+    Dim checkResult As Long
+    checkResult = InputCheck(dataRange)
+    If checkResult &lt;&gt; 0 Then
+        QtyMean = CVErr(checkResult)
+        Exit Function
+    End If
+
+    Dim dataWithQty As Variant
+    dataWithQty = GetDataArray(dataRange)
+
+    If IsArray(dataWithQty) Then
+        QtyMean = Application.WorksheetFunction.Average(dataWithQty)
+    Else
+        QtyMean = CVErr(xlErrValue)
+    End If
+End Function
+
+Private Function GetDataArray(ByRef srcRange As Variant) As Variant
+    Dim theSourceData As Variant
+    theSourceData = srcRange.Value
+    If srcRange.Columns.Count = 1 Then
+        '--- only one column, so we're done!
+        GetDataArray = theSourceData
+        Exit Function
+    End If
+
+    '--- we're building a single array and (possibly) repeating values
+    '    based on the quantity indicator in the second column, so...
+
+    '--- size the results array first...
+    Dim resultsSize As Long
+    Dim n As Long
+    For n = LBound(theSourceData, 1) To UBound(theSourceData, 1)
+        resultsSize = resultsSize + theSourceData(n, 2)
+    Next n
+
+    Dim resultArray() As Variant
+    ReDim resultArray(0 To resultsSize)
+
+    '--- ... now build the array and repeat values as necessary
+    Dim i As Long
+    Dim j As Long
+    For n = LBound(theSourceData, 1) To UBound(theSourceData, 1)
+        If theSourceData(n, 2) &gt; 1 Then
+            '--- repeat values in the array
+            For i = 0 To theSourceData(n, 2) - 1
+                resultArray(j + i) = theSourceData(n, 1)
+            Next i
+            j = j + i
+        ElseIf theSourceData(n, 2) = 1 Then
+            '--- only a single value
+            i = 0
+            resultArray(j + i) = theSourceData(n, 1)
+            j = j + 1
+        End If
+    Next n
+    GetDataArray = resultArray
+End Function
+
+Private Function InputCheck(ByRef dataRange As Variant) As Long
+    '--- returns 0 if all checks pass!!
+
+    '--- input must be a range
+    If Not TypeName(dataRange) = "Range" Then
+        InputCheck = xlErrRef
+        Exit Function
+    End If
+
+    '--- input range must be one or two columns ONLY
+    If (dataRange.Columns.Count &lt; 1) Or (dataRange.Columns.Count &gt; 2) Then
+        InputCheck = xlErrRef
+        Exit Function
+    End If
+
+    '--- all cells MUST contain numeric values
+    Dim cell As Variant
+    For Each cell In dataRange
+        If Not IsNumeric(cell) Then
+            InputCheck = xlErrNum
+            Exit Function
+        End If
+    Next cell
+
+    '--- create any other checks for valid input data...
+
+    '--- everything looks good!
+    InputCheck = 0
+End Function
+</code></pre>
+    </div>

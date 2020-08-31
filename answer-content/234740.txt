@@ -1,0 +1,113 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I don't have any experience with arcpy, so possibly some of this may be invalid.</p>
+<p>Mostly the code is very good: It's concise; it's clear enough what it does without lot's of documentation, and it has the documentation it needs.</p>
+<p>Exactly what makes code "good" depends on how it's going to be used. This looks like a standalone utility you use at your work, so keeing it brief and easy to maintain is probably worth more that thoroughly documenting everything and enforcing type constraints. Not everything below will be applicable to you.</p>
+<h2>Context:</h2>
+<ul>
+<li><strong>Use python 3.x if at all possible.</strong></li>
+<li>It's good that you've already put most of your code inside a function; now consider using the <a href="https://realpython.com/python-main-function/" rel="nofollow noreferrer">main method pattern</a>.</li>
+<li>The comment about truncating the table is good. You could move it to a confirmation prompt that would be shown to the user at runtime.</li>
+</ul>
+<h2>Style:</h2>
+<ul>
+<li>If you have parens of any kind (<code>({[</code>), you don't need to use <code>\</code> to break your lines.</li>
+<li>Your variable names could be more descriptive.</li>
+<li>Use snake-case: <code>this_is_a_variable</code></li>
+<li>Be more aggressive about breaking your lines. A reader should rarely, if ever, need to scroll sideways.</li>
+<li>Use parens for print statements. <code>print("message")</code> This is required in python 3.</li>
+<li>Consider using <code>"string".format()</code> instead of string concatenation. (It make more of a difference in more complicated situations.)</li>
+<li>You could save yourself a level of indentation by doing both your DB connections in a <a href="https://stackoverflow.com/questions/4617034/how-can-i-open-multiple-files-using-with-open-in-python#4617069">single with statement</a>. (but see below)</li>
+<li>The warning about truncating the table could be moved to a <a href="https://www.python.org/dev/peps/pep-0257/" rel="nofollow noreferrer">docstring</a>.</li>
+<li>The standard indentation scheme  is 4 spaces per level of indentation, and brackets &amp; parens close on the same level of indentation as the line they were opened on:</li>
+</ul>
+<pre class="lang-py prettyprint-override"><code>lstFC = [
+    ["&lt;OWNER&gt;.&lt;SIDEWALK&gt;", "&lt;OWNER&gt;.S_SIDEWLK_MIDPOINT", "SDW_ID"   ],
+    ["&lt;OWNER&gt;.&lt;SEWER&gt;"   , "&lt;OWNER&gt;.S_SEWER_MIDPOINT"  , "SEWER_ID" ],
+    ["&lt;OWNER&gt;.&lt;ROAD&gt;"    , "&lt;OWNER&gt;.S_ROAD_MIDPOINT"   , "ROAD_ID"  ],
+]
+</code></pre>
+<h2>Architecture:</h2>
+<ul>
+<li>It looks like you could make the string literals in <code>lstFC</code> less verbose, by pulling out the common patterns. But that might not be a good idea if those patterns are likely to fail in the future.</li>
+<li>Instead of assigning <code>inputFC</code>, <code>targetFC</code>, and <code>idField</code> in three steps, use <a href="https://note.nkmk.me/en/python-tuple-list-unpack/" rel="nofollow noreferrer">unpacking</a> to do them all at once.</li>
+<li>Alternately, you could save yourself the comment about what's in <code>lstFC</code> by having a class that exposes those as <a href="https://syntaxdb.com/ref/python/class-variables" rel="nofollow noreferrer">instance properties</a>.</li>
+<li>I think it would look better, and be more flexable, to move the <code>for fc in lstFC:</code> loop outside <code>def ReloadMidpoints():</code>, so you'll be calling the function inside the loop.</li>
+<li>There's probably a way to do <code>i_rows.insertRows(rows)</code>. That way you could first load all the data, then do all the transformations, then write all the data. You'd be making a single large request against the DB, which would likely be faster, and you'd have already succeeded or failed at all of the processing before you ever touched the database. You can even avoid having two connections going on at once.</li>
+<li>Speaking of DB safety, consider using a transaction? I don't know how that's done in arcpy.</li>
+<li>A lot of database systems support a command called <code>REPLACE</code>, which is like <code>INSERT</code> except it will delete conflicting data before inserting the new rows. If that's an option it might be better than the truncate and rebuild pattern you're using.</li>
+</ul>
+<p>To summarize a lot of what I've written:</p>
+<pre class="lang-py prettyprint-override"><code>#!/usr/bin/env python3
+
+import arcpy
+
+DESCRIPTION = """
+Transcribe the midpoints of source feature classes
+to their respective target feature classes.
+This script only works for polyline feature classes (not polygons or points).
+CAUTION! The target FCs will get truncated!
+         All records in the target FCs will be deleted.
+"""
+
+default_connection = "Database Connections\\&lt;YOUR CONNECTION.sde&gt;\\"
+
+default_feature_classes = [
+    ("&lt;OWNER&gt;.&lt;SIDEWALK&gt;", "&lt;OWNER&gt;.S_SIDEWLK_MIDPOINT", "SDW_ID"),
+    ("&lt;OWNER&gt;.&lt;SEWER&gt;", "&lt;OWNER&gt;.S_SEWER_MIDPOINT", "SEWER_ID"),
+    ("&lt;OWNER&gt;.&lt;ROAD&gt;", "&lt;OWNER&gt;.S_ROAD_MIDPOINT", "ROAD_ID"),
+]
+
+def main():
+    if(_confirm()):
+        for (input_FC, target_FC, id_field) in default_feature_classes:
+            reload_midpoints(
+                default_connection + input_FC,
+                default_connection + target_FC,
+                id_field
+            )
+        print(_main_success_message)
+
+def _confirm():
+    print(DESCRIPTION)
+    input(_confirmation_prompt)
+    return True
+    
+def midpoint(row):
+    return row[0].positionAlongLine(0.50,True).firstPoint
+    
+def reload_midpoints(input_connection, target_connection, id_field):
+    """Caution! 
+    The target FCs will get truncated! All records in the target FCs will be deleted."""
+
+    new_rows = []
+    with arcpy.da.SearchCursor(input_connection, ['SHAPE@', id_field]) as s_rows:
+        new_rows = [
+            [(m.X, m.Y), s_rows[1], m.X, m.Y]
+            for m in map(midpoint, s_rows)
+        ]
+    
+    if(new_rows):
+        arcpy.TruncateTable_management(target_connection)
+        print(_truncation_success_message.format(target_connection))
+        with arcpy.da.InsertCursor(
+            target_connection,
+            ['SHAPE@', id_field, "MIDPOINT_X","MIDPOINT_Y"]
+        ) as i_rows:
+            i_rows.insertRows(new_rows)
+        print(_midpoints_reloaded_message.format(target_connection, input_connection))
+    else:
+        print(_no_rows_message)
+        
+    print("")
+    
+_truncation_success_message = "&lt;{0}&gt; has been truncated."
+_midpoints_reloaded_message = "&lt;{0}&gt; has been reloaded with midpoints that were generated from &lt;{1}&gt;."
+_no_rows_message = "There are no new rows; doing nothing."
+_confirmation_prompt = "Press Enter to continue..."
+_main_success_message = "Complete."
+    
+if __name__ == "__main__":
+    main()
+<span class="math-container">```</span>
+</code></pre>
+    </div>

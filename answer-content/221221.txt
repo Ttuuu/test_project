@@ -1,0 +1,123 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>Separation of concerns</h3>
+
+<p>There is (in my opinion) too much logic in the main function. Splitting an amount “fairly” into <span class="math-container">\$ n \$</span> parts is difficult enough. That function should not know about “friends,” that a list of friends might not be unique, or that friends are represented as strings.</p>
+
+<p>I would suggest to define a function </p>
+
+<pre><code>splitAmount(total: numParts: )
+</code></pre>
+
+<p>which takes an amount and a number and returns an array of amounts (the exact signature is discussed later). Your <code>splitTransaction()</code> function can then build on <code>splitAmount()</code>.</p>
+
+<h3>Why only GBP? – Make it generic!</h3>
+
+<p>Your <code>splitTransaction()</code> function takes a <code>Money&lt;GBP&gt;</code> amount, i.e. it works only with  pound sterling, the British currency. Only minimal changes are required to make the same function work with arbitrary currencies: Change the function type to</p>
+
+<pre><code>func splitTransaction&lt;Currency&gt;(amount: Money&lt;Currency&gt;, with friends: [String]) -&gt; [String: SplitTransactionAmount]
+    where Currency: CurrencyType {
+    // ...
+}
+</code></pre>
+
+<p>and replace <code>Money&lt;GBP&gt;</code> by <code>Money&lt;Currency&gt;</code> in the function body.</p>
+
+<p>For the <code>splitAmount()</code> function suggested above that would be</p>
+
+<pre><code>func splitAmount&lt;Currency&gt;(amount: Money&lt;Currency&gt;, numParts: Int) -&gt; [Money&lt;Currency&gt;]
+    where Currency: CurrencyType {
+    // ...
+}
+</code></pre>
+
+<h3>The algorithm</h3>
+
+<p>Here are two examples how an amount split into 6 parts with your algorithm:</p>
+
+<pre><code>10.04 -&gt; 1.69, 1.67, 1.67, 1.67, 1.67, 1.67
+10.05 -&gt; 1.65, 1.68, 1.68, 1.68, 1.68, 1.68
+</code></pre>
+
+<p>In the first example, the remainder is <span class="math-container">\$0.02\$</span>, and a better result would be achieved by splitting that among two friends:</p>
+
+<pre><code>10.04 -&gt; 1.68, 1.68, 1.67, 1.67, 1.67, 1.67
+</code></pre>
+
+<p>In the second example, the remainder is <span class="math-container">\$-0.03\$</span>. Again the split is not optimal, in addition the first amount is <em>less</em> then the others, contrary to the description of your method. A better result would be</p>
+
+<pre><code>10.05 -&gt; 1.68, 1.68, 1.68, 1.67, 1.67, 1.67
+</code></pre>
+
+<p>The problem is of course the floating point arithmetic. Even if <code>Money</code> uses the <code>Decimal</code> type which can represent <em>decimal</em> fractions exactly: It still cannot represent the result of a division like <span class="math-container">\$ 10.05 / 6 \$</span> exactly. Rounding that fraction to a multiple of <span class="math-container">\$ 0.01 \$</span>  (the “minor unit” of the currency) can result in a smaller or a larger value (as in the second example).</p>
+
+<p>Actually such calculations are much better done in <em>integer arithmetic.</em> If £10.04 are represented as 1004 (pennies), then we can perform an integer division with remainder</p>
+
+<pre><code>1004 = 167 * 6 + 2
+</code></pre>
+
+<p>so that each part is 167 pennies, plus 1 penny for the first two parts. Similarly:</p>
+
+<pre><code>1005 = 167 * 6 + 3
+</code></pre>
+
+<p>Unfortunately, the <code>Money</code> class does not provide methods to get an amount as integer multiple of the currency's minor unit, but that is not too difficult to implement:</p>
+
+<pre><code>extension Money {
+
+    /// Creates an amount of money with a given number of “minor units” of the currency.
+    init(units: Int) {
+        self.init(Decimal(units) * Decimal(sign: .plus, exponent: -Currency.minorUnit, significand: 1))
+    }
+
+    /// The amount of money as the count of “minor units” of the currency.
+    var units: Int {
+        var amount = self.amount 
+        var rounded = Decimal()
+        NSDecimalRound(&amp;rounded, &amp;amount, Currency.minorUnit, .bankers)
+        rounded *= Decimal(sign: .plus, exponent: Currency.minorUnit, significand: 1)
+        return NSDecimalNumber(decimal: rounded).intValue
+    }
+}
+</code></pre>
+
+<p>With these preparations, the <code>splitAmount()</code> function is easily implemented:</p>
+
+<pre><code>func splitAmount&lt;Currency&gt;(amount: Money&lt;Currency&gt;, numParts: Int) -&gt; [Money&lt;Currency&gt;]
+    where Currency: CurrencyType {
+        let units = amount.units
+        let fraction = units / numParts
+        let remainder = units % numParts
+
+        return Array(repeating: Money&lt;Currency&gt;(units: fraction + 1),
+                     count: remainder)
+            + Array(repeating: Money&lt;Currency&gt;(units: fraction),
+                    count: numParts - remainder)
+}
+</code></pre>
+
+<p>The above works for non-negative amounts only. If the amounts can be negative as well then a possible implementation would be</p>
+
+<pre><code>func splitAmount&lt;Currency&gt;(amount: Money&lt;Currency&gt;, numParts: Int) -&gt; [Money&lt;Currency&gt;]
+    where Currency: CurrencyType {
+        let units = amount.units
+        let fraction = units / numParts
+        let remainder = abs(units) % numParts
+
+        return Array(repeating: Money&lt;Currency&gt;(units: fraction + units.signum()),
+                     count: remainder)
+            + Array(repeating: Money&lt;Currency&gt;(units: fraction),
+                    count: numParts - remainder)
+}
+</code></pre>
+
+<p><strong>Examples:</strong></p>
+
+<pre><code>// Pound Sterling, minor unit is 0.01:
+print(splitAmount(amount: Money&lt;GBP&gt;(10.04), numParts: 6))
+// [1.68, 1.68, 1.67, 1.67, 1.67, 1.67]
+
+// Iraqi Dinar, minor unit is 0.001:
+print(splitAmount(amount: Money&lt;IQD&gt;(10.000), numParts: 6))
+// [1.667, 1.667, 1.667, 1.667, 1.666, 1.666]
+</code></pre>
+    </div>

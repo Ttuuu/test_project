@@ -1,0 +1,266 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Custom Formatter</h1>
+<p>Half way through <a href="https://codereview.stackexchange.com/a/244398">my previous answer</a> I decided to integrate Python's <a href="https://docs.python.org/3/library/string.html#formatspec" rel="noreferrer">Format Specification Mini-Language</a>. I had originally thought there was a lot more formatting going on, but this was not the case. It has a few benefits, but also a few deficits.</p>
+<p>Pros:</p>
+<ul>
+<li>It's using syntax that should be in every Python programmers toolbox.</li>
+<li>It forced me to split <code>print_table</code> into two functions. Because the formatting was moved inside the class. And then later I moved it out into <code>select_colors</code>.</li>
+<li>If you are building more tables it's really quite powerful.</li>
+</ul>
+<p>Cons:</p>
+<ul>
+<li>You are unlikely to know this mini-language.</li>
+<li>You're not really using any of the power it brings.</li>
+<li>The method <code>_cformat</code> is long and filled with boilerplate.</li>
+<li>You can definitely write the code in fewer lines of code without it.</li>
+</ul>
+<p>Whilst it is probably not the best solution for this code it's at least interesting. And can help if you need more advanced formats.</p>
+<pre class="lang-py prettyprint-override"><code>import curses
+import enum
+import re
+import string
+import subprocess
+import time
+
+
+class Colours(enum.IntFlag):
+    DEFAULT = 0
+    GRAY = 1
+    SELECT = 2
+    HEAD = 4
+
+
+class CursedFormatter(string.Formatter):
+    def __init__(self, stdscr, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._stdscr = stdscr
+    
+    def _cformat(self, format_string, args, kwargs, index=0):
+        result = []
+        for pre, name, spec, conversion in self.parse(format_string):
+            if name is None:
+                result.append((pre,))
+            else:
+                if name == '':
+                    if index is False:
+                        raise ValueError('cannot switch from manual field specification to automatic field numbering')
+                    name = str(index)
+                    index += 1
+                elif name.isdigit():
+                    if index:
+                        raise ValueError('cannot switch from manual field specification to automatic field numbering')
+                    index = False
+                obj, _ = self.get_field(name, args, kwargs)
+                if isinstance(obj, tuple):
+                    obj, *a = obj
+                else:
+                    a = ()
+                obj = self.convert_field(obj, conversion)
+                spec, index = super()._vformat(spec, args, kwargs, set(), 1, auto_arg_index=index)
+                result.append((self.format_field(obj, spec),) + tuple(a))
+        return result, index
+
+    def vformat(self, fmt, args, kwargs):
+        return ''.join(
+            value
+            for value, *_ in self._cformat(fmt, args, kwargs)[0]
+        )
+
+    def _makestr(self, fn, fmt, args, kwargs):
+        values, _ = self._cformat(fmt, args, kwargs)
+        x = kwargs.get('x', 0)
+        y = kwargs.get('y', 0)
+        result = []
+        for value in values:
+            self._stdscr.insstr(y, x, *value)
+            x += len(value[0])
+            result.append(value[0])
+        return ''.join(result)
+
+    def insstr(self, fmt, *args, **kwargs):
+        return self._makestr(self._stdscr.insstr, fmt, args, kwargs)
+    
+    def addstr(self, fmt, *args, **kwargs):
+        return self._makestr(self._stdscr.addstr, fmt, args, kwargs)
+
+
+def virsh(command, arg):
+    proc = subprocess.Popen(
+        ['virsh', command, arg],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT
+    )
+    out, _ = proc.communicate()
+    return [
+        [
+            x.strip()
+            for x in re.split('\\s{2,}', line)
+        ]
+        for line in re.split('[\r\n]+', out.decode("utf-8"))
+    ]
+
+
+def select_colors(values, sel_i, gray_sel, grays):
+    for i, row in enumerate(values):
+        gray_row = gray_sel(row)
+        new_row = []
+        for item, gray in zip(row, grays):
+            color = Colours.SELECT if sel_i == i else Colours.DEFAULT
+            if gray_row and gray:
+                color |= Colours.GRAY
+            if i == 0:
+                color = Colours.HEAD
+            new_row.append((item, curses.color_pair(color)))
+        yield new_row
+
+
+def print_table(stdscr, fmt, values, x, y):
+    for i, row in enumerate(values):
+        CursedFormatter(stdscr).addstr(fmt, *row, x=x, y=y + i)
+
+
+def print_help(stdscr, helps):
+    height, width = stdscr.getmaxyx()
+    help_color = curses.color_pair(Colours.SELECT)
+    CF = CursedFormatter(stdscr)
+    CF.insstr('{}', (' ' * width, help_color), x=0, y=height - 1)
+    max_len = max(len(h[1]) for h in helps) + 1
+    offset = 0
+    for key, name in helps:
+        CF.insstr('{}{:&lt;{}}', key, (name, help_color), max_len, x=offset, y=height - 1)
+        offset += len(key) + max_len
+
+
+def set_x_for_yes(x):
+    return 'X' if x == 'yes' else ' '
+
+
+def echo(x):
+    return x
+
+
+TABLES = [
+    (
+        ['ID', 'VM', 'STATUS'],
+        [False, True, False],
+        [echo, echo, echo],
+        lambda vm: vm[2] != 'running',
+    ),
+    (
+        ['NET', 'STATUS', 'A', 'P'],
+        [True, False, False, False],
+        [echo, echo, set_x_for_yes, set_x_for_yes],
+        lambda net: net[1] != "active",
+    ),
+    (
+        ['POOL', 'STATUS', 'A'],
+        [True, False, False],
+        [echo, echo, set_x_for_yes],
+        lambda pool: pool[1] != "active",
+    ),
+]
+
+
+def render(stdscr, vms, nets, pools, sel, sel_i):
+    pool_diff = 2
+    longest_net = max(len(net[0]) for net in nets)
+    longest_pool = max(len(pool[0]) for pool in pools)
+    longest_net = max(longest_net, longest_pool - pool_diff)
+    height, width = stdscr.getmaxyx()
+    net_offset = width - longest_net - 9 - pool_diff - 3
+    vm_width = net_offset - 3 - 9 - 1 - 2
+
+    tables = [
+        (
+            0,
+            0,
+            vms,
+            (4, vm_width, 10)
+        ),
+        (
+            net_offset,
+            0,
+            nets,
+            (longest_net + 1, 9, 2, 2)
+        ),
+        (
+            net_offset,
+            len(nets) + 2,
+            pools,
+            (longest_net + pool_diff + 1, 9, 2)
+        ),
+    ]
+    for (
+        i,
+        (
+            (x, y, items, widths),
+            (header, grays, maps, gray_test)
+        ),
+    ) in enumerate(zip(tables, TABLES)):
+        values = (
+            [header]
+            + [
+                [tran(item) for tran, item in zip(maps, row)]
+                for row in items
+            ]
+        )
+        selected = sel_i + 1 if sel == i else -1
+        values = select_colors(values, selected, gray_test, grays)
+        fmt = ''.join(f'{{:&lt;{width}}}' for width in widths)
+        print_table(stdscr, fmt, values, x, y)
+
+    print_help(
+        stdscr,
+        [("TAB", "Next"), ("F1", "Start"), ("F2", "Stop"), ("F10", "Quit")]
+    )
+
+
+def main(stdscr):
+    curses.curs_set(0)
+    curses.halfdelay(20)
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(Colours.GRAY, 8, -1)
+    curses.init_pair(Colours.SELECT, 0, 6)
+    curses.init_pair(Colours.SELECT | Colours.GRAY, 8, 6)
+    curses.init_pair(Colours.HEAD, 0, 2)
+    curses.init_pair(Colours.HEAD | Colours.GRAY, 8, 2)
+    sel = 0
+    sel_i = 0
+
+    start_commands = ['start', 'net-start', 'pool-start']
+    stop_commands = ['destroy', 'net-destroy', 'pool-destroy']
+
+    while True:
+        vms = virsh('list', '--all')[2:][:-1]
+        nets = virsh('net-list', '--all')[2:][:-1]
+        pools = virsh('pool-list', '--all')[2:][:-1]
+
+        args = [vms, nets, pools]
+        arg_indexes = [1, 0, 0]
+
+        stdscr.clear()
+        render(stdscr, vms, nets, pools, sel, sel_i)
+        stdscr.refresh()
+        c = stdscr.getch()
+
+        if c == curses.KEY_F10:
+            exit()
+        elif c == ord('\t'):
+            sel = 0 if sel == 2 else sel + 1
+        elif c == curses.KEY_DOWN or c == curses.KEY_UP:
+            sel_i += -1 if c == curses.KEY_UP else 1
+        elif (c == curses.KEY_F1 or c == curses.KEY_F2) and sel_i &lt; len(args[sel]):
+            commands = stop_commands if c == curses.KEY_F2 else start_commands
+            virsh(commands[sel], args[sel][sel_i][arg_indexes[sel]])
+
+        if sel_i == -1:
+            sel_i += 1
+        if sel_i &gt;= len(args[sel]):
+            sel_i = len(args[sel]) - 1
+
+
+if __name__ == '__main__':
+    curses.wrapper(main)
+</code></pre>
+    </div>

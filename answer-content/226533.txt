@@ -1,0 +1,182 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The code's straightforward enough at a glance, I wouldn't have worried
+too much about the duplicate bits, especially since it's only double and
+not multiple times for each part!  Overdoing abstraction can hurt readability too.  See below for some thoughts on how I'd approach this with that warning in mind.</p>
+
+<hr>
+
+<p>First of I'd try and move some of the functionality out of the function.
+The constants ... should be constants and not right in the middle of the
+function body.  Plus, some of them look like constants, while some are
+inline (<code>'orders'</code>).  I can't tell why the distinction is made here,
+maybe there was a reason.</p>
+
+<p>Also consider making all of this not a class method, but a regular one,
+then you could for example start creating helper objects beforehand
+(like the <code>s3</code> client) and/or pass in preconstructed ones, e.g. for
+testing purposes (like with mock objects).</p>
+
+<p>I'm not going to do these changes right here because you might have had
+a reason for the <code>@classmethod</code>.</p>
+
+<hr>
+
+<p>Instead, let's do a few different changes to make the flow a little bit
+easier to comprehend for a reader not already familiar with the code
+base:</p>
+
+<ul>
+<li><p>Moving construction and usage of an object closely together will let
+readers just continue reading while not having to jump up the block
+again to find out where a particular name was defined ... <em>unless</em>
+there are pressing reasons like failing early if no connection could
+be made (c.f. the <code>s3</code> client, though I'm guessing it doesn't actually
+establish a connection until the <code>upload_fileobj</code> call is made).</p></li>
+<li><p>Breaking out functionality into more functions (or even local helper
+functions, no one's stoppiing you from creating more abstractions.
+Alternatively, and I think that's better suited for this case, create
+a new class to wrap things together that belong together.  The hint
+for me here is <code>event_data_...</code> appearing with two suffixes and then
+<code>order_data_...</code> with the same suffixes.  That begs to be an object
+with two attributes.</p></li>
+</ul>
+
+<p>E.g. like this:</p>
+
+<pre><code>BUCKET_NAME = 'fbprophet'
+EVENT_DATA_OBJECT = 'event_data_test.csv'
+ORDER_DATA_OBJECT = 'orders_order_test.csv'
+
+
+class ForecastBuffer:
+    def __init__(self, columns):
+        # Prepare buffer for csv files
+        self.buffer = io.StringIO()
+        self.writer = csv.writer(self.buffer)
+        self.writer.writerow(columns)
+
+    def write_row(self, row):
+        self.writer.writerow(row)
+
+    def upload(self, s3, bucket_name, object_name):
+        # Prepare buffer and transform to binary
+        to_binary = io.BytesIO(self.buffer.getvalue().encode('utf-8'))
+        s3.upload_fileobj(to_binary, bucket_name, object_name)
+
+
+class Forecast:
+    @classmethod
+    def export_data_for_forecast(cls):
+        event_data = ForecastBuffer(["Event PK", "Name", "Start date"])
+        order_data = ForecastBuffer(["Event PK", "Created", "Total Gross"])
+
+        events = Event.objects.filter(status=EventStatus.LIVE).prefetch_related(
+            'orders'
+        )
+
+        for event in filter(lambda event: not event.is_over, events):
+            event_data.write_row([event.pk, event.name, event.start_date])
+
+            for order in event.orders.all():
+                order_data.write_row(
+                    [order.event.pk, order.created, order.total_gross]
+                )
+
+        # Upload to S3
+        s3 = boto3.client(
+            's3',
+            aws_access_key_id=settings.ML_AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.ML_AWS_SECRET_ACCESS_KEY,
+        )
+
+        event_data.upload(s3, BUCKET_NAME, EVENT_DATA_OBJECT)
+        order_data.upload(s3, BUCKET_NAME, ORDER_DATA_OBJECT)
+</code></pre>
+
+<p>Okay, so, the methods still a bit long in the middle.</p>
+
+<p>One thing that came to my mind was that <code>order.event.pk</code> is probably the
+same as <code>event.pk</code> itself, right?  Maybe check and simplify that.</p>
+
+<p>Then, the <code>filter</code> call with the <code>lambda</code> feels a bit weird to me, could
+that perhaps already be filtered out in the <code>Event.objects.filter...</code>
+chain above it?</p>
+
+<p>You could also move one last bit to make things clearer:  Don't expose
+the "raw" <code>writerow</code> call, instead just feed objects to the buffers:</p>
+
+<pre><code>        for event in filter(lambda event: not event.is_over, events):
+            event_data.write(event)
+
+            for order in event.orders.all():
+                order_data.write(order)
+</code></pre>
+
+<p>However, that would require to have either a method on the object being
+written that specifies the serialisation output (well, which values to
+select for the rows), or the same information on the <code>ForecastBuffer</code>
+object (you could pass in a function that formats an object for CSV).
+Depends entirely on the rest of the code if that's worth it / feasible
+at all.</p>
+
+<hr>
+
+<p>Btw. I just saw that <code>itertools</code> has a complement to <code>filter</code> called
+<a href="https://docs.python.org/3/library/itertools.html#itertools.filterfalse" rel="nofollow noreferrer"><code>filterfalse</code></a> (arguably that could be a better name, <code>keep</code> comes to my
+mind):</p>
+
+<pre><code>        # from itertools import filterfalse
+
+        for event in filterfalse(Event.is_over, events):
+            event_data.write(event)
+</code></pre>
+
+<p>Assuming that you can get the unbound method <code>Event.is_over</code> that way.</p>
+
+<hr>
+
+<p>Coming back to that <code>@classmethod</code>, the method here is difficult to test
+due to the global variables.  Depending on how it's called it might be
+worth to make <code>events</code> a parameter so that the functionality of <em>this
+method</em> is simply: format to CSV and upload.  Same goes for <code>settings</code> -
+the <code>s3</code> client most definitely should be passed in so this function
+doesn't have to deal with configuration on top of formatting and
+uploading.</p>
+
+<p>Actually that's still two things, but it's short enough that that's
+probably okay, splitting the formatting into another method might also
+be worth it actually:</p>
+
+<pre><code>class Forecast:
+    @classmethod
+    def format_data_for_forecast(cls, events):
+        event_data = ForecastBuffer(["Event PK", "Name", "Start date"])
+        order_data = ForecastBuffer(["Event PK", "Created", "Total Gross"])
+
+        for event in filterfalse(Event.is_over, events):
+            event_data.write(event)
+
+            for order in event.orders.all():
+                order_data.write(order)
+
+        return event_data, order_data
+
+    @classmethod
+    def export_data_for_forecast(cls):
+        events = Event.objects.filter(status=EventStatus.LIVE).prefetch_related(
+            'orders'
+        )
+
+        event_data, order_data = cls.format_data_for_forecast(events)
+
+        # Upload to S3
+        s3 = boto3.client(
+            's3',
+            aws_access_key_id=settings.ML_AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.ML_AWS_SECRET_ACCESS_KEY,
+        )
+
+        event_data.upload(s3, BUCKET_NAME, EVENT_DATA_OBJECT)
+        order_data.upload(s3, BUCKET_NAME, ORDER_DATA_OBJECT)
+</code></pre>
+    </div>

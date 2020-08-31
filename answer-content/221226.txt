@@ -1,0 +1,178 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>A couple of observations:</p>
+
+<ul>
+<li><p>When <code>splitTransaction</code> is diving into <code>Decimal</code> types and the like, that indicates that you’ve placed algorithms at the wrong level.</p></li>
+<li><p>To that end, let’s give the <code>Money</code> the necessary arithmetic operators so that <code>splitTransaction</code> doesn’t get into the weeds of <code>Decimal</code> or other details of the <code>Money</code> type.</p></li>
+<li><p>You have a <code>rounded</code> computed property. I’d suggest making that a function and allowing the caller to specify the type of rounding to be applied.</p></li>
+<li><p>You have made <code>Currency</code> conform to <code>Codable</code> (which you presumably did so you could make <code>Money</code> also <code>Codable</code>). I don’t think you intended to do that because currencies will have all sorts of properties that you most likely don’t want to encode. That should not be codable, and <code>Money</code> should have the currency code as a property, not the currency itself. That code is presumably the only thing you want <code>Money</code> to encode.</p></li>
+<li><p>Your algorithm assumes there will be one user who picks up the remainder. I’d suggest you spread it around. If the bill is €9.02, rather than sticking the first person with €3.02, let’s give two people €3.01 and the third €3.00.</p></li>
+<li><p>You are applying the remainder to the first user. I’d suggest you randomize it. If the list was sorted, for example, you don’t want the same people always getting the short end of the stick.</p></li>
+<li><p>Your rounding algorithm presumably assumes that you’ll be rounding to the nearest pence. But you should handle currencies that generally don’t use fractional values. In fact, going a step further, you should really handle arbitrary minimum units for the currency. E.g. imagine a world where the US decides it doesn’t want to deal with pennies any more, and makes the nickel the minimum unit. Well, that’s how you should be rounding (to the nearest $0.05), not to two decimal places. Likewise, imagine that Japan decided that they weren’t going to deal with anything smaller than ¥20. Then, again, that’s what you should be rounding to, not to the nearest yen.</p></li>
+<li><p>The <code>splitTransaction</code> should probably be generic.</p></li>
+</ul>
+
+<p>Thus, you end up with something like:</p>
+
+<pre><code>private func splitTransaction&lt;T: Currency&gt;(_ transaction: Money&lt;T&gt;, with friends: [String]) -&gt; [String: SplitTransaction&lt;T&gt;] {
+    let uniqueFriends = friends.removingDuplicates()
+
+    guard !uniqueFriends.isEmpty else { return [:] }
+
+    let currency = transaction.currency
+    let minimumUnit = currency.minimumUnit
+    let total = transaction.roundedToMinimumUnit()
+    let count = uniqueFriends.count
+    let baseIndividualAmount = (total / count).roundedToMinimumUnit(.down)
+    let remainder = total - baseIndividualAmount * count
+    let howManyAdjustments = currency.howManyUnits(remainder)
+
+    // split the transaction
+
+    var splitTransaction = uniqueFriends.reduce(into: [:]) {
+        $0[$1] = SplitTransaction(amount: baseIndividualAmount, setByUser: false)
+    }
+
+    // adjust random friends based upon remainder
+
+    for friend in uniqueFriends.shuffled()[0..&lt;howManyAdjustments] {
+        splitTransaction[friend]!.amount = splitTransaction[friend]!.amount + minimumUnit
+    }
+    return splitTransaction
+}
+</code></pre>
+
+<p>Where:</p>
+
+<pre><code>protocol Currency {
+    var code: String { get }
+    var minimumUnit: Decimal { get }
+    var symbol: String { get }
+    var decimalPlaces: Int { get }
+    init()
+}
+
+extension Currency {
+    func howManyUnits&lt;T: Currency&gt;(_ money: Money&lt;T&gt;) -&gt; Int {
+        return NSDecimalNumber(decimal: money.value / minimumUnit).intValue
+    }
+}
+
+struct GBP: Currency {
+    let code = "GBP"
+    let symbol = "£"
+    let decimalPlaces = 2
+    let minimumUnit = Decimal(sign: .plus, exponent: -2, significand: 1) // 0.01
+}
+
+struct EUR: Currency {
+    let code = "EUR"
+    let symbol = "€"
+    let decimalPlaces = 2
+    let minimumUnit = Decimal(sign: .plus, exponent: -2, significand: 1) // 0.01
+}
+
+struct JPY: Currency {
+    let code = "JPY"
+    let symbol = "¥"
+    let decimalPlaces = 0
+    let minimumUnit = Decimal(sign: .plus, exponent: 1, significand: 2) // 20, for demonstration purposes only
+}
+
+class Currencies {
+    static let shared = Currencies()
+
+    let availableCurrencies: [String: Currency] = {
+        let array: [Currency] = [GBP(), EUR(), JPY()]
+        return Dictionary(grouping: array) { $0.code }
+            .mapValues { $0.first! }
+    }()
+
+    func currency(for code: String) -&gt; Currency {
+        return availableCurrencies[code]!
+    }
+}
+
+extension Array where Element: Hashable {
+    func removingDuplicates() -&gt; [Element] {
+        return Array(Set(self))
+    }
+
+    mutating func removeDuplicates() {
+        self = self.removingDuplicates()
+    }
+}
+
+struct Money&lt;T: Currency&gt;: Codable {
+    let value: Decimal
+    let currencyCode: String
+    var currency: Currency { return Currencies.shared.currency(for: currencyCode) }
+
+    init(_ value: Decimal) {
+        self.value = value
+        self.currencyCode = T().code
+    }
+
+    func roundedToMinimumUnit(_ mode: NSDecimalNumber.RoundingMode = .bankers) -&gt; Money {
+        var input = (value / currency.minimumUnit)
+        var result = input
+        NSDecimalRound(&amp;result, &amp;input, 0, mode)
+        return Money(result * currency.minimumUnit)
+    }
+
+    static func + (lhs: Money, rhs: Money) -&gt; Money {
+        return Money(lhs.value + rhs.value)
+    }
+
+    static func + (lhs: Money, rhs: Decimal) -&gt; Money {
+        return Money(lhs.value + rhs)
+    }
+
+    static func - (lhs: Money&lt;T&gt;, rhs: Money&lt;T&gt;) -&gt; Money&lt;T&gt; {
+        return Money(lhs.value - rhs.value)
+    }
+
+    static func / (lhs: Money&lt;T&gt;, rhs: IntegerLiteralType) -&gt; Money&lt;T&gt; {
+        return Money(lhs.value / Decimal(rhs))
+    }
+
+    static func * (lhs: Money&lt;T&gt;, rhs: IntegerLiteralType) -&gt; Money&lt;T&gt; {
+        return Money(lhs.value * Decimal(rhs))
+    }
+}
+
+struct SplitTransaction&lt;T: Currency&gt;: Codable {
+    var amount: Money&lt;T&gt;
+    let setByUser: Bool
+}
+</code></pre>
+
+<p>Thus:</p>
+
+<pre><code>let money = Money&lt;JPY&gt;(10_040) // with my imaginary rendition where ¥20 is the smallest unit
+let split = splitTransaction(money, with: ["fred", "george", "sue"])
+</code></pre>
+
+<p>That yields:</p>
+
+<blockquote>
+  <p>fred, 3360<br>
+  george, 3340<br>
+  sue, 3340</p>
+</blockquote>
+
+<p>And </p>
+
+<pre><code>let money = Money&lt;GBP&gt;(9.02)
+</code></pre>
+
+<p>Yields:</p>
+
+<blockquote>
+  <p>fred, 3.00<br>
+  george, 3.01<br>
+  sue, 3.01</p>
+</blockquote>
+
+<p>And in both of these cases, who gets hit with the remainder is randomized.</p>
+    </div>

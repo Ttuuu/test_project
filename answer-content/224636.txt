@@ -1,0 +1,68 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The major compilers did not really auto-vectorize this, but it can be done manually. For example with AVX, we could do something like (not tested)</p>
+
+<pre><code>int indexOfMin(double pt_x, double pt_y, double pt_z, int n)
+{
+    __m256d ptx = _mm256_set1_pd(pt_x);
+    __m256d pty = _mm256_set1_pd(pt_y);
+    __m256d ptz = _mm256_set1_pd(pt_z);
+    __m256d xdif = _mm256_sub_pd(ptx, _mm256_loadu_pd(cx));
+    __m256d ydif = _mm256_sub_pd(pty, _mm256_loadu_pd(cy));
+    __m256d zdif = _mm256_sub_pd(ptz, _mm256_loadu_pd(cz));
+    __m256d min_dist = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(xdif, xdif), 
+                                                   _mm256_mul_pd(ydif, ydif)), 
+                                                   _mm256_mul_pd(zdif, zdif));
+    __m128i min_index = _mm_set_epi32(3, 2, 1, 0);
+    __m128i index = min_index;
+    __m256d dist;
+    for (int i = 4; i &lt; n; i += 4) {
+        xdif = _mm256_sub_pd(ptx, _mm256_load_pd(cx + i));
+        ydif = _mm256_sub_pd(pty, _mm256_load_pd(cy + i));
+        zdif = _mm256_sub_pd(ptz, _mm256_load_pd(cz + i));
+        dist = _mm256_add_pd(_mm256_add_pd(_mm256_mul_pd(xdif, xdif), 
+                                           _mm256_mul_pd(ydif, ydif)), 
+                                           _mm256_mul_pd(zdif, zdif));
+        index = _mm_add_epi32(index, _mm_set1_epi32(4));
+        __m256 mask256 = _mm256_castpd_ps(_mm256_cmp_pd(dist, min_dist, _CMP_LT_OS));
+        // mask256 has the masks as 4 x int64, but we need 4 x int32
+        // there's no nice 'pack' to do it, but shufps can extract
+        // the relevant floats, and then we can reinterpret as integers
+        // mask256 = * D * C * B * A (* is an ignored float)
+        __m128 maskL = _mm256_castps256_ps128(mask256);   // * B * A
+        __m128 maskH = _mm256_extractf128_ps(mask256, 1); // * D * C
+        __m128 maskps = _mm_shuffle_ps(maskL, maskH, _MM_SHUFFLE(2, 0, 2, 0)); // D C B A
+        __m128i mask = _mm_castps_si128(maskps);
+        min_dist = _mm256_min_pd(min_dist, dist);
+        // if the mask is set (this distance is LT the old minimum) then take the current index
+        // otherwise keep the old index
+        min_index = _mm_blendv_epi8(min_index, index, mask);
+    }
+
+    double mdist[4];
+    _mm256_storeu_pd(mdist, min_dist);
+    uint32_t mindex[4];
+    _mm_storeu_si128((__m128i*)mindex, min_index);
+    double closest = mdist[0];
+    int closest_i = mindex[0];
+    for (int i = 1; i &lt; 4; i++) {
+        if (mdist[i] &lt; closest) {
+            closest = mdist[i];
+            closest_i = mindex[i];
+        }
+    }
+    return closest_i;
+}
+</code></pre>
+
+<p>The relevant header to include is <code>&lt;immintrin.h&gt;</code> and to compile you would need to enable AVX with <code>-mavx</code> (GCC, Clang) or <code>/arch:AVX</code> (MSVC).</p>
+
+<p>Most of the code is just subtracting the values from the given coordinate, squaring the difference, and summing the squares. That's not very interesting to discuss, though it plays a significant part in making the code fast. Finding the minimum is more interesting, and is what prevented auto-vectorization. The approach I used is comparing the distance (obviously that was going to be part of it) which results in a bit-mask that is all set where the comparison is true, and then I use that to blend between the "index of best-so-far" and the current index, to conditionally replace values without branching.</p>
+
+<p>Because AVX was targeted instead of AVX2, the simpler approach of using an <code>__m256i</code> for the indexes could not be used. That would have removed the need to extract/shuffle the mask, as it would have already been the right size. With AVX2 there are no 256 bit wide integer operations (well, mostly) so it would not be possible to add 4 to the indexes. It <em>would</em> be possible to do a 256 bit blend by using a floating point type blend, then the blend mask is easy but it just pushes the problem to incrementing the indexes.</p>
+
+<p>Finally at the end there is a small loop to select the best index among the 4 candidates.</p>
+
+<p>The array size must be a multiple of 4, it would not be hard to remove that requirement. 32-byte alignment of the arrays is not required but would be better.</p>
+
+<p>By the way this is related to an SSE2 version that I did <a href="https://stackoverflow.com/a/30031003/555045">a couple of years ago</a>, which used single precision floats.</p>
+    </div>

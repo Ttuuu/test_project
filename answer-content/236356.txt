@@ -1,0 +1,134 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Scope</h2>
+
+<p>I cannot fully comment on use of the class  or the linear algebra involved, because:</p>
+
+<ol>
+<li>It's not clear how it will be used </li>
+<li>There are no real operations shown, just setup/config of the class plus "camera move". </li>
+</ol>
+
+<h2>General</h2>
+
+<ul>
+<li>Code compiles fine on a recent compiler (I am using clang-9 ). Only 2 warnings with <code>-Wall -Wextra</code>:</li>
+</ul>
+
+<pre><code>camera.cpp:110:9: warning: private field 'm_near' is not used [-Wunused-private-field]
+  float m_near;
+        ^
+camera.cpp:111:9: warning: private field 'm_far' is not used [-Wunused-private-field]
+  float m_far;
+        ^
+</code></pre>
+
+<ul>
+<li>Given you are using gcc7.4 and that I assume you have <code>-std=C++17</code> enabled, then I do <strong>not</strong> believe you need <code>EIGEN_MAKE_ALIGNED_OPERATOR_NEW</code>. As <a href="https://eigen.tuxfamily.org/dox-devel/group__TopicUnalignedArrayAssert.html" rel="nofollow noreferrer">documented here</a> and explained in more detail in this <a href="https://eigen.tuxfamily.org/bz/show_bug.cgi?id=1409" rel="nofollow noreferrer">bugzilla entry</a>. All of Eigen's aligment challenges are solved in recent C++17 compilers apparently. Your question mentions C++11, but if you can you should be compiling with <code>-std=c++17</code> to get best behaviour from Eigen and have access many other useful features. The only reason to not do this would be if you have some other 3rd party dependency which won't compile in C++17 mode, or if you also need to support platforms with older , more limited compilers, where C++17 is not available. </li>
+<li>You are using <code>double</code> for all your vector/matrix coefficients, yet you are using <code>float</code> for <code>m_width</code> and <code>m_height</code> and therefore <code>AspectRatio()</code>. Is there a specific reason? If not I would just standardise on <code>double</code>, which can often be faster on modern hardware with FP co-processors. </li>
+<li>Instead of your <code>typedef</code>s you could consider writing this, which is considered "more modern practice":</li>
+</ul>
+
+<pre><code>using Vector9d = Eigen::Matrix&lt;double, 9, 1&gt;;
+</code></pre>
+
+<ul>
+<li>Your constructors and operator methods look fine to me</li>
+<li>You could get "extra points" for C++ style by making your "getter" methods <code>const</code> and <code>[[nodiscard]]</code> like this:</li>
+</ul>
+
+<pre><code>  [[nodiscard]] const Vector3d&amp; Forward() const { /* ... */ };
+  [[nodiscard]] const Vector3d&amp; a() const { /* ... */ };
+  [[nodiscard]] const Vector3d&amp; up() const { /* ... */ };
+  [[nodiscard]] Matrix32d A() const { /* ... */ };
+  [[nodiscard]] Matrix32d R11() const { /* ... */ };
+  [[nodiscard]] Matrix32d R12() const { /* ... */ };
+</code></pre>
+
+<ul>
+<li>When you compile for performance (ie "Release mode") ensure you pass <code>-DNDEBUG=1 -O3</code> similar to below. The <code>NDEBUG</code> bypasses runtime checks on matrix dimensions and <code>-O3</code> will bring huge benefits, especially with Eigen's <a href="https://eigen.tuxfamily.org/dox-devel/group__TutorialMatrixArithmetic.html" rel="nofollow noreferrer">expression templates</a>.</li>
+</ul>
+
+<pre><code>g++ -DNDEBUG=1 -O3 -Wall -Wextra -std=c++17 -I include/eigen/ -o build/camera apps/camera.cpp
+</code></pre>
+
+<h2>Memory structure: layout, allocation and operations</h2>
+
+<p>You seemed concerned about speed / copying / memory usage and therefore whether you should be using pointers. </p>
+
+<p>Firstly the vectors/matrices you are using are fixed size and very very small. The biggest one is 9 elements of <code>double</code>s which are 8 bytes each so 72 bytes (you don't seem to use the <code>Matrix92d</code>). You don't appear to have <code>std::vector</code>s or other collections of these vectors/matrices or of the camera object itself. </p>
+
+<p>Your concern seems to be related to "moving and therefore changing the camera object often". You have decided to recompute the internal <code>m_r1</code> and <code>m_r2</code> during <code>m_setCamVec</code> which is called from eg <code>operator-=</code>. </p>
+
+<p>I have read up on the Eigen operations and studied how Eigen stores its structures. They are very simple: essentially, under the hood they are C-style arrays. On my machine, <code>sizeof (Camera)</code> reports that your objects will be 208 bytes, which is very manageable on the stack. This includes all the vectors/matrices which are all packed into the object (no heap allocations here). </p>
+
+<p>If you needed to pass one or a few <code>Camera</code> objects around between functions, you should pass them by reference. Not least because Eigen <a href="https://eigen.tuxfamily.org/dox-devel/TopicFunctionTakingEigenTypes.html" rel="nofollow noreferrer">recommends that</a> for its structures. </p>
+
+<p>If you were to make thousands of <code>Camera</code> objects then these should probably go on the heap, and that would happen naturally if you made a <code>std::vector&lt;Camera&gt;</code> of them. But even then, each <code>Camera</code> object on the heap would contain all its 208 bytes of vectors/matrices within it. </p>
+
+<p>When you call <code>operator+=</code> or other methods which reposition the Camera it looks like there are just a few assignment statements for <code>m_position</code> etc and then <code>recalculateRS()</code> which does 2 tiny cross-products and assignments. </p>
+
+<p>Therefore, <strong>there is no need to worry about copying</strong> during the recalculation and re-assigning to the member fields. Apart from any possible temporaries, (which Eigen tries to minimise), Eigen and C++ will use <strong>the same memory</strong> which is already part of your 208-byte Camera object. Very little (if any!) extra memory will be used and everything (!) will be cleaned up each time you reposition the camera object. </p>
+
+<h2>Expected costs</h2>
+
+<p>This should all be super fast because:</p>
+
+<ul>
+<li>You have chosen a good quality linear algebra library </li>
+<li>You are using fixed sized matrices</li>
+<li>Your matrices are very small</li>
+<li>If you compile with <code>-O3 -DNDEBUG=1</code> then Eigen &amp; the compiler should be able to optimise away any temporaries. </li>
+<li>There are no heap allocations here at all (unless you have thousands of camera objects). Also, if Eigen cannot avoid a temporary, it will likely use the stack for it:</li>
+</ul>
+
+<blockquote>
+  <p><code>EIGEN_STACK_ALLOCATION_LIMIT</code> - defines the maximum bytes for a buffer
+  to be allocated on the stack. For internal temporary buffers, dynamic
+  memory allocation is employed as a fall back. For fixed-size matrices
+  or arrays, exceeding this threshold raises a compile time assertion.
+  Use 0 to set no limit. Default is 128 KB.</p>
+</blockquote>
+
+<p>you can further force this with:</p>
+
+<blockquote>
+  <p><code>EIGEN_NO_MALLOC</code> - if defined, any request from inside the Eigen to
+  allocate memory from the heap results in an assertion failure. This is
+  useful to check that some routine does not allocate memory
+  dynamically. Not defined by default.</p>
+</blockquote>
+
+<p>Note that, if Eigen did allocate memory (very unlikely from what we have seen of your application), then Eigen <strong>will free</strong> that memory as soon as it's not needed. This is the standard behaviour in C++. </p>
+
+<h2>Better to store or construct?</h2>
+
+<p>Impossible to tell without knowing the usage pattern. Need to know the actual number of times camera is repositioned vs the number of times these quantities would have to be computed if they were not stored. <strong>Neither option seems expensive</strong>. Since there is no <code>malloc</code>, this is just two SIMD optimised cross products of tiny matrices. I have no idea how long that takes but if it's longer than a couple of hundred cycles I would be surprised. </p>
+
+<h2>Performance mockup</h2>
+
+<p>I hacked this basic loop to get an idea. The <code>escape()</code> is to avoid the compiler just removing our program altogether. </p>
+
+<pre><code>static void escape(void *p) {
+  asm volatile("" : : "g"(p) : "memory");
+}
+
+int main() {
+  Vector9d init = Vector9d::Random();
+  auto cam = Camera{init, 2, 1, 3, 4};
+  std::cout &lt;&lt; cam.Position() &lt;&lt; "\n";
+  for (std::size_t i = 0; i &lt; 1'000'000; ++i) {
+    cam += init;
+    Matrix32d r12 = cam.R12();
+    escape(&amp;r12);
+  }
+  std::cout &lt;&lt; cam.Position() &lt;&lt; "\n";
+  return 0;
+}
+</code></pre>
+
+<p>On my (quite old i7 2600) machine with <code>-O3 -DNDEBUG</code> that runs in 65ms. So a single camera move takes around (very roughly!) 65ns. Here is the, slightly modified to eliminate the <code>std::cout</code> printing, version <a href="https://godbolt.org/z/baaf6x" rel="nofollow noreferrer">in machine code</a>. A few hundred lines of assembly, packed full of SIMD instructions. Scary fast? </p>
+
+<p>The bottlenecks for your application <em>are likely to lie elsewhere</em> in your calling code. In general you are slightly in danger of "premature optimisation" concerns. It's not at all clear that there is anything expensive here. Need to measure first when application is up and running. </p>
+
+<p>I hope that helps. I had to make some assumptions. Come back with comments if they were incorrect. </p>
+    </div>

@@ -1,0 +1,192 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+ 
+
+<p>This is a nice example of <a href="https://en.wikipedia.org/wiki/Cooperative_multitasking" rel="nofollow noreferrer">Cooperative Multitasking</a>. Each task has to decide if and when it yields. However based on the fact that the individual tasks are placed in a single program, this could sooner be called Cooperative <a href="https://en.wikipedia.org/wiki/Multithreading_(computer_architecture)" rel="nofollow noreferrer">Multithreading</a>.</p>
+
+<p>In the <em>putstring</em> procedure you erroneously wrote <code>jmp putstring</code> where you clearly wanted to write <code>jmp .continue</code>. That's an honest mistake.
+What you do keep neglecting though is the <em>DisplayPage</em> parameter that BIOS expects in the <code>BH</code> register.</p>
+
+<p>If you've programmed in MASM before, it can be hard to adopt the shorter way to load an address via the <code>mov</code> instruction. <code>mov si, task_a</code> does the same as your <code>lea si, [task_a]</code> but it is 1 byte shorter. You used this many times (11x).</p>
+
+<blockquote>
+<pre class="lang-none prettyprint-override"><code>    cmp     cx, 3                 ; change this to add more tasks
+    jl      .continue
+    ret                           ; no free task, return immediately
+.continue:
+</code></pre>
+</blockquote>
+
+<p>This ressembles a beginner's code, yet I'm sure you are not a beginner!
+The <em>spawn_new_task</em> procedure has a nice <code>ret</code> near its end, so why not jump there based on the opposite condition?</p>
+
+<pre class="lang-none prettyprint-override"><code>    cmp     cx, 3                 ; change this to add more tasks
+    jnl     .ret                  ; no free task, return immediately
+
+    ...
+
+.ret:
+    ret
+</code></pre>
+
+<p>Same thing happens here:</p>
+
+<blockquote>
+<pre class="lang-none prettyprint-override"><code>    cmp     byte [bx], 1          ; is this stack active
+    je      .found_one
+    jmp     .loop
+.found_one:
+</code></pre>
+</blockquote>
+
+<p>Why not write (no need for the label this time):</p>
+
+<pre class="lang-none prettyprint-override"><code>      cmp     byte [bx], 1          ; is this stack active
+      jne     .loop
+</code></pre>
+
+<p>Because your <em>main</em> task will always be active, there's no reason to consider it in the search for a free task slot. This saves one iteration forever.<br>
+Also there's no need to test the <code>CX</code> counter up front. Better have the test near the bottom and avoid the extraneous unconditional jump back. So changing from a <strong>Do While</strong> loop into a <strong>Loop While</strong> loop.<br>
+Starting from a byte that is known to be 0, <code>inc byte [bx]</code> will produce shorter code than <code>mov byte [bx], 1</code>.</p>
+
+<pre class="lang-none prettyprint-override"><code>spawn_new_task:                   ; find a free task, start pointers off at -1
+    xor     cx, cx
+    mov     bx, stack_status
+.loop:
+    inc     bx
+    inc     cx
+    cmp     [bx], ch              ; CH=0
+    je      .done                 ; if equal, tasks is free
+    cmp     cx, 2                 ; change this to add more 'spawnable' tasks
+    jb      .loop
+    ret                           ; no free task, return immediately
+.done:
+    inc     byte [bx]             ; task was free, reserve it
+</code></pre>
+
+<p>What's the comment "start pointers off at -1" about? Your code nowhere has any -1.</p>
+
+<p>The bulk of this program contains empty space. You can easily move the free space for the additional stacks outside of the program file.</p>
+
+<hr>
+
+<p>The following rewrite (FASM) reveals a <strong>code size</strong> reduction of 9% (171 → 156) and a <strong>file size</strong> reduction of 72% (735 → 208).</p>
+
+<pre class="lang-none prettyprint-override"><code>org 100h
+
+main:
+    mov     si, task_a
+    call    spawn_new_task
+    mov     si, task_b
+    call    spawn_new_task
+
+.loop_forever:
+    mov     si, main_str
+    call    putstring
+    call    yield
+    jmp     .loop_forever
+
+task_a:
+    mov     si, main_a
+    call    putstring
+    call    yield
+    jmp     task_a
+
+task_b:
+    mov     si, main_b
+    call    putstring
+    call    yield
+    jmp     task_b
+
+spawn_new_task:                   ; find a free task slot
+    xor     cx, cx
+    mov     bx, stack_status
+.loop:
+    inc     bx
+    inc     cx
+    cmp     [bx], ch              ; CH=0
+    je      .done                 ; if equal, task slot is free
+    cmp     cx, 2                 ; change this to add more 'spawnable' tasks
+    jb      .loop
+    ret                           ; no free task, return immediately
+.done:
+    inc     byte [bx]             ; task was free, reserve it
+    mov     bx, stack_pointers
+    mov     [bx], sp              ; save main's stack pointer
+    add     bx, cx                ; switch to free stack
+    add     bx, cx                ; free stack is list of words (not bytes) and add is cheaper than mul
+    mov     sp, [bx]              ; change to free stack
+    push    si                    ; push stuff
+    pusha
+    pushf
+    mov     [bx], sp              ; save new stack's new pointer
+    mov     sp, [stack_pointers]  ; change back to main
+    ret
+
+yield:
+    ; ret already saved by call
+    pusha
+    pushf
+    movzx   cx, byte [current_task]
+    ; save current stack pointer
+    mov     bx, stack_pointers
+    add     bx, cx
+    add     bx, cx
+    mov     [bx], sp
+    ; loop through stack status looking for a 1
+    mov     bx, stack_status
+    add     bx, cx                ; make sure we start looking at next task
+.loop:
+    inc     bx
+    inc     cx
+    cmp     cx, 3                 ; increment this for more tasks
+    jb      .continue
+    xor     cx, cx                ; clear cx
+    mov     bx, stack_status      ; reset bx back to start
+.continue:
+    cmp     byte [bx], 1          ; is this stack active
+    jne     .loop
+    mov     [current_task], cl
+    ; switch to new stack
+    mov     bx, stack_pointers
+    add     bx, cx
+    add     bx, cx
+    mov     sp, [bx]
+    popf
+    popa
+    ret
+
+    ; takes an address to write to in si
+    ; writes to address until a null term is encountered
+    ; returns nothing
+putstring:
+    mov     bh, 0
+    mov     ah, 0Eh
+    jmp     .first
+.next:
+    int     10h                   ; call interrupt
+.first:
+    lodsb                         ; put char to write in al
+    test    al, al                ; simulate and
+    jnz     .next                 ; was al 0?
+    ret
+
+    main_str: db "I am task main", 13, 10, 0
+    main_a: db "I am task a", 13, 10, 0
+    main_b: db "I am task b", 13, 10, 0
+
+    current_task: db 0
+
+    stack_status:
+    status_1: db 1                ; this is for Main
+    status_2: db 0
+    status_3: db 0
+
+    stack_pointers:
+    dw 0                          ; this is for Main
+    dw stacks + 256
+    dw stacks + 512
+
+    stacks:
+
+</code></pre>
+    </div>

@@ -1,0 +1,82 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Let's start with the good:</p>
+
+<ul>
+<li>Ohh recent Python 3, nice!</li>
+<li>Good documentation</li>
+<li>Good use of <code>typing</code>. This is great for datastructures.</li>
+<li>Good formatting of your code. Nice spacing. Decent naming</li>
+<li>Good use of <code>defaultdict</code></li>
+<li>Good use of <code>assert</code>s</li>
+</ul>
+
+<p>Things I noticed along the way:</p>
+
+<ul>
+<li><code>contains</code> is usually spelled <code>__contains__</code>. This way you can do <code>item in queue</code>.</li>
+<li>I'd rename <code>contains_with_prio</code>. I'm not sure if I would call it <code>contains</code>, but <code>queue.contains(item, priority=5)</code> reads better to me. At the least, don't abbreviate <code>priority</code>.</li>
+<li>I'd name <code>condition_var</code> to just <code>lock</code>. <code>with self.lock</code> reads better this way.</li>
+<li>If you name it <code>remove</code> for parity with how <a href="https://docs.python.org/3/library/stdtypes.html#set" rel="nofollow noreferrer">the builtin <code>set</code> does it</a>, I'd have it <code>raise KeyError</code> if <code>item</code> isn't in the queue instead of returning a <code>bool</code>. If you want to return a <code>bool</code>, then name it <code>discard</code> (also for parity).</li>
+<li>I'd do <code>assert removed_count in (0, 1)</code> (tuples are preferred when you don't need to modify the object)</li>
+<li>Instead of <code>empty</code> define a <code>__bool__</code> which returns <code>True</code> if the queue has items. This is for parity with lists. lists and other builtins are falsy when empty</li>
+<li>Rename <code>size</code> to <code>__len__</code> so you can do <code>len(queue)</code></li>
+<li>Rename <code>get</code> to <code>pop</code> (you even call it this in the comment) for parity with sets (and python's <a href="https://docs.python.org/3/library/heapq.html" rel="nofollow noreferrer">heap implementation</a>)</li>
+<li>For imports, I generally prefer <code>from unittest import TestCase</code>. Repeating the module name tends to be tedious and in many cases doesn't add much.</li>
+<li>Make sure your tests are in a separate file (if the source is in <code>foo/ordered_set_priority_queue.py</code> you'd typically place them in <code>test/foo/test_ordered_set_priority_queue.py</code>; this allows you--assuming you've added all the <code>__init__.py</code>s--to do <code>python3 -m unittest discover .</code> to run all tests)</li>
+<li><code>queue.put(0, 1)</code> is unclear without looking at the method definition. Perhaps use a kwarg here to make it clearer: <code>queue.put(0, priority=1)</code></li>
+<li>Using <code>Thread</code> in a test is fairly fragile. Generally, testing concurrent datastructures is tricky business. This test may not always fail if there is a problem in your code unless you're very careful: <a href="https://stackoverflow.com/questions/8995491/testing-concurrent-data-structures">https://stackoverflow.com/questions/8995491/testing-concurrent-data-structures</a>. You're probably better off introducing some special breakpoints in your code (removed out for production) that allows you to pause your datastructure so you can specifically craft degenerate access patterns.</li>
+<li>One of the key parts of a priority queue is constant time access to the top of the queue. You actually don't have that because in your <code>get</code> you do <code>sorted(self.deques.keys())[-1]</code>. This is <code>n log n</code> and also inefficient because it sorts the whole list (when you only need the first element). It also requires building a list in memory. Consider using <a href="https://docs.python.org/3/library/heapq.html" rel="nofollow noreferrer">python heaps</a> to maintain a sorted heap of priorities. This way your <code>get</code> is always constant time.</li>
+<li>Generally we prefix private attributes with <code>_</code>, so <code>self._deques</code>, <code>self._elem_sets</code> (call this <code>self._item_sets</code>, don't abbreviate), <code>self._lock</code>, etc.</li>
+<li>There's no need to do <code>priorities = list(self.elem_sets.keys())</code> in <code>_clean_up()</code></li>
+<li>I'd benchmark to see if <code>_clean_up</code> is necessary. It may not be, and eliminating it makes the logic simpler (if you take my advice and use python heap stuff)</li>
+<li>For parity with Python sets rename <code>put</code> to <code>insert</code></li>
+</ul>
+
+<p>Here's a big detail:</p>
+
+<p>The fact that you <code>assert sorted(self.deques.keys()) == sorted(self.elem_sets.keys())</code> is an indication that you have a data dependency that could probably be refactored. Ideally, you'd never want that to be <code>False</code>, but if you separately manage <code>deques</code> and <code>elem_sets</code> then perhaps they could get out of sync. This also gives you multiple ways to get all of the priority levels (ex. <code>self._deques.keys()</code> and <code>self._item_sets.keys()</code>). You can fix this be grouping a deque and set together into a <code>PriorityLevel</code>.</p>
+
+<pre><code>class PriorityLevel(Generic[T]):
+    def __init__(self) -&gt; None:
+        self._ordered_items: Deque[T] = deque()
+        self._items_set: Set[T] = {}
+
+    def __contains__(self, item: T) -&gt; bool:
+        return item in self._items_set
+
+    def pop(self) -&gt; T:
+        item = self._ordered_items.pop()
+        self._items_set.remove(item)
+        return item
+
+    # etc.
+</code></pre>
+
+<p>Then have your datastructure maintain one <code>defaultdict</code> of these:</p>
+
+<pre><code>class OrderedSetPriorityQueue(Generic[T]):
+    def __init__(self) -&gt; None:
+        self._levels: DefaultDict[int, PriorityLevel[T]] = defaultdict(PriorityLevel)
+
+    def __contains__(self, item: T) -&gt; bool:
+        with self._lock:
+             return any(item in level for level in self._levels.values())
+
+    def insert(self, item, *, priority: int = 0) -&gt; bool:
+        with self._lock:
+            self.discard(item)
+            return self._levels[priority].insert(item)
+
+    def discard(self, item: T) -&gt; bool:
+        with self._lock:
+            return any(level.discard(item) for level in self._levels.values())
+
+    # etc.
+</code></pre>
+
+<p>In this way you never have to have a <code>priority</code> and then hope that <code>self.deques[priority]</code> and <code>self.elem_sets[priority]</code> gives you what you want (and they haven't gotten out of sync).</p>
+
+<p>You may also want to consider not using a global lock. A readwrite lock may be more efficient (especially for non-mutating operations). Refactoring out <code>PriorityLevel</code> may also allow you to do per-level locking, which may be more efficient than global locking.</p>
+
+<p>Also, don't check <code>if item in self</code> before doing a <code>discard</code> for example. It's just needless work. Do the <code>discard</code> and handle failure accordingly. Also be careful with how this interacts with locking (I see you needed a <code>notify</code>, which I suspect stems from this).</p>
+    </div>

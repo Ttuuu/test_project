@@ -1,0 +1,90 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>Threading</h3>
+<p>I'd like to join the others in recommending you drop your threading. You're also doing it wrong - you're only grabbing the semaphore for creating the thread, but you never acquire it inside of the thread when executing.</p>
+<p>If you use a lock of semaphore, do it with a context manager:</p>
+<pre class="lang-py prettyprint-override"><code>with my_semaphore:
+    # code...
+</code></pre>
+<p>And if you can't, you're doing something wrong.</p>
+<h3>Garbage Collection</h3>
+<p>Drop all <code>gc.collect()</code> lines. Python does this automatically at a frequency and at moments that are plenty sufficient for your application.</p>
+<h3>Lets have a look at your class.</h3>
+<pre class="lang-py prettyprint-override"><code>class add_line:                                   # Class names should be TitleCase, so make this AddLine
+    def __init__(self,semaphore,q):               # q is to short. Just use queue here.
+        self.q = q # queue                        # Same here, of course. self.queue is perfectly fine.
+        self.semaphore = semaphore
+
+    def put_queue(self,li): #insert               # This function serves no purpose. Just use 
+        self.q.put(li)                            # self.queue.put(li) directly elsewhere.
+
+    def fetch_word(self,w_list):
+        fetched_text = ""# targeted text          # Remove this line - it's created below, and not used inbetween.
+        path = "https://ejje.weblio.jp/content/"+ w_list[1]
+        res = requests.get(path)                  # If you expect to use this more than ten times, use a session like @C.Nivs explains clearly.
+        res.raise_for_status()
+        no_starch_soup = bs4.BeautifulSoup(res.text)
+        # See below for how to change this bit.
+        # [Skipped Code]
+        self.semaphore.release()                 # This thread never acquired it.
+</code></pre>
+<p>Take a good look at what we're doing in that double conditional statements there. We select something from the soup, and if it's empty, from elsewhere. This is a great place to use a simple <code>or</code> and reduce it to this:</p>
+<pre class="lang-py prettyprint-override"><code>        fetched_text = no_starch_soup.select('.conjugateRowR &gt; table &gt; tr &gt; td') or \
+            no_starch_soup.select('.conjugateRowR &gt; a')
+        if not fetched_text: #if get nothing 
+            self.put_queue(w_list)  # return original conjurate
+        else:
+            li_=list(map(lambda x:x.contents[0], fetched_text))
+            li_.insert(0,w_list[0])
+            self.put_queue(li_)
+</code></pre>
+<p>The <code>\</code> is a a line continuation token - it allows you to split a single line of python code over two lines if it's to long. It's rarely a good idea, but in this case, I consider it warranted. The statement is simply - it tries <code>no_starch_soup.select('.conjugateRowR &gt; table &gt; tr &gt; td')</code> first, and if that results in a False value (like an empty string, empty list, <code>False</code>, <code>None</code>, 0, empty dict... you get the point), then it will evaluate <code>no_starch_soup.select('.conjugateRowR &gt; a')</code> and put the result in the variable.</p>
+<p>Now lets have a look at your appended list:</p>
+<pre class="lang-py prettyprint-override"><code>            li_=list(map(lambda x:x.contents[0], fetched_text))
+            li_.insert(0,w_list[0])
+            self.put_queue(li_)
+</code></pre>
+<p>This could just as easily be:</p>
+<pre class="lang-py prettyprint-override"><code>            self.put_queue(w_list[0] + list(map(lambda x:x.contents[0], fetched_text)))
+</code></pre>
+<p>At least, if we're allowed to make the assumption that w_list is small, which it seems to be as it's the result of a string.split() operation, which is used on a string read from a file opened for text reading.</p>
+<p>However, I would refactor this class into a function, as it has no state you're modifying anyway. Here I'll assume you're really determined to keep threading, despite threading only having advantages if you're doing a lot of work outside python code, like lengthy file I/O or complicated math in numpy.</p>
+<pre class="lang-py prettyprint-override"><code>def add_line(queue, semaphore, w_list):
+    with semaphore:  # This single line takes care of all threading headaches for the entire function
+        path = "https://ejje.weblio.jp/content/"+ w_list[1]
+        no_starch_soup = bs4.BeautifulSoup(requests.get(path).text)
+        fetched_text = no_starch_soup.select('.conjugateRowR &gt; table &gt; tr &gt; td') or \
+            no_starch_soup.select('.conjugateRowR &gt; a')
+        if fetched_text: #if get nothing 
+            queue.put(w_list)  # return original conjurate
+        else:
+            queue.put(w_list[0] + list(map(lambda x:x.contents[0], fetched_text)))
+</code></pre>
+<p>And then lets go into your script Thread generation:</p>
+<pre class="lang-py prettyprint-override"><code>from queue import Queue  # I like this type of import, makes you need less dots.
+# [...]
+    sema = BoundedSemaphore(value=maxconnections)
+    queue = Queue()  # Words to write to output file
+    path_w = "./threading_test_result.txt"
+    with open(path) as f:
+        for line in f:  # lines is plural, line is singular. 
+            Thread(target=add_line, args=(queue, sema, lines.split(" "))).start()
+</code></pre>
+<p>Keep in mind that this will spawn a Thread for every line in the file. Unless this is somewhere lower than around 30 lines, it's very likely that this is what causes your slowdowns. Therefore I'd just forget about the threads if I were you.</p>
+<p>And your output generation:</p>
+<pre class="lang-py prettyprint-override"><code>    with open(path_w, mode='a') as f:
+        while not q.empty():
+            for x in q.get():
+                f.write(x)
+                f.write(" ")
+            f.write("\n")
+        f.close()
+</code></pre>
+<p>Can very easily be replaced by:</p>
+<pre class="lang-py prettyprint-override"><code>    with open(path_w, mode='a') as f:
+        while not queue.empty():
+            print(*queue.get(), file=f)
+</code></pre>
+<p>Wait what, isn't that the <a href="https://docs.python.org/3.7/library/functions.html#print" rel="nofollow noreferrer">super-basic simple output-to-console command for starters with python</a>? Why yes it is. It's a very powerful function. With the <code>*</code> before the <code>entry</code>, we unpack the list and feed it's elements as seperate arguments to the function. These objects will all be converted to strings and then printed, seperated by the <code>sep= </code> keyword argument, which happens to be a string with a single space by default. Then it's finished by the <code>end=</code> keyword argument, which by default is your system specific line ending, so we don't need to put any thought in that either. And then we can tell it where to print, and the <code>file=</code> keyword argument perfectly understands file handles.</p>
+<p>You should probably check to make sure your program doesn't empty the queue faster than the other threads can fill it, which is another reason to drop threading here. If it does, you can wait and restart processing after a second or so.</p>
+<p>I've got the feeling that dependent on what sort of data you expect in <code>fetched_text </code> in the function, there's more improvements possible, but I must confess to not knowing the BeautifulSoup module at all, so I'll pass on that.</p>
+    </div>

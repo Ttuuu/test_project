@@ -1,0 +1,144 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>As you mention, some of this is messy and haphazard, which is a side-effect of writing one-off scripts that have a single behavior they need to perform, instead of something extensible. In that case, this review is going to largely focus on how we make this extensible and use our hammer to build a screwdriver (among other things).</p>
+
+<hr>
+
+<p>If we start at how we interact with cells and ranges, it becomes pretty clear that we have a lot of stuff going on</p>
+
+<ul>
+<li>ASCII constants and offsets</li>
+<li>Hardcoded row/column limits</li>
+<li>Hardcoded sizes</li>
+<li>etc</li>
+</ul>
+
+<p>What I think we want is a well designed <code>ExcelSheetRange</code> class that handles a few things:</p>
+
+<ul>
+<li>R1C1 vs A1 reference styles 
+
+<ul>
+<li>Relative references (<code>A1</code> or <code>R[1]C[1]</code>)</li>
+<li>Absolute references (<code>$A$1</code> or <code>R1C1</code>)</li>
+<li>Semi absolute/relative reference (<code>$A1</code> or <code>A$1</code> or <code>R1C[1]</code> or <code>R[1]C1</code>)</li>
+</ul></li>
+<li>translation between an index and the Excel Cells</li>
+<li>efficient range transformations</li>
+</ul>
+
+<p>I imagine you could implement a base class <code>ExcelSheetRange</code>, then at least 2 subclasses (one each for R1C1 and A1). That would be a lot, so I'll skip it, but assuming we can do that then some of this code gets much cleaner:</p>
+
+<pre><code>return "={0}('{1}'!{2}{3}:{4}{5})".format(formula, target, chr(CONST_A), i, chr(CONST_H), i)
+# becomes
+return "={0}('{1}'!{2})".format(formula, target, ExcelSheetRange('A', i, 'H', i))
+
+tour_ws.Columns("A:H").ColumnWidth = 2.86
+#becomes
+tour_ws.Columns(ExcelSheetRange("A", 1, "H", 8).column_range) = 2.86
+</code></pre>
+
+<p>From there, we get a few generalizable problems:</p>
+
+<ul>
+<li>Formatting cells</li>
+<li>putting a value in a cell</li>
+<li>performing a calculation on a range</li>
+</ul>
+
+<p>You could add some enhancements to this presumed <code>ExcelSheetRange</code> class such as <code>cell_size_in_px</code>, <code>cell_color_scale</code>, <code>cell_value</code>, <code>cell_vertical_alignment</code>, etc. Then a lot of your operations get even easier</p>
+
+<pre><code>range = ExcelSheetRange("A", 1, "H", 8)
+range.cell_size_in_px = (25, 25) # abstracts away Microsoft's weird measurement rules
+range.cell_color_scale = 3 # Whatever this means; if there is something more useful and understandable to put here then do that
+</code></pre>
+
+<p>Then if we have a simple <code>apply_to_sheet</code> operation we could just do</p>
+
+<pre><code>range.apply_to_sheet(tour_ws)
+# or if you want some dependency injectable method so you can test it, you could do
+apply_range_to_sheet(range, tour_ws)
+</code></pre>
+
+<p>Assuming we've implemented all of this, then the program becomes pretty simple</p>
+
+<pre><code>def main():
+    wb, tour_sheet, calc_sheet = get_knight_tour_workbook()
+
+    knight_tour_range = ExcelSheetRange("A", 1, "H", 8)
+    knight_tour_range.cell_size_in_px = (
+        25,
+        25,
+    )  # Assume property with a setter that does scaling as appropriate
+    knight_tour_range.cell_color_scale = 3
+    knight_tour_range.literal_values = [
+        (x_pos, y_pos, value)
+        for value, (x_pos, y_pox) in enumerate(positions, 1)
+    ]  # Assume property with a setter that stores the values in an intermediate array
+    knight_tour_range.alignment = AlignmentEnum.Center # Assume this is a property with a setter that can figure out that horizontal and vertical are the same
+
+    calculation_ranges = []
+
+    for i, formula in enumerate(FORMULAE, 1):
+        calculation_range = ExcelSheetRange(1, i, 17, i)
+        calculation_range.cell_color_scale = 3
+        calculation_range.calculated_values = [
+            (
+                i,
+                row,
+                get_function_call(
+                    row, formula, tour_sheet.Name
+                ),
+            )
+            for row in range(1, 18)
+        ]
+        calculation_ranges.append(calculation_range)
+
+    apply_range_to_sheet(tour_sheet, knight_tour_range)
+    apply_all_ranges_to_sheet(
+        calc_sheet, *calculation_ranges
+    )
+</code></pre>
+
+<p>I've left it a bit hand-wavy, and there are definitely additional improvements that can be made, but we've now pretty much separated the Excel manipulations and your actual logic. </p>
+
+<p>If we wanted to get really crazy, and really generic, we could even make our "range" stuff completely independent of Excel, and just lean really heavily on the <code>apply_*</code> functions. Getting even crazier and more generic, we split our "here are calculations that should eventually be performed on these sets of values" and our "here is how things should look", and pass them both into some kind of "tabular data visualization tool" that is generic to actual visualization application, and then make an Excel implementation that quacks the same way. This is probably going too far.</p>
+
+<hr>
+
+<p>Some nitpicky things</p>
+
+<pre><code>def range_format(formula, target, i):
+    if i &lt; 9:
+        return "={0}('{1}'!{2}{3}:{4}{5})".format(
+            formula, target, chr(CONST_A), i, chr(CONST_H), i)
+    elif i &lt; 10:
+        return ""
+    else:
+        return "={0}('{1}'!{2}{3}:{4}{5})".format(
+            formula, target, chr(i + OFFSET), 1, chr(i + OFFSET), 8)
+</code></pre>
+
+<p>This function is a bit clunky as-is:</p>
+
+<ul>
+<li><code>elif i &lt; 10</code> should just be <code>elif i == 9</code></li>
+<li>You can use <code>f</code>-strings here</li>
+<li>You duplicate the formatting logic as well (also you don't need to specify <code>i</code> twice)</li>
+</ul>
+
+<p>I would probably want to write this:</p>
+
+<pre><code>def range_format(formula, target, i):
+    if i == 9:
+        return ""
+
+    start_row = chr(CONST_A) if i &lt; 9 else chr(i + OFFSET)
+    start_col = i if i &lt; 9 else 1
+    end_row = chr(CONST_H) if i &lt; 9 else chr(i + OFFSET)
+    end_col = i if i &lt; 9 else 8
+
+    return f"={formula}('{target}'!{start_row}{start_col}:{end_row}{end_col})"
+</code></pre>
+
+<p>Then, as you mention, you probably want a bit better validation on the allowed functions. An <code>enum</code> would be fine to meet this need.</p>
+    </div>

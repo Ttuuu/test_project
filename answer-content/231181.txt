@@ -1,0 +1,209 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Complex refactorings and optimizations:</p>
+
+<p><strong><em>Relation</em></strong><br>
+When starting restructuring the initial program we need to reconsider the relation between game (<code>Jaipur</code>) and players.<br>The current approach tries to instantiate players from global scope by class name:</p>
+
+<pre><code>player1 = globals()[player1]
+player2 = globals()[player2]
+</code></pre>
+
+<p>which is definitely a bad way. Instead, let's pass players names/tags to the game constructor:</p>
+
+<pre><code>game = Jaipur('P1', 'P2')
+</code></pre>
+
+<p>We are doing so to internally create <code>Player</code> instances and pass back-reference to the same game <code>Jaipur</code> instance for each player. Thus, each player can access/request the needed features/behavior from <em>game</em>'s public interface.<br>When looking at <code>Player</code>s all crucial methods <code>take(self, market)</code>, <code>sell(self, market, commodity=None)</code>, <code>make_move(self, market, winner)</code> we see that they all expect <code>market</code> and return that <code>market</code> although all the <em>callers</em> aren't using that return value.<br>
+But the <code>market</code> is <strong>owned</strong> by the <em>game</em>.
+So we make a <em>player</em> to request a copy of the current <em>market</em> state from the <em>game</em>.</p>
+
+<hr>
+
+<p><strong><em>The commodities</em></strong><br>
+As was mentioned in previous answer, the commodity list presented as consecutive integer numbers is a good candidate to be <em>enumeration</em>. <br>But we'll go further and apply <a href="https://docs.python.org/3/library/enum.html#enum.unique" rel="nofollow noreferrer"><code>enum.unique</code></a> decorator that ensures only one name is bound to any one value. To proceed with new <em>enum</em> let's look at <code>Player</code>'s <code>sell</code> method and its condition:</p>
+
+<pre><code>if commodity in [DIAMOND, GOLD, SILVER] ...
+</code></pre>
+
+<p>it checks if a particular commodity is the <em>most costly</em> one.<br>
+We'll give such a responsibility to our <code>Commodity</code> enum class so eventually it'll look as below:</p>
+
+<pre><code>@unique
+class Commodity(Enum):
+    DIAMOND = 0
+    GOLD = 1
+    SILVER = 2
+    SILK = 3
+    SPICE = 4
+    LEATHER = 5
+
+    @classmethod
+    def is_costly(cls, val):
+        return val in [cls.DIAMOND.value, cls.GOLD.value, cls.SILVER.value]
+</code></pre>
+
+<p>We'll set the current prices for commodities as a constant attribute of the <em>game</em>:</p>
+
+<pre><code>C_PRICES = [7, 6, 5, 3, 3, 1]  # DIAMOND, GOLD, SILVER, SILK, SPICE, LEATHER
+</code></pre>
+
+<hr>
+
+<p><strong><code>Jaipur</code></strong> (game) class refactoring:</p>
+
+<ul>
+<li><p><code>play_game</code> method. The crucial <code>while</code> loop with condition <code>self.winner is None</code> inefficiently checks for <code>if self.winner is not None:</code> on each iteration. <br>
+Instead, we'll apply a convenient Python's feature <a href="https://docs.python.org/3/reference/compound_stmts.html#the-while-statement" rel="nofollow noreferrer"><code>while ... else</code></a></p></li>
+<li><p><code>play_move</code> method. Essentially initiates the current player action (take or sell) and switches/sets to another player. This is a good case for <code>itertools.cycle</code> feature (to infinitely switch to next player) <code>cycle([self.player1, self.player2])</code>. See the implementation in bottom full code.</p></li>
+<li><p>finding price for a commodity (initially based on global list access <code>price[commodity]</code>) is now moved to a <em>game</em> class:</p>
+
+<pre><code>@classmethod
+def get_price(cls, commodity):
+    return cls.C_PRICES[commodity]
+</code></pre></li>
+<li><p><em>game</em> class is able to pick a commodity from the market for a player by request:</p>
+
+<pre><code>def pick_commodity(self):
+    return self._market.pop()
+</code></pre></li>
+</ul>
+
+<hr>
+
+<p><strong><code>Player</code></strong> class refactoring:</p>
+
+<ul>
+<li><p>the constructor is now also accepts <code>game</code> parameter (<code>Jaipur</code>(game) instance) as a reference for the current game the player plays in.</p>
+
+<pre><code>def __init__(self, tag, game)
+</code></pre></li>
+<li><p><code>take</code> method. It tells that the player can only pick a commodity if he hasn't already took 7 ones (<code>if self.hand_size() == 7</code>) or he can't pick from the <em>empty</em> market <code>if len(market) == 0</code>. That's a sign for <a href="https://refactoring.com/catalog/consolidateConditionalExpression.html" rel="nofollow noreferrer">Consolidate conditional</a> refactoring technique.</p></li>
+<li><p><code>sell</code> method. <code>np.argmax(self.hand)</code> is aimed to return a list of indices of maximum value. Instead we'll return a position/index of the most frequent commodity in player's hand: <code>self.hand.index(max(self.hand))</code>.<br> The method also tells that the player can not sell the costly commodity of one <code>if commodity in [DIAMOND, GOLD, SILVER] and self.hand[commodity] &lt; 2</code> and can't sell an <em>empty</em> commodity <code>if self.hand[commodity] &lt; 1</code>. That's also a sign for <a href="https://refactoring.com/catalog/consolidateConditionalExpression.html" rel="nofollow noreferrer">Consolidate conditional</a> refactoring technique. See below.</p></li>
+<li><code>make_move(self, market, winner)</code> method. Accepts/passes/assigns and returns <code>new_market</code> though it's not used neither by caller or the method itself. This method would be significantly simplified/optimized.  </li>
+</ul>
+
+<hr>
+
+<p>From theory to practice, the final version:</p>
+
+<pre><code>import random
+from enum import Enum, unique
+from itertools import cycle
+
+
+@unique
+class Commodity(Enum):
+    DIAMOND = 0
+    GOLD = 1
+    SILVER = 2
+    SILK = 3
+    SPICE = 4
+    LEATHER = 5
+
+    @classmethod
+    def is_costly(cls, val):
+        return val in [cls.DIAMOND.value, cls.GOLD.value, cls.SILVER.value]
+
+
+class Jaipur:
+    C_PRICES = [7, 6, 5, 3, 3, 1]  # DIAMOND, GOLD, SILVER, SILK, SPICE, LEATHER
+
+    def __init__(self, player1_tag, player2_tag):
+        self._market = [Commodity.DIAMOND.value] * 6 + [Commodity.GOLD.value] * 6 + [Commodity.SILVER.value] * 6 + \
+                       [Commodity.SILK.value] * 8 + [Commodity.SPICE.value] * 8 + [Commodity.LEATHER.value] * 10
+
+        self.player1 = Player(tag=player1_tag, game=self)
+        self.player2 = Player(tag=player2_tag, game=self)
+
+        self.winner = None
+        self._players_gen = cycle([self.player1, self.player2])  # cycling `players` generator
+        self.player_turn = next(self._players_gen)
+
+    @property
+    def market(self):
+        return self._market.copy()
+
+    @classmethod
+    def get_price(cls, commodity):
+        return cls.C_PRICES[commodity]
+
+    def pick_commodity(self):
+        return self._market.pop()
+
+    def play_game(self):
+        while self.winner is None:
+            self.switch_player()
+            self.game_winner()
+        else:
+            print('P1 score:', self.player1.score)
+            print('P2 score:', self.player2.score)
+            print('Winner is', self.winner)
+
+    def switch_player(self, learn=False):
+        self.player_turn.make_move()
+        self.player_turn = next(self._players_gen)
+        self.print_game()
+
+    def print_game(self):
+        print('turn: ', self.player_turn.tag)
+        print('_market: ', self._market)
+        print('player hand: ', self.player_turn.hand)
+        print('player score: ', self.player_turn.score)
+
+    def game_winner(self):
+        if len(self._market) == 0:
+            if self.player1.score &gt; self.player2.score:
+                self.winner = self.player1.tag
+            else:
+                self.winner = self.player2.tag
+        return self.winner
+
+
+class Player:
+    def __init__(self, tag, game):
+        self.tag = tag
+        self.hand = [0] * len(Commodity)
+        self.score = 0
+
+        self._game = game
+
+    def hand_size(self):
+        return sum(self.hand)
+
+    def take(self):
+        print('taking..')
+        if len(self._game.market) &gt; 0 and self.hand_size() &lt; 7:
+            taken = self._game.pick_commodity()
+            self.hand[taken] += 1
+
+    def sell(self, commodity=None):
+        print('selling..')
+        if commodity is None:
+            commodity = self.hand.index(max(self.hand))
+
+        if (Commodity.is_costly(commodity) and self.hand[commodity] &gt; 1) or self.hand[commodity] &gt; 0:
+            self.score += self.hand[commodity] * Jaipur.get_price(commodity)
+
+            if self.hand[commodity] == 3:
+                self.score += 2
+            elif self.hand[commodity] == 4:
+                self.score += 5
+            elif self.hand[commodity] &gt;= 5:
+                self.score += 9
+
+            self.hand[commodity] = 0
+
+    def make_move(self):
+        # move = int(input('0: Take, 1: Sell. Choose move..'))
+        move = random.randint(0, 1)
+        self.take() if move == 0 else self.sell()
+
+
+def play():
+    game = Jaipur('P1', 'P2')
+    game.play_game()
+
+
+play()
+</code></pre>
+    </div>

@@ -1,0 +1,202 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Main</h1>
+
+<p>Use an helper function to separate unit of work. Namely, I would use a function performing the required operations on a county and call it from main.</p>
+
+<pre><code>def main(main_directory="C:/A__P6_GIS4/"):
+    if arcpy.CheckExtension("Spatial") != "Available":
+        arcpy.AddError("Unable to get spatial analyst extension")
+        arcpy.AddMessage(arcpy.GetMessages(0))
+        sys.exit(1)
+    arcpy.AddMessage("Checking out Spatial")
+    arcpy.CheckOutExtension("Spatial")
+
+    for county in os.listdir(main_directory):
+        manage_county(main_directory, county)
+</code></pre>
+
+<p>And that's all you need in your <code>main</code>. Separating this <code>manage_county</code> function into <code>turf</code>, <code>forest</code>, <code>mixed</code> and <code>final</code> subfunctions could be a good thing to do too.</p>
+
+<p>A few things to note:</p>
+
+<ul>
+<li><code>sys.exit(0)</code> means there was no error, so better use an exit status of 1 to indicate an error;</li>
+<li><code>os.listdir</code> can be used directly to iterate over county directory, there in no need in using a file as buffer;</li>
+<li>using a parameter with default value can help with reusability/maintenance as the function can easily be tested and such value is not burried within the code;</li>
+<li>timing and debug printing can be delegated to helper functions/decorators, more on that later.</li>
+</ul>
+
+<h1>Manage_county</h1>
+
+<p>The main issue with the rest of the code, is the amount of redundant line of code one can read. Once again helper function can help reduce the amount of repetition. Loops are also a great way to perform the same operation on copious amount of filenames.</p>
+
+<p>You should also take some time to remove useless variables, such as <code>BEACH</code> which is defined, printed, tested for existence, but nothing usefull is done with it.</p>
+
+<p>You should also read <a href="https://www.python.org/dev/peps/pep-0008/" rel="nofollow noreferrer">PEP 8</a> and the official naming conventions to make the code look like Python code; and avoid needless abreviations in your variable names.</p>
+
+<p>Strings management is also a mess: there is a lot of useless call to <code>str</code> as the variables it is applied to are already strings; <code>os.path.join</code> is mainly applied to a single string, thus it is just noise; and <code>str.format</code> should be prefered to string concatenation.</p>
+
+<pre><code>FEATURE_NAME_PATTERN = '{}/{}_{}'
+FEATURE_1M_PATTERN = '{}/{}_{}_1m'
+
+
+def create_directory(root, directory_name):
+    directory = os.path.join(root, directory_name)
+    if not arcpy.Exists(directory):
+        arcpy.CreateFolder_management(root, directory_name)
+    return directory
+
+
+def create_geodatabase(root, filename):
+    file_name = os.path.join(root, filename)
+    created = False
+    if not arcpy.Exists(file_name):
+        arcpy.CreateFileGDB_management(root, filename)
+        created = True
+    return file_name
+
+
+def manage_county(root, county_name):
+    county_directory = os.path.join(root, county_name)
+    output_directory = create_directory(county_directory, 'Outputs')
+    tiff_directory = create_directory(output_directory, county_name + '_FINAL')
+
+    imputs = os.path.join(county_directory, county_name + '_Inputs.gdb') # Former CoGDB
+    temp_1m, _ = create_geodatabase(output_directory, 'Temp_1m.gdb') # Former TempGDB
+    temp_10m, _ = create_geodatabase(output_directory, 'Temp_10m.gdb') # Former Temp10GDB
+    final_10m, _ = create_geodatabase(output_directory, 'Final_10m.gdb') # Former Final_10m
+    final_1m, created = create_geodatabase(output_directory, 'Final_1m.gdb') # Former LuGDB
+    if created:
+        for feature in ['IR', 'INR', 'TCoI', 'WAT']:
+            feature_in = FEATURE_1M_PATTERN.format(inputs, county_name, feature)
+            feature_out = FEATURE_1M_PATTERN.format(final_1m, county_name, feature)
+            arcpy.Copy_management(feature_in, feature_out)
+        arcpy.Copy_management(
+            FEATURE_NAME_PATTERN.format(inputs, county_name, 'LC'),
+            FEATURE_NAME_PATTERN.format(final_1m, county_name, 'LandCover'))
+
+    arcpy.env.overwriteOutput = True
+    coord_data = FEATURE_NAME_PATTERN.format(inputs, county_name, 'Snap')
+    ir_1m_path = FEATURE_1M_PATTERN.format(final_1m, county_name, 'IR')
+    arcpy.env.outputCoordinateSystem = arcpy.Describe(coord_data).spatialReference
+    arcpy.env.workspace = temp_1m
+    arcpy.env.scratchWorkspace = temp_1m
+    arcpy.env.extent = ir_1m_path
+    arcpy.env.parallelProcessingFactor = "100%"
+    arcpy.env.snapRaster = ir_1m_path  #location of the default snap raster
+
+    #------------------------- TURF &amp; FRACTIONAL MODELS -----------------------------
+    for parcel in ['IMP', 'IMP2']:
+        arcpy.Delete_management('{}/Parcel_{}'.format(temp_1m, parcel))
+    for feature in ['INRmask', 'RTmask', 'Parcels_TURFtemp', 'Parcels_TURF', 'TURF_parcels', 'Parcels_FTGtemp', 'Parcels_FTG', 'FTG_parcels', 'TGmask', 'FTGmask', 'TURFtemp', 'FTGtemp', 'FTGtemp2', 'FTGtemp3', 'FINRtemp']:
+        arcpy.Delete_management(FEATURE_NAME_PATTERN.format(temp_1m, county_name, feature))
+    for feature in ['TG', 'TCI', 'FTG1', 'FTG2', 'FTG3', 'FINR']:
+        arcpy.Delete_management(FEATURE_1M_PATTERN.format(final_1m, county_name, feature))
+
+    # Call each function, passing the necessary variables...
+    turf_1(final_1m, county_name, temp_1m)
+    turf_2(inputs, county_name, temp_1m)
+    turf_3(inputs, county_name, temp_1m)
+    # # TURF 4: Create Parcel-based Turf and Fractional Turf Masks
+    if arcpy.Exists('{}/{}_Parcels'.format(inputs, county_name)):
+        turf_4a(inputs, county_name, temp_1m, final_1m)
+        turf_4b(inputs, county_name, temp_1m)
+        turf_4c(inputs, county_name, temp_1m)
+        turf_4d(inputs, county_name, temp_1m)
+        turf_4e(inputs, county_name, temp_1m)
+    else:
+        turf_5a(inputs, county_name, temp_1m)
+        turf_5b(inputs, county_name, temp_1m)
+    turf_6(inputs, county_name, temp_1m, final_1m)
+    frac_1(inputs, county_name, final_1m)
+    frac_2(inputs, county_name, final_1m)
+    frac_3(inputs, county_name, final_1m)
+    frac_4(inputs, county_name, final_1m)
+
+    # TURF &amp; FRACTIONAL Clean up
+    for parcel in ['IMP', 'IMP2']:
+        arcpy.Delete_management('{}/Parcel_{}'.format(temp_1m, parcel))
+    for feature in ['INRmask', 'RTmask', 'Parcels_TURFtemp', 'Parcels_TURF', 'TURF_parcels', 'Parcels_FTGtemp', 'Parcels_FTG', 'FTG_parcels', 'TGmask', 'FTGmask', 'TURFtemp', 'FTGtemp', 'FTGtemp2', 'FTGtemp3', 'FINRtemp']:
+        arcpy.Delete_management(FEATURE_NAME_PATTERN.format(temp_1m, county_name, feature))
+
+    #--------------------------------FOREST MODEL----------------------------------------
+    for feature in ['RLTCP', 'EDGE', 'CDEdge', 'URBmask', 'RURmask', 'URB_TCT', 'RUR_TCT', 'TCT1', 'nonTCT', 'potFor', 'NATnhbrs', 'ForRG', 'MOtemp', 'MOspace', 'MOherb', 'MOTrees']:
+        arcpy.Delete_management(FEATURE_NAME_PATTERN.format(temp_1m, county_name, feature))
+    for feature in ['FOR', 'MO']:
+        arcpy.Delete_management(FEATURE_1M_PATTERN.format(final_1m, county_name, feature))
+
+    for_1(inputs, county_name)
+    for_2(inputs, county_name)
+    for_3(inputs, county_name)
+    for_4(inputs, county_name)
+    for_5(inputs, county_name)
+    for_6(inputs, county_name, temp_1m, final_1m)
+    for_7(inputs, county_name)
+    for_8(inputs, county_name, temp_1m, final_1m)
+
+    #---------------------------MIXED OPEN MODEL-----------------------------------------------------
+    # MO 1: Create Mixed Open with just MOtrees and Scrub-shrub (no ancillary data)
+    inras_list_MO = [
+        name for name in ['MOBeach', 'MoLU', 'ExtLFill']
+        if arcpy.Exists(FEATURE_NAME_PATTERN.format(inputs, county_name, name))
+    ]
+
+    if not inrasListMO:
+        mo_1(inputs, county_name, temp_1m, final_1m)
+    else:
+        mo_2a(inputs, county_name, temp_1m, inras_list_MO)
+        mo_2b(inputs, county_name, temp_1m)
+        mo_2c(inputs, county_name, temp_1m)
+        mo_2d(inputs, county_name, temp_1m, final_1m)
+
+    # FOREST &amp; MIXED OPEN Clean up
+    for feature in ['RLTCP', 'EDGE', 'CDEdge', 'URBmask', 'RURmask', 'URB_TCT', 'RUR_TCT', 'TCT1', 'nonTCT', 'potFor', 'NATnhbrs', 'ForRG', 'MOtemp', 'MOspace', 'MOherb', 'MOTrees']:
+        arcpy.Delete_management(FEATURE_NAME_PATTERN.format(temp_1m, county_name, feature))
+
+    #----------------------FINAL AGGREGATION MODEL-----------------------------------------
+    final_1(inputs, county_name, temp_1m)
+    final_2(inputs, county_name, temp_1m, temp_10m, final_1m, county_directory)
+    final_3(inputs, county_name, temp_10m)
+    final_4(inputs, county_name, temp_10m)
+    final_5(inputs, county_name, temp_10m, final_10m)
+</code></pre>
+
+<p>You’ll see that there is still some repetitions, especially when deleting features from <code>temp_1m</code> before and after computations. But they are handled with less verbosity. However, I don't find any advantage in removing them both before <em>and</em> after. Either you let the file clean for the next computation, or you clean it before your own, but doing both is counter productive as one of them will yield no results. Instead, I recommend only deleting before your computation to start from a clean state and let the next computation perform its own cleanup when necessary.</p>
+
+<p>You’ll also note that I removed most of the parameters from each intermediate calls. This is because they are variable that are unnecessary for this function. Instead, it is better to define them at the beginning of each of your helper functions. This is also the reason I added <code>inputs</code> and <code>final_1m</code> (but I might have missed some) as first parameter for each of the calls. For instance, the first lines of <code>turf_1</code> can become:</p>
+
+<pre><code>def turf_1(final_1m, county_name, temp_1m):
+    INRmask = FEATURE_NAME_PATTERN.format(temp_1m, county_name, 'INRmask')
+    IR = FEATURE_1M_PATTERN.format(final_1m, county_name, 'IR')
+    INR = FEATURE_1M_PATTERN.format(final_1m, county_name, 'INR')
+    TCI = FEATURE_1M_PATTERN.format(final_1m, county_name, 'TCoI')
+    ...
+</code></pre>
+
+<h1>Timing and debug prints</h1>
+
+<p>Even though debug prints inform the user that something is going on, they disturb for development and maintenance purpose. Instead, you could reduce the amount of information printed and rely on an helper function to time the execution:</p>
+
+<pre><code>import time
+from functools import wraps
+
+
+def timer(func):
+    @wraps(func)
+    def wrapper(*args):
+        start = time.time()  # or time.perf_counter() in Python 3
+        print 'Starting', func.__name__, args
+        func(*args)
+        end = time.time()  # or time.perf_counter()
+        print 'Computation time:', end - start
+</code></pre>
+
+<p>Usage being:</p>
+
+<pre><code>@timer
+def manage_county(root, county_name):
+    # rest of the code
+</code></pre>
+
+<p>And you can decorate other functions as well to get outputs more often.</p>
+    </div>

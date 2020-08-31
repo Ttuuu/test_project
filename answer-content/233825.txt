@@ -1,0 +1,135 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Overall the code looks really nice. I like the separation with a separate <code>Difficulty</code> type instead of doing the parsing directly in <code>fetchWords</code>.</p>
+<h2>Bugs</h2>
+<p>I have found three bugs:</p>
+<h3>Crash on invalid user input</h3>
+<p>If a user enters a number that is larger than the number of characters in the string, the program will crash. This is because you use the partial<sup>1</sup> function <code>(!!)</code> without verifying its precondition that for <code>xs !! i</code>, <code>i &gt;= 0</code> and <code>i &lt; length xs</code>. This could also be solved if you used a <a href="https://hackage.haskell.org/package/safe-0.3.18/docs/Safe.html#v:atMay" rel="nofollow noreferrer">non-partial version</a> of the function which returns a <code>Maybe</code> value so you can display a better error to the user and ask them to retry.</p>
+<h3>Random crash every 3:rd execution</h3>
+<p>There is also an off-by-one error in <code>generateSecret</code>, since <code>randomRs</code> generates an inclusive range and <code>length xs</code> is not a valid index for <code>xs</code>. This will cause the program to crash randomly on average once every <code>length (fetchWords difficulty) + 1</code> times you play.</p>
+<h3>Only one random number</h3>
+<p>Speaking of randomness: the <code>randomNumber</code> function calls <a href="https://hackage.haskell.org/package/random-1.1/docs/System-Random.html#v:getStdGen" rel="nofollow noreferrer"><code>getStdGen</code></a>, which
+doesn't update the RNG state, it just fetches it. This means that all random numbers will be the same. To make it update the state, you can either use <a href="https://hackage.haskell.org/package/random-1.1/docs/System-Random.html#v:randomRIO" rel="nofollow noreferrer"><code>randomRIO</code></a> which will update the global RNG state automatically, or use <a href="https://hackage.haskell.org/package/random-1.1/docs/System-Random.html#v:newStdGen" rel="nofollow noreferrer"><code>newStdGen</code></a> which will split the RNG state to allow you to generate random numbers from pure code. In this code you don't notice it though, since you only generate a single number.</p>
+<p>The <code>randomNumber</code> function can be fixed by simplifying it to</p>
+<pre class="lang-hs prettyprint-override"><code>randomNumber :: Int -&gt; Int -&gt; IO Int
+randomNumber begin end = randomRIO (begin, end)
+</code></pre>
+<h2>Idiomatic code</h2>
+<h3>Partial functions</h3>
+<p>You use partial functions in a couple of places. Many of them can be avoided by using the principle <a href="https://lexi-lambda.github.io/blog/2019/11/05/parse-don-t-validate/" rel="nofollow noreferrer">"Parse, don't validate"</a>. In this case, all the "<code>isX</code>" functions can be replaced with <code>getX</code> functions that try to parse the data and <code>Maybe</code> returns a parsed value. The <code>createDifficulty</code> function is already such a function. This guarantees that the validation actually matches the code that uses it.</p>
+<p>Here's an example of how it could be done. I have only included the relevant functions here. The index is validated, but there is no easy way to tell which list it is a valid index for unless you use some advanced trickery<sup>2</sup>.</p>
+<pre class="lang-hs prettyprint-override"><code>import Text.Read (readMaybe)
+
+newtype ValidIndex = ValidIndex Int
+
+createDifficulty :: String -&gt; Maybe Difficulty
+createDifficulty s = lookup s [
+    ("e", Easy),
+    ("m", Medium),
+    ("h", Hard),
+    ("", Easy)
+    ]
+
+getInt :: String -&gt; Maybe Int
+getInt = readMaybe
+
+isValidIndex :: [a] -&gt; Int -&gt; Bool
+isValidIndex list idx = idx &gt;= 0 &amp;&amp; idx &lt; length list
+
+getValidIndex :: [a] -&gt; String -&gt; Maybe ValidIndex
+getValidIndex list str = do
+  idx &lt;- getInt
+  guard $ isValidIndex list idx
+  return $ ValidIndex idx
+
+getChar :: String -&gt; Maybe Char
+getChar [c] | isAlpha c = Just c
+getChar []  = Nothing
+
+promptUntil :: (String -&gt; Maybe a) -&gt; String -&gt; String -&gt; IO a
+promptUntil parser prompt failureMessage = do
+    putStr (prompt ++ "\n&gt; ")
+    input &lt;- getLine
+    case parser input of
+      Just result -&gt; return result
+      Nothing -&gt; do
+        putStrLn $ input ++ failureMessage
+        promptUntil parser prompt failure
+
+loop :: String -&gt; String -&gt; IO ()
+loop secret guess = do
+
+    putStrLn guess
+
+    pos &lt;- promptUntil (getValidIndex secret) "Enter position:" " is not a valid index."
+    c &lt;- promptUntil getChar "Enter character:" " is not a character."
+
+    let result = compareSecret secret guess pos c
+    if result /= secret then
+        loop secret result
+    else
+        return ()
+
+main = do
+    putStrLn "\n Welcome to Guess The Word!\n"
+
+    difficulty &lt;- promptUntil createDifficulty "Enter difficulty level [e/m/h] or leave empty for easy difficulty: "
+        " is not a valid difficulty."
+
+    putStrLn $ show difficulty ++ " difficulty selected."
+
+    secret &lt;- generateSecret difficulty
+
+    loop secret $ replicate (length secret) '-'
+
+    putStrLn secret
+    putStrLn "You win!"
+
+-- These functions are still partial, but we have checked their preconditions.
+replaceChar :: ValidIndex -&gt; String -&gt; Char -&gt; String
+replaceChar (ValidIndex n) s c = pre ++ [c] ++ tail post
+    where (pre, post) = splitAt n s
+
+compareSecret :: String -&gt; String -&gt; ValidIndex -&gt; Char -&gt; String
+compareSecret secret guess pos@(ValidIndex i) c =
+    if secret !! i == c then
+        replaceChar pos guess c
+    else
+        guess
+</code></pre>
+<h3>Separating business logic from generic combinators</h3>
+<p>There are some cases where you can separate the code that is specific
+to your application from generic code that could be used anywhere.</p>
+<p>For example, the <code>generateSecret</code> function can be split into a <code>pickOne</code> function:</p>
+<pre class="lang-hs prettyprint-override"><code>pickOne :: [a] -&gt; IO a
+pickOne [] = error "pickOne: Empty list"
+pickOne xs = do
+    num &lt;- randomRIO (0, length xs - 1)
+    return $ xs !! num
+
+generateSecret :: Difficulty -&gt; IO (String)
+generateSecret = pickOne . fetchWords
+
+</code></pre>
+<p>As you can see, the function is still partial, but since the word list is hard coded, we can probably assume that there is at least one word for each difficulty.</p>
+<h3>Explicit import lists</h3>
+<p>The recommended way of handling imports is to either use a qualified import like this:</p>
+<pre><code>import qualified Data.Char as Char
+
+example = Char.isDigit '2'
+</code></pre>
+<p>or use an explicit import list like this</p>
+<pre><code>import Data.Char (isDigit)
+
+example = isDigit '2'
+</code></pre>
+<p>This makes it easier for readers to see where functions come from.</p>
+<h2>Performance</h2>
+<p>Since all strings and lists are really short in this example, performance will not really be an issue. However, if the strings or lists were a lot longer, there are a few things to note. All functions that work with an index into a list are <code>O(n)</code> (instead of the <code>O(1)</code> they would be if we were working with a mutable array).</p>
+<p>Haskell has support for <a href="https://hackage.haskell.org/package/vector-0.12.0.2/docs/Data-Vector-Mutable.html" rel="nofollow noreferrer">mutable vectors</a>, but then you lose the purity that is so nice about Haskell. If you want to keep purity, you can use a <a href="https://hackage.haskell.org/package/containers-0.6.2.1/docs/Data-Map.html" rel="nofollow noreferrer"><code>Data.Map</code></a>, which has <code>O(n*log n)</code> complexity, but at the cost of a <code>O(n*log n)</code> memory cost. You could also use <code>Data.Text</code>, which still has <code>O(n)</code> complexity, but has a much more compact representation and is faster overall.</p>
+<p>Anyways, as I said, this is not really relevant for this program since <code>n</code> (the length of the lists/strings) is really small and will probably never be large.</p>
+<hr>
+<ol>
+<li>A partial function is any function that can crash</li>
+<li>For example using <a href="https://ucsd-progsys.github.io/liquidhaskell-blog/" rel="nofollow noreferrer">Liquid Haskell</a> or by using some fancy type-level trickery where the length of the list is in its type</li>
+</ol>
+    </div>

@@ -1,0 +1,64 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>As has been said in the comments, there are bits missing here for a full answer.... however some general feedback.  I'm assuming that the <code>job</code> method will be running on multiple threads.</p>
+
+<p><strong>samples</strong></p>
+
+<p>How important is it that the number of samples collected is exactly <code>reqsamples</code>?  If it's important then you need to protect <code>samples</code>.  As it stands, it's possible (although fairly unlikely) that a thread would unlock <code>lock</code> just as another thread enters the while loop, having checked the value of <code>samples</code>.  This would result in an extra sample being created and added to <code>points</code>.  It's also worth mentioning that <code>sample++</code> isn't guaranteed to be threadsafe.  If you're not going to protect it, it may be worth considering using <code>AtomicInteger</code>.</p>
+
+<p><strong>trylock</strong></p>
+
+<p>I don't really see the advantage of using <code>trylock</code> here, over just using <code>lock</code>.  If you fail to get the lock, you're simply spinning checking if enough samples have been generated / it's been shutdown.  This seems like wasted cycles that could be used elsewhere.</p>
+
+<p><strong>minimise locked time</strong></p>
+
+<p>In general, I try to keep the amount of work that's done within locks to a minimum.  Sometimes that might mean doing a bit of extra work that's wasted but the net result can be beneficial.  So, for example the generation of the <code>x</code>/<code>y</code> values and <code>dist</code> don't really need to be done during protected processing.</p>
+
+<p><strong>schedule vs sleep</strong></p>
+
+<p>I think the aversion to putting sleeps in loops is that it suggests that you're polling / performing an operation that might be handled better in another way.  Looking at the code you've written, you're essentially replacing sleep with your own more complicated implementation of it.  I don't see a benefit over using sleep here at all.</p>
+
+<p><strong>sampledelay</strong></p>
+
+<p>So, on the face of it, it looks like <code>sampledelay</code> is supposed to be how long to wait before generating the next sample.  This would be fine if only one thread is running the <code>job</code> method.  However, if you've got multiple threads running it, then the behaviour is going to be somewhat unpredictable since it's really telling each thread how long to wait before it starts trying to create the next sample (which might mean that multiple threads generate a sample close to each other, then they all wait for <code>sampledelay</code> then you get another batch of samples).  This may(not) be what you're expecting.  For the below, I'll assume that it is...</p>
+
+<p><strong>Tweaked version</strong></p>
+
+<p>Putting it together, you might end up with some code more like this:</p>
+
+<pre><code>private void job() {
+    // Keep looping until we're done
+    while (samples.get() &lt; reqsamples &amp;&amp; started) {
+        // Generate the sample information outside the lock,
+        // worst case each thread discards one.
+        double x = 500 * random.nextDouble();
+        double y = 500 * random.nextDouble();
+
+        double dist = Math.hypot(x, y);
+        Point newPoint = new Point((int) x, (int) y);
+
+        try {
+            lock.lock();
+            // Now that we have the lock, check if we still need to actually
+            // use our sample
+            if (samples.get() &lt; reqsamples &amp;&amp; started) {
+                points.add(newPoint);
+
+                samples.incrementAndGet();
+                if (dist &lt; 500) innersamples++;
+                else outersamples++;
+            }
+        } finally {
+            lock.unlock();
+        }
+
+        // Only need to sleep if we're not done already
+        if (sampledelay &gt; 0 &amp;&amp; (samples.get() &lt; reqsamples &amp;&amp; started)) {
+            try {
+                Thread.sleep(sampledelay * 1000);
+            } catch (InterruptedException ex) {
+            }
+        }
+    }
+}
+</code></pre>
+    </div>

@@ -1,0 +1,193 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Observations</h2>
+<p>Your rule of 5 implementation is basically wrong. You are implement copy operations for both copy and move (which means you may as well not have the move operations).</p>
+<p>Your destructor is not doing any real work and thus adding unneeded code.</p>
+<p>Your swap function does not work as expected as it can not be used with  Koenig lookup (ADL) and thus in most standard library would be replaced with <code>std::swap</code> resulting in a sub optimal swap.</p>
+<h2>Details</h2>
+<p>Here I don't see the need for creating a temporary.</p>
+<pre><code>    //Move constructor
+    Test(Test&amp;&amp; other) noexcept {
+        Test temp(other);
+        swap(*this, temp);
+    }
+</code></pre>
+<p>By creating the temporary your move is basically just as expensive as your copy. The whole point of the move is that it is cheap.</p>
+<p>I would simply swap the current with <code>other</code>.</p>
+<pre><code>    //Move constructor
+    Test(Test&amp;&amp; other) noexcept {
+        swap(other);
+    }
+</code></pre>
+<p>After the move construction the content of <code>other</code> has no guaranteed state (only that it is valid). Since you define <code>m_size</code> and <code>m_buffer</code> to auto initialize the current <code>this</code> is in a valid state and can simply be swapped with <code>other</code>.</p>
+<pre><code>    // Note I usually define a `noexcept` swap method.
+
+    void swap(Test&amp; other) noexcept {
+        using std::swap;
+        swap(m_size,   other. m_size);
+        swap(m_buffer, other. m_buffer);
+    }
+</code></pre>
+<p>I also define <code>swap()</code> with two parameters as a free standing function that simply calls the swap method. This is because the compiler can using Koenig lookup (ADL) to find the correct swap function.</p>
+<pre><code>    void swap(Test&amp; lhs, Test&amp; rhs) {
+        lhs.swap(rhs);
+    }
+</code></pre>
+<hr>
+<p>The Copy assignment is sub optimal.</p>
+<pre><code>    //Assignment operator
+    Test&amp; operator=(Test other) {
+        if(this != &amp;other) {
+            swap(*this, other);
+        }
+        return *this;
+    }
+</code></pre>
+<p>Since the parameter <code>other</code> is created via a copy construction it is guaranteed not to be the same as <code>this</code>. Thus the test <code>if(this != &amp;other)</code> is just a pessimization as it is not needed.</p>
+<hr>
+<p>Again you perform a copy during the move assignment.</p>
+<pre><code>    //Move assignment operator
+    Test&amp; operator=(Test&amp;&amp; other) noexcept {
+        if(this != &amp;other) {
+            Test temp(other);
+            swap(*this, temp);
+        }
+        return *this;
+    }
+</code></pre>
+<p>This defeats the purpose of the move (as it is supposed to be cheaper than a copy). You can simply swap <code>this</code> and <code>other</code> as they should both be valid.</p>
+<pre><code>    Test&amp; operator=(Test&amp;&amp; other) noexcept {
+        swap(other);
+        return *this;
+    }
+</code></pre>
+<p>No need to check for self assignment as this is a pessimization of the normal more common situation. Even of they are the same object the swap will work correctly.</p>
+<hr>
+<p>The destructor is useless:</p>
+<pre><code>    //Destructor
+    ~Test() {
+        m_size = 0;
+        m_buffer = nullptr;
+    }
+</code></pre>
+<p>The member: <code>m_buffer</code> will correctly clean up the memory.</p>
+<hr>
+<p>Making this a static member is not doing you any favors as it prevents Koenig lookup (ADL).</p>
+<pre><code>    static void swap(Test&amp; first, Test&amp; second) noexcept{
+        using std::swap;
+        swap(first.m_size, second.m_size);
+        swap(first.m_buffer, second.m_buffer);
+    }
+</code></pre>
+<p>Make this a free standing function:</p>
+<pre><code>namespace PL
+{
+
+class TestStatic
+{
+    public:
+        static void swap(TestStatic&amp; lhs, TestStatic&amp; rhs) noexcept
+        {}
+};
+
+
+class TestFreeStand
+{
+    public:
+};
+void swap(TestFreeStand&amp; lhs, TestFreeStand&amp; rhs) noexcept
+{}
+
+}
+
+
+int main()
+{
+    PL::TestStatic      staticA;
+    PL::TestStatic      staticB;
+
+    swap(staticA, staticB);
+
+
+    PL::TestFreeStand   freeStandA;
+    PL::TestFreeStand   freeStandB;
+
+    swap(freeStandA, freeStandB);
+}
+</code></pre>
+<p>Notice the only compilation error here is: <code>swap(staticA, staticB);</code></p>
+<p>This means that if you add <code>using std::swap;</code> this code will now compile but it will not use your <code>static void swap()</code> method it will use <code>std::swap</code> which makes a copy of the object. The point of writing your own version of swap is that you are providing an optimization over the standard swap.</p>
+<h2>Better Implementation</h2>
+<pre><code>#include &lt;cstring&gt;
+#include &lt;memory&gt;
+#include &lt;utility&gt;
+
+namespace Testing
+{
+
+    class Test
+    {
+        public:
+            // Default constructor
+            Test() = default;
+        
+            // Parametrized constructor
+            Test(std::size_t len, const char* data)
+                : m_size(len)
+                , m_buffer(new char[len]())
+            {
+                // Should validate the input here.
+                // It is the only time you get outside input.
+                // Potentially you could throw here I choose
+                // not too (because I can see it as a valid input)
+                // Your use case may be different.
+                if (data) {
+                    strncpy(m_buffer.get(), data, m_size);
+                }
+            }
+    
+            // Copy constructor
+            Test(const Test&amp; other)
+                : m_size(other.m_size)
+                , m_buffer(new char[m_size]())
+            {
+                strncpy(m_buffer.get(), other.m_buffer.get(), m_size);
+            }     
+        
+            // Copy Assignment operator
+            Test&amp; operator=(Test other)
+            {
+                swap(other);
+                return *this;
+            }
+    
+            // Move constructor
+            Test(Test&amp;&amp; other) noexcept
+            {
+                swap(other);
+            }
+        
+            // Move assignment operator
+            Test&amp; operator=(Test&amp;&amp; other) noexcept
+            {
+                swap(other);
+                return *this;
+            }
+        
+            void swap(Test&amp; rhs) noexcept
+            {
+                using std::swap;
+                swap(m_size,    rhs.m_size);
+                swap(m_buffer,  rhs.m_buffer);
+            }
+        private:
+            std::size_t m_size = 0;    
+            std::unique_ptr&lt;char[]&gt; m_buffer = nullptr;
+    };
+    
+    void swap(Test&amp; lhs, Test&amp; rhs) noexcept
+    {
+        lhs.swap(rhs);
+    }
+}
+</code></pre>
+    </div>

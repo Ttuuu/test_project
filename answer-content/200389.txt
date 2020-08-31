@@ -1,0 +1,338 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I got some speedup by replacing <code>pow(u,2)</code> with <code>u * u</code>. Time for <code>i == 0</code> went from 33 sec to 26 sec.</p>
+
+<p>It can be noted that <code>pdf(u)</code> is <code>h</code> <em>invariant</em> [unlike <code>cdf(h - u)</code>].</p>
+
+<p>So, at each integral level <code>pdf(u)</code> can be <em>cached</em> and <em>only</em> calculated once.  This is akin to <em>memoization</em> in dynamic programming.</p>
+
+<p>By doing this, I reduced the runtime to 12 sec. That is, it is 2.75x faster than the original</p>
+
+<p>Note that on the first call to <code>pdf(u)</code>, <code>u</code> will be 0. It follows the sequence: <code>0, du, 2*du, ..., iter*du</code> where <code>iter</code> is the iteration index of the loop.</p>
+
+<p>This is true <em>regardless</em> of what level integral we're calculating. The <code>pdf</code> sequence will <em>always</em> be the same.</p>
+
+<p>So, we can keep track of the largest <code>iter</code> index we've seen. If the current index is greater than the largest, we do: <code>pdf_cache[iter] = pdf(u)</code>. Otherwise, we use <code>pdf_cache[iter]</code>.</p>
+
+<p>See the code below for full details.</p>
+
+<p>As a possible alternative, the <code>pdf_cache</code> array could be fully precalculated <em>once</em> before starting <em>anything</em>. Then, <em>all</em> usage of <code>pdf(u)</code> could be replaced with <code>pdf_cache[i]</code>.</p>
+
+<p>This could be done in <code>main</code> before its <code>for</code> loop as <code>pdf_cache</code> will be the same no matter what <code>main</code>'s values for <code>i</code> or <code>gammath</code> (aka <code>h</code>) are.</p>
+
+<p>Further, this precalculation could be split up amongst multiple cores if needed.</p>
+
+<p>Also, if <code>openmp</code> is used within <code>integ</code> [as others have suggested], the full precalculation would probably be necessary to prevent interthread write contention.</p>
+
+<p><strong>Edit:</strong> I added this version as an update at the bottom</p>
+
+<hr>
+
+<p>Here is the code. Please pardon the C-like stuff. This is also a prototype level.</p>
+
+<pre><code>#include &lt;iostream&gt;
+#include &lt;cmath&gt;
+#include &lt;stdio.h&gt;
+#include &lt;time.h&gt;
+
+double
+tvgetf(void)
+{
+    struct timespec ts;
+    double sec;
+
+    clock_gettime(CLOCK_REALTIME,&amp;ts);
+    sec = ts.tv_nsec;
+    sec /= 1e9;
+    sec += ts.tv_sec;
+
+    return sec;
+}
+
+#define inline_always   static inline __attribute__((__always_inline__))
+
+// NOTE: the size of pdf_cache is _hardwired_. The max size _can_ be calculated
+// and this can become a pointer to an allocated area
+int pdf_max;
+float pdf_cache[10000000];
+
+inline_always float
+pdf(float u)
+{
+    //u += 1;
+    return (1 / (u * u));
+}
+
+inline_always float
+cdf(float u)
+{
+    u += 1;
+    return (1 - 1 / (u));
+}
+
+inline_always float
+pdfx(float u,int i)
+{
+    //u += 1;
+    if (i &gt; pdf_max) {
+        pdf_cache[i] = pdf(u);
+        pdf_max = i;
+    }
+    return pdf_cache[i];
+}
+
+// The main function that implements the numerical integration,
+//and it is a recursive function
+float
+integ(float h, int k, float du)
+{
+    float res = 0;
+    float u = 1;
+    int i;
+
+    int iter = h / du;
+
+    k -= 1;
+
+    h += 1;
+
+    if (k == 1) {
+        for (i = 0;  i &lt; iter;  ++i) {
+            res += cdf(h - u) * pdfx(u,i) * du;
+            u += du;
+        }
+    }
+    else {
+        for (i = 0;  i &lt; iter;  ++i) {
+            res += integ(h - u, k, du) * pdfx(u,i) * du;
+            u += du;
+        }
+    }
+
+    return res;
+}
+
+// The main function that implements the numerical integration,
+//and it is a recursive function
+float
+integ_top(float h, int k, float du)
+{
+    float res = 0;
+
+    pdf_max = -1;
+
+    if (k == 1)
+        res = cdf(h);
+    else
+        res = integ(h,k,du);
+
+    return res;
+}
+
+int
+main()
+{
+    float du = 0.0001;
+    int K = 3;
+
+    float gamma[4] = { 0.31622777, 0.79432823,
+        1.99526231, 5.01187234
+    };
+    int G = 50;
+    int Q = 2;
+
+    for (int i = 0; i &lt; 4; i++) {
+        if ((G - Q * (K - 1)) &gt; 0) {
+            float gammath = (gamma[i] / Q) * (G - Q * (K - 1));
+
+            double tvbeg = tvgetf();
+            double rtn = 1 - integ_top(gammath, K, du);
+            //std::cout &lt;&lt; 1 - integ(gammath, K, du) &lt;&lt; endl;
+            double tvdif = tvgetf() - tvbeg;
+
+            printf("i=%d rtn=%f tvdif=%.9f\n",i,rtn,tvdif);
+            fflush(stdout);
+        }
+    }
+
+    return 0;
+}
+</code></pre>
+
+<hr>
+
+<p>This technique may have some roundoff error as I ran the original and got:</p>
+
+<pre><code>i=0 rtn=0.418665 tvdif=27.172003746
+i=1 rtn=0.183092 tvdif=168.498732328
+</code></pre>
+
+<p>The cached version output was:</p>
+
+<pre><code>i=0 rtn=0.418630 tvdif=13.691759109
+i=1 rtn=0.183040 tvdif=85.953905582
+i=2 rtn=0.070858 tvdif=526.217260361
+</code></pre>
+
+<p>This might be alleviated by using <code>double</code> for the <code>pdf_cache</code> array</p>
+
+<hr>
+
+<p><strong>UPDATE:</strong></p>
+
+<p>Here is a version that precalculates the <code>pdf_cache</code> values (again, please pardon the C-like stuff):</p>
+
+<pre><code>#include &lt;iostream&gt;
+#include &lt;cmath&gt;
+#include &lt;stdio.h&gt;
+#include &lt;time.h&gt;
+
+double
+tvgetf(void)
+{
+    struct timespec ts;
+    double sec;
+
+    clock_gettime(CLOCK_REALTIME,&amp;ts);
+    sec = ts.tv_nsec;
+    sec /= 1e9;
+    sec += ts.tv_sec;
+
+    return sec;
+}
+
+#define inline_always   static inline __attribute__((__always_inline__))
+
+// NOTE: the size of pdf_cache is _hardwired_. The max size _can_ be calculated
+// and this can become a pointer to an allocated area
+int pdf_max;
+float *pdf_cache;
+
+inline_always float
+pdf(float u)
+{
+    //u += 1;
+    return (1 / (u * u));
+}
+
+inline_always float
+cdf(float u)
+{
+    u += 1;
+    return (1 - 1 / (u));
+}
+
+inline_always float
+pdfx(float u,int i)
+{
+    //u += 1;
+    if (i &gt; pdf_max) {
+        pdf_cache[i] = pdf(u);
+        pdf_max = i;
+    }
+    return pdf_cache[i];
+}
+
+// The main function that implements the numerical integration,
+//and it is a recursive function
+float
+integ(float h, int k, float du)
+{
+    float res = 0;
+    float u = 1;
+    int i;
+
+    int iter = h / du;
+
+    k -= 1;
+
+    h += 1;
+
+    if (k == 1) {
+        for (i = 0;  i &lt; iter;  ++i) {
+            res += cdf(h - u) * pdf_cache[i] * du;
+            u += du;
+        }
+    }
+    else {
+        for (i = 0;  i &lt; iter;  ++i) {
+            res += integ(h - u, k, du) * pdf_cache[i] * du;
+            u += du;
+        }
+    }
+
+    return res;
+}
+
+// The main function that implements the numerical integration,
+//and it is a recursive function
+float
+integ_top(float h, int k, float du)
+{
+    float res = 0;
+
+    if (k == 1)
+        res = cdf(h);
+    else
+        res = integ(h,k,du);
+
+    return res;
+}
+
+int
+main()
+{
+    float du = 0.0001;
+    int K = 3;
+
+    float gamma[4] = { 0.31622777, 0.79432823,
+        1.99526231, 5.01187234
+    };
+    int G = 50;
+    int Q = 2;
+
+    float maxgam = 0;
+    int initflg = 1;
+    for (int i = 0; i &lt; 4; i++) {
+        if ((G - Q * (K - 1)) &gt; 0) {
+            float gammath = (gamma[i] / Q) * (G - Q * (K - 1));
+            printf("i=%d gammath=%f\n",i,gammath);
+
+            if (initflg) {
+                maxgam = gammath;
+                initflg = 0;
+                continue;
+            }
+
+            if (gammath &gt; maxgam)
+                maxgam = gammath;
+        }
+    }
+
+    pdf_max = maxgam / du;
+    printf("pdf_max=%d\n",pdf_max);
+    pdf_cache = (float *) malloc(sizeof(*pdf_cache) * pdf_max);
+
+    float u = 1;
+    for (int i = 0;  i &lt; pdf_max;  ++i) {
+        pdf_cache[i] = pdf(u);
+        u += du;
+    }
+
+    for (int i = 0; i &lt; 4; i++) {
+        if ((G - Q * (K - 1)) &gt; 0) {
+            float gammath = (gamma[i] / Q) * (G - Q * (K - 1));
+
+            double tvbeg = tvgetf();
+            double rtn = 1 - integ_top(gammath, K, du);
+            //std::cout &lt;&lt; 1 - integ(gammath, K, du) &lt;&lt; endl;
+            double tvdif = tvgetf() - tvbeg;
+
+            printf("i=%d rtn=%f tvdif=%.9f\n",i,rtn,tvdif);
+            fflush(stdout);
+        }
+    }
+
+    return 0;
+}
+</code></pre>
+    </div>

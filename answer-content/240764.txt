@@ -1,0 +1,134 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Your code seems very dense; I see a mix of <code>snake_case</code> and <code>camelCase</code> identifiers, and a lot of code comments that somehow manage to be very detailed and technical and yet make my eyes glaze over. Like this:</p>
+
+<pre><code>    // Restructuring the strong pointers: getting all the positions greater than pos
+    auto it = contiguous_memory_to_multimap.upper_bound(pos);
+    std::unordered_set&lt;size_t&gt; toInsert;
+    std::map&lt;size_t, std::unordered_set&lt;size_t&gt;&gt; contiguous_memory_to_multimap2; // Decreased map values
+    while (it != contiguous_memory_to_multimap.end()) {
+        for (const size_t&amp; strong : it-&gt;second) {
+            toInsert.emplace(strong); // Getting all the strong pointers pointing at values greater than
+        }
+        contiguous_memory_to_multimap2[it-&gt;first-1] = it-&gt;second; // Decreasing the key for all the values
+        it = contiguous_memory_to_multimap.erase(it);
+    }
+</code></pre>
+
+<p>I'm sure those comments are meant to be helpful, but they really don't clarify what's going on in this code at all. Just removing all the comments and mechanically translating the code line by line, I get something like this:</p>
+
+<pre><code>    auto first = contiguous_memory_to_multimap.upper_bound(pos);
+    auto last = contiguous_memory_to_multimap.end();
+    std::unordered_set&lt;size_t&gt; toInsert;
+    std::map&lt;size_t, std::unordered_set&lt;size_t&gt;&gt; decreased;
+    for (const auto&amp; [k, ptrs] : make_range(first, last)) {
+        toInsert.insert(ptrs.begin(), ptrs.end());
+        decreased.emplace(k-1, ptrs);
+    }
+    contiguous_memory_to_multimap.erase(first, last);
+</code></pre>
+
+<p>(Here <code>make_range(first, last)</code> is a helper function that returns a lightweight view over those elements, like <a href="https://en.cppreference.com/w/cpp/ranges/subrange" rel="nofollow noreferrer">C++20 <code>std::ranges::subrange</code></a>.)</p>
+
+<hr>
+
+<p>I notice there's a circular dependency between <code>weak_pointer</code> and <code>repository</code>. You broke the dependency by forward-declaring <code>template&lt;class&gt; class repository;</code> at the top of "weak_pointer.h". However, forward declarations aren't really so great for maintainability — what if you wanted to add a second (defaulted?) template parameter to <code>repository</code>?</p>
+
+<p><a href="https://www.youtube.com/watch?v=fzFOLsFASjU" rel="nofollow noreferrer">John Lakos has a bunch of material on this.</a> What I'd do here is parameterize <code>weak_pointer</code> on a <code>Repository</code> type parameter:</p>
+
+<pre><code>template&lt;class T, class Repository&gt;
+class weak_pointer {
+    Repository *element;
+    size_t strong_ptr_pos;
+</code></pre>
+
+<p>Then in "repository.h":</p>
+
+<pre><code>template&lt;class T&gt;
+class repository {
+    using pointer = weak_pointer&lt;T, repository&lt;T&gt;&gt;;
+
+    template&lt;class... Args&gt; pointer new_element(Args&amp;&amp;...);
+    template&lt;class... Args&gt; pointer&amp; set_new_element(pointer&amp;, Args&amp;&amp;...);
+</code></pre>
+
+<p>and so on. Ta-da, no more circular dependency!</p>
+
+<hr>
+
+<p>Your <code>T *operator-&gt;()</code> should be const-qualified.</p>
+
+<p>Your <code>resolveStrongPonter()</code> is misspelled, and completely unused, and should have been const-qualified, too. (But since it's unused, you should delete it instead.)</p>
+
+<p>Your <code>getReferenceCounterToVal()</code> is also unused, and should have been const-qualified.</p>
+
+<p>Your <code>operator&lt;&lt;</code> <em>could</em> be written slightly more tersely as</p>
+
+<pre><code>friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; os, const weak_pointer&amp; wptr) {
+    if (T *p = wptr.get()) {
+        os &lt;&lt; *p;
+    } else {
+        os &lt;&lt; "null";
+    }
+    return os;
+}
+</code></pre>
+
+<hr>
+
+<p>I see you're using <code>std::optional&lt;size_t&gt;</code>, which must store a <code>size_t</code> <em>and</em> a <code>bool</code>, which is a lot of wasted memory. You'd get a 50% memory savings by using a plain old <code>size_t</code> where <code>size_t(-1)</code> means "null." Just watch out and don't type <code>sizeof(-1)</code> when you mean <code>size_t(-1)</code>, as I just almost did. :)</p>
+
+<p>For extra bonus points, implement a <code>class StrongPointer { size_t data; }</code> with implicit conversion from <code>nullptr_t</code> and so on.</p>
+
+<hr>
+
+<pre><code>void clear() {
+    // By deallocating in this order, I guarantee that all the information is freed in the right order, thus avoiding
+    // sigfaults from mutual dependencies within the data structures
+    contiguous_memory_to_multimap.clear();
+    strong_pointers.clear();
+    contiguous_memory_reference_count.clear();
+    contiguous_memory.clear();
+}
+</code></pre>
+
+<p>First of all, you're just clearing things in reverse order of their construction, which means this is exactly what the compiler-generated destructor would do anyway. Second of all, there cannot be any "mutual dependencies" between elements of those data structures, because they're all just simple value types. Clearing the contents of one container cannot possibly affect the contents of any other container.</p>
+
+<p>So, you can eliminate your non-defaulted <code>~repository()</code>. The defaulted destructor is fine.</p>
+
+<p>You can also eliminate the misleading comment. (And btw, it's "segfault," as in "segmentation fault" — not "sigfault.")</p>
+
+<hr>
+
+<pre><code>strong_pointers.emplace_back();
+</code></pre>
+
+<p>I'd prefer to see</p>
+
+<pre><code>strong_pointers.push_back(std::nullopt);
+</code></pre>
+
+<p>or, if you use my <code>class StrongPointer</code> idea, you could just write</p>
+
+<pre><code>strong_pointers.push_back(nullptr);
+</code></pre>
+
+<hr>
+
+<pre><code>const std::optional&lt;size_t&gt;&amp; oleft = strong_pointers[left], &amp;oright = strong_pointers[right];
+</code></pre>
+
+<p>Pop quiz, hotshot: What is the const-qualification of <code>oright</code>?</p>
+
+<p>Avoid multiple declarations on the same line. Instead, write two lines:</p>
+
+<pre><code>const StrongPointer&amp; oleft = strong_pointers[left];
+const StrongPointer&amp; oright = strong_pointers[right];
+</code></pre>
+
+<p>Even if you don't use <code>class StrongPointer</code>, consider adding a member typedef</p>
+
+<pre><code>using StrongPointer = std::optional&lt;size_t&gt;;
+</code></pre>
+
+<p>Anyway, that's probably enough for a first review.</p>
+    </div>

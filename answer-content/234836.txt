@@ -1,0 +1,105 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I don't know much about C#, so this answer will focus solely on generic stuff. Performance problems in image processing applications usually happen inside loops over all pixels. I'm focusing on this section of the code:</p>
+
+<pre><code>for (int x = 0; x &lt; tempImg.Width; x++)
+{
+    for (int y = 0; y &lt; tempImg.Height; y++)
+    {
+        double distence = GetDistance(absPos.X, absPos.Y, x, y); //Distence from pixel to cursor
+        int pixelIndex = x * 4 + y * imgRawData.Stride;
+
+            for (int i = 0; i &lt; 3; i++)
+            {
+                if (distence &gt; rgbValues[pixelIndex + i])
+                {
+                    rgbValues[pixelIndex + i] = 0; //Sets pixel to black
+                }
+                else
+                {
+                    rgbValues[pixelIndex + i] -= (byte)distence; //Reduce pixel brightness                                                         
+                }
+            }
+    }
+}
+</code></pre>
+
+<p>You loop over all pixels, but only do something for those pixels close to <code>absPos</code>. The maximum distance over which your filter will have effect is 255, assuming that <code>rgbValues</code> is an 8-bit unsigned integer. Outside of that range, you always set pixels to 0.
+Thus, you can loop over only those pixels within that range: <code>x</code> goes from <code>max(absPos.X - 255, 0)</code> to <code>min(absPos.X + 255, tempImg.Width - 1)</code>, and similarly for the y-coordinate (maybe this is <code>Math.Max</code> and <code>Math.Min</code> in C#?). Outside of that range simply fill with zeros.</p>
+
+<p>Next, <code>GetDistance</code> computes the square root, which is quite expensive. It is a lot cheaper to compute the square of a value. We also know that if <code>a &lt; b</code>, then <code>a*a &lt; b*b</code>. So instead write a function <code>GetSquareDistance</code>, which returns <code>Math.Pow((x2 - x1), 2) + Math.Pow((y2 - y1), 2)</code>, and compare the square distance to the square of the pixel's value. By not computing the square root, all operations can be done as integers, which might or might not be faster.</p>
+
+<p>This function <code>GetSquareDistance</code> can actually be further improved by computing <code>Math.Pow((y2 - y1), 2)</code> once outside the loop over <code>x</code>, then adding only the square of the x-difference inside the loop.</p>
+
+<p>Finally, the innermost <code>if</code> statement also duplicates work. I presume that a good optimizing compiler will correct this, but in principle <code>distence &gt; rgbValues[pixelIndex + i]</code> computes the difference and compares to 0, then inside the loop you again compute the same difference. Using a <code>max</code> function would improve this conditional statement:</p>
+
+<pre><code>int diff = (int)rgbValues[pixelIndex + i] - (int)distence;
+rgbValues[pixelIndex + i] = (byte)max(diff, 0); // again, maybe Math.Max?
+</code></pre>
+
+<p>(using <code>int</code> in case integer subtraction is faster than floating-point subtraction.)</p>
+
+<hr>
+
+<p>Another issue I've just noticed: You loop over <code>y</code> in the inner loop, and over <code>x</code> in the outer loop. If you reverse these two loops, then the array will be accessed in storage order (<code>pixelIndex = x * 4 + y * imgRawData.Stride</code> will increase monotonically). With this access pattern, the cache will be used optimally, and the code should be quite a bit faster.</p>
+
+<p>The code would look like this (not tested, sorry for any typo):</p>
+
+<pre><code>int firstX = max(absPos.X - 255, 0); // max and min could be Math.Max and Math.Min?
+int lastX = min(absPos.X + 255, tempImg.Width - 1) + 1;
+int firstY = max(absPos.Y - 255, 0);
+int lastY = min(absPos.Y + 255, tempImg.Height - 1) + 1;
+int pixelIndex = 0;
+for (int y = 0; y &lt; firstY; y++)
+{
+    SetRowToZero(rgbValues + pixelIndex, tempImg.Width); // This function iterates over a line of the image and sets it to 0
+    pixelIndex += imgRawData.Stride;
+}
+for (int y = firstY; y &lt; lastY; y++)
+{
+    int yDistance2 = absPos.Y - y;
+    yDistance2 = yDistance2 * yDistance2;
+
+    SetRowToZero(rgbValues + pixelIndex, firstX); // Here the function sets the first set of pixels in the line to 0
+
+    int index = pixelIndex + firstX * 4;
+    for (int x = firstX; x &lt; lastX; x++)
+    {
+        int xDistance2 = absPos.X - x;
+        xDistance2 = xDistance2 * xDistance2;
+        int distance2 = xDistance2 + yDistance2;
+        for (int i = 0; i &lt; 3; i++)
+        {
+            int value2 = rgbValues[index + i];
+            value2 = value2 * value2 - distance2;
+            if (value2 &lt;= 0)
+            {
+                rgbValues[index + i] = 0; // Sets pixel to black
+            }
+            else
+            {
+                rgbValues[index + i] = (byte)Math.Sqrt(value2); // Reduce pixel brightness                                                         
+            }
+        }
+        index += 4;
+    }
+
+    SetRowToZero(rgbValues + index, tempImg.Width - lastX); // Here the function sets the last set of pixels in the line to 0
+
+    pixelIndex += imgRawData.Stride;
+}
+for (int y = lastY; y &lt; tempImg.Height; y++)
+{
+    SetRowToZero(rgbValues + pixelIndex, tempImg.Width);
+    pixelIndex += imgRawData.Stride;
+}
+</code></pre>
+
+<hr>
+
+<p>Additional comments:</p>
+
+<ol>
+<li><p>Typo: "distence" should be "distance"</p></li>
+<li><p>Don't leave commented-out code in your source files. They tend to be confusing. If you do, at least add a clear bit of comment text to indicate <strong>why</strong> the code is commented out.</p></li>
+</ol>
+    </div>

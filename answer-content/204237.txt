@@ -1,0 +1,190 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Ok, let's start from the top: Is this a mediator pattern?</p>
+
+<p>I'd argue what you have is 2 components of a mediator pattern (2 objects that interact) <em>without</em> an actual mediator. To just quote the first line of the wiki entry for the mediator pattern:</p>
+
+<blockquote>
+  <p>In software engineering, the mediator pattern defines an object that encapsulates how a set of objects interact.</p>
+</blockquote>
+
+<p>So it's an object encapsulating interactions between a set of objects. What you're doing is creating 2 types that interact, and because it's modelled on a teacher/student example, where students are quite passive, you're calling the teacher the mediator. However: how does the teacher encapsulate how a set of objects (ie the students) interact? It doesn't.</p>
+
+<p>This isn't a bad thing, though, as you're probably coming from another, more classically OOP language, and you're trying to replicate what you're used to in go. That's a common mistake people make. Go is not a classical OO language, though. It doesn't have classes, yet has (ducktype/implicit) interfaces. It doesn't have inheritance, but has composition. It doesn't have exceptions, it doesn't have a specific things like static properties, or static methods. So please, don't force yourself to stick to the classical OO patterns. Use the freedom and expressive power Go brings through it's slightly different type system.</p>
+
+<p>Other criticisms I have directly relating to your code:</p>
+
+<pre><code>func (a *ClassMate) Class() string {
+   return a.forum
+}
+</code></pre>
+
+<p>Why use a pointer receiver here? This is basically making what <em>should</em> be a perfectly safe function unsafe. Imagine:</p>
+
+<pre><code>go func() {
+   student.forum = "some random message"
+}()
+fmt.Printf("student says: %s", student.Forum()) // or whatever
+</code></pre>
+
+<p>What is the output going to be? Can you be sure it's always going to be the same?</p>
+
+<p>The same applies to the <code>Learned()</code> func for the student and <code>Spread(messqger string)</code> for the teacher/<em>"Mediator"</em>. Especially the teacher, in fact. The <code>Spread</code> function might be fired off concurrently, as it may take some time to return. If you imagine a scenario where someone ends up doing something like this:</p>
+
+<pre><code>go teacher.Spread("some really important life-lesson")
+teacher.TeachTo(anotherStudent)
+// and some more calls like this
+teacher.TeachTo(anotherStudent2)
+teacher.TeachTo(anotherStudent3)
+</code></pre>
+
+<p>How confident are you that the result of the code above will be reliable and reproducible? I'd much rather have a copy of the slice head available to me at the point where the call is made, rather than to rely on the behaviour of a <code>range</code> loop. The moment you add some checks, or other logic in the <code>Spread</code> function, you're at risk of the behaviour changing.</p>
+
+<p>Lastly, as noted in my comment: <code>TeachesTo(c *Student)</code> is invalid code. <code>Student</code> is an interface type, there is no pointer-to-interface type. It's either a pointer to a type implementing said interface, or the interface itself.</p>
+
+<hr>
+
+<p>Moving on from the code itself, and more into more general comments/suggestions on how to approach things in a more idiomatic golang type of way.</p>
+
+<p>I can't help noticing you're calling this an awful lot in succession:</p>
+
+<pre><code>teacher.TeachesTo(student)
+</code></pre>
+
+<p>Golang supports for variadic arguments, just pass in all the students at once. The name of the func is also quite misleading. If I see <code>TeachesTo</code>, I expect the call to actually interact with the object I'm passing in, as and when I pass it in. I don't expect a later call to <code>Spread</code> to actually perform the action. I'm expecting to be able to call <code>TeachesTo</code>, and be done with it. I'd change the <code>Mediator</code> interface to a <code>Classroom</code> or <code>Course</code> interface along the lines of:</p>
+
+<pre><code>type Course struct {
+    EnterTeacher(t Teacher) error // Teacher being an interface
+    EnterStudents(s ...Student) error // variadic, only requires a single call
+    AddLesson(data []string) error // using []string, but probably should be structured
+    StartLesson() error
+    TeacherLeave() error
+    StudentsLeave() error
+    EndLesson() error
+    GetComplaints() []string // complain type?
+    GetBannedStudents() []Student
+    GetScores() map[string]float64 // results by student name?
+    // and so on...
+}
+</code></pre>
+
+<p>Now we actually have a mediator. We just add a teacher, add one or more lessons, we can start/stop lessons, get some kind of state (like scores, banned students, complaints about the way the teacher interacts with the students etc...</p>
+
+<p>The implementation could be a simple thing like:</p>
+
+<pre><code>type course struct {
+    name       string
+    t          Teacher
+    s          []Student
+    lessons    []Lesson // create a type that's fitting
+    day        int // can be used as offset in lessons
+    scores     map[string]float64
+    complaints []string
+    banned     map[string]Student
+}
+</code></pre>
+
+<p>Other repercussions of this approach: you'll notice both the type and the fields are <em>not</em> exported. That's how it should be: the whole point of a mediator is that you encapsulate the way objects interact. You shouldn't leave them exposed to external interaction, for that very reason.</p>
+
+<p>Usage, quite simple</p>
+
+<pre><code>package school // or whatever
+
+// google functional options if this is confusing you
+type CourseOption func (c *course)
+
+// add funcs like these for banned students, lessons, students, etc...
+func SetCourseTeacher(t Teacher) CourseOption {
+    return func(c *Course) {
+        c.t = t
+    }
+}
+
+func NewCourse(n string, opts ...CourseOption) Course {
+    c := &amp;course{
+        name: n,
+        scores: map[string]float64{},
+        banned: map[string]Student{}, // initialise these to avoid issues when accessing these
+    }
+    for _, o := range opts {
+        o(c)
+    }
+    return c
+}
+// a couple of implementation examples:
+
+func (c *course) EnterStudents(s ...Student) error {
+    // ensure we're not entering a banned student
+    for i := range s {
+        if _, ok := c.banned[s[i].Name()]; ok {
+            return fmt.Errorf("student %s is banned", s[i].Name())
+        }
+        if _, ok := c.scores[s[i].Name()]; ok {
+            return fmt.Errorf("student %s already entered", s[i].Name())
+        }
+    }
+    // this is messy, but required
+    for i := range s {
+        s.scores[s[i].Name()] = 0 // add new name to score list
+    }
+    c.s = append(c.s, s...) // append students from arg to students in list
+    return nil
+}
+</code></pre>
+
+<p>As you can see, I can now safely add any number of students, and return errors in case some of them are banned already, and a different error in case the student was already added. It also initialises the state correctly. Now let's see some actual mediation implemented:</p>
+
+<pre><code>func (c *course) StartLesson() error {
+    if len(c.lessons) &lt;= c.day {
+        return fmt.Errorf("no lesson can be started, Last lesson %d of %d", c.day, len(c.lessons))
+    }
+
+    // mediator decides which lesson object the teacher uses, and determines the teacher should prepare it
+    if err := c.t.PrepareLesson(c.lesson[c.day]); err != nil {
+        return err
+    }
+    // pass in students to which to teach the prepared lessen to, like a mediator does
+    if err := c.t.Teach(c.s...); err != nil {
+        return err
+    }
+    return nil
+}
+
+func (c *course) EndLesson() error {
+    if !c.t.InClass() {
+        // obviously...
+        return fmt.Errorf("teacher not in class, cannot end lesson")
+    }
+    // see if teacher banned anyone
+    for _, banned := range c.t.ProblemStudents() {
+        // find student in slice, cut from slice and add to banned map
+        // at this point, a map of students is easier to handle, but I can't be bothered
+        // to rewrite most of this answer ;-p
+    }
+    for i := range c.s {
+        // listen to complaints from students, too
+        c.complaints = append(c.complaints, c.s[i].Complaints()...)
+    }
+    // mediator checks if the lesson was important, and instructs the teacher
+    // to prepare a test. How the test is taken, is part of the lesson preparation and the teaching implementations
+    if c.lessons[c.day].Important() {
+        c.t.PrepareTest()
+    }
+    c.day++ // increment this, so we don't accidentally start the same lesson again
+    return nil
+}
+</code></pre>
+
+<p>Now at this point, this is getting rather convoluted and complex. It's suffering from the classical OEP-bloat (Over-Engineered-Programming). Something the golang designers wanted to discourage in their language.</p>
+
+<p>Note that all of the code I provided above is <em>very</em> unsafe the moment you're going to use it with concurrency: the use of maps is, by definition unsafe. If you have someone calling:</p>
+
+<pre><code>go course.EnterStudents(studentSlice[4:]...)
+go course.EnterStudents(studentSlice...)
+studentSlice := append([]Student{prependStudent}, studentSlice[4:6]...)
+go course.EnterStudents(studentSlice...)
+</code></pre>
+
+<p>Guess what will happen, that is: if it's even possible... (hint: it's not).</p>
+
+<p>I'd recommend you use the <code>sync</code> package, and always test/compile with the race-detector. </p>
+    </div>

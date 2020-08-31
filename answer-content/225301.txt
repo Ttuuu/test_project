@@ -1,0 +1,97 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I first had to <em>look up</em> what <strong>KPI</strong> stands for. It is a "<strong>K</strong>ey <strong>P</strong>erformance <strong>I</strong>ndicator". Then a "KPI breachable event" must be when some indicator gets over a certain threshold? That's my best guess... Better not use an abbreviation, or jargon, that is unrelated to programming, when explaining what your code is doing. There's a big change we don't know what you're talking about.</p>
+
+<p>There will also be a lot of things I cannot review in this answer, since your question doesn't contain all the code/data/schema. Lack thereof also means I cannot test the code here. <strong>Warning:</strong> There may be bugs.</p>
+
+<p>Given these restrictions I've tried to rewrite your code so it only does one query on each database for all the days in the graph, thereby possibly speeding up your code by a factor of 30, meaning that it should complete in less than half a second. Which is still quite a long time. </p>
+
+<p>One of the other reasons the queries can be slow is the way you've implemented the <code>action</code> column in the <code>tblticketlog</code> table query. It is a string and uses several <code>LIKE</code> comparisons. The query could be made faster if the status of a ticket can be checked more efficiently. Imagine you had a column called <code>status</code> of type <a href="https://dev.mysql.com/doc/refman/8.0/en/set.html" rel="nofollow noreferrer">SET</a> with the values <code>('new', 'rejected', 'pending', 'progress', 'responded', 'delete')</code>, or something similar. The test could then be:</p>
+
+<pre><code>.... AND status IN ('new', 'pending', 'progress', 'responded')
+</code></pre>
+
+<p>Which is a lot faster, and also shorter. You could still have a column similar to <code>action</code> with more details about the status of the ticket.</p>
+
+<p>Also check whether you have set <a href="http://www.mysqltutorial.org/mysql-index" rel="nofollow noreferrer">the proper indexes</a> for these queries.</p>
+
+<p>Here's the rewritten code, without the debugging stuff. </p>
+
+<p>I am going to use this function:</p>
+
+<pre><code>function selectDailyEvents($db, $query)
+{
+    $data = [];
+    if ($result = mysqli_query($db, $query)) {
+        while ($row = $result-&gt;fetch_assoc()) {
+            $data[$row["dayNo"]] = ["date"  =&gt; $row["eventDate"],
+                                    "count" =&gt; $row["eventCount"]];
+        }
+        $result-&gt;free();
+    }
+    return $data;
+}
+</code></pre>
+
+<p>Because both queries below return, more or less, the same result, I can use the single function above to retrieve the data from the databases. This is how the function is used:</p>
+
+<pre><code>$totalDays = 31;
+
+$query = "SELECT COUNT(*) AS eventCount,
+                 DATE(date) AS eventDate,
+                 $totalDays - DATEDIFF(date, curdate()) AS dayNo
+          FROM tblticketlog
+          WHERE DATE(date) &gt; date_sub(curdate(),INTERVAL $totalDays day) AND 
+                dayofweek(date) NOT IN (1,7) AND 
+                ((action = 'New Support Ticket Opened') OR 
+                 (action LIKE 'Status changed to Pending%') OR 
+                 (action LIKE 'Status changed to In Progress%') OR 
+                 (action LIKE 'New Ticket Response made by%'))
+         GROUP BY ticketDate 
+         ORDER BY ticketDate";
+
+$dailyTickets = selectDailyEvents($db, $query);
+
+$query = "SELECT COUNT(*) AS eventCount,
+                 DATE(esc_at) AS eventDate, 
+                 $totalDays - DATEDIFF(date, curdate()) AS dayNo
+          FROM escalations
+          WHERE DATE(esc_at) &gt; date_sub(curdate(), INTERVAL $totalDays day) AND 
+                dayofweek(esc_at) NOT IN (1,7) AND 
+                escalated = 1      
+          GROUP BY escalationDate   
+          ORDER BY escalationDate";
+
+$dailyEscalations = selectDailyEvents($db2, $query);
+</code></pre>
+
+<p>These two queries are exactly the same ones as you have, except that I added the <code>GROUP BY</code> and <code>ORDER BY</code>. I also added a <code>dayNo</code> in the output, because that indicates which day it is in the sequence.</p>
+
+<p>Now we have two arrays, <code>$dailyTickets</code> and <code>$dailyEscalations</code>, which needs to be rearranged for the graph. We use a loop to go over each day:</p>
+
+<pre><code>$graphData = [];
+
+for ($dayNo = 0; $dayNo &lt; $totalDays; $dayNo++) {
+    $ticketCount = 0;
+    if (isset($dailyTickets[$dayNo])) {
+        $eventDate   = $dailyTickets[$dayNo]["eventDate"];
+        $ticketCount = $dailyTickets[$dayNo]["eventCount"];
+    }
+    $escalationCount = 0;
+    if (isset($dailyEscalations[$dayNo])) {
+        $eventDate       = $dailyEscalations[$dayNo]["eventDate"];
+        $escalationCount = $dailyEscalations[$dayNo]["eventCount"];
+    }
+    if (isset($eventDate)) {
+        $serviceLevel = round(100 * ($ticketCount - $escalationCount) / $ticketCount, 0);
+        $readableDate = date("d-m-Y", strtotime($eventDate));
+        $graphData[] = ['x'     =&gt; $dayNo,
+                        'label' =&gt; $readableDate,
+                        'y'     =&gt; $serviceLevel];
+    }
+}
+</code></pre>
+
+<p>I'm not sure the result of this last bit of code is exactly what you need, but with a bit of debugging you should be able to get there. As I said before: I cannot test this. The database queries are probably correct.</p>
+
+<p>I've also notice that your coding style is not optimal. Spacing is inconsistent. Also the naming of database columns and PHP variables could be improved. That means <code>escalated_at</code> instead of <code>esc_at</code> and <code>$ticketCount</code> or <code>$escalationCount</code> instead of <code>$day_result_value</code>. Always try to make your code as easy to read as possible.</p>
+    </div>

@@ -1,0 +1,148 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You should use <code>decimal</code> or at least <code>double</code> as data type for financial figures. You usually operate with (at least) two decimals in financial calculations.</p>
+
+<hr>
+
+<p><code>IEmployeeRepository</code> should inherit from <code>IDisposable</code> to force implementers to implement <code>IDisposable</code> to dispose of the <code>EmployeesDbContext</code> instance. 
+   And that means that <code>ISalaryCalculator</code> should do the same in order to dispose of the <code>EmployeeRepository</code> instance.</p>
+
+<hr>
+
+<p>I'm not sure I understand the "Lineage" concept. To me it looks like you 
+   maintain two parent-child relationships on the same objects: <code>Subordinaries</code> and <code>Lineage</code> (and what role has the <code>SupervisorId</code>
+   in that equation?) Why don't you rely on the hierarchical
+   relationship through <code>Subordinates</code> (maintained through the navgation property(ies))?</p>
+
+<hr>
+
+<p>There is a "conceptual meltdown" in having <code>CalcSupervisorPremium(...)</code> as a member of the <code>BaseSalaryCalculator</code>
+   because it is a specialization of the common salary calculation - related only to certain employee types.
+   I would create an <code>abstract class SupervisorSalaryCalculator : BaseSalaryCalculator</code> as base class for <code>ManagerSalaryCalculator</code> and <code>SalesmanSalaryCalculator</code>
+   and because the two sub classes are almost identical except for the values of their members you can let the new base class do the calculations:</p>
+
+<pre><code>  public abstract class SupervisorSalaryCalculator : BaseSalaryCalculator
+  {
+    public override string EmployeeGroup { get; }
+    private int PremiumPercentForEachYearExp { get; }
+    private int MaxExperiencePremiumPercent { get; }
+    private float SupervisorPremiumPercent { get; }
+
+    public SupervisorSalaryCalculator(
+      string employeeGroup, 
+      int experienceRate, 
+      int experienceRateMax,
+      float supervisorRate,
+      IEmployeeRepository employeeRepository, 
+      ISalaryCalculatorFactory salaryCalculatorFactory)
+        : base(employeeRepository, salaryCalculatorFactory)
+    {
+      EmployeeGroup = employeeGroup;
+      PremiumPercentForEachYearExp = experienceRate;
+      MaxExperiencePremiumPercent = experienceRateMax;
+      SupervisorPremiumPercent = supervisorRate;
+    }
+
+    protected async Task&lt;int&gt; CalcSupervisorPremium(IEnumerable&lt;Employee&gt; subordinates, float supervisorPremiumPercent)
+    {
+      int salarySum = 0;
+      foreach (var employee in subordinates)
+      {
+        var calculator = _salaryCalculatorFactory.CreateCalculator(employee.EmployeeGroup);
+        var salary = await calculator.CalculateSalaryAsync(employee);
+        salarySum += salary;
+      }
+      var premium = (int)Math.Ceiling(salarySum / 100 * supervisorPremiumPercent);
+      return premium;
+    }
+
+    async public override Task&lt;int&gt; CalculateSalaryAsync(Employee employee)
+    {
+      var experience = CalcEmployeeExperience(employee.EmploymentDate);
+      var experiencePremium = CalcExperiencePremium(employee.BaseSalary, PremiumPercentForEachYearExp, MaxExperiencePremiumPercent, experience);
+      var subordinates = await GetSubordinatesAsync(employee);
+      var supervisorPremium = await CalcSupervisorPremium(subordinates, SupervisorPremiumPercent);
+      var totalSalary = employee.BaseSalary + experiencePremium + supervisorPremium;
+      return totalSalary;
+    }
+
+    abstract protected Task&lt;List&lt;Employee&gt;&gt; GetSubordinatesAsync(Employee employee);
+  }
+
+  public class ManagerSalaryCalculator : SupervisorSalaryCalculator
+  {
+    public ManagerSalaryCalculator(IEmployeeRepository employeeRepository, ISalaryCalculatorFactory salaryCalculatorFactory)
+        : base("Manager", 5, 40, 0.5f, employeeRepository, salaryCalculatorFactory)
+    {
+    }
+
+    async protected override Task&lt;List&lt;Employee&gt;&gt; GetSubordinatesAsync(Employee employee)
+    {
+      return await _employeeRepository.GetFirstLevelSubordinatesAsync(employee);
+    }
+  }
+
+  public class SalesmanSalaryCalculator : SupervisorSalaryCalculator
+  {
+    public SalesmanSalaryCalculator(IEmployeeRepository employeeRepository, ISalaryCalculatorFactory salaryCalculatorFactory)
+        : base("Salesman", 1, 35, 0.3f, employeeRepository, salaryCalculatorFactory)
+    {
+    }
+
+    async protected override Task&lt;List&lt;Employee&gt;&gt; GetSubordinatesAsync(Employee employee)
+    {
+      return await _employeeRepository.GetAllSubordinatesAsync(employee);
+    }
+  }
+</code></pre>
+
+<hr>
+
+<p>The calculation of years of employment is not always correct.
+   Try for instance <code>employmentDate = new DateTime(2000, 12, 3)</code> and <code>now = new DateTime(2018, 11, 29)</code>
+   It will give 18 years, where it should give 17 (whole) years, while <code>employmentDate = new DateTime(2000, 12, 7)</code>
+   gives the correct 17 for the same <code>now</code> value. 365 is not a reliable number of days per year.</p>
+
+<p>Instead you can do something like this:</p>
+
+<pre><code>   years = now.Year - employmentDate.Year;
+   if (now.Date &lt; employmentDate.AddYears(years).Date)
+     years--;
+   return years;
+</code></pre>
+
+<p>Not very fancy but more reliable.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>public SalaryCalculatorFactory(IEmployeeRepository employeeRepository)
+{
+    salaryCalculators = Assembly.GetExecutingAssembly().GetTypes()
+        .Where(t =&gt; typeof(BaseSalaryCalculator).IsAssignableFrom(t) &amp;&amp; t.IsAbstract == false)
+        .Select(t =&gt; new Func&lt;BaseSalaryCalculator&gt;(() =&gt; Activator.CreateInstance(t,employeeRepository, this) as BaseSalaryCalculator))
+        .ToDictionary(f =&gt; f().EmployeeGroup);
+}
+</code></pre>
+</blockquote>
+
+<p>To investigate all types in an <code>assembly</code> to find the few you can use may be an expensive task every time the salary factory is created. If working
+   in a large assembly with lots of types, that may be a bottleneck. You'll have to measure on that. You could consider to make the calculator dictionary static, so it is only loaded once, or 
+   have the calculators in a dedicated assembly, and/or read the types from a configuration file.</p>
+
+<hr>
+
+<p>Your naming is very descriptive, but some names maybe a little too much: <code>premiumPercentForEachYearExp</code>; 
+   maybe <code>experienceRate</code> or the like would be descriptive enough? IMO both abbreviated and too long names influence the readability negatively.</p>
+
+<p>More about naming:</p>
+
+<p>You have <code>SalaryCalculator</code> which is the main "interface" for clients to use and then you have <code>BaseSalaryCalculator</code> etc. which takes care of the 
+   actual calculations. Maybe a little confusing with the similar names, when they are not directly related? - if confused me at least.</p>
+
+<hr>
+
+<p>According to the overall design and structure, you show good understanding of dependency injection, dependency inversion, repository and factory patterns
+   and having these concepts at hand is very useful when it comes to larger projects. But here the amount of code lines seems rather overwhelming, which is increased by your rather verbose naming style.</p>
+
+<p>But then again the overall impression is a code that is thought through and well-structured. </p>
+    </div>

@@ -1,0 +1,133 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Elephant in the room</h2>
+
+<p>Let's first try and identify the elephant in the room. There is one big problem with using GCM and file decryption: tag validation. The problem is that for GCM there are two choices: either you output unvalidated chunks of data, or you buffer all data until the tag is validated. The first option should be followed by any reasonable <strong>low level</strong> API designer, leaving it up to the user to handle invalid tags.</p>
+
+<p>In Java, those will result in <a href="https://docs.oracle.com/javase/7/docs/api/javax/crypto/AEADBadTagException.html" rel="nofollow noreferrer"><code>AEADBadTagException</code></a> (or just <code>BadPaddingException</code> in some older / third party implementations). Unfortunately Java devs had some struggle with this as well, so there have been multiple implementations of both the cipher and the <code>CipherInputStream</code> &amp; <code>CipherOutputStream</code> if I remember correctly. To be honest, I lost track and most of my knowledge of this issue some time ago.</p>
+
+<p>Anyway, you should really test how the current Java versions handle the situation. But it is very important that for your program you make sure that:</p>
+
+<ol>
+<li>not all data is buffered (for large files);</li>
+<li>you indicate to the user that the encryption has failed and that cleanup is necessary.</li>
+</ol>
+
+<p>Because if the data is not all buffered, you don't want to leave the user with partial files with content that was <em>not</em> valid. Some kind of strategy is required.</p>
+
+<h2>Design</h2>
+
+<p>The class requires one password per file. That's OK, but please mind you that this gets cumbersome fast for multiple files, especially since the PBKDF2 function needs to be run each time - even if you'd use the same password. Creating a key and then using that makes more sense, and it simplifies your methods. You still have a random IV anyway.</p>
+
+<p>The parameters of the function say that you need to provide a path to a writable file. However, that's not how <code>path</code> is actually used. All side effects should be made clear to the user, and the <em>format</em> of the encrypted file should be documented as well.</p>
+
+<p>The design is relatively OK. The streams seem to be used correctly. The security parameters seem correct as well, kudos. You are using streaming with a small (too small?) buffer size - which isn't configurable though and stated as a literal instead of a constant. There is precious little encoding / decoding going on, which is exactly how file handling should be; little to no stringified code to be found except maybe for the parameters (<code>char[]</code> and <code>File</code> make more sense to me).</p>
+
+<p>The iteration count is already at the small side; it is very much expected to change per system, so I would write it to file as well. Including a versioning header is always a good idea.</p>
+
+<p>There is too little checking on the parameters and on the files themselves, especially when it comes to error generation. Java does have more extensive file libraries since the NIO libraries were introduced.</p>
+
+<p>The exception handling is not very good. There is too little distinction made between various exception classes, especially when it comes to e.g. ciphers not being found and input / output errors.</p>
+
+<h2>FileCryptor class</h2>
+
+<pre><code>public class FileCryptor implements Serializable {
+</code></pre>
+
+<p>Why would this kind of class be serializable? That just doesn't make sense. Besides that, you should include a serialization constant in case your inner class design is changed.</p>
+
+<pre><code>private int gcmAuthenticationTagSizeBits = DEFAULT_GCM_AUTHENTICATION_TAG_SIZE_BITS;
+</code></pre>
+
+<p>That's nice, you can reprogram or upgrade you class and you don't have to create your fields. However, a subclass cannot use them because they are private. And if you upgrade then you can always introduce them. Don't increase the state / fields unless necessary and directly use the constants. The constants will get inlined, speeding up the Java code.</p>
+
+<p>On the other hand:</p>
+
+<pre><code>private int pbkdf2Iterations = DEFAULT_PBKDF2_ITERATIONS;
+</code></pre>
+
+<p>is something you do immediately want to be upgradable, so much so that it could be saved with the file.</p>
+
+<h2>generateRandomArry method</h2>
+
+<p>Method name is missing an "a" for "Arry"</p>
+
+<pre><code>    final byte[] salt = new byte[sizeInBytes];
+</code></pre>
+
+<p>Sorry? What salt? If you just return it as a generic array then you should not name the variable <code>salt</code>.</p>
+
+<pre><code>SecureRandom random = SecureRandom.getInstanceStrong();
+</code></pre>
+
+<p>That's overdoing it, <code>getInstanceStrong()</code> is for long term key generation. Just use <code>new SecureRandom()</code>.</p>
+
+<h2>encrypt method</h2>
+
+<pre><code>password.toCharArray(),
+</code></pre>
+
+<p>The whole idea of <code>char[]</code> is that you can zero it out. So passing it as a string doesn't make a whole lot of sense.</p>
+
+<p>Note too that the PBKDF2 function implementation of the standard JVM only uses the lower 8 bits of each char (rather stupidly if you ask me). I would make sure that the characters are not <strong>outside that range</strong>, or you may end up with something that is encrypted with a different password than you might have thunk. This is particularly "fun" if somebody uses a Chinese password or if you try and get compatibility with other runtimes.</p>
+
+<p>From the <code>PBEKeySpec</code> class documentation:</p>
+
+<blockquote>
+  <p>You convert the password characters to a PBE key by creating an instance of the appropriate secret-key factory. For example, a secret-key factory for PKCS #5 will construct a PBE key from only the low order 8 bits of each password character, whereas a secret-key factory for PKCS #12 will take all 16 bits of each character.</p>
+</blockquote>
+
+<p>And, as PBKDF2 is specified in the PKCS#5 Password Based Encryption (PBE) standards, this is from the <a href="https://docs.oracle.com/en/java/javase/12/docs/specs/security/standard-names.html#secretkeyfactory-algorithms" rel="nofollow noreferrer">algorithms page</a> of Java:</p>
+
+<blockquote>
+  <p>Password-based key-derivation algorithm <strong>defined in PKCS #5</strong>: Password-Based Cryptography Specification, Version 2.1 using the specified pseudo-random function (). Example:
+  PBKDF2WithHmacSHA256.</p>
+</blockquote>
+
+<pre><code>        byte[] buffer = new byte[32];
+        while (fileInputStream.read(buffer) &gt; 0) {
+            encryptedOutputStream.write(buffer);
+        }
+</code></pre>
+
+<p><code>InputStream</code> has a <code>transferTo</code> method since Java 9.</p>
+
+<pre><code>throw new SecurityException(e.getMessage(), e);
+</code></pre>
+
+<p>No, that cannot be right. Think of your own message and possibly throw your own checked exception. A security exception "file cannot be opened" doesn't make sense.</p>
+
+<p>From the documentation:</p>
+
+<blockquote>
+  <p>Thrown by the security manager to indicate a security violation.</p>
+</blockquote>
+
+<p>... that's not it. Probably you wanted to reuse <code>GeneralSecurityException</code>, but that would also be wrong.</p>
+
+<h2>decrypt method</h2>
+
+<pre><code>    byte[] myNonce = new byte[gcmIvNonceSizeBytes];
+</code></pre>
+
+<p>Oh, my, don't start with the <code>my</code> prefix now, just use the same names as in the encryption method.</p>
+
+<pre><code>        int countReadBytesNonce = fileInputStream.read(myNonce);
+</code></pre>
+
+<p>Please use <code>readFully</code>. This won't fail on files, but will fail for other input streams.</p>
+
+<pre><code>/* Derive the key*/
+</code></pre>
+
+<p>If you have to write that down the you need to introduce a method. Duplicate code.</p>
+
+<pre><code>path.length() - 4
+</code></pre>
+
+<p>Oh, right, that's never going to fail right? Try running that on <code>"LPT1.enc"</code> on Windows. Please check your input before doing that.</p>
+
+<pre><code>byte[] skipped = new byte[gcmIvNonceSizeBytes+pbkdf2SaltSizeBytes];
+</code></pre>
+
+<p>Just keep the file open please.</p>
+    </div>

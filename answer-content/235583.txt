@@ -1,0 +1,109 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>C++ port of <a href="https://codereview.stackexchange.com/a/235570/212940">Björn's code</a> using a single large array instead of one hashmap per thread. Björn's C code is very nice, but this question was tagged C++ so i thought it was worth showing that too. The changes from my code above are very small:</p>
+
+<ul>
+<li>Using std::thread instead of std::async, because we don't need to return anything</li>
+<li>Use a <code>std::unique_ptr</code> of <code>std::atomic&lt;uint64_t&gt;[1'000'001]</code> as the central datastructure and update with <code>.fetch_add()</code>  (<code>std::vector</code> doesn't like atomics without writing wrappers). Note that Björn's <code>array</code> is 2M entries and mine is 1M+1, because I subtract <code>min_val</code> from key. </li>
+<li>the zero initialisation of the array was slightly tricky to find the right syntax for. can't do it with <code>make_unique</code> until we get <code>make_unique_init</code> in c++20 so used empty brace initialisation instead, see code. --- <strong>EDIT</strong>: this is incorrect. It's not complicated. I proved that the array is always zero initialised. Both with <a href="https://godbolt.org/z/aB7eJr" rel="nofollow noreferrer">make_unique</a>, and with <a href="https://godbolt.org/z/Cs_ENk" rel="nofollow noreferrer">new[]{}</a>  and got a detailed explanation of <a href="https://www.reddit.com/r/cpp/comments/eomwv2/why_make_unique_default_init_stdsize_t_size/" rel="nofollow noreferrer">the standardese here</a>. So I have changed the code to the more idiomatic <code>make_unique&lt;&gt;</code>.</li>
+<li>I didn't include Björn's hand-unrolling of the parsing. I tried limiting the loop iterations to 7, and as soon as I did that, the compiler automatically unrolled it for me. But I felt this was too restrictive on the file format and didn't provide any measurable performance benefit. </li>
+</ul>
+
+<p>For discussion of the prons/cons of this approach see comments under Björn's answer. </p>
+
+<p>Performance of this code on the <code>yahtzee-upper-big2.txt</code> (800MB of 100M 7digit ints with cardinality 1M+1) is ~0.55s on my machine. This is a 4x speedup against the original "1x bytell_hash_map per thread" approach at top. Putting it another way this is parsing ~1.7GB/s which is a fair clip on this old machine.</p>
+
+<p>The obvious downside is that it makes assumptions about the <em>range</em> of ints in the input file (they must be min=1M and max=2M inclusive). </p>
+
+<p>Björn put it well when he said in comments above: The global atomic array works very well when we have a relatively small range but many numbers. Whereas when we have a very large range (worst case 2^64) and not so many unique numbers (eg the original, low cardinality, "-big" file), then a hash map per thread is fastest.</p>
+
+<p><strong>EDIT</strong>: I changed the code to use <code>std::unit32_t</code> as the main value type in the array. Then just count each value and multiply during the final loop. This optimisation was suggested by someone else, in the previous question, but it never made a measurable difference for me. However, now that this array is central to the performance, particularly whether this array can fit in L3 cache, should make a bigger difference. At 1M * 4bytes =&gt; 4MB, it just about might and sure enough, I got a 33% performance gain. The "big2" file now runs in ~350ms, which is about 2.4GB/s.</p>
+
+<p>When you have a windfall, you should treat yourself just a little, so I reintroduced <em>some</em> parsing checks. ie the range of the integers is now checked, so we don't access out of bounds memory for UB, and the range of characters is strictly limited to <code>[0-9\n]</code>. Performance is hardly affected by these "never taken" branches thanks to the CPU's branch predictor. </p>
+
+<p>On the subject of: "Is this realistic? Why are you doing it cached? The disk will always be the bottleneck.": I did some quick shopping and it seems that, even as of Q4 2017, there are NVMe SSDs which do sequential reads <a href="https://ssd.userbenchmark.com/SpeedTest/375784/INTEL-SSDPED1D480GA" rel="nofollow noreferrer">at a blistering 1800MB/s</a>. So it seems we need to work quite hard to stay ahead of these devices.  </p>
+
+<pre><code>#include "os/fs.hpp"
+#include &lt;cstdint&gt;
+#include &lt;future&gt;
+#include &lt;iostream&gt;
+#include &lt;memory&gt;
+#include &lt;string&gt;
+#include &lt;string_view&gt;
+#include &lt;vector&gt;
+
+using val_t = std::uint32_t;
+
+constexpr val_t      min_val  = 1'000'000;
+constexpr val_t      max_val  = 2'000'000;
+constexpr std::size_t map_size = max_val - min_val + 1;
+
+std::pair&lt;const char* const, const char* const&gt; from_sv(std::string_view sv) {
+  return std::make_pair(sv.data(), sv.data() + sv.size());
+}
+
+std::string_view to_sv(const char* const begin, const char* const end) {
+  return std::string_view{begin, static_cast&lt;std::size_t&gt;(end - begin)};
+}
+
+void parse(std::string_view buf, std::atomic&lt;val_t&gt; map[]) {
+  auto [begin, end] = from_sv(buf);
+  const char* curr  = begin;
+  val_t      val   = 0;
+  while (curr != end) {
+    if (*curr == '\n') {
+      assert(min_val &lt;= val &amp;&amp; val &lt;= max_val);
+      map[val - min_val].fetch_add(1); // NOLINT
+      val = 0;
+    } else if ('0' &lt;= *curr &amp;&amp; *curr &lt;= '9') {
+      val = val * 10 + (*curr - '0');
+    }
+    ++curr; // NOLINT
+  }
+}
+
+std::vector&lt;std::string_view&gt; chunk(std::string_view whole, int n_chunks, char delim = '\n') {
+  auto [whole_begin, whole_end] = from_sv(whole);
+  auto        chunk_size        = std::ptrdiff_t{(whole_end - whole_begin) / n_chunks};
+  auto        chunks            = std::vector&lt;std::string_view&gt;{};
+  const char* end               = whole_begin;
+  for (int i = 0; end != whole_end &amp;&amp; i &lt; n_chunks; ++i) {
+    const char* begin = end;
+    if (i == n_chunks - 1) {
+      end = whole_end; // always ensure last chunk goes to the end
+    } else {
+      end = std::min(begin + chunk_size, whole_end);   // NOLINT std::min for OOB check
+      while (end != whole_end &amp;&amp; *end != delim) ++end; // NOLINT ensure we have a whole line
+      if (end != whole_end) ++end;                     // NOLINT one past the end
+    }
+    chunks.push_back(to_sv(begin, end));
+  }
+  return chunks;
+}
+
+val_t yahtzee_upper(const std::string&amp; filename) {
+  auto     mfile     = os::fs::MemoryMappedFile{filename};
+  unsigned n_threads = std::thread::hardware_concurrency();
+  // zero initialised via the empty {} and that's why we didn't use std::make_unique
+  auto map = std::make_unique&lt;std::atomic&lt;val_t&gt;[]&gt;(map_size);
+  auto     threads   = std::vector&lt;std::thread&gt;{};
+
+  for (std::string_view chunk: chunk(mfile.get_buffer(), n_threads)) // NOLINT
+    threads.emplace_back(parse, chunk, map.get());
+
+  for (auto&amp; t: threads) t.join();
+
+  std::uint64_t max_total = 0;
+  for (std::size_t i = 0; i &lt; map_size; ++i) {
+    std::uint64_t s = map[i].load() * (i + min_val);
+    if (s &gt; max_total) max_total = s;
+  }
+  return max_total;
+}
+
+int main(int argc, char* argv[]) {
+  if (argc &lt; 2) return 1;
+  std::cout &lt;&lt; yahtzee_upper(argv[1]) &lt;&lt; '\n'; // NOLINT
+  return 0;
+}
+</code></pre>
+    </div>

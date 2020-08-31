@@ -1,0 +1,259 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Style: <strong>Indent your operands to a consistent column, so mnemonics of different length don't make your code look so ragged</strong>.  And use local <code>.label</code> labels inside functions.</p>
+
+<hr>
+
+<p>Comment code that depends on non-standard behaviour: <code>stdout</code> is only guaranteed to be line-buffered, and isn't automatically flushed when you read <code>stdin</code> in ISO C.  Some systems (like Linux) do need <code>fflush(stdout)</code> after a <code>printf</code> of a string that doesn't end with a newline.  But I tried building a win64 executable by linking with mingw64 gcc, and running it under <code>wine64</code>, and it did actually print the prompt, to my surprise.</p>
+
+<p>Normally you'd want to write a program like this to take its input as a command-line argument, instead of prompting for it with stdio at all.  (Then you just use <code>strtoul</code> or <code>atoi</code>, or <code>sscanf</code>, or even a hand-written loop to convert the ASCII decimal string to integer.)</p>
+
+<hr>
+
+<p>Correctness problem: <strong><code>rbx</code> is a call-preserved register in the x64 Windows calling convention</strong>.  Pick a call-clobbered scratch register, like <code>rcx</code>, or <code>r8..r11</code>. 
+ <a href="https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/x64-architecture" rel="nofollow noreferrer">https://docs.microsoft.com/en-us/windows-hardware/drivers/debugger/x64-architecture</a>.  If <code>main</code>'s caller happens not to crash when you return after stepping on its RBX, you got lucky.</p>
+
+<hr>
+
+<p><strong>Use 32-bit operand operand-size when possible, and make sure operand-size is consistent.</strong>  You're only reading a 32-bit <code>int</code> with <code>scanf("%d", &amp;number)</code>, and the upper 32 bits are left zero from your <code>dq 0</code>.  It makes no sense to reserve 64 bits of space and then only ask <code>scanf</code> to write the low 32 of it.</p>
+
+<p>See also <a href="https://stackoverflow.com/questions/38303333/the-advantages-of-using-32bit-registers-instructions-in-x86-64">The advantages of using 32bit registers/instructions in x86-64</a></p>
+
+<p><strong>Worse, you do <code>cdq</code> (sign extend EAX into EDX:EAX), but then you use 64-bit <code>idiv rbx</code> which divides RDX:RAX by RBX</strong>.  If your number input was <code>-15</code> (base 10), your 128-bit dividend would be <code>0x00000000FFFFFFFF00000000FFFFFFF1</code>.  Dividing that by a small integer would make the quotient overflow RAX, raising <code>#DE</code> (divide exception).  I didn't test your original version to see if I could provoke that with negative inputs; I changed to using <code>%u</code> for scanf and printf.</p>
+
+<p>It's unclear why you'd want signed division.  Is this program supposed to work for negative inputs?  Your loop condition exits the loop if the counter is less than 2 (signed compare).  Unsigned lets us handle a larger range of inputs with faster 32-bit division.</p>
+
+<hr>
+
+<p><strong>Use 32-bit division for 32-bit numbers, it's about 2.5x faster than <code>div r64</code> on Skylake</strong>, with similar performance ratios on other Intel CPUs.  See <a href="https://stackoverflow.com/questions/29983453/trial-division-code-runs-2x-faster-as-32-bit-on-windows-than-64-bit-on-linux/52558274#52558274">Trial-division code runs 2x faster as 32-bit on Windows than 64-bit on Linux</a> for details.  (<code>idiv</code> and <code>div</code> are pretty similar in performance.  <code>idiv r32</code> has a faster best-case throughput on Haswell than <code>div r32</code>, according to Agner Fog's instruction tables (<a href="https://agner.org/optimize/" rel="nofollow noreferrer">https://agner.org/optimize/</a>).  (1 per 8 vs. 9 clock cycles, and 1 fewer uop.  But for 64-bit division, <code>div r64</code> has better throughput than <code>idiv r64</code>).</p>
+
+<p>You were only checking the low 32-bits of the 64-bit remainder, too.  Since your original input was limited to 32-bit, this might be safe.  So possibly not a correctness problem.</p>
+
+<p>Check a register for zero with <code>test reg,reg</code>, not <code>cmp reg,0</code>.  <a href="https://stackoverflow.com/questions/33721204/test-whether-a-register-is-zero-with-cmp-reg-0-vs-or-reg-reg/33724806#33724806">It saves a byte of code-size</a>.  If the next instruction was <code>js</code> instead of <code>jz</code>, it would also have an advantage of micro-fusing into a compare+branch uop on more CPUs.</p>
+
+<hr>
+
+<p><strong>Use registers instead of static storage for your tmp variables, especially inside the loop</strong>.   That's what registers are for.  Static storage like you're using is equivalent to C <code>static unsigned long long isPrime = 0;</code>, instead of using an automatic storage variable that the compiler could optimize into a register.</p>
+
+<p>asm doesn't have "variables", that's a high level concept that you can implement however you want, with registers, static storage, stack space, or whatever.  The normal way is to use registers and comment your code to keep track of what's where.  Anything that makes your code slower or larger defeats the purpose of writing in asm in the first place.  A compiler would easily make more efficient asm than what you've written.  (This is normal when you're a beginner, so don't feel bad about it, but be aware that looking at compiler output is another good way to learn efficient ways to do things in asm.  See <a href="https://stackoverflow.com/questions/38552116/how-to-remove-noise-from-gcc-clang-assembly-output.">How to remove “noise” from GCC/clang assembly output?</a>)</p>
+
+<hr>
+
+<p><strong>Don't create a 0/1 boolean and then test it</strong>, just branch on the original condition and lay out your code to minimize the amount of jumping around.</p>
+
+<p>You might want to save a 0/1 so you can exit with success or failure, making it possible to use this code as a prime-test in a script or something.  I did that in my version below, so I could verify its correctness with this bash one-liner on Linux.  (I tested it on Linux by using <code>mov rdi, rcx</code> / <code>mov rsi, rdx</code> before every scanf/printf to adapt for the calling convention difference between x86-64 System V and x64 Windows.)</p>
+
+<pre class="lang-bsh prettyprint-override"><code> # check that all the numbers we think are non-prime actually have at least 2 prime factors (expect empty output because we filter out all lines with 2 spaces in `factor` output)
+for i in $(seq 3 2 9999 );do echo $i | ./win-primes &gt;/dev/null || echo $i ;done | factor | grep -v ' .* '
+
+# check that all the numbers we think are prime only have 1 prime factor (no lines with multiple spaces in the factor output
+for i in $(seq 3 2 9999 );do echo $i | ./win-primes &gt;/dev/null &amp;&amp; echo $i ;done | factor | grep ' .* '
+</code></pre>
+
+<hr>
+
+<p>Speaking of branching, it's possible to branch <em>much</em> less.  See <a href="https://stackoverflow.com/questions/47783926/why-are-loops-always-compiled-into-do-while-style-tail-jump">Why are loops always compiled into do while style tail jumps</a>.</p>
+
+<p><strong>Put one of the conditional branches at the bottom of the loop, and another inside as a <code>break</code> condition</strong>.  In my version below, notice that I put the <code>.notprime</code> block <em>after</em> the <code>ret</code> at the end of the main function.  Putting a block out-of-line means you don't have to jump over it in the other path of execution.  Branch layout is a hard problem, figuring out which code can fall through into what other code, and with what values in registers, is part of the fun of writing branchy asm code.  (As opposed to simple loops with mostly SIMD instructions, then the fun in in branchless logic.)</p>
+
+<p>Speaking of which, I probably should have laid out my loop so the fall-through and less-branching case was non-primes.  We expect them to be more common, and jumping around less in the common case is generally best for I-cache footprint and other front-end factors.  The loop naturally lends itself to checking both things in that order <em>after</em> division, though, so I'd have to do some extra setup to skew the loop and put the <code>n%c == 0</code> branch at the bottom.</p>
+
+<hr>
+
+<p><strong>Pretty much never use <code>mov rcx, symbol</code> to get a static address into a register</strong>.  With <code>nasm -fwin64</code>, it assembles to the 10-byte <code>mov r64, imm64</code> encoding, which is larger and typically slower to decode and/or fetch from uop cache than a 7-byte RIP-relative LEA.  Also, it needs a load-time fixup for ASLR.</p>
+
+<p>If static addresses fit in 32-bit signed immediates (true in some systems), they usually also fit in 32-bit unsigned, so <code>mov ecx, symbol</code> is shorter (only 5 bytes).</p>
+
+<ul>
+<li><strong><code>mov ecx, symbol</code>: 5 bytes, <a href="https://www.felixcloutier.com/x86/mov" rel="nofollow noreferrer"><code>mov r32, imm32</code></a>.  Best choice in position-dependent code</strong> (and usable in Windows with LargeAddressAware = no)</li>
+<li><code>mov rcx, strict dword symbol</code>: 7 bytes, <code>mov r/m64, sign_extended_imm32</code>.  Never use, except for kernel code (high addresses).</li>
+<li><code>mov rcx, strict qword symbol</code>: 10 bytes, <code>mov r64, imm64</code>.  Never use.</li>
+<li><code>mov rcx, symbol</code> with <code>nasm -fwin64</code> is equivalent to <code>strict qword</code></li>
+<li><strong><code>lea rcx, [rel symbol]</code>: 7 bytes, normally the best choice if <code>mov ecx, symbol</code> isn't available and/or for position-independent code</strong>.    (You used <code>default rel</code> so you don't need the <code>rel</code> in every addressing mode).</li>
+</ul>
+
+<p>I don't have a Windows system to test on, but <code>x86_64-w64-mingw32-ld win-primes.obj</code> will link all 4 of these into an executable.  (Unlike trying to link a Linux PIE executable, where 32-bit relocations aren't accepted at all).</p>
+
+<p>Windows executables can be Large Address Aware or not.  If not, pointers will be 32-bit (I think <em>all</em> pointers, not just static code/data label addresses).  Or actually 31-bit, so zero-extension and sign-extension both work, I think, allowing <code>[array + rdx*4]</code> addressing modes.  Anyway, in a Windows non-largeaddress executable, you can use <code>mov ecx, symbol</code> to put a symbol address into a register with only 5 bytes.  It's a tradeoff between needing a load-time fixup (for ASLR) of the immediate in the machine code vs. costing 2 extra bytes for a RIP-relative LEA.</p>
+
+<p><code>mov reg,immediate</code> can execute on more ports than RIP-relative LEA in some CPUs, but back-end port pressure is not usually a problem for these instructions (no input dependencies so they can run any time there's a spare cycle on the port they're scheduled to).</p>
+
+<hr>
+
+<p><strong>Don't use <code>BITS 64</code></strong>.  All that does is let you accidentally assemble 64-bit machine code into a 32-bit object file instead of getting an assemble-time error on <code>push rbp</code>, because <code>rbp</code> isn't a register outside of 64-bit mode.</p>
+
+<p><code>nasm -fwin64</code> sets the target bitness to 64-bit.  The only time <code>bits 64</code> is useful for fully 64-bit code is if you want to make a flat binary, e.g. for turning asm into shellcode or a bootloader.  (<code>nasm -fbin</code> doesn't have <code>bin64</code> or any other option for setting the target mode.)</p>
+
+<p>The main use-case for <code>bits 64</code> is if you're writing code that starts out in 16 bit mode, and switches the CPU to 64-bit mode.  So the first part of the code would be <code>bits 16</code>, then you might have some <code>bits 32</code> code that you reach with a <code>jmp far</code>, or maybe go straight to <code>bits 64</code> after setting up a GDT.  If you're not doing that or didn't understand this paragraph, you don't need and shouldn't use <code>bits 64</code>.</p>
+
+<hr>
+
+<p><strong>Put your read-only constant data in <code>.rdata</code>, not <code>.data</code></strong>  The <code>.data</code> section is for mutable static data.  Grouping read-only data together into <code>.rdata</code> is good because 1) it catches bugs if you accidentally write to it, and 2) whole pages that are unmodified can be shared between different processes running the same executable.  (shared memory mapping.)  Note that runtime relocation fixups from stuff like <code>mov ecx, symbol</code> in an executable or DLL using ASLR will prevent sharing.</p>
+
+<p>(On non-Windows, the equivalent section is <code>.rodata</code>).</p>
+
+<hr>
+
+<p><strong>Omit the frame pointer, like <code>gcc -fomit-frame-pointer</code></strong> (on by default with optimization enabled).  You're not accessing the stack through RBP anyway, so you're not saving any code size by having it available instead of using offsets relative to RSP.  So those extra instructions are just costing you code-size and uops for no benefit.  <code>mov rsp, rbp</code> (note that you got this backwards but it's ok because you'd already adjusted RSP so they were equal again anway) + <code>pop rbp</code> is equivalent to <code>leave</code>.  <code>leave</code> costs 3 uops total, one more than <code>mov</code> + <code>pop</code> on Intel CPUs, but it's only 1 per function.  If you already have your stack pointer pointing at the saved RBP value, you should just <code>pop rbp</code> instead of <code>leave</code> or <code>mov</code> + <code>pop</code>.</p>
+
+<p><strong>You actually should use stack space to <code>scanf</code> into, instead of static storage, though.</strong></p>
+
+<hr>
+
+<p>You're not checking for errors from <code>scanf</code>.  If the user enters invalid input, scanf will return <code>0</code> and leave <code>number</code> unmodified, so <code>0</code>.  That's pretty much ok for asm.  It doesn't get stuck in an infinite loop or crash.</p>
+
+<p>In most languages that would be a big no-no, but you wouldn't normally write the input/output code in asm for real in the first place.</p>
+
+<p>So as long as you're <em>aware</em> you're doing so, leave out error checking if you want.  You can always single-step in a debugger and print RAX after function calls, or even trace all the system calls your program makes.  (See the bottom of <a href="https://stackoverflow.com/tags/x86/info">https://stackoverflow.com/tags/x86/info</a> for debugging tips.)</p>
+
+<hr>
+
+<h2>Here's how I'd write it</h2>
+
+<p>Incorporating some of the things mentioned in other answers as well, like counting up from small divisors (quickly rule out most numbers), and only counting up to <code>~sqrt(n)</code> because divisors come in pairs.  This vastly speeds up the code for large primes like <code>2^31-1</code> = 2147483647.  My version is dominated by startup overhead for that on Linux; <code>perf stat</code> says task clock = 0.339985 ms.  <code>arith.divider_active</code> only reports 180k clock cycles out of ~950k clocks total on my i7-6700k Skylake (including kernel time).  The inner loop should saturate the division unit and just bottleneck on <code>div</code> throughput.</p>
+
+<pre><code>;; bits 64
+default rel
+
+extern printf
+extern scanf
+
+section .rdata   ;; I typically put static data at the end, but here is fine too
+;;    number: dq 0        ; use stack space for these
+;    isPrime: dq 1
+;    counter: dq 0        ; and just a register for this.
+
+    prompt: db "Which number would you like to check? ", 0
+    scan_fmt: db "%u", 0                                   ; %u instead of %d
+    numberIsPrime: db "%u is prime", 10, 0
+    numberIsNotPrime: db "%u is not prime", 10, 0
+
+section .text
+
+global main
+main:
+;    push rbp
+;    mov rbp, rsp   ; unneeded, we're not using the stack frame
+
+    stack_reserve: equ 32+8
+    sub    rsp, stack_reserve   ; shadow space for callees + 8 bytes for stack alignment
+
+    lea    rcx, [prompt]
+    call   printf             ; magically flushes stdout with Windows C library
+
+    ; memory from rsp+0 .. rsp+31 has potentially been stepped on by printf
+    ; leave RSP where it is, ready for another call
+
+;;; scanf into that 8-byte block of stack space above the shadow space, or into our *own* shadow space
+    lea    rdx, [rsp+32]        ; stack addresses are normally 64-bit, can't get away with edx
+    lea    rcx, [scan_fmt]
+    mov    dword [rdx], 0       ; instead of error check, set n = 0 in case of I/O error
+    call   scanf
+    ;cmp   eax, 1               ; success = exactly 1 conversion
+    ;jnz   .scanf_fail          ; TODO: error check
+
+    mov    r8d, [rsp+32]        ; r8d: 32-bit unsigned number to be checked
+
+    cmp    r8d, 3
+    jbe   .prime                ; 2 is prime, and let's consider 0 and 1 prime as well.
+                                ; catch 3 here so the loop can avoid the 3%3 == 0 corner case
+
+    test   r8b, 1               ; all *other* even numbers (LSB=0) are non-prime
+    jz    .notprime
+
+    ;; n &gt;= 5 at this point
+    mov    ecx, 3               ; ECX: trial divisor counter
+.divloop:                  ; do {
+    mov    eax, r8d
+    xor    edx, edx
+    div    ecx                ; *much* faster than div rcx
+
+    test   edx, edx
+    jz    .notprime           ; if (n%c == 0) goto notprime
+
+    add    ecx, 2             ; we've already ruled out all the even divisors
+
+    cmp    eax, ecx
+    ja    .divloop         ; while( n/c &gt; (c+2) );
+    ;; loop until c*c &gt; n, i.e. until c &gt;= sqrt(n), because divisors come in pairs
+    ;; The c*c == n exact case is caught by the edx==0 test
+
+    ;; Checking based on c*(c+2) lets us exit even earlier,
+    ;;  and saves instructions because we can add before cmp
+    ;; It's safe: I checked against a known-good primality test.
+    ;; It works because any numbers between c*c and c*(c+2) are either prime
+    ;;  or have smaller prime factors that we already found
+
+;; fall-through: n is prime
+.prime:
+    lea    rcx, [numberIsPrime]
+    mov    byte [rsp+32], 0
+.print:
+    mov    edx, r8d        ; n
+    call   printf          ; format string already set one of 2 ways
+;    mov rsp, rbp
+;    pop rbp          ; just use LEAVE if you need this
+
+    ;xor    eax,eax    ; return 0
+    movzx  eax, byte [rsp+32]    ; return isprime(n) ? EXIT_SUCCESS(0) : EXIT_FAILURE(1)
+    add    rsp, stack_reserve
+    ret
+
+.notprime:
+    mov    byte [rsp+32], 1            ; store return value on the stack (above printf's shadow space).
+                                       ;;  Typically you'd use a call-preserved register but we didn't need any for anything else
+    lea    rcx, [numberIsNotPrime]
+    jmp   .print
+   ;; function tail-duplication would also be an option instead of jmp back
+   ;; i.e. call printf  here and fall through to a mov eax,1 / ret
+</code></pre>
+
+<p><strong>Note the comments describing conditions that hold when execution reaches that comment line.  I find that useful for keeping track of what previous conditions have ruled out.</strong></p>
+
+<p>This actually does one better than checking <code>n/c &gt; c</code> as the loop condition.  <code>n/c &gt; c+2</code> doesn't miss any primes, and will exit the loop one iteration sooner sometimes.  It also saves instructions by not having to copy the old <code>ecx</code> to <code>edx</code> so you can compare against the old value.</p>
+
+<p>A more intuitive / more-obviously-correct version that does <code>n/c &gt; c</code> needs an extra <code>mov edx,ecx</code></p>
+
+<pre><code>.divloop:                  ; do {
+    mov    eax, r8d
+    xor    edx, edx
+    div    ecx
+
+    test   edx, edx
+    jz    .notprime           ; if (n%c == 0) goto notprime
+
+    mov    edx, ecx           ; save old c for compare
+    add    ecx, 2             ; we've already ruled out all the even divisors
+
+    cmp    eax, edx
+    ja    .divloop         ; while( n/c &gt; c );
+</code></pre>
+
+<hr>
+
+<p>Using the division result in the loop condition means out-of-order execution can't evaluate the loop condition ahead of <code>div</code> progress.  So it won't be able to hide the branch mispredict when we leave the loop.</p>
+
+<p><strong>If we had calculated <code>sqrt(n)</code> ahead of time with something like this</strong>:</p>
+
+<pre><code>cvtsi2ss   xmm0, r8      ; signed 64-bit source = zero-extended r8d = uint32_t =&gt; float
+sqrtss     xmm0, xmm0
+cvtss2si   r9d,  xmm0    ; upper bound for ecx = sqrt(n)
+;; or maybe we'd need to use sd instead of ss to avoid maybe rounding down
+</code></pre>
+
+<p>then the divide execution unit would have been busy doing that for about 3 cycles on Skylake.  That might actually be worth it; the branch mispredict penalty is probably higher.  <a href="https://stackoverflow.com/questions/49932119/avoid-stalling-pipeline-by-calculating-conditional-early/49933702#49933702">Avoid stalling pipeline by calculating conditional early
+</a>.  Skylake has relatively great throughput for FP sqrt, older CPUs are worse.  But it's still slow compared to multiply.  If the throughput cost of one sqrt is less than the branch-mispredict penalty + <code>div</code> latency, then this wins for primes (where we eventually exit the loop by falling through the <code>cmp/ja</code> which OoO exec can't check until the <code>div</code> result for that iteration is ready.)</p>
+
+<p>More importantly, most of the time you'll leave the loop from finding a divisor, unless you expect your inputs to usually be primes, and that branch unavoidably depends on the <code>div</code> result; that's the whole point of doing division.  So on the whole, doing an actual <code>sqrt</code> ahead of time to calculate a loop bound isn't worth it vs. using the clever trick of comparing the divisor and quotient.</p>
+
+<p>To put it another way, an extra <code>sqrtsd</code> at the start delays all the <code>div</code> instructions including the last one by however long <code>sqrt</code> occupies the divider (before an integer <code>div</code> can start).  Or maybe one <code>div</code> could start while <code>cvtsi2sd</code> is running.  But anyway, that's approximately how many extra cycles it would add before execution of the last <code>test/jz</code> uop can detect that the loop should have exited, and starts branch mispredict recovery.</p>
+
+<p>(I'm assuming that the loop-exit branch does mispredict.  This is normal unless you have a loop that runs for the same number of iterations repeatedly, and that count is under about 22 or 23 for Skylake.  It's IT-TAGE branch predictors are based on branch history, so this loop with 2 branches in it might only accurately predict the loop-exit for trip counts of &lt;= ~11 even if the loop has the same trip-count repeatedly.  Neither of those things are probably common.)</p>
+
+<hr>
+
+<p><code>sqrtss</code> is faster than <code>sqrtsd</code>.  A <code>double</code> can exactly represent every 32-bit integer (in fact up to ~53 bits, the size of its significand).  But We're probably find with rounding to the nearest <code>float</code>; a 32-bit <code>float</code> has more range than even <code>int64_t</code> so there's no risk of overflow to +Inf.  The only worry is that <code>(float)n</code> could round down, and we could miss a composite like <code>n = prime^2</code>.  You could compensate by always adding half the distance between representable <code>float</code>s for numbers in the size range 2<sup>32</sup>-1, but the extra <code>div</code> operations we end up doing for large primes costs more than just spending a few extra cycles for <code>double</code>.</p>
+
+<p>Even if we could cheaply do int-&gt;float conversion with rounding towards +Inf, any rounding up would mean extra loop iterations for large <code>n</code>.  But if we only need correctness for large <code>n</code> and speed for small <code>n</code>, it would be fun.  But changing the MXCSR rounding mode isn't worth it.</p>
+
+<p>If we did use <code>double</code> sqrtsd, we could check check for <code>n</code> being a perfect square just by looking at the FP inexact flag when square-rooting and converting to integer.  If both of those operations are exact, then <code>n</code> was a perfect square.  (But you'd have to reset the IE flag in MXCSR first, and that's slower than just integer squaring and comparison.)</p>
+    </div>

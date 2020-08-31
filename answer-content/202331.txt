@@ -1,0 +1,347 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I see a number of things that may help you improve your program, but first I wanted to say that you've definitely improved the program greatly from the previous version.  Nice work!</p>
+
+<h2>Fix the (minor) bug</h2>
+
+<p>The previous version correctly showed blanks at the end of the lines if there were fewer actual bytes in the file than the line length called for.  Unfortunately, that's no longer the case, so this command:</p>
+
+<pre><code>echo "foo" |hexdumpadvanced 
+</code></pre>
+
+<p>Produces this response:</p>
+
+<pre><code>66 6F 6F 0A 00 00 00 00 00 00 00 00 00 00 00 00 |foo.............|
+</code></pre>
+
+<p>That's not really correct because there are only 4 bytes and not 16.  The response of the previous version is what I would expect:</p>
+
+<pre><code>66 6F 6F 0A                                     |foo.            |
+</code></pre>
+
+<h2>Use shorter instructions</h2>
+
+<p>Since we're writing in assembly language, it makes sense to use that to our advantage. One way to do that is to keep the code as small as possible to help facilitate caching. If the code is small enough to fit entirely within L1 cache, for example, (and this program is), it won't have to go back out to slower memory (L2, L3 caches and hard drive) as often. One way to keep the code small is by using smaller instructions. One could write, for example,</p>
+
+<pre><code>mov rdi, 0    ; this sets edi to zero with a 5-byte instruction
+xor rdi, rdi  ; so does this but with a 3-byte instruction
+xor edi, edi  ; so does this but with a 2-byte instruction
+</code></pre>
+
+<p>The difference, however, is that the <code>xor</code> instructions are two and three bytes shorter. They also set the flags register (unlike a <code>mov</code>) so don't use it if you need to preserve flags.  There are quite a number of places in the code where that particular trick can be used.  </p>
+
+<h2>Don't save more registers than needed</h2>
+
+<p>Most of the skill involved in assembly language programming, and especially for the x86 series processors, is in making very careful use of registers.  So while it's often a good idea to save used registers (as your program generally does), careful use of registers while <em>avoiding</em> pushing and popping is how to make programs smaller and faster.  While the use of macros tends to make the program easier to read and understand, it can also hide the fact that you're generating inefficient code.  Use nasm's <code>-l</code> flag to generate a program listing.  It will show you exactly what machine language bytes are generated and you will find, for example, that the program pushes and pops the <code>rcx</code> many, many times and for no good reason since every time the <code>rcx</code> register is needed, it's explicitly set to the required value anyway.</p>
+
+<h2>Use memory efficiently</h2>
+
+<p>Right now, there is an input area and an separate output area, but they could easily be combined.  Consider the output data format for an 8-byte/line output:</p>
+
+<pre><code>00 01 02 03 04 05 06 07 |........|
+                         ^
+                     InputBuff
+</code></pre>
+
+<p>As shown above, the input buffer could be part of the output line.  That is, read the data into the location shown (part of the output buffer), convert to pairs of hex bytes to the left and then convert in-place to replace non-printable characters with <code>'.'</code> characters.</p>
+
+<h2>Understand standard <code>elf</code> segments</h2>
+
+<p>The <code>.data</code> section is a writable area that is initialized by reading data from the file.  However, there is also an <code>.rodata</code> which is read-only data.  That would be the more appropriate segment to use for the error messages, since there's no reason to modify those at runtime.</p>
+
+<h2>Restore the ability to tune the output</h2>
+
+<p>One of the things that was good about the previous version that is lost in this one is that one could simply redefine the <code>INPUTLEN</code> constant and recompile to change the line size.  This doesn't need to be the case, as I'll demonstrate in a rewritten version below.</p>
+
+<h2>Make jumps as short as possible</h2>
+
+<p>Shorter jumps are generally faster than longer jumps, so keeping the code compact helps assure that the jumps are short.  Of course the shortest jump is no jump at all, so eliminating jumps entirely is even better for performance because not only does it make the code shorter, but it also tends to eliminates cache misses and pipeline stalls.</p>
+
+<h2>Eliminate subroutine calls for maximum performance</h2>
+
+<p>If a routine is only used one place, it's generally faster to have the code in line rather than using a <code>call</code>.</p>
+
+<h2>Use buffering for read/write or both</h2>
+
+<p>C and C++ tend to use buffered reads and writes for performance.  It's also quite possible to do in assembly language and has significant performance benefits.  One way to think about it: write a subroutine that mimics a <code>sys_read</code> kernel call in that the buffer to write is in <code>rsi</code>, and the desired length is in <code>rdx</code>.  Then it would return either an error code or the number of bytes actually read in <code>rax</code>.  For the first iteration, it could simply be a wrapper for the <code>sys_read</code> kernel call.  Then enhance it by adding a buffer.  I'll show a worked example in the code below, but it might be a better learning experience if you try to implement it yourself before looking at my version.  You might also want to implement write buffering for further performance gains.</p>
+
+<h2>Consider adding an offset</h2>
+
+<p>The dump would contain more information if each line started with the hexadecimal offset of that portion of the file.</p>
+
+<h2>Consider other user enhancements</h2>
+
+<p>It would be nice to be able to do things like dynamically control the length of the lines via a command-line switch.  It would also be nice to allow for turning a hex dump back into a binary file.  For further inspiration, look at the man page for <code>xxd</code> and test its performance against your program.</p>
+
+<h2>Measured performance</h2>
+
+<p>I used a single video file with a length of 5144214118 bytes (5 Gib) to do some performance testing.  The earlier version of your program crashed with files over 64Kib in length, so I wasn't able to time that.  However, here are the timings for both your program and the updated one posted below with various settings.  With this large file, output was sent to <code>/dev/null</code> because I didn't want to use so much disk space.</p>
+
+<pre><code>3:45.09 version 1.1  
+2:17.00 updated with no address, 16Kib buffer
+4:11.07 updated, no address, no buffering
+2:21.48 updated with 8-byte address, 16Kib buffer
+</code></pre>
+
+<p>As noted above, read buffering provides a significant performance gain.  I also added the feature of showing the address (offset) of each line.  Finally, note that the three basic settings of address size, line size and buffer size are all (mostly) independently settable, so one can even specify weird things like a 3-byte address size and a 7-byte line size if desired.</p>
+
+<h2>Updated version</h2>
+
+<pre><code>; hexdump.asm
+;
+; This program reads INPUTLEN bytes at a time from stdin and writes out a 
+; formatted hex version as a dump.  For an INPUTLEN of 8 and ADDRBYTES = 4,
+; for example, here is an example of an output line:
+;
+; 00000000: 66 6F 6F 0A             |foo.    |
+; 
+; Very little error checking is done, because if writing to stdout fails, 
+; what would we do anyway?  An error on reading from stdin causes the 
+; program to exit with the received error code.  An input of zero length
+; is not considered an error and simply produces no output.
+;
+
+SECTION .bss
+;----------------------------------------------------------------------
+; Configurable settings
+;----------------------------------------------------------------------
+    ; ADDRBYTES is the size of the displayed address counter in bytes
+    ; set it to zero to omit display of addresses or to 8 for max size
+    ADDRBYTES: equ 4
+    ; INPUTLEN is the number of data bytes to display per line
+    INPUTLEN: equ 16
+    ; BUFFERBYTES is the size of the input buffer used or set to zero
+    ; to disable buffering.  This must always be some multiple of
+    ; INPUTLEN
+    BUFFERBYTES: equ INPUTLEN * 1024
+
+;----------------------------------------------------------------------
+; Derived settings
+;----------------------------------------------------------------------
+    ; ADDRLEN includes the length of the address (8 hex digits) 
+    ; plus the ": " immediately following
+%if ADDRBYTES
+%if ADDRBYTES &gt; 8
+%error "ADDRBYTES must be an integer in the range 0 through 8 inclusive"
+%endif
+    ADDRLEN: equ ADDRBYTES * 2 + 2
+%else
+    ADDRLEN: equ 0
+%endif
+    OUTPUTLEN: equ INPUTLEN * 4 + 3 
+    Address: resb ADDRLEN
+    Output: resb OUTPUTLEN      
+    InputBuff: equ Output + (INPUTLEN * 3) + 1  
+%if BUFFERBYTES
+%if BUFFERBYTES % INPUTLEN
+%error "BUFFERBYTES must be an integral multiple of INPUTLEN"
+%endif
+    ReadBuff: resb BUFFERBYTES
+    remaining: resq 1
+    current: resq 1
+    noMore: resb 1
+%endif
+
+SECTION .text
+;----------------------------------------------------------------------
+; ALtoHex
+;   converts the input byte in al to two ASCII hex digits in
+;   al,ah as hi,lo digits so that STOSW may be used to store
+;   them in the correct order
+;
+; INPUT: al = input byte to be converted to ASCII hex digits
+; OUTPUT: al,ah = hi,lo ASCII hex digits 
+; TRASHED: all other bits of RAX are zeroed
+; 
+;----------------------------------------------------------------------
+%macro ALtoHex 0
+        mov ah, al                  ; 
+        shr al,4                    ; 
+        and eax, 0f0fh              ; now hi and lo nybbles in ah,al
+        add eax, 3030h              ; convert to ASCII digits
+        cmp al,'9'                  ; high digit in printable range?
+        jbe %%chkLoDigit             
+        add al, 7                   ; if not it must be A-F, so add 7 
+%%chkLoDigit:
+        cmp ah, '9'                 ; lo digit in printable range?
+        jbe %%writeHexPair
+        add ah, 7                   ; if not it must be A-F, so add 7 
+%%writeHexPair:
+%endmacro
+
+;----------------------------------------------------------------------
+; main routine
+;   writes formatted hex dump of STDIN to STDOUT
+;
+; Register usage:
+; rax - various purposes, mostly data
+; rbx - address (preserved across system calls)
+; rcx - used as count of various things
+; rdx - length of most recently read "line"; &lt;= INPUTLEN
+; rdi - destination pointer, various
+; rsi - source pointer, various
+; 
+;----------------------------------------------------------------------
+GLOBAL _start                                      
+_start:
+        xor ebx, ebx                ; initialize address = 0
+%if ADDRBYTES
+        mov al,'0'                  ; fill address with all zeroes
+        lea rdi, [Address]
+        mov rcx, ADDRLEN - 2
+        rep stosb
+        mov al,':'                  ; then ':'
+        stosb
+        mov al,' '                  ; then ' '
+        stosb
+%endif
+%if BUFFERBYTES
+        mov [remaining], rbx        ; clear remaining
+        mov [noMore], bl            ; clear no-more file bytes flag
+%endif
+        ; fill output buffer
+        mov al, ' '                 ; fill rest of line with spaces 
+        lea rdi, [Output]
+        mov rcx, OUTPUTLEN - 2
+        rep stosb
+        mov al, '|'                 ; then '|'
+        stosb
+        mov [InputBuff - 1], al     ; another '|' at the end
+        mov al, 0ah                 ; and newline char
+        stosb
+        jmp .readline
+
+.checkLen:
+        ; at this point we've just read a line. len in rax and rdx
+        mov rcx, INPUTLEN
+        sub rcx, rax                ; if it's a short line, remainder in rcx
+        jz .tohex
+        ; this is a short line so pad areas with spaces
+        ; first, the ASCII area
+        mov rsi, rcx                ; save pad size in rsi
+        mov al, ' '                 ; spaces
+        std
+        lea rdi, [InputBuff + INPUTLEN - 1]
+        rep stosb
+        ; now the hex area
+        lea rdi, [InputBuff - 2]
+        lea rcx,[rsi*2 + rsi]       ; now store three spaces for each byte
+        rep stosb
+        cld
+.tohex:
+%if ADDRBYTES
+        ; convert address counter into ASCII digits
+        lea rdi, [Address]          ; point to output buffer
+        mov rsi, ADDRBYTES          ; convert this many bytes
+        mov rcx, (ADDRBYTES - 1) * 8  ; shift this many bits
+.addrLoop:
+        mov rax, rbx                ; recall address
+        shr rax, cl
+        ALtoHex                     ; macro to convert to ASCII hex
+        stosw                       ; store two ASCII hex digits
+        sub rcx, 8                  ; next time shift 8 fewer bits
+        dec rsi
+        jnz .addrLoop
+        add rbx, rdx                ; increment address counter
+%endif
+        ; convert each input byte to two ASCII hex digits
+        lea rdi, [Output]           ; 
+        lea rsi, [InputBuff]        ;
+        mov rcx, rdx                ; recall line length
+.hexLoop:
+        lodsb                       ; fetch next byte 
+        ALtoHex                     ; macro to convert to ASCII hex
+        stosw                       ; store two ASCII hex digits
+        inc rdi                     ; skip space
+        dec rcx                     ; do entire line
+        jnz .hexLoop
+
+        ; now convert the input to printable chars
+        lea rdi, [InputBuff]
+        mov rcx, rdx                ; recover length to rcx
+.substLoop:
+        mov al, byte [rdi]          ;
+        cmp al, 20h
+        jb .substitute
+        cmp al, 7eh
+        jbe .nextchar
+.substitute:
+        mov byte [rdi], '.'
+.nextchar:
+        inc rdi
+        dec rcx
+        jnz .substLoop
+
+        lea rsi,[Address]
+        mov edi,1                   ; write to stdout
+        mov rdx, OUTPUTLEN + ADDRLEN
+        mov rax, rdi                ; sys_write (1)
+        syscall
+
+.readline:
+        lea rsi,[InputBuff]         ; prepare to read a line of bytes
+        mov rdx, INPUTLEN
+%if BUFFERBYTES
+;----------------------------------------------------------------------
+; BufferedRead
+;   converts the input byte in al to two ASCII hex digits in
+;   al,ah as hi,lo digits so that STOSW may be used to store
+;   them in the correct order
+;
+; INPUT: rsi = buffer into which we read
+;        rdx = requested number of bytes
+; OUTPUT: rax = actual number of bytes read or -1 on error
+; TRASHED: none
+; 
+;----------------------------------------------------------------------
+.BufferedRead:
+        ; if remaining &lt; request size, fetch another block
+        cmp rdx, [remaining]
+        jbe .copyBuffer
+        xor eax, eax
+        cmp [noMore], al
+        jnz .copyBuffer
+        ; fetch block
+        push rdx
+        push rsi
+        lea rsi, [ReadBuff]
+        mov [current], rsi
+        mov rdx, BUFFERBYTES
+        xor edi, edi
+        xor eax, eax
+        syscall
+        pop rsi
+        pop rdx 
+        or  eax, eax                ; was there an error?
+        jle .exit                   
+        cmp rax, BUFFERBYTES        ; was it a short read?
+        adc byte [noMore], 0        ; if so, set flag
+        mov [remaining], rax
+        ; if remaining &gt;= request size, just copy from buffer
+.copyBuffer:
+        cmp rdx, [remaining]
+        jbe .justCopy
+        mov rdx, [remaining]        ; if not enough bytes, use all remaining
+.justCopy:
+        mov rcx, rdx
+        mov rdi, rsi
+        mov rsi, [current]          ;
+        rep movsb                   ; move bytes
+        sub [remaining], rdx        ; decrement remaining
+        add [current], rdx          ; advance current pointer
+        mov rax, rdx                ; return remaining bytes
+.exit:
+%else
+        xor edi, edi
+        xor eax, eax                ; sys_read (0)
+        syscall
+%endif
+        mov rdx, rax                ; save actual len in rdx temporarily
+        or  eax, eax
+        jg  .checkLen               ; keep going if OK
+        mov rdi, rax                ; bail out on error
+        mov rax, 60                 ; sys_exit (60)
+        syscall
+
+        ; END of program
+</code></pre>
+    </div>

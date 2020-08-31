@@ -1,0 +1,70 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Improve robustness and readability</h1>
+
+<ul>
+<li>Don't <code>using namespace</code> with namespaces not designed for it.</li>
+<li>Use <code>const</code> and <code>constexpr</code> to make your intent clear and prevent silly accidents.</li>
+<li>Make your internal functions <code>static</code>.</li>
+<li>Use more whitespace around operators.</li>
+</ul>
+
+<h1>Improve performance</h1>
+
+<p>I started with your code as a baseline, but increased <code>du</code> tenfold (to <code>.001</code>) to be able to test in a reasonable amount of time.  I compiled with <code>g++ -std=c++17 -O3 -march=native</code> to allow the optimiser to use its full range of substitutions and to use the full capabilities of the machine.</p>
+
+<p><code>std::pow()</code> normally works by multiplying logarithms.  For a power of 2, it's much simpler to simply multiply a number by itself.  I got about 10% speed improvement by re-writing <code>pdf()</code> thus:</p>
+
+<pre><code>static float pdf(float u)
+{
+    return 1 / ((1+u)*(1+u));
+}
+</code></pre>
+
+<p>Note that the seemingly equivalent <code>return 1 / (1+u) / (1+u)</code> provided exactly zero improvement, because the cost of division is so high.  (Which obviously suggests <code>std::pow(1+u, -2)</code> as an alternative, but I recommend the version I shown above, as it's more accurate).</p>
+
+<p>Are you sure you want to use <code>float</code>?  If <code>double</code> is slower on your platform, it may still be a worthwhile trade-off if it allows you to use a larger value of <code>du</code>.</p>
+
+<p>You can parallelize the loop in <code>main()</code>, like this (add <code>-fopenmp</code> to your <code>g++</code> command):</p>
+
+<pre><code>    float result[4] = {};
+    constexpr auto gqk = G - Q*(K-1);
+
+#pragma omp parallel for
+    for (int i = 0;  i &lt; 4;  ++i) {
+        if (gqk &gt; 0) {
+            result[i] = 1-integ(gamma[i]*gqk/Q, K, du);
+        }
+    }
+
+    for (auto r: result) {
+        std::cout &lt;&lt; r &lt;&lt; std::endl;
+    }
+</code></pre>
+
+<p>That saves me another 25% or so in wall-clock time (at the expense of using more CPU cores).</p>
+
+<p>However, you'll get a much better improvement by parallelizing the  loop in <code>integ</code> instead:</p>
+
+<pre><code>static float integ(float h, int k, float du)
+{
+    if (k == 1) {
+        return cdf(h);
+    }
+
+    float res = 0;
+    const int iterations = h / du;
+
+#pragma omp parallel for reduction(+:res)
+    for (int i = 0;  i &lt; iterations;  ++i) {
+        const float u = i * du;
+        res += integ(h - u, k - 1, du) * pdf(u) * du;
+    }
+
+    return res;
+}
+</code></pre>
+
+<p>(We need the <code>reduction</code> clause so that all the threads can contribute to <code>res</code> without needing to synchronize for that step - OpenMP applies the reduction after the threads have each produced their own local sum).</p>
+
+<p>That gained about 80% improvement over the original, on this 8-core machine.  (9 seconds elapsed with du = .001, and 15m 6s with du = .0001.  You're still going to have severe scaling problems when K goes to 10 - you'll probably need to also apply some mathematical insight to reduce the complexity at this point).</p>
+    </div>

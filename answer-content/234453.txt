@@ -1,0 +1,182 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'd endorse both of the reviews you've already gotten.  I just wanted to add a few points not already mentioned.</p>
+
+<h2>Prefer to pass <code>std::istream</code> rather than a file name</h2>
+
+<p>Your program could very easily be made a little more useful and general by writing <code>load()</code> to take an already open <code>std::istream&amp;</code> instead of a <code>std::string</code> filename.  For instance, it would allow you to pass a <code>std::stringstream</code> for testing.  </p>
+
+<h2>Use a simple state machine to read input</h2>
+
+<p>It seems that your <code>load</code> can be made a bit simpler and more robust by reading a character at a time and using a state machine.  Here's one way to do that that also uses the previous suggestion:</p>
+
+<pre><code>void CPU::load(std::istream&amp; in) {
+    enum States{sign, digit, error};
+    States state{States::sign};
+    bool negative{false};
+    Int value{0};
+    char ch;
+    while (in &gt;&gt; ch) {
+        switch(state) {
+            case States::sign:
+                switch(ch) {
+                    case '-':
+                        negative = true;
+                        state = States::digit;
+                        break;
+                    case '+':
+                        negative = false;
+                        state = States::digit;
+                        break;
+                    default:
+                        if (std::isdigit(ch)) {
+                            value = ch - '0';
+                            state = States::digit;
+                        } else {
+                            state = States::error;
+                        }
+                }
+                break;
+            case States::digit:
+               if (std::isdigit(ch)) {
+                    value = value * 10 + ch - '0';
+                } else if (ch == ',') {
+                   m.push_back(negative ? -value : value);
+                   value = 0;
+                   negative = false;
+                   state = States::sign;
+                } else {
+                    state = States::error;
+                }
+                break;
+            case States::error:
+                in.setstate(std::ios::failbit);
+                return;
+        }
+    }
+    if (state == States::digit) {
+       m.push_back(negative ? -value : value);
+    }
+}
+</code></pre>
+
+<h2>Gather like things together</h2>
+
+<p>It was already mentioned that having a <code>Memory</code> class might be a good idea.  I'd go a bit further and say that it would make sense to have both a <code>Memory</code> and a <code>Register</code> class.  The <code>Register</code> class could contain the <code>pc</code> and <code>sp</code> values and even <code>in</code> and <code>out</code>.</p>
+
+<h2>Separate interface from implementation</h2>
+
+<p>You may already know this, but in C++, a common idiom is to separate the interface from the implementation.  That is, the public interface would go into a header file and the corresponding implementation would go into a <code>.cpp</code> file.  The advantage is that with a carefully designed interface, the underlying implementation can be refined and modified without having to recompile the rest of the code.  See <a href="https://github.com/isocpp/CppCoreGuidelines/blob/master/CppCoreGuidelines.md#Rs-file-suffix" rel="nofollow noreferrer">SF.1</a> for details.</p>
+
+<h2>Gather things together into objects</h2>
+
+<p>The <code>Cpu</code> class arguably contains everything required to understand instructions, but it's spread over many places: there are multiple <code>enum</code>s, a number of <code>switch</code> statements and finally the operations themselves.  We can do better!  I would recommend creating an <code>Instruction</code> class.  Here's what I wrote:</p>
+
+<pre><code>struct Instruction {
+    Int value;
+    unsigned len;
+    std::string_view mnemonic;
+    void (* op )(const Instruction&amp; inst, Regs &amp;r, Mem &amp;m);
+
+    // more functions
+};
+</code></pre>
+
+<p>The <code>value</code> is the basic opcode value, such as <code>1</code> for add and <code>2</code> for multiply.  The <code>len</code> is the number of bytes for this instruction and <code>mnemonic</code> is the printable name of the instruction such as "ADD" or "MUL".  Finally, we have a function pointer to a <code>void</code> function that takes three arguments: a reference to the containing function (equivalent to the <code>this</code> pointer), a reference to the registers and a reference to the memory.  Now we can create a <code>static constexpr</code> list of these: </p>
+
+<pre><code>static constexpr std::array&lt;Instruction, 10&gt; instructions {{
+    // opcode,  len,  mnemonic,   operation
+    { 1, 4, "ADD", [](const Instruction&amp; inst, Regs&amp; r, Mem&amp; m){ 
+        inst.c(r, m) = inst.a(r, m) + inst.b(r, m);
+        r.pc += inst.len; 
+    }},
+    { 2, 4, "MUL", [](const Instruction&amp; inst, Regs&amp; r, Mem&amp; m){ 
+        inst.c(r, m) = inst.a(r, m) * inst.b(r, m);
+        r.pc += inst.len; 
+    }},
+    { 3, 2, "INPUT", [](const Instruction&amp; inst, Regs&amp; r, Mem&amp; m){
+        r.in &gt;&gt; inst.a(r, m);
+        r.pc += inst.len; 
+    }},
+    { 4, 2, "OUTPUT", [](const Instruction&amp; inst, Regs&amp; r, Mem&amp; m){
+        r.out &lt;&lt; inst.a(r, m) &lt;&lt; '\n';
+        r.pc += inst.len; 
+    }},
+    { 5, 3, "JNZ", [](const Instruction&amp; inst, Regs&amp; r, Mem&amp; m){
+        r.pc = (inst.a(r, m) == 0 ? r.pc + inst.len : inst.b(r, m));
+    }},
+    { 6, 3, "JZ", [](const Instruction&amp; inst, Regs&amp; r, Mem&amp; m){
+        r.pc = (inst.a(r, m) == 0 ? inst.b(r, m) : r.pc + inst.len);
+    }},
+    { 7, 4, "TESTLT", [](const Instruction&amp; inst, Regs&amp; r, Mem&amp; m){
+        inst.c(r, m) = inst.a(r, m) &lt; inst.b(r, m);
+        r.pc += inst.len; 
+    }},
+    { 8, 4, "TESTEQ", [](const Instruction&amp; inst, Regs&amp; r, Mem&amp; m){
+        inst.c(r, m) = inst.a(r, m) == inst.b(r, m);
+        r.pc += inst.len; 
+    }},
+    { 9, 2, "ADDRB", [](const Instruction&amp; inst, Regs&amp; r, Mem&amp; m){
+        r.rb += inst.a(r, m);
+        r.pc += inst.len; 
+    }},
+    { 99, 1, "HALT", [](const Instruction&amp; inst, Regs&amp; r, Mem&amp; ){
+        r.halted = true;
+        r.pc += inst.len; 
+    }},
+}};
+</code></pre>
+
+<p>Note that because it's <code>constexpr</code>, all of this is created at compile time and not at runtime.  The code relies on a few simple helper functions within the <code>Instruction</code> class:</p>
+
+<pre><code>bool operator==(const Int &amp;a) const { return opcode(a) == value; }
+Int&amp; a(Regs &amp;r, Mem &amp;m) const { 
+    return param(r, m, 1);
+}
+Int&amp; b(Regs &amp;r, Mem &amp;m) const { 
+    return param(r, m, 2);
+}
+Int&amp; c(Regs &amp;r, Mem &amp;m) const { 
+    return param(r, m, 3);
+}
+
+Int&amp; param(Regs &amp;r, Mem &amp;m, unsigned param) const { 
+    auto mul = 10;
+    for (unsigned i = 0; i &lt; param; ++i) {
+        mul *= 10;
+    }
+    const auto mode = m[r.pc] / mul % 10;
+    switch(mode) {
+        case 0:  // position
+            return m[m[r.pc + param]];
+            break;
+        case 1:  // immediate
+            if (param != 3) {
+                return m[r.pc + param];
+            }
+            break;
+        case 2:
+            return m[r.rb + m[r.pc + param]];
+            break;
+    }
+    throw std::logic_error("bad destination addressing mode");
+}
+
+static Int opcode(const Int&amp; num) { return num % 100; }
+</code></pre>
+
+<p>Finally, we can easily implement <code>run</code>:</p>
+
+<pre><code>void CPU::run() {
+    while (!r.halted) {
+        auto inst{std::find(instructions.begin(), instructions.end(), m[r.pc])};
+        if (inst != instructions.end()) {
+            inst-&gt;op(*inst, r, m);
+        } else {
+            throw std::runtime_error("Invalid instruction");
+        }
+    }
+}
+</code></pre>
+
+<p>In this code <code>m</code> is the memory structure and <code>r</code> is the register structure.  Because all of the instruction logic is encapsulated within each instruction, this loop is very clean and neat.  Adding new instructions is now literally as simple as adding new entries to the <code>instructions</code> array.</p>
+    </div>

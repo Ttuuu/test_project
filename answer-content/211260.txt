@@ -1,0 +1,386 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong>Code:</strong></p>
+
+<ul>
+<li><p>I realise you're not implementing <a href="https://en.cppreference.com/w/cpp/container/vector" rel="noreferrer">the complete functionality</a>, but you probably want add and use at least the <code>value_type</code>, <code>size_type</code>, <code>reference</code> and <code>const_reference</code> typedefs.</p></li>
+<li><p><code>operator==</code> and <code>operator!=</code> are simple to implement and quite useful.</p></li>
+<li><p>Use <code>std::size_t</code>, not <code>size_t</code> (the latter is the C version).</p></li>
+<li><p>Prefer named constants to magic numbers (e.g. declare a <code>static const std::size_t m_initial_size = 10u;</code>).</p></li>
+</ul>
+
+<hr>
+
+<ul>
+<li><p><code>m_first</code> is the same as <code>buffer</code>, so we don't need it.</p></li>
+<li><p>It's simpler to store the <code>size</code> and <code>capacity</code>, and calculate <code>last</code> and <code>end</code> when needed (we seem to need the size and capacity quite often).</p></li>
+</ul>
+
+<hr>
+
+<ul>
+<li>Good job with <code>const</code>-correctness. Note that function arguments passed by value may be better left non-<code>const</code> because:
+
+<ul>
+<li><code>const</code> is very important for reference / pointer types since with these the function can affect a variable outside its scope. It's easier to read a function definition where these "important" <code>const</code>s stand out. e.g. <code>(int foo, T const* bar)</code> vs <code>(const int foo, T const* const bar)</code>.</li>
+<li>C++ will actually match a function declaration that includes / omits a <code>const</code> for a pass-by-value argument with a function definition that omits / includes it respectively.</li>
+</ul></li>
+</ul>
+
+<hr>
+
+<ul>
+<li><p>Note that the standard version of the single argument constructor <code>explicit vector(const size_t count);</code> does initialize elements (as if it were calling <code>vector(const size_t count, const Ty&amp; val);</code> with a default constructed <code>Ty</code>). In fact, we can use a delegating constructor to do this:</p>
+
+<pre><code>template&lt;typename Ty&gt;
+vector&lt;Ty&gt;::vector(const size_t count) : vector(count, Ty()) { }
+</code></pre></li>
+</ul>
+
+<hr>
+
+<ul>
+<li>Don't call the class destructor in the copy / move operators. The destructor should be called only once (usually automatically) when a class is destroyed. Calling it multiple times may be undefined behaviour. The memory cleanup should be moved into a separate function (e.g. <code>deallocate()</code>), which should be called wherever necessary.</li>
+</ul>
+
+<hr>
+
+<p><strong>Design:</strong></p>
+
+<p>The difference between memory allocation and object construction is an important feature of <code>std::vector</code> that isn't mirrored completely in this <code>nonstd</code> version. With <code>std::vector</code>, a memory buffer of the appropriate size is allocated without any constructor calls. Then objects are constructed in place inside this buffer using <a href="https://en.cppreference.com/w/cpp/language/new" rel="noreferrer">"placement new"</a>.</p>
+
+<p>As such, it might be cleaner to abstract the memory buffer into a separate class that only allocates / deallocates memory. This is separate from the construction, copying, and destruction of the elements contained within this buffer, which can be handled by the <code>vector</code> class.</p>
+
+<p>Various standard algorithms also exist to help with placement new, e.g. <a href="https://en.cppreference.com/w/cpp/memory/uninitialized_copy_n" rel="noreferrer"><code>std::uninitialized_copy_n</code></a> and <a href="https://en.cppreference.com/w/cpp/memory/uninitialized_fill_n" rel="noreferrer"><code>std::uninitialized_fill_n</code></a>.</p>
+
+<p>As a (largely untested) example:</p>
+
+<pre><code>#include &lt;cassert&gt;
+#include &lt;cstddef&gt;
+#include &lt;algorithm&gt;
+
+namespace nonstd {
+
+    template&lt;class Ty&gt;
+    class memory_block
+    {
+    public:
+
+        using size_type = std::size_t;
+        using value_type = Ty;
+        using pointer = Ty*;
+        using const_pointer = Ty const*;
+
+        memory_block():
+            m_size(size_type{ 0 }),
+            m_buffer(nullptr) { }
+
+        explicit memory_block(size_type count):
+            m_size(count),
+            m_buffer(allocate(m_size)) { }
+
+        memory_block(memory_block const&amp; other):
+            m_size(other.m_size),
+            m_buffer(allcoate(m_size)) { }
+
+        memory_block(memory_block&amp;&amp; other):
+            m_size(std::move(other.m_size)),
+            m_buffer(std::move(other.m_buffer))
+        {
+            other.m_size = size_type{ 0 };
+            other.m_buffer = nullptr;
+        }
+
+        ~memory_block()
+        {
+            deallocate(m_buffer);
+        }
+
+        void swap(memory_block&amp; other)
+        {
+            using std::swap;
+            swap(m_size, other.m_size);
+            swap(m_buffer, other.m_buffer);
+        }
+
+        memory_block&amp; operator=(memory_block const&amp; other)
+        {
+            auto temp = memory_block(other);
+            swap(temp);
+            return *this;
+        }
+
+        memory_block&amp; operator=(memory_block&amp;&amp; other)
+        {
+            auto temp = memory_block(std::move(other));
+            swap(temp);
+            return *this;
+        }
+
+        size_type size() const
+        {
+            return m_size;
+        }
+
+        pointer data()
+        {
+            return m_buffer;
+        }
+
+        const_pointer data() const
+        {
+            return m_buffer;
+        }
+
+        pointer at(size_type index)
+        {
+            assert(index &lt; m_size); // maybe throw instead
+            return m_buffer + index;
+        }
+
+        const_pointer at(size_type index) const
+        {
+            assert(index &lt; m_size);  // maybe throw instead
+            return m_buffer + index;
+        }
+
+    private:
+
+        static pointer allocate(std::size_t size)
+        {
+            return static_cast&lt;pointer&gt;(::operator new (sizeof(value_type) * size));
+        }
+
+        static void deallocate(pointer buffer)
+        {
+            delete static_cast&lt;void*&gt;(buffer);
+        }
+
+        std::size_t m_size;
+        Ty* m_buffer;
+    };
+
+    template&lt;class Ty&gt;
+    inline void swap(memory_block&lt;Ty&gt;&amp; a, memory_block&lt;Ty&gt;&amp; b)
+    {
+        a.swap(b);
+    }
+
+    template&lt;class Ty&gt;
+    class vector
+    {
+    public:
+
+        using size_type = std::size_t;
+        using value_type = Ty;
+
+        vector();
+        explicit vector(size_type count);
+        vector(size_type count, const value_type&amp; val);
+
+        vector(const vector&amp; other);
+        vector(vector&amp;&amp; other);
+
+        ~vector();
+
+        void swap(vector&amp; other);
+
+        vector&amp; operator=(const vector&amp; other);
+        vector&amp; operator=(vector&amp;&amp; other);
+
+        size_t size() const;
+        size_t capacity() const;
+
+        void push_back(const value_type&amp; val);
+        void pop_back();
+
+    private:
+
+        static const size_type M_INITIAL_SIZE = size_type{ 10 };
+
+        size_type m_size;
+        memory_block&lt;Ty&gt; m_buffer;
+
+        void grow(size_type amount);
+        void reallocate(size_type min_size);
+
+        void construct(size_type index, const value_type&amp; value);
+        void destruct(size_type index);
+        void destruct_all();
+    };
+
+    template&lt;class Ty&gt;
+    inline void swap(vector&lt;Ty&gt;&amp; a, vector&lt;Ty&gt;&amp; b)
+    {
+        a.swap(b);
+    }
+
+    template&lt;class Ty&gt;
+    vector&lt;Ty&gt;::vector(): 
+        m_size(0u), 
+        m_buffer(M_INITIAL_SIZE)
+    {
+
+    }
+
+    template&lt;class Ty&gt;
+    vector&lt;Ty&gt;::vector(size_type count):
+        m_size(count),
+        m_buffer(m_size)
+    {
+        std::uninitialized_value_construct_n(m_buffer.data(), m_size); // value construct each element w/ placement new (C++17)
+    }
+
+    template&lt;class Ty&gt;
+    vector&lt;Ty&gt;::vector(size_type count, const value_type&amp; value) : 
+        m_size(count),
+        m_buffer(m_size)
+    {
+        std::uninitialized_fill_n(m_buffer.data(), m_size, value); // copy construct each element w/ placement new
+    }
+
+    template&lt;class Ty&gt;
+    vector&lt;Ty&gt;::vector(const vector&amp; other):
+        m_size(other.m_size),
+        m_buffer(m_size) // note: allocates only what we need to contain the existing elements, not the same as the capacity of the other buffer
+    {
+        std::uninitialized_copy_n(other.m_buffer.data(), other.m_size, m_buffer.data()); // copy construct each element from old buffer to new buffer w/ placement new
+    }
+
+    template&lt;class Ty&gt;
+    vector&lt;Ty&gt;::vector(vector&amp;&amp; other):
+        m_size(std::move(other.m_size)),
+        m_buffer(std::move(other.m_buffer)) // take ownership of the buffer
+    {
+        other.m_size = size_type{ 0 }; // other vector is now empty (nothing needs to be constructed / destructed)
+    }
+
+    template&lt;class Ty&gt;
+    vector&lt;Ty&gt;::~vector()
+    {
+        destruct_all();
+    }
+
+    template&lt;class Ty&gt;
+    void vector&lt;Ty&gt;::swap(vector&amp; other)
+    {
+        using std::swap;
+        swap(m_size, other.m_size);
+        swap(m_buffer, other.m_buffer);
+    }
+
+    template&lt;class Ty&gt;
+    vector&lt;Ty&gt;&amp; vector&lt;Ty&gt;::operator=(const vector&amp; other)
+    {
+        auto temp = vector(other);
+        swap(temp);
+        return *this;
+    }
+
+    template&lt;class Ty&gt;
+    vector&lt;Ty&gt;&amp; vector&lt;Ty&gt;::operator=(vector&amp;&amp; other)
+    {
+        auto temp = vector(std::move(other));
+        swap(temp);
+        return *this;
+    }
+
+    template&lt;class Ty&gt;
+    size_t vector&lt;Ty&gt;::size() const
+    {
+        return m_size;
+    }
+
+    template&lt;class Ty&gt;
+    size_t vector&lt;Ty&gt;::capacity() const
+    {
+        return m_buffer.size();
+    }
+
+    template&lt;class Ty&gt;
+    void vector&lt;Ty&gt;::push_back(const value_type&amp; value)
+    {
+        grow(size_type{ 1 });
+        construct(m_size, value);
+        ++m_size;
+    }
+
+    template&lt;class Ty&gt;
+    void vector&lt;Ty&gt;::pop_back()
+    {
+        assert(m_size &gt; 0); // maybe throw instead
+
+        destruct(m_size - 1);
+        --m_size;
+    }
+
+    template&lt;class Ty&gt;
+    void vector&lt;Ty&gt;::grow(size_type amount)
+    {
+        if (m_buffer.size() - m_size &lt; amount)
+            reallocate(m_size + amount);
+    }
+
+    template&lt;class Ty&gt;
+    void vector&lt;Ty&gt;::reallocate(size_type min_size)
+    {
+        assert(min_size &gt; m_size);
+
+        auto capacity = std::max(min_size, m_buffer.size() + std::max(m_buffer.size() / size_type{ 2 }, size_type{ 1 })); // growth factor of 1.5ish
+
+        auto buffer = memory_block&lt;value_type&gt;(capacity);
+        std::uninitialized_copy_n(m_buffer.data(), m_size, buffer.data()); // copy each element from old buffer to new buffer w/ placement new
+
+        destruct_all(); // clean up the old buffer (call destructors on each of the old elements)
+
+        m_buffer = std::move(buffer); // take ownership of the new buffer
+    }
+
+    template&lt;class Ty&gt;
+    void vector&lt;Ty&gt;::construct(size_type index, const value_type&amp; value)
+    {
+        new (m_buffer.at(index)) value_type(value); // placement new w/ copy constructor
+    }
+
+    template&lt;class Ty&gt;
+    void vector&lt;Ty&gt;::destruct(size_type index)
+    {
+        assert(index &lt; m_size);
+
+        m_buffer.at(index)-&gt;~value_type(); // explictly call destructor (because we used placement new)
+    }
+
+    template&lt;class Ty&gt;
+    void vector&lt;Ty&gt;::destruct_all()
+    {
+        for (auto index = size_type{ 0 }; index != m_size; ++index)
+            destruct(index);
+    }
+
+} // nonstd
+
+int main()
+{
+    {
+        nonstd::vector&lt;int&gt; v;
+        v.push_back(10);
+    }
+    {
+        nonstd::vector&lt;int&gt; v(5);
+        v.pop_back();
+    }
+    {
+        nonstd::vector&lt;int&gt; v(5, 1);
+    }
+    {
+        nonstd::vector&lt;int&gt; v1(2, 2);
+        nonstd::vector&lt;int&gt; v2(v1);
+    }
+    {
+        nonstd::vector&lt;int&gt; v1(2, 2);
+        nonstd::vector&lt;int&gt; v2(std::move(v1));
+    }
+}
+</code></pre>
+
+<p>Note the use of the "copy and swap" idiom in the copy and move assignment operators, which makes implementing them quite a lot easier.</p>
+    </div>

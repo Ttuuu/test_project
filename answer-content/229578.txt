@@ -1,0 +1,90 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>This answer uses pointer-casting for type-punning just to save space.  In practice keep using your union (safe in ISO C99, and in C++ as a GNU and MSVC extension) or memcpy (safe in C and C++).  This pointer-casting is only safe in MSVC, or GNU-compatible compilers with <code>-fno-strict-aliasing</code></p>
+
+<h1>Initial approximation</h1>
+
+<p>Packed bit fields are not only unnecessary here, they make the result worse. You do something along the lines of:</p>
+
+<pre><code>uint64_t i = *(uint64_t*)&amp;f;           // double to int
+i = i - (1023 &lt;&lt; 52);                  // remove IEEE754 bias
+i = i &gt;&gt; 1;                            // divide exponent by 2
+i = i + (1023 &lt;&lt; 52);                  // add IEEE754 bias
+</code></pre>
+
+<p>If you change the order of operations, you can handle the biasing in a single constant:</p>
+
+<pre><code>uint64_t i = *(uint64_t*)&amp;f;           // double to int
+i = i &gt;&gt; 1;                            // divide exponent by 2
+i = i + (1023 &lt;&lt; 52) - (1023 &lt;&lt; 51);   // remove/add IEEE754 bias
+</code></pre>
+
+<p>The constant can then be simplified to:</p>
+
+<pre><code>uint64_t i = *(uint64_t*)&amp;f;           // double to int
+i = (i &gt;&gt; 1) + (1023 &lt;&lt; 51);           // all of the above
+</code></pre>
+
+<p>Note that I didn't bother to mask when shifting, so the exponent's rightmost bit drops into the mantissa, which is shifted as well. This is a feature, not a bug. The IEEE754 formats are deliberately chosen to be monotonic when interpreted as integers, so carry-overs between exponent and mantissa are explicitly allowed.</p>
+
+<p>With my approximation, the mapping is as follows (linear mapping within intervals):</p>
+
+<pre><code>original   number is    exponent   manitssa   orig interval
+exponent  in interval   in sqrt   first bit     maps to
+   0     [  1.0,  2.0 )    0         0       [  1.0,  1.5 )
+   1     [  2.0,  4.0 )    0         1       [  1.5,  2.0 )
+   2     [  4.0,  8.0 )    1         0       [  2.0,  3.0 )
+   3     [  8.0, 16.0 )    1         1       [  3.0,  4.0 )
+   4     [ 16.0, 32.0 )    2         0       [  4.0,  6.0 )
+</code></pre>
+
+<p>With your code, the mapping is (also linear within intervals):</p>
+
+<pre><code>original   number is    exponent  orig interval
+exponent  in interval   in sqrt     maps to
+   0     [  1.0,  2.0 )    0     [  1.0,  2.0 )
+   1     [  2.0,  4.0 )    0     [  1.0,  2.0 )
+   2     [  4.0,  8.0 )    1     [  2.0,  4.0 )
+   3     [  8.0, 16.0 )    1     [  2.0,  4.0 )
+   4     [ 16.0, 32.0 )    2     [  4.0,  8.0 )
+</code></pre>
+
+<h1>Newton-Raphson</h1>
+
+<p>Given a good approximation, Newton-Raphson doubles the number of significant digits on each iteration (quadratic convergence). The above approximation provides about 4 bits of accuracy (max error: 6% or ~1/16), so 3 Newton-Raphson iterations are required for single and 4 iterations for double precision.</p>
+
+<p>The entire code could look like this:</p>
+
+<pre><code>float sqrtf(float x)
+{
+    float y = x;
+    // Approximation
+    uint32_t* i = (uint32_t*)&amp;x;
+    *i = (*i &gt;&gt; 1) + (127 &lt;&lt; 22);
+    // Newton-Raphson
+    x = (x + y/x) / 2;
+    x = (x + y/x) / 2;
+    x = (x + y/x) / 2;
+    return x;
+}
+
+double sqrt(double x)
+{
+    double y = x;
+    // Approximation
+    uint64_t* i = (uint64_t*)&amp;x;
+    *i = (*i &gt;&gt; 1) + (1023 &lt;&lt; 51);
+    // Newton-Raphson
+    x = (x + y/x) / 2;
+    x = (x + y/x) / 2;
+    x = (x + y/x) / 2;
+    x = (x + y/x) / 2;
+    return x;
+}
+</code></pre>
+
+<h1>Subnormals and other hazards</h1>
+
+<p>You already have special handling for <code>nan</code>, <code>inf</code>, <code>0</code> and <code>x &lt; 0</code>, which is good, but we need to handle subnormal numbers as well. The code, both yours and mine, fails when confronted with such numbers. As a remedy, I suggest you scale subnormal numbers by <code>2^200</code> and scale the result by <code>2^-100</code>. I chose <code>2^200</code> because it safely brings all subnormals back into normal range for all precisions, including quad, but other numbers work equally well (but only powers of two retain full precision).</p>
+
+<p>Also observe that my code relies on IEEE754 properties. It doesn't work for non-IEEE754 numbers, most notably x86's 80bit <code>extended double</code> format. If you want to handle such numbers, you can convert them to <code>float</code> or <code>double</code> for the approximation step and back to <code>extended double</code> for Newton-Raphson.</p>
+    </div>

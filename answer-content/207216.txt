@@ -1,0 +1,150 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>The interface is dangerous</h1>
+<p>Functions that write to user-provided memory absolutely need to know how much memory is valid, and not write beyond the bounds.  I could write something like this:</p>
+<pre><code> char s[] = "some string with tags";
+ findDelimitedBlocks(s, "@");
+</code></pre>
+<p>And if the replacements are larger than the tags, then we'll write beyond the bounds of <code>s</code>.  We really need another argument, <code>size_t max</code>, that specifies how much of <code>inString</code> is available for writing, in the same way that <code>snprintf()</code> and <code>strncpy</code> do.</p>
+<p>I think perhaps it might be better for the caller to provide <code>outString</code> separately from <code>inString</code> (which could then be <code>const char*</code> - e.g. a string literal), giving the option whether or not to copy back and overwrite the original.</p>
+<p>Also, we want to make the function general, so that the list of replacements can be passed as a parameter.</p>
+<h1>Use standard library <code>strstr()</code></h1>
+<p>We seem to be painfully reimplementing string search when we're looking for <code>delimiter</code>.  I think we could simplify the code greatly by using <code>strstr()</code>; we then know how much to directly <code>strcpy</code> to output, or to search for amongst the replacements.</p>
+<h1>Remove pointless <code>memset()</code></h1>
+<p>Here, memory is immediately overwritten, and the first line achieves nothing:</p>
+<blockquote>
+<pre><code>        memset(string_Variable, 0x00, strlen(string_Variable));
+        sprintf(string_Variable,"LION");
+</code></pre>
+</blockquote>
+<h1>Nitpick</h1>
+<p><code>int main(void)</code>, not <code>void main()</code>.</p>
+<hr>
+<h1>Working replacement</h1>
+<p>Here's how I'd write this, taking into account the comments I made:</p>
+<pre><code>#include &lt;stdbool.h&gt;
+#include &lt;string.h&gt;
+
+/*
+   Attempt to copy COUNT chars from SRC to DEST without exceeding
+   CAPACITY (including terminating NUL char).
+
+   Update capacity and dest to reflect the remaining space.
+
+   Return the amount that would be written if capacity were unlimited.
+ */
+static size_t write_and_update(char **dest, size_t *capacity,
+                               const char *src, size_t count)
+{
+    if (!dest || !count) {
+        return count;
+    }
+
+    if (count &lt; *capacity) {
+        strncpy(*dest, src, count);
+        *dest += count;
+        *capacity -= count;
+    } else if (*capacity) {
+        strncpy(*dest, src, *capacity);
+        (*dest)[*capacity-1] = '\0';
+        *dest = NULL;
+        *capacity = 0;
+    }
+
+    return count;
+}
+
+
+struct replacement {
+    const char *tag;
+    const char *text;
+};
+
+/* return length of substituted string (perhaps greater than capacity). */
+/* dest may be NULL only if capacity is zero */
+size_t replace_in_string(char *dest, size_t capacity,
+                         const char *src, const char *delimiter,
+                         size_t rep_count, const struct replacement *reps)
+{
+    const size_t delim_len = strlen(delimiter);
+
+    size_t output_size = 0;
+
+    while (true) {
+        /* find two delimiters */
+        const char *const delim_start = strstr(src, delimiter);
+        if (!delim_start) break;
+        const char *const tag_start = delim_start + delim_len;
+
+        const char *const tag_end = strstr(tag_start, delimiter);
+        if (!tag_end) break;
+        const char *const delim_end = tag_end + delim_len;
+
+        const size_t tag_len = (size_t)(tag_end - tag_start);
+
+        /* write the prefix part */
+        const size_t text_len = (size_t)(delim_start - src);
+        output_size += write_and_update(&amp;dest, &amp;capacity, src, text_len);
+
+        /* look up the replacement */
+        /* linear search, but we could use binary search if rep_count gets large */
+        const struct replacement *rep = NULL;
+        for (size_t i = 0;  i &lt; rep_count;  ++i) {
+            if (strlen(reps[i].tag) == tag_len &amp;&amp; memcmp(reps[i].tag, tag_start, tag_len) == 0) {
+                rep = &amp;reps[i];
+                break;
+            }
+        }
+        if (!rep) {
+            /* not found */
+            const size_t delim_len = (size_t)(delim_end - delim_start);
+            output_size += write_and_update(&amp;dest, &amp;capacity, delim_start, delim_len);
+        } else {
+            output_size += write_and_update(&amp;dest, &amp;capacity, rep-&gt;text, strlen(rep-&gt;text));
+        }
+
+        /* update */
+        src = delim_end;
+    }
+
+    {
+        /* write the remaining text */
+        output_size += write_and_update(&amp;dest, &amp;capacity, src, strlen(src));
+    }
+
+    return output_size;
+}
+
+    
+</code></pre>
+
+<pre><code>#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+
+int main(void)
+{
+    const char *template = "@@#animal@@# is a great hunter, he likes @@#food@@#....";
+    printf("String Before [%s]\n", template);
+
+    static const struct replacement replacements[] = {
+        { "animal", "LION" },
+        { "food", "deer" },
+    };
+
+    const size_t rep_len = sizeof replacements / sizeof *replacements;
+
+    const size_t out_size = replace_in_string(NULL, 0, template, "@@#",
+                                              rep_len, replacements);
+
+    char *output = malloc(out_size+1);
+    if (!output) {
+        fprintf(stderr, "Allocation of %zu failed!", out_size);
+        return 1;
+    }
+
+    replace_in_string(output, out_size, template, "@@#", rep_len, replacements);
+    printf("String After [%s]\n", output);
+
+    free(output);
+}
+</code></pre>
+    </div>

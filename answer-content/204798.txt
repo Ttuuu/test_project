@@ -1,0 +1,269 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>As David has pointed out it's difficult to know what the company actual means by SOLID, DRY, YAGNI and KISS, so the below is just my thoughts about your code:</p>
+
+<blockquote>
+<pre><code>  public virtual bool AddCustomer(string firstName, string surname, string email, DateTime dateOfBirth, int companyId)
+  {
+    // Validate customer fields before going further
+    if (!IsValidCustomerHelper(firstName, surname, email, dateOfBirth)) return false;
+
+    var company = GetCustomerCompanyHelper(companyId);
+
+    var customer = new Customer
+    {
+      Company = company,
+      DateOfBirth = dateOfBirth,
+      EmailAddress = email,
+      Firstname = firstName,
+      Surname = surname
+    };
+
+    SetCreditValuesHelper(company, customer);
+    GetCreditLimitHelper(customer);
+
+    if (customer.HasCreditLimit &amp;&amp; customer.CreditLimit &lt; 500)
+    {
+      return false;
+    }
+
+    CustomerDataAccess.AddCustomer(customer);
+
+    return true;
+  }
+</code></pre>
+</blockquote>
+
+<p>At first sight you manage to clean the code up to some extend. But you keep the creation of the <code>Customer</code> inside the main method - but make a nice method to create the company in. I would make a <code>CreateCustomer(...)</code> method in order to keep the main method clean (see below).</p>
+
+<p>In the same way: you have the nice helper methods <code>SetCreditValuesHelper</code> and <code>GetCreditLimitHelper</code> but then you make the credit limit check in the main method. I would handle all that in one method.</p>
+
+<p>Names: Why do you add "<code>Helper</code>" to all your private methods, for instance: <code>SetCreditValuesHelper()</code>. IMO it is redundant and disturbing.</p>
+
+<p>So - again IMO - your refactoring of <code>AddCustomer()</code> still violates both SOLID and KISS</p>
+
+<p>A gentle but yet efficient refactoring of the <code>AddCustomer()</code> could be:</p>
+
+<pre><code>public bool AddCustomer(string firname, string surname, string email, DateTime dateOfBirth, int companyId)
+{
+  try
+  {
+    if (!CheckName(firname) || !CheckName(surname) || !CheckEmail(email) || !CheckAge(dateOfBirth))
+    {
+      return false;
+    }
+
+    var company = GetCompany(companyId);
+    if (company == null)
+    {
+      return false;
+    }
+
+    var customer = CreateCustomer(firname, surname, email, dateOfBirth, company);
+    if (customer == null)
+    {
+      return false;
+    }
+
+    if (!HandleCredit(customer, company))
+    {
+      return false;
+    }
+
+    CustomerDataAccess.AddCustomer(customer);
+
+    return true;
+  }
+  catch (Exception)
+  {
+
+  }
+
+  return false;
+}
+</code></pre>
+
+<p>Here I've encapsulated everything in a <code>try..catch</code> because we don't know what <code>CompanyRepository</code> or <code>CustomerCreditServiceClient</code> is up to, when it comes to exceptions, and the existing client doesn't handle exceptions.</p>
+
+<p>And the helper functions :</p>
+
+<pre><code>private bool CheckName(string name)
+{
+  return !string.IsNullOrWhiteSpace(name);
+}
+
+private bool CheckEmail(string email)
+{
+  return !string.IsNullOrWhiteSpace(email) &amp;&amp; email.Contains("@") &amp;&amp; email.Contains(".");
+}
+
+private bool CheckAge(DateTime birthDate)
+{
+  var now = DateTime.Now;
+  int age = now.Year - birthDate.Year;
+  if (now.Month &lt; birthDate.Month || (now.Month == birthDate.Month &amp;&amp; now.Day &lt; birthDate.Day))
+  {
+    age--;
+  }
+
+  return age &gt;= 21;
+}
+
+private Company GetCompany(int companyId)
+{
+  var companyRepository = new CompanyRepository();
+  return companyRepository.GetById(companyId);
+}
+
+private Customer CreateCustomer(string firname, string surname, string email, DateTime dateOfBirth, Company company)
+{
+  return new Customer
+  {
+    Company = company,
+    DateOfBirth = dateOfBirth,
+    EmailAddress = email,
+    Firstname = firname,
+    Surname = surname
+  };
+}
+
+private bool HandleCredit(Customer customer, Company company)
+{
+  if (company.Name == "VeryImportantClient")
+  {
+    // Skip credit check
+    customer.HasCreditLimit = false;
+  }
+  else
+  {
+    customer.HasCreditLimit = true;
+    using (var customerCreditService = new CustomerCreditServiceClient())
+    {
+      customer.CreditLimit = customerCreditService.GetCreditLimit(customer.Firstname, customer.Surname, customer.DateOfBirth);
+      customer.CreditLimit = company.Name == "ImportantClient" ? customer.CreditLimit * 2 : customer.CreditLimit;
+    }
+  }
+
+  return !customer.HasCreditLimit || customer.HasCreditLimit &amp;&amp; customer.CreditLimit &gt;= 500;
+}
+</code></pre>
+
+<hr>
+
+<p>You are right, it is difficult to meaningfully unit test a method just returning <code>true/false</code>, and it seems that the existing client doesn't even accept some well chosen exceptions either. Therefore your DI-idea seems to be a good idea - in order to be able to test each action separately.</p>
+
+<p>The idea of derive from <code>CustomerService</code> is good because you then meet the <strong>O</strong> in SOLID. </p>
+
+<p>But you actually make some bugs:</p>
+
+<blockquote>
+<pre><code>  public class CustomerCompanyService : CustomerService, ICustomerService
+  {
+    protected override void SetCreditValuesHelper(Company company, Customer customer)
+    {
+        // Has limit if not VeryImportantClient.
+        // Could re-factor further and remove magic string
+        customer.HasCreditLimit = company.Name != "VeryImportantClient";
+
+        // Do credit check and double credit limit
+        if (!customer.HasCreditLimit) return;
+        var creditLimit =
+            _customerCreditService.GetCreditLimit(customer.Firstname, customer.Surname, customer.DateOfBirth);
+        creditLimit = creditLimit * 2;
+        customer.CreditLimit = creditLimit;
+    }
+  }
+</code></pre>
+</blockquote>
+
+<p>What about <code>company.Name != "ImportantClient"</code>?</p>
+
+<p>(By the way: having company names as "VeryImportantClient" and "ImportantClient" seems to be candidates for trouble, and you should maybe have suggested an <code>enum</code> property instead).</p>
+
+<p>And by subclassing you violate the DRY principle to some extent, and maybe also YAGNI? And you won't actually be able to unit test the original code.</p>
+
+<p>Instead of subclassing, I think I would stick to the extra constructor idea mentioned by David Arno in a way like this:</p>
+
+<pre><code>  public interface ICustomerProvider
+  {
+    // Should throw appropriate exceptions
+    Customer GetCustomer(string firstName, string lastName, string email, DateTime birthDate, Company company);
+  }
+
+  public interface ICompanyProvider
+  {
+    // Should throw appropriate exceptions
+    Company GetCompany(int companyId);
+  }
+
+  public interface ICreditHandler
+  {
+    // Should throw appropriate exceptions
+    void SetCredit(Customer customer);
+  }
+
+  public class CustomerService
+  {
+    public CustomerDataAccess CustomerDataAccess { get; private set; }
+    private ICustomerProvider _customerProvider;
+    private ICompanyProvider _companyProvider;
+    private ICreditHandler _creditHandler;
+
+    public CustomerService()
+    {
+      // TODO instantiate some default implementations:
+      //_customerProvider = new DefaultCustomerProvider();
+      //_companyProvider = new DefaultCompanyProvider();
+      //_creditHandler = new DefaultCreditHandler();
+    }
+
+    public CustomerService(ICustomerProvider customerProvider, ICompanyProvider companyProvider, ICreditHandler creditHandler)
+    {
+      _customerProvider = customerProvider;
+      _companyProvider = companyProvider;
+      _creditHandler = creditHandler;
+    }
+
+    public Customer CreateAndAddCustomer(string firname, string surname, string email, DateTime dateOfBirth, int companyId)
+    {
+      Company company = _companyProvider.GetCompany(companyId);
+      if (company == null)
+      {
+        throw new InvalidOperationException($"Unable to find the company with Id: {companyId}");
+      }
+
+      Customer customer = _customerProvider.GetCustomer(firname, surname, email, dateOfBirth, company);
+      if (customer == null)
+      {
+        throw new InvalidOperationException($"Unable to create the customer: {firname} {surname}");
+      }
+
+      _creditHandler.SetCredit(customer);
+
+      CustomerDataAccess.AddCustomer(customer);
+
+      return customer;
+    }
+
+    public bool AddCustomer(string firname, string surname, string email, DateTime dateOfBirth, int companyId)
+    {
+      try
+      {
+        //CreateAndAddCustomer(firname, surname, email, dateOfBirth, companyId);
+        //return true;
+        return CreateAndAddCustomer(firname, surname, email, dateOfBirth, companyId) != null;
+      }
+      catch (Exception)
+      {
+
+      }
+
+      return false;
+    }
+</code></pre>
+
+<p>Here the default providers/handler in the parameterless constructor can use the original existing code, and the DI-constructor makes it easy to customize the behavior. <code>CreateAndAddCustomer(...)</code> is well suited for a test environment. The interfaces make it easy to test each step or action independently.</p>
+
+<p>Some would claim that adding the DI-constructor, one violates the open/close-principle, but I think it's doable because we extent but don't modify the existing interface.</p>
+
+<p>If all that is "over-engineering" in the way the company interprets the term, we will probably never know?</p>
+    </div>

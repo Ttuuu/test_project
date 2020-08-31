@@ -1,0 +1,98 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>While I think the underlying idea is quite nice, the actual implementation and design has some issues.</p>
+<h1>Wrong Abstraction Level</h1>
+<p>Let's start with the less obvious one: How would you actually use <code>Clock</code> or <code>BaseClock</code> with <code>std::chrono::high_resolution_clock</code> or <code>std::chrono::system_clock</code>?</p>
+<p>The simplest approach would be something akin to this:</p>
+<pre><code>struct HighResClock : BaseClock {
+    time_point now() override { return std::chrono::high_resolution_clock::now(); }
+};
+</code></pre>
+<p>It seems so clean, so simple, and so easy. Except that it doesn't compile! That's because <code>std::chrono::high_resolution_clock::time_point</code> is not the same as <code>BaseClock::time_point</code> (and cannot easily be converted, if at all possible).</p>
+<p>But: Do we actually need <code>time_point</code>s in the public interface?</p>
+<p>The only reason to expose <code>time_point</code> values is to extract time differences between them. But that only matters if arbitrary <code>time_point</code>s are to be compared.</p>
+<blockquote>
+<p>Technically, the <code>time_point</code> could be stored in some form. However, for many clocks, like <code>std::chrono::steady_clock</code> or <code>std::chrono::high_resolution_clock</code>, the epoch from when the clock are measuring their time offset can change between different executions of the same program (e.g. because the computer got rebooted).</p>
+<p>This makes storing <code>time_point</code>s, especially those not obtained from <code>std::chrono::system_clock</code>, rather useless. In that case, you'll likely need a calendar library (or similar) to get points of time in a storable format.</p>
+</blockquote>
+<p>But in most cases, a simple <code>Timer</code> abstraction can fulfill all clock needs (comparing some <code>time_point</code>s with some relation). A simple <code>Timer</code> interface could look like this:</p>
+<pre><code>struct timer {
+    // choose an appropriate duration type
+    using duration = std::chrono::duration&lt;double&gt;;
+
+    virtual ~timer() = default;
+    
+    virtual void start() = 0;
+    virtual duration stop() = 0;
+    virtual duration tick() = 0; // to obtain multiple measurements from the same baseline
+};
+
+class steady_timer : public timer {
+    using clock = std::chrono::steady_clock;
+    using time_point = clock::time_point;
+
+    time_point start_time;
+    bool running;
+
+public:
+    steady_timer() = default;
+
+    void start() override
+    {
+        start_time = clock::now();
+        running = true;
+    }
+
+    duration tick() override
+    {
+        return duration(clock::now() - start_time);
+    }
+
+    duration stop() override
+    {
+        auto elapsed = tick();
+        running = false;
+        return elapsed;
+    }
+};
+</code></pre>
+<p>Now the only exposed part of the interface is the duration. And it is easily extensible to other time sources (e.g. Win32 <code>QueryPerformanceCounter</code>) or mockable.</p>
+<h1>Singleton</h1>
+<p>I really don't like the <code>Clock</code> singleton. Yes, it is easy to just ask a global clock. Yes, it is also easy to screw all code depending on this clock by changing the underlying instance.</p>
+<p>For example, a test setting <code>Clock</code> to a mock but not restoring the original clock breaks all other tests that assume the default clock implementation - making test failure dependent on test execution order.</p>
+<p>Instead, take a reference or pointer to a <code>timer</code> as parameter. This allows you to pass in a clock where needed, without changing (or corrupting) everyone elses <code>timer</code>.</p>
+<p>Rewriting your test case:</p>
+<pre><code>class mock_timer : public timer {
+    std::vector&lt;duration&gt; measurements;
+    int counter = 0;
+
+public:
+    mock_timer(std::initializer_list&lt;duration&gt; il) : measurements(il) {}
+
+    void start() override {}
+
+    duration tick() override
+    {
+        if(counter &lt; measurements.size()) return measurements[counter++];
+        return measurements.back();
+    }
+
+    duration stop() override
+    {
+        return measurements.back(); // just example
+    }
+};
+
+void test_method(){
+    using namespace std::literals::chrono_literals;
+    mock_timer my_timer{ 10s };
+
+    testClass.methodUsingClock(my_timer);
+    
+    // or, more likely:
+    testclass inst{my_timer};
+    inst.methodUsingClock();
+
+    REQUIRE(testClass.checkTimeout());
+}
+</code></pre>
+    </div>

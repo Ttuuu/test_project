@@ -1,0 +1,80 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Code review</h1>
+
+<p>I am just going to review <code>table_get_value_directly()</code> for efficiency. However, the findings might or might not be relevant for the performance figures you are getting, since it depends a lot on how the program is compiled (optimization level, whether LTO is used or not), and what data is is actually hashing.</p>
+
+<pre><code>bool table_get_value_directly(Table* table, Value key, Value* out) {
+</code></pre>
+
+<p>Already at the start there is room for improvement: you can make <code>table</code> <code>const</code>, since this function should not change the contents of the hash tabel. Furthermore, <code>key</code> is copied by value here, it is likely to be more efficient to pass it as a <code>const</code> pointer.</p>
+
+<pre><code>    if (table-&gt;capacity == 0) {
+        return false;
+    }
+</code></pre>
+
+<p>The first thing you are doing is checking whether the capacity is zero. However, if you would ensure that a valid <code>Table</code> always has a non-zero capacity, you can omit this check.</p>
+
+<pre><code>    unsigned long hash;
+    if (!value_hash(&amp;key, &amp;hash)) {
+        FAIL("Couldn't hash");
+    }
+</code></pre>
+
+<p>Here is error checking for the case that someone provides a <code>Value</code> that cannot be hashed. It would be better if there was no possibility for an error here. Either make sure all possible <code>Value</code>s have a valid hash value, or just return a special value for hash errors. This will cause a lookup in the rest of the code, but then it will discard the result because <code>keys_equal()</code> will return false. Since it is hopefully very unlikely that you call <code>table_get_value_directly()</code> with an unhashable <code>Value</code>, this extra check will not hurt the average performance.</p>
+
+<pre><code>    int slot = hash % table-&gt;capacity;
+</code></pre>
+
+<p>The modulo operation does an integer division, which can be very slow (it is typically tens of CPU cycles, but the exact speed depends on your CPU model). If you ensure that the table capacity is always a power of two, you could instead do a bitwise AND instead, which is very fast, like so:</p>
+
+<pre><code>    int slot = hash &amp; (table-&gt;capacity - 1);
+</code></pre>
+
+<p>If you ensure you store capacity as the actual number minus 1, you can omit the -1 here.</p>
+
+<pre><code>    Node* root_node = table-&gt;entries[slot];
+    Node* node = root_node;
+
+    while (node != NULL) {
+        if (keys_equal(node-&gt;key, key)) {
+            *out = node-&gt;value;
+            return true;
+       }
+</code></pre>
+
+<p>This bit is making a lot of copies. First, <code>keys_equal()</code> makes copies of the two <code>Value</code>s. The compiler could optimize that away since it is a static function, however it in turn calls <code>value_compare()</code> which also takes the parameter by value, so copies still have to be made.</p>
+
+<p>Furthermore, once the right node is found, this is making a copy of <code>node-&gt;value</code>. It will likely be more efficient to just return a const pointer to <code>node-&gt;value</code>.</p>
+
+<p>All this of course depends on how big a <code>Value</code> is, but since it is a large <code>union</code> that includes some non-trivial types, I think it is better to use pointers.</p>
+
+<pre><code>        node = node-&gt;next;
+    }
+
+    return false;
+}
+</code></pre>
+
+<p>One issue with your use of a linked list per hash bucket is that, if you were to have many items in each bucket, the above code would have to do pointer lookups for each node in the list. That would be slower than using linear probing. However, your statistics suggest that you only have one entry in there, so this won't matter in this case.</p>
+
+<h1>Analysis of the assembler output</h1>
+
+<p>I compiled your <code>table_get_value_directly()</code>, as well as an version that I optimized according to what I wrote above, and looked at the <a href="https://godbolt.org/e#z:OYLghAFBqd5QCxAYwPYBMCmBRdBLAF1QCcAaPECAM1QDsCBlZAQwBtMQBGAFlICsupVs1qgA%2BhOSkAzpnbICeOpUy10AYVSsArgFtaXAGylV6ADJ5amAHJ6ARpmJcADAHZSAB1TTCS2pp19I09vXzoLK1tdBydONxk5TAU/BgJmYgIAvQNOY1l5RTpU9IIIm3tHF3dpNIysoNyZWtLLcujKuNcAShlUbWJkDgByAFIAJgBmS2QdLABqEYn1Gvx6ADoERewR5wBBcanaGe15xeWCdDtULQ2tnf3J6dnMBaWV1jw7W4ntvYOnk4vM7aWh4FbfX4PQ7HU5vC5KCH3e4EACeHkwWCocxqxG0CgWrgAQvc5qS5mhaDVyQh0gAqOa0Zi6TCLYl7MnYvAAL0wYgInJ5rKRrgAInNdqxWKgWIVaEK/ntUejMdiCLj8SMiSSyRSqcgacR6ehmGl5bsOZZ%2BexRARNhM2eaySCfMArOg5lLRHMadI7Q7NWKAErMADuqWIlmAZuRaIxmCxqj0BIdHIAarszABVbBiayZgCyhOwgdI2tJ6azOcJAHlq2ZsLtrKX2WSK9ncwBJMzNx3ljPtwO7ADqYgYABVAx3rABxHtp/s59QACUz1gA0nPWwuxNXCQApbDqMebvuVsQZszV9S7Mcd6tNuYAekfcw79EcjNYZbmbZzuxFIqBtgDAME%2BL5vgQH5sMKYqpmw2iYGOsbRoqsYqjieL8nBOhAlqLblvBiGxnMSosva34gn4ybfhy6B9HY7AMhUxBmhyHJXFocwcewIisWxpLBmGaqRnMxChmIOKRnx/EYfi1Z2HwSQEPSqAKUp0lsRKUoylRbDaSafgaRy2iWh4ap8nMzDoOgxCYNI0gaQGlkOeRfyij%2BhEobspHoWqmHUfhHk4XMADWmAohp2EIXMABunmufs7nYPQxAotYmAhl5Pnxqq6r8tYGC4SmZKyflhX0lYAAeBCRYRoXhbVwVxTh0buQVWBZWhOWlQFvZzJa5LMB4zDIIQEUJRa9BcXiYUEGIaAgjVE1ku1mC0vSqjCXZGncf10hiMyugkCiYiWFQYmlf0ZHFaSu1gmIwDEKgIZSfaYFzDQxBzFgdjaMAwBSYFPg8hZtB6GIm0RttCVOWOzAMddSJ7M%2BczYNVUGsB9ILJHQDl7DFqB4O6ABiuxdhAur8vq6RzLSOJdGau3NQhYg%2BggEBRWtsWEaQczOngroYh6dDAPStnSNorAEAzCVM4R82oLow22RzdXMLznNcbzloqdoBAeHrMv%2BnsNQGcgXHXJjYUovtmAAI7aGwqtNZwGt1TFYxdL1k1U4ryu8uLkv8osYoALScDtlvkn76S8hLyCDPZrxiszvJoErscQDFruxWMvPjIY6f%2B2IgdS0b362QQ/S0NHGe2RJeKJ9ICxjIYBdzBTMf16XwcTCKIdzM45duf3Cq7LtaQIw9mBzanYj4LZCisCiEBwwj9KT%2BwbvBdb28Ibr0ve2SeBYhAm%2BYKHWwsMNo2osnA9D0f/GV9XH1sLIjmikjfX84L7qesAb0zBfQaRPh3MAYA55swgAXXeLdDBsy6F7TUN02Kk3JuMMYmhJboFoGAIY/I2aYOHn1AM38fbYilL3MUbMW4AFYSLw3YJfH418RpjQ0qtMW1w5q0EKsnRhCMWHYEhngbadDCTSCoSMOh/dlqki4QyfhA8nqoF4YVLyHIQwIDwIxCAfD5gQIHnmMwZhkF4T6haU%2B1tbYOydgYi%2BWw4HWyQU/fiZJaR9GoUorAwjU5GXcS/YgNc/KI0ChyMhY93E%2BKBH3GJwiqpLVQZE/YgUgk1yoO/MJiVR6pLySjNGkFglsCxkcWUzdbQmksgTIm0cPBiLxrsX%2BbphZeigcAhAYhUBmTwLobkGJO6UiwnVWkqcSFyxwgrOuvJumKD6TydAgyqSa1pOraOQygrRVpHYI2710kVNxC8MB9tHZfjHpTTZLxaTn2nrPeWC8lLLy6T0%2BZAyLlr3YBvJhmBeYXJWS4txzShYAKAb6AR7TfTPLmf0xZLjNHHymlItRAjaHtzPt84RbDb4ojmKHOYnASEcguatWmqj1GwjFOfYRojxGSOkbIjSxL%2BG0gcQIslYgHHwtJNo3RLx9H8KMXEkxZi3FWI7nPIuscoW9JhTA1uDjhHOPCq4lBNFAkz1fgXBVWx/HyLYiktVpJWUD21T8RJn9ckVw1cEuYwrWq5KGD0VgIAhh0KGKQAwQxnDutQC69Q2I%2BgDCBJMTg7qCAuu9Ug0gIUQB0NcGsAAHBMXIzgACcSbW6GAmM4POzqhjcHdZ671pBfVDHddIEAzhSDhq9Y60gcBYBICLrysgFBO5KxbSgYAqaJikCoLoopFaIB2Aje6uwlh0gohdaG0g6dmT0GrLQZeo7SBYF0CIYA7AV0POSDFOyK7MCVSSHrYYxbLRyBXR8OwYlUqaCwNOsNEZdAPp6DQegTA2AcB4PwQQwhRAgAkPNIQnwK2QB6LMvwFahih2rGMctiQcYGAgKYeoOQTBqDKFEGIggvA%2BFlKhnDoRZSYeYoIfISkUjNAI67cjiHigZBI%2B0WITQSjUZYwx1oWGOg9GkIGwYXAnUurdR6ldpbKoJsMKHQw3A5jAATnMVNawJgd1wIQEgLdk2800B29gX0DgErmOoMNo6o0xu4GMNYuQk2pucLkVwEwJiGHTUIF1BbSDPriFWotPqXXlsrdWkzgmhhwZE7WktvmAu1qjXu4gPhlDcCAA%3D" rel="nofollow noreferrer">generated assembly</a>.</p>
+
+<p>Looking at raw instruction counts, your version has 75 instructions, while the optimized version only uses 34 instructions. But looking more closely, your version results in a <code>div</code> instruction for the modulo (which is quite slow), but it also spends 17 <code>mov</code> and 8 <code>push</code> instructions on the inlined call to <code>keys_equal()</code>, which are there to prepare the arguments of the call to <code>value_compare()</code>. For the line <code>*out = node-&gt;value</code>, it seems GCC manages to combine a lot of moves into a few SSE instructions.</p>
+
+<p>The optimized version, which uses (<code>const</code>) pointers to <code>Value</code>s where possible, uses much less <code>mov</code> and <code>push</code> instructions, and has no <code>div</code>. So that means less instructions to execute, less memory bandwidth used, and less CPU cycles to spend.</p>
+
+<h1>Reason for the large self-time</h1>
+
+<p>Proper hash tables are O(1), however that doesn't mean that a lookup will be fast, only that it will not get slower the more entries you have in a hash table. There still is an overhead for doing a hash table lookup. And if the keys you are looking up are very small, then that overhead will be large compared to a call to <code>value_compare()</code>, and thus a relatively large time will be spent in the hash table lookup logic itself.</p>
+
+<h1>About performance measurements</h1>
+
+<p>Measuring performance is always a bit tricky, since it often is the case that the mere act of instrumenting your code to measure its performance changes the performance.</p>
+
+<p>If you can run your code on Linux, then instead of using <code>gprof</code>, I would consider using <a href="https://perf.wiki.kernel.org/index.php/Main_Page" rel="nofollow noreferrer">Linux <code>perf</code></a>. It does not need the binary to be instrumented, just ensure it is compiled with debugging symbols. It uses statistical profiling, where it interrupts the program at random times to check at which instruction it is. Use the <code>perf record -g</code> command to capture call graphs, so you can get similar information as with <code>gperf</code>. However, <code>perf record</code> will also capture exact locations within the binary, so you can also use it to zoom in on a function, and see the assembly code annotated with how often each instruction is hit, which can give you hints to which lines of code are the largest contributors to the performance.</p>
+
+<p>For Windows, there are <a href="https://stackoverflow.com/questions/34641644/is-there-a-windows-equivalent-of-the-linux-command-perf-stat">alternatives</a> such as Intel VTune and Visual Studio Profiler that might be able to give similar insights.</p>
+    </div>

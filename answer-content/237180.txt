@@ -1,0 +1,120 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Give the mode enum a name</h1>
+
+<p>While <code>enum</code>s are not strongly typed in C, it is more elegant to pretend they are. Give the <code>enum</code> you are declaring a type, and use it in <code>struct bio</code>, like so:</p>
+
+<pre><code>enum bio_mode {
+    BIO_MODE_READ,
+    BIO_MODE_WRITE,
+};
+
+struct bio {
+    enum bio_mode mode;
+    ...
+};
+</code></pre>
+
+<p>Compilers can use this information, for example if you write a <code>switch (mode) {...}</code> statement and you forget to handle all possible modes, the compiler will warn about this.</p>
+
+<p>Also change functions that take <code>int mode</code> as a parameter to <code>enum bio_mode mode</code>.</p>
+
+<h1>Use standard types where possible</h1>
+
+<p>Use the standard fixed width integer types from <a href="https://en.cppreference.com/w/c/types/integer" rel="nofollow noreferrer"><code>&lt;stdint.h&gt;</code></a> instead of inventing your own names. So instead of <code>uint32</code>, use <code>uint32_t</code>, and instead of <code>uchar</code>, use <code>uint8_t</code>.</p>
+
+<p>There is no need to <code>assert()</code> that the size of <code>uint32_t</code> is 32 bits.</p>
+
+<h1>Reorder <code>struct bio</code> to be more compact</h1>
+
+<p>On most 64-bit architectures, the layout of <code>struct bio</code> is suboptimal, because pointers and <code>size_t</code> have a 64-bit alignment, while <code>int</code>s have 32-bit alignment. I suggest the following:</p>
+
+<pre><code>struct bio {
+    enum bio_mode mode;
+    uint32_t b;
+    uint8_t *ptr;
+    size_t c;  
+};
+</code></pre>
+
+<h1>Make <code>ptr</code> <code>uint32_t *</code></h1>
+
+<p>Since you are casting <code>ptr</code> to <code>uint32_t *</code> in many places, it makes more sense to store it directly as that type, and only cast it once in <code>bio_open()</code>. I also recommend you take a <code>void *</code> in <code>bio_open()</code>, so there is no need for the caller to do any casting.</p>
+
+<pre><code>struct bio {
+    enum bio_mode mode;
+    uint32_t b;
+    uint32_t *ptr;
+    size_t c;  
+};
+
+static void bio_open(struct bio *bio, void *ptr, int mode)
+{
+    ...
+    bio-&gt;ptr = ptr;
+    ...
+}
+</code></pre>
+
+<p>Remember to also change all occurrences of <code>bio-&gt;ptr += 4</code> to <code>bio-&gt;ptr++</code>.</p>
+
+<h1>Assert that <code>ptr</code> is 32-bit aligned</h1>
+
+<p>Casting a pointer to an <code>uint32_t *</code> is only valid if the pointer is 32-bit aligned. On some architectures, accessing memory through a pointer that is not properly aligned is not allowed. On those that do, it might be less efficient than having the pointer properly aligned. To assert this write:</p>
+
+<pre><code>assert(((uintptr_t)ptr &amp; 3) == 0);
+</code></pre>
+
+<p>Another option would be to allow <code>ptr</code> to be non-aligned in the call to <code>bio_open()</code>, but then to initialize <code>bio-&gt;b</code> such that it contains the first few bytes up to the first 32-bit aligned address, and of course set <code>bio-&gt;c</code> accordingly.</p>
+
+<h1>Assert the right mode is set in <code>bio_read_*()</code> and <code>bio_write_*()</code></h1>
+
+<p>To avoid accidental reuse of a <code>struct bio</code>, or mixing read and write calls on the same <code>bio</code>, <code>assert(bio-&gt;mode == BIO_MODE_READ)</code> in read functions, and so on.</p>
+
+<h1>Optimizing <code>bio_write_bits()</code></h1>
+
+<p>There's a lot of things in <code>bio_write_bits()</code> that can be optimized. First, there is a lot of unnecessary casting going. While it doesn't change the actual binary, it cleans up the source code to remove them, and makes it easier to see the actual equations. For example, you can just write:</p>
+
+<pre><code>bio-&gt;b |= (b &amp; ((1 &lt;&lt; m) - 1)) &lt;&lt; bio-&gt;c;
+</code></pre>
+
+<p>In the above, you are masking the lower bits of <code>b</code> before shifting it by <code>bio-&gt;c</code>. However, this is completely unnecessary, as either those high bits were zero to begin with, or they will be shifted out anyway. So you can write:</p>
+
+<pre><code>bio-&gt;b |= b &lt;&lt; bio-&gt;c;
+</code></pre>
+
+<p>More importantly, you have written this function as a loop, but you would only ever have at most two iterations of the loop: either all <code>n</code> bits fit in <code>bio-&gt;b</code>, or you have to flush once and put the rest of the bits in. You can rewrite the code as follows:</p>
+
+<pre><code>static void bio_write_bits(struct bio *bio, uint32_t b, size_t n)
+{
+    assert(n &lt;= 32);
+    assert((b &gt;&gt; n) == 0);
+    assert(bio-&gt;c &lt; 32);
+
+
+    bio-&gt;b |= b &lt;&lt; bio-&gt;c;
+    bio-&gt;c += n;
+
+    /* Exit early if we didn't fill bio-&gt;b yet */
+    if (bio-&gt;c &lt; 32)
+        return;
+
+    bio_flush_buffer(bio);
+
+    /* Store the remaining bits */
+    bio-&gt;c -= 32;
+    bio-&gt;b = b &gt;&gt; (n - bio-&gt;c);
+}
+</code></pre>
+
+<p>A similar optimization is possible for <code>bio_write_zero_bits()</code>.</p>
+
+<h1>Reset <code>ptr</code> in <code>bio_close()</code></h1>
+
+<p>To catch potential use of a <code>struct bio</code> after calling <code>bio_close()</code>, set <code>bio-&gt;ptr = NULL</code> in <code>bio_close()</code>.</p>
+
+<h1>Validate your input</h1>
+
+<p>In <code>bio_read_unary()</code>, you have a loop reading zero bits. What if the input is malformed and just contains zero bits? After consuming the whole input, <code>bio_read_unary()</code> would continue reading past the end of the input.</p>
+
+<p>First, you can get rid of the loop by just assuming you have to do at most two iterations, just like in <code>bio_write_bits()</code>. Second, it would be good to have an extra field in <code>struct bio</code> that is either the remaining size in the buffer, or the end pointer, and keep track of how much you have read and written. Don't use <code>assert()</code> to check that you don't go past the end, but use an actual <code>if</code>-statement, and return an error or at least call <code>abort()</code> if the input is invalid.</p>
+    </div>

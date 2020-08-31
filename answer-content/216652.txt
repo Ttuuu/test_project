@@ -1,0 +1,111 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Building on the answers of Quuxplusone and kmdreko, here's a few more issues I noticed.  I'll start with a couple of serious ones, before moving on to stylistic issues and potential optimizations:</p>
+
+<h3>Dead code</h3>
+
+<p>The only thing seriously wrong with your <code>spin()</code> function is that you never call it.  It's generally not very useful to ask people to review code you're not using.</p>
+
+<p>(The other, minor thing wrong with it is that it seems to be written with the assumption that the input is a random integer from 1 to 10.  Or maybe it's meant to be from 0 to 9, in which case the <code>r &gt; 5</code> should be <code>r &gt;= 5</code>?  But either way is needlessly complicated: since you're only using the input value to make a binary choice, just have it be 0 or 1.  Or you could have the input be a float between 0.0 and 1.0, if you'd like to have the ability to bias the initial magnetization state.  But of course, none of that makes any difference if you don't actually <em>use</em> the function.)</p>
+
+<h3>Use of uninitialized variables</h3>
+
+<p>On line 29 of your main function (10 lines below <code>//populate the lattice</code>), you're calling <code>flip()</code> and passing <code>beta</code> as an argument to it.  But <code>beta</code> has not been initialized at that point, since you've commented out the line that would do it!</p>
+
+<p><a href="https://en.cppreference.com/book/uninitialized" rel="noreferrer">That's a bad thing, and you shouldn't do it.</a>  Not only can the value passed to <code>flip()</code> be anything (and possibly vary between runs), leading to unpredictable results, but using the value of an uninitialized variable <a href="https://en.cppreference.com/w/cpp/language/ub" rel="noreferrer">makes the behavior of your program formally undefined</a>, which means that the compiler is allowed to make it do <em>anything</em>, up to and including <a href="http://catb.org/jargon/html/N/nasal-demons.html" rel="noreferrer">making demons fly out of your nose</a> when you run it.  A slightly more likely (but still protentially catastrophic) result is that the compiler might simply decide to <a href="https://kukuruku.co/post/undefined-behavior-and-fermats-last-theorem/" rel="noreferrer">optimize out your entire main function</a>, since it can prove that there are no code paths through it that don't have undefined behavior!</p>
+
+<p>(Of course, the out-of-bounds array access pointed out by kmdreko also leads to undefined behavior, so just setting an initial value for <code>beta</code> isn't enough to fix your code.)</p>
+
+<h3>Confusing variable naming</h3>
+
+<p>In <code>flip()</code>, you use <code>H</code> both as an argument to the function and as the name of a local variable.  While that's technically allowed, it's very confusing to read.  Rename one of them.</p>
+
+<p>Also, your use of <code>temp</code> as the name of a <em>temp</em>orary(?) variable in the main function is potentially confusing too, given that the surrounding code deals with (thermodynamic) <em>temp</em>eratures.  For that matter, <code>temp</code> isn't a particularly informative or appropriate variable name anyway.  If you really can't think of a good name for a variable, <a href="https://en.wikipedia.org/wiki/Metasyntactic_variable" rel="noreferrer">call it <code>foo</code> or something</a> so that readers can at least tell at a glance that the name means nothing.  But in this case, something like <code>iteration</code> would be a decently meaningful name.</p>
+
+<h3>Optimization opportunities</h3>
+
+<p>First of all, note that your code spends almost all of its time calling <code>flip()</code> repeatedly, so making that function run fast should be your first optimization priority.</p>
+
+<p>Getting rid of the indirect indexing via the <code>tab</code> array, as suggested by kmdreko, is a good start.  In the same vein, you might want to turn <code>lattice</code> from a vector of vectors into a <a href="https://stackoverflow.com/questions/4810664/how-do-i-use-arrays-in-c/4810676#4810676">proper two-dimensional array</a>, which will eliminated another layer of indirection.</p>
+
+<p>(The down side of using two-dimensional arrays is that you'll have to know the dimensions at compile time, but in your code that's the case anyway.  If you want to allow the size of the lattice to be specified at runtime, one option is to dynamically allocate a <em>one-dimensional</em> array of the appropriate size and <a href="http://www.cplusplus.com/doc/tutorial/arrays/#multidimensional" rel="noreferrer">treat it as a pseudo-multidimensional array</a> by indexing it e.g. as <code>lattice[a*N + b]</code> instead of <code>lattice[a][b]</code>.)</p>
+
+<p>You can also trivially save some memory by using <code>signed char</code> instead of <code>int</code> as the type of the <code>lattice</code> elements.  You might even want to consider using <a href="https://en.cppreference.com/w/cpp/utility/bitset" rel="noreferrer">std::bitset</a> (or implementing your own bit-packed lattice representation) to save even more memory, but this would require you to represent your lattice spin states as 0 and 1 instead of -1 and +1 (which in itself is not necessarily a bad idea at all), and likely comes at the cost of some minor speed reduction and added code complexity.  For relatively small values of <code>N</code>, it's probably not worth it.</p>
+
+<hr>
+
+<p>Also, calculating <code>exp(-beta*dE)</code> inside <code>flip()</code> looks like it could potentially be <a href="http://www.latkin.org/blog/2014/11/09/a-simple-benchmark-of-various-math-operations/" rel="noreferrer">somewhat slow</a> (although, of course, you really ought to profile the code first before spending too much effort on such optimizations).  It would be nice to move the exponential calculation out of the inner loop, if we can.  Can we?</p>
+
+<p>Expanding the definition of <code>dE</code> earlier in the code (and using the definitions of the neighbor site values <code>val1</code> to <code>val4</code> from kmdreko's answer), the argument to <code>exp()</code> is <code>-beta * 2 * s * (H + val1 + val2 + val3 + val4)</code>.  Here, <code>beta</code> and <code>H</code> do not change within the inner loop, while <code>s</code> and <code>val1</code> to <code>val4</code> are always either +1 or -1.</p>
+
+<p>The addition of the external field parameter <code>H</code> to the summed spin of the neighbors makes things a bit more complicated, but we can deal with it by distributing the common <code>-beta * 2 * s</code> term over the sum, giving <code>-beta*2*s*H - beta*2*s*val1 - beta*2*s*val2 - beta*2*s*val3 - beta*2*s*val4</code>.  Now, depending on the signs of <code>s</code> and <code>val1</code>...<code>val4</code>, each of these terms can only take one of two values: &amp;pm;<code>beta*2*H</code> for the first term, and &amp;pm;<code>beta*2</code> for the others.  If we precalculate the exponentials of each of these values outside the <code>flip()</code> function (and the inner loop that calls it), we can calculate <code>exp(-beta*dE)</code> simply by multiplying these precalculated terms together, e.g. like this:</p>
+
+<pre><code>void flip (float exp_2_beta, float exp_m2_beta, float exp_2_beta_H, float exp_m2_beta_H)
+{
+    int a = (int)prandom(0, N);
+    int b = (int)prandom(0, N);
+    int s = lattice[a][b];
+
+    // calculate exp(-beta * 2 * s * (H + sum(neighbors))) based on precalculated
+    // values of exp(2*beta), exp(-2*beta), exp(2*beta*H) and exp(-2*beta*H):
+    float prob = (s != 1 ? exp_2_beta_H : exp_m2_beta_H);
+    prob *= (lattice[a &gt; 0 ? a-1 : N-1][b] != s ? exp_2_beta : exp_m2_beta);
+    prob *= (lattice[a &lt; N-1 ? a+1 : 0][b] != s ? exp_2_beta : exp_m2_beta);
+    prob *= (lattice[a][b &gt; 0 ? b-1 : N-1] != s ? exp_2_beta : exp_m2_beta);
+    prob *= (lattice[a][b &lt; N-1 ? b+1 : 0] != s ? exp_2_beta : exp_m2_beta);
+
+    // flip spin of this site with probability min(prob, 1.0)
+    if (prob &gt;= 1 || prob &gt;= prandom(0, 1))
+    {
+        lattice[a][b] = -s;
+    }
+}
+</code></pre>
+
+<p>This makes use of <a href="https://en.wikipedia.org/wiki/Short-circuit_evaluation" rel="noreferrer">short-circuit evaluation</a> to avoid calling <code>prandom(0, 1)</code> when it's not needed.  Rewriting the code like this also avoids making an unnecessary write to <code>lattice[a][b]</code> if the spin doesn't change.  (Also, I'm assuming that <code>N</code> and <code>lattice</code> are global constants, since there's really no good reason for them not to be, and that you've fixed <code>prandom()</code> to actually return a float.)</p>
+
+<p>Now, passing all these precalculated factors as parameters to <code>flip()</code> may feel a bit ugly, since they're really just an internal optimization detail.  Fortunately, there's a simple fix to that: just move the inner loop (and the precalculation of those values) <em>into</em> the function, e.g. like this:</p>
+
+<pre><code>void do_flips (int count, float beta, float H)
+{
+    // precalculate some useful exponential terms
+    float exp_2_beta = exp(2 * beta), exp_m2_beta = exp(-2 * beta);
+    float exp_2_beta_H = exp(2 * beta * H), exp_m2_beta_H = exp(-2 * beta * H);
+
+    // do up to (count) spin flips
+    for (int i = 0; i &lt; count; i++) {
+        int a = (int)prandom(0, N);
+        int b = (int)prandom(0, N);
+        int s = lattice[a][b];
+
+        // calculate prob = exp(-beta * 2 * s * (H + sum(neighbors)))
+        float prob = (s != 1 ? exp_2_beta_H : exp_m2_beta_H);
+        prob *= (lattice[a &gt; 0 ? a-1 : N-1][b] != s ? exp_2_beta : exp_m2_beta);
+        prob *= (lattice[a &lt; N-1 ? a+1 : 0][b] != s ? exp_2_beta : exp_m2_beta);
+        prob *= (lattice[a][b &gt; 0 ? b-1 : N-1] != s ? exp_2_beta : exp_m2_beta);
+        prob *= (lattice[a][b &lt; N-1 ? b+1 : 0] != s ? exp_2_beta : exp_m2_beta);
+
+        // flip spin of this site with probability min(prob, 1.0)
+        if (prob &gt;= 1 || prob &gt;= prandom(0, 1))
+        {
+            lattice[a][b] = -s;
+        }
+    }
+}
+</code></pre>
+
+<p>Finally, instead of "sweeping" the lattice periodically to calculate its overall magnetization state, it may be more efficient to just keep track of the sum of the spin states as you update them.  For example, you could take the code above and replace the last <code>if</code> statement with:</p>
+
+<pre><code>        // flip spin of this site with probability min(prob, 1.0)
+        if (prob &gt;= 1 || prob &gt;= prandom(0, 1))
+        {
+            lattice[a][b] = -s;
+            lattice_sum += -2*s;  // keep track of the sum of all the spins
+        }
+</code></pre>
+
+<p>where <code>lattice_sum</code> is either a global — or, better yet, a local copy of a global variable — or passed into the function as a parameter and returned from it at the end.</p>
+
+<p>Whether such real-time tracking of the total magnetization is faster or slower than periodic sweeping depends on how often you want to sample the magnetization state.  With one sample per transition per lattice site, as your current code effectively does, I'd expect the real-time tracking to be somewhat faster, if only because it has better cache locality.  Especially so if you make <code>lattice_sum</code> a local variable in <code>do_flips()</code>, which ensures that the compiler will know that it can't be <a href="https://stackoverflow.com/questions/9709261/what-is-aliasing-and-how-does-it-affect-performance">aliased</a> and can be safely stored in a CPU register during the loop.</p>
+
+<p>(Also, the way you're updating the time-averaged magnetization state <code>M</code> looks wonky, and I'm pretty sure you have a bug in it.  To test this, try fixing <code>M_sweep</code> to a non-zero constant value and see if <code>M</code> correctly evaluates to <code>M_sweep/(N*N)</code>.  The way your code is currently written, it doesn't look like it will.  Maybe you changed one of your "magic numbers" from 1000 to 500 — or vice versa — and forgot to update the other?  One more reason to prefer named constants...)</p>
+    </div>

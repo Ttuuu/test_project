@@ -1,0 +1,112 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Memory management</h1>
+
+<p>You never <code>delete[] arr;</code>, which leaks memory. Not a good thing! There are multiple ways to fix this:</p>
+
+<ul>
+<li><p>Adding correct calls to <code>delete[] arr;</code> in the right places (remember exceptions, assignments and so on!), which is rather bug-prone.</p>
+
+<p>Also, <code>new T[size]</code> default-constructs <code>size</code> objects of type <code>T</code> in the contiguous memory. This requires <code>T</code> to be default constructible and might be expensive, depending on <code>T</code> and <code>size</code>.</p></li>
+<li><p>Use a <code>std::unique_ptr&lt;T[]&gt; arr</code> instead. This will automatically clean up memory, but you still need to keep track of size, capacity etc.</p>
+
+<p>Still has the default-construction issue from above.</p></li>
+<li><p>Use a <code>std::unique_ptr&lt;std::aligned_storage&lt;sizeof(T), alignof(T)&gt;[]&gt;</code>. Similar to above, but without the default-construction issue. Requires placement new, though.</p></li>
+<li><p>Use a <code>std::vector&lt;T&gt;</code> (or similar container) and let it handle all that memory management stuff. The easiest solution, and hard to screw up. It also makes adding additional features easier, like growing capacity.</p></li>
+</ul>
+
+<p>I'd suggest using the last option, unless you have some really strong reasons for not using <code>std::vector</code>. </p>
+
+<h1>Design</h1>
+
+<h3>Reusing code</h3>
+
+<p>At the very lowest level, one could extract the comparison operation and the actual container and write the <code>heap</code> logic independently of those. This would allow to reuse the same implementation for many orderings (min-heap, max-heap, ...) and different underlying storage.</p>
+
+<h3>Member function accessibility</h3>
+
+<ul>
+<li><p><code>heapify</code> is an internal helper function, and thus shouldn't be accessible to the public.</p></li>
+<li><p><code>print_heap</code> might be a handy debugging utility function, but doesn't seem to fit into the finished product.</p></li>
+<li><p>How would someone effectively use <code>delete_by_index</code>? An outsider doesn't have access to <code>MinHeap::arr</code>, so there isn't a good way to determine which indices might contain a value that ought to be removed.</p></li>
+</ul>
+
+<h3>Member function names</h3>
+
+<p>Most of the remaining <code>public</code> facing member functions have names that differ from the usual standard library ones. Examples:</p>
+
+<ul>
+<li><code>get_min</code> = <code>top</code> (or maybe <code>front</code>)</li>
+<li><code>delete_min</code> = <code>pop</code></li>
+<li><code>insert</code> = <code>push</code> and/or <code>emplace</code></li>
+</ul>
+
+<h3>Putting it all together</h3>
+
+<p>A revised class design could look something like this:</p>
+
+<pre><code>template&lt;typename T, typename Container = std::vector&lt;T&gt;, typename Comparer = std::less&lt;typename Container::value_type&gt;&gt;
+class heap {
+    Container storage{};
+    Comparer compare{};
+
+public:
+    heap() = default;
+
+    void push(const T&amp; value);
+    void push(T&amp;&amp; value);
+
+    template&lt;typename... Args&gt;
+    void emplace(Args&amp;&amp;... args);
+
+    void pop();
+
+    const T&amp; top() const; // could return T, but would be expensive for large T
+
+    typename Container::size_type size() const;
+    bool empty() const;
+
+private:
+    void heapify();
+    void bubble_down(typename Container::iterator pos); // could be std::size_t or std::ptrdiff_t instead
+};
+</code></pre>
+
+<p>Some of those member functions could be marked <code>noexcept</code> (or conditionally <code>noexcept</code>), depending on their actual implementation.</p>
+
+<h1>Implementation</h1>
+
+<ul>
+<li><p>An "out of range" exception is so common that it got included in the <code>&lt;stdexcept&gt;</code> standard library header: <a href="https://en.cppreference.com/w/cpp/error/out_of_range" rel="nofollow noreferrer"><code>std::out_of_range</code></a>. This could be used instead of <code>OutOfRange</code>.</p></li>
+<li><p>There are lots of random debug messages which get printed to <code>std::cout</code>. Either they aren't needed at all, or an exception would convey much better to the caller that something went wrong.</p>
+
+<p>For example, instead of <code>std::cout &lt;&lt; "Error: Heap capacity reached" &lt;&lt; std::endl; return;</code> (taken from <code>MinHeap::insert</code>), throwing an exception like <code>throw std::out_of_range{ "Max heap capacity reached!" };</code> would tell the caller that something went wrong.</p></li>
+<li><p><code>(T)NULL</code> might not work for non-numeric types <code>T</code>. If a default value is wanted, <code>T{}</code> could be used instead.</p></li>
+<li><p>In many cases there is no need for the costly <code>heapify</code> operation. A simpler <code>bubble_down</code> operation (like that loop inside <code>delete_min</code>) that only checks one branch would often suffice, reducing the complexity of those calls from <span class="math-container">\$\mathcal{O}(n)\$</span> to <span class="math-container">\$\mathcal{O}(\log n)\$</span>.</p></li>
+<li><p>In <code>delete_min</code>, there are two patterns that are repeated quite a lot: <code>2 * i + 1</code> and <code>2 * i + 2</code>. Would it hurt to give them names, like <code>left_child</code> and <code>right_child</code>?</p></li>
+<li><p>The implementer for type <code>T</code> might provide its own free-standing <code>swap(T&amp;, T&amp;)</code> function, which usually is better than <code>std::swap(T&amp;, T&amp;)</code>. To use that one if it exists, you could add <code>using std::swap;</code> at the top of each function where <code>std::swap</code> is used, and then replace all calls to <code>std::swap</code> with just <code>swap</code>. (That way, if a type-specific <code>swap</code> function exists, it will be a better match than <code>std::swap</code>. <code>std::swap</code> will be used as fallback.)</p></li>
+<li><p>The bubble-down loop in <code>delete_min</code> can exit early if the condition <code>arr[i] &gt; arr[min_child]</code> is not true.</p></li>
+<li><p>Try to <code>std::move</code> values instead of copying them if a strict copy isn't necessary. (Hint: None are in this implementation.) This allows the heap to contain move-only types (like <code>std::unique_ptr</code>), which cannot be copied.</p></li>
+</ul>
+
+<h1>Q &amp; A</h1>
+
+<ol>
+<li><p>There are many uses for heaps (or as the standard library calls them: Priority queues), and more often than not they don't operate on pure numbers. Most likely you'll have some objects ordered by a <code>priority</code> data member or by some timestamp. Relying on <code>std::numeric_limits</code> thus isn't a good idea.</p>
+
+<p>For deleting a random element, it would be better to swap it with the last element, and then bubble that one up or down as needed.</p></li>
+<li><p>If I understand the question correctly, you seem to want to ask "How can I fail gracefully if I have to return a value?". The simple answer is: You can't. If you need to return a value, that value needs to come from somewhere, and special values like <code>INT_MIN</code>, <code>INT_MAX</code>, <code>0</code>, <code>-1</code> or <code>T{}</code> just aren't expressive enough since they introduce ambiguities and require special checks by the caller.</p>
+
+<p>In some cases, if "no result" is an actually expected return value, you can use <code>std::optional&lt;T&gt;</code> for that, which makes those checks more explicit.</p>
+
+<p>In other cases, there is no need for returning a value. For example, <code>delete_min</code> doesn't need to return a value (the same value could have been retrieved by calling <code>get_min</code> beforehand). If <code>delete_min</code>s return type got changed to <code>void</code>, it could fail gracefully (not throwing an exception) if the heap were empty.</p>
+
+<blockquote>
+  <p>Generally, try to not return values from state modifiers (e.g. insertion or deletion operations), unless those values are an indirect result of those state modifiers themselves (e.g. an iterator pointing to the newly inserted element/to the element after the removed element).</p>
+</blockquote></li>
+<li><p>See above.</p>
+
+<ul>
+ - 
+</ul></li>
+</ol>
+    </div>

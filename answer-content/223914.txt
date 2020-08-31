@@ -1,0 +1,128 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Here are some suggestions.</p>
+
+<h1>Non conformance</h1>
+
+<p>Many of your functions are marked <code>constexpr</code>.  This is non-conforming.  Per <a href="http://eel.is/c++draft/constexpr.functions" rel="nofollow noreferrer">[constexpr.functions]</a>:</p>
+
+<blockquote>
+  <p>This document explicitly requires that certain standard library
+  functions are <code>constexpr</code> ([dcl.constexpr]).
+  <strong>An implementation shall not declare any standard library function signature as <code>constexpr</code> except for those where it is explicitly
+  required.</strong> Within any header that provides any non-defining
+  declarations of constexpr functions or constructors an implementation
+  shall provide corresponding definitions.</p>
+</blockquote>
+
+<p>And generally speaking, you cannot expect allocation to be constexpr anyway.</p>
+
+<p>You are missing allocator overloads for the constructors.  Specifically, the following overloads vanish altogether:</p>
+
+<blockquote>
+<pre><code>explicit vector(const Allocator&amp;) noexcept;     
+vector(const vector&amp;, const Allocator&amp;);
+vector(vector&amp;&amp;, const Allocator&amp;);
+</code></pre>
+</blockquote>
+
+<p>And the allocator parameters are missing in the following overloads:</p>
+
+<blockquote>
+<pre><code>explicit vector(const Allocator&amp;) noexcept;
+explicit vector(size_type n, const Allocator&amp; = Allocator());
+vector(size_type n, const T&amp; value, const Allocator&amp; = Allocator());
+template&lt;class InputIterator&gt;
+  vector(InputIterator first, InputIterator last, const Allocator&amp; = Allocator());
+vector(const vector&amp;, const Allocator&amp;);
+vector(vector&amp;&amp;, const Allocator&amp;);
+vector(initializer_list&lt;T&gt;, const Allocator&amp; = Allocator());
+</code></pre>
+</blockquote>
+
+<p>They aren't hard to implement, so why not implement them anyway?</p>
+
+<p>You mark your destructor virtual.  This is definitely wrong.  <code>vector</code> is not designed for runtime polymorphism.  Marking the destructor virtual can lead to severe consequences.</p>
+
+<p><code>max_size</code> returns <code>size_type</code>, not <code>difference_type</code>.  <code>data</code> returns <code>T*</code> and <code>const T*</code>, not <code>pointer</code> and <code>const_pointer</code> (they can be different).  <code>swap</code> is not unconditionally <code>noexcept</code>; the correct version is</p>
+
+<blockquote>
+<pre><code>void swap(vector&amp;)
+      noexcept(allocator_traits&lt;Allocator&gt;::propagate_on_container_swap::value ||
+               allocator_traits&lt;Allocator&gt;::is_always_equal::value);
+</code></pre>
+</blockquote>
+
+<p>You use <code>fill</code> on uninitialized memory:</p>
+
+<pre><code>template &lt;typename T, class Allocator&gt;
+constexpr vector&lt;T, Allocator&gt;::vector(size_t n_, const value_type &amp;val_) {
+  m_size = m_capacity = n_;
+  m_data = m_allocator.allocate(m_capacity);
+
+  std::fill(begin(), end(), val_);
+}
+</code></pre>
+
+<p>This is undefined behavior because the lifetime of the objects are not started.  You should use <code>uninitialized_fill</code> instead, which requires <code>#include &lt;memory&gt;</code>.  (This happens multiple times in your code.)</p>
+
+<p>The iterator overload of the constructor participates in overload resolution only when <code>InputIt</code> is an input iterator.  The extent to which the library determines input iterators is unspecified, but at least integer types should not qualify as input iterator.  Your version participates in overload resolution even if <code>InputIt</code> is an integer type.  This can be fixed with SFINAE:</p>
+
+<pre><code>template &lt;class InputIt, typename std::iterator_traits&lt;InputIt&gt;::iterator_category* = nullptr&gt;
+vector(InputIt first, InputIt last);
+</code></pre>
+
+<p>Or, with C++20, concepts:</p>
+
+<pre><code>template &lt;std::input_iterator InputIt&gt;
+vector(InputIt first, InputIt last);
+</code></pre>
+
+<p>Moving from <code>initializer_list</code> does not do what you expect it to do because the elements of <code>initializer_list</code> are const.  Moreover, using <code>move</code> on uninitialized memory is undefined behavior.  Use <code>uninitialized_copy</code> instead.</p>
+
+<p>The copy constructor of <code>vector</code> calls <code>std::allocator_traits&lt;allocator_type&gt;::select_on_container_copy_construction</code> to select the appropriate allocator.  And again, don't use <code>move</code>.  Use <code>uninitialized_copy</code>.</p>
+
+<p>Similarly, the copy assignment operator should decide whether to propagate the allocator depending on whether <code>std::allocator_traits&lt;allocator_type&gt;::propagate_on_container_copy_assignment</code> is true or not.</p>
+
+<p>These also apply to the move operations.  And consider using the <a href="https://stackoverflow.com/q/3279543">copy-and-swap</a> idiom when feasible.</p>
+
+<p>Your <code>shrink_to_fit</code> is problematic:</p>
+
+<pre><code>template &lt;typename T, class Allocator&gt;
+void vector&lt;T, Allocator&gt;::shrink_to_fit() {
+  m_capacity = m_size;
+}
+</code></pre>
+
+<p>This breaks the class invariant and causes problems on deallocation.</p>
+
+<p>You never call constructors or destructors on the elements.  This makes your <code>vector</code> unable to handle nontrivial types.</p>
+
+<h1>Other suggestions</h1>
+
+<p>Generally speaking, <code>#pragma once</code> is OK for me.  But in this case, since you are implementing a component in the standard library, I'd advise you to resort to <code>#ifndef</code> — <code>#define</code> — <code>#endif</code> for portability.</p>
+
+<p>Your data members <code>m_allocator</code>, <code>m_data</code>, <code>m_capacity</code>, and <code>m_size</code> are all public.  I don't see a reason.  I suggest making them private.  Also, why is <code>m_growing_rate</code> of type <code>uint8_t</code> (which should be <code>std::uint8_t</code> and requires <code>#include &lt;cstdint&gt;</code>), and why is it not <code>constexpr</code>?</p>
+
+<p>You love assignment and hate initializer clauses.  This way, you first default initialize (or use the in class member initializer) and then assign, causing performace degradation.  Use initializer clauses.  Instead of:</p>
+
+<pre><code>template &lt;typename T, class Allocator&gt;
+vector&lt;T, Allocator&gt;::vector() noexcept(noexcept(Allocator())) {
+  m_size = 0;
+  reserve(1);
+}
+</code></pre>
+
+<p>It is sufficient to do</p>
+
+<pre><code>template &lt;typename T, class Allocator&gt;
+vector&lt;T, Allocator&gt;::vector() noexcept(noexcept(Allocator())) { }
+</code></pre>
+
+<p>Since you already provided an in class initializer for <code>m_size</code>.</p>
+
+<p>Your allocation policy is to always reserve a lot of space.  <code>vector</code> is not always resized.  If the user doesn't intend to grow it, your policy actually decreases efficiency.  I would suggest reserving space only on <code>insert</code> or the like.</p>
+
+<p>It is not wrong to use <code>m_allocator.allocate(m_capacity)</code>, but it is still advised to do <code>std::allocator_traits&lt;Allocator&gt;::allocate(m_allocator, m_capacity)</code>.</p>
+
+<p>Your code features duplication.  For example, it may be a good idea to let the <code>initializer_list</code> overloads delegate to the iterator overloads.</p>
+    </div>

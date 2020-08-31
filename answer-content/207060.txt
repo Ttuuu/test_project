@@ -1,0 +1,181 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I really admire your efforts and I read the question as more about <code>Expressions</code> than <code>comparison</code>.</p>
+
+<p>Anyway: as for the comparison, you should be aware that the result is different if the initial order of the <code>Products</code> is changed:</p>
+
+<p>this:</p>
+
+<blockquote>
+<pre><code>  var products = new[]
+  {
+    new Product {Name = "Car", Price = 7 },
+    new Product {Name = "Table", Price = 3 },
+    new Product {Name = "Orange", Price = 1 },
+  };
+  var sorted = products.OrderByDescending(p =&gt; p, comparer).ToList();
+</code></pre>
+</blockquote>
+
+<p>gives:</p>
+
+<pre><code>Orange, Car, Table
+</code></pre>
+
+<p>where</p>
+
+<pre><code>  var products = new[]
+  {
+    new Product {Name = "Orange", Price = 1 },
+    new Product {Name = "Car", Price = 7 },
+    new Product {Name = "Table", Price = 3 },
+  };
+  var sorted = products.OrderByDescending(p =&gt; p, comparer).ToList();
+</code></pre>
+
+<p>gives</p>
+
+<pre><code>Table, Orange, Car
+</code></pre>
+
+<p>I would call that an undesired side effect</p>
+
+<hr>
+
+<p>In the same way you'll get different results if you change the order of the operators:</p>
+
+<blockquote>
+<pre><code>if (_comparers[CompareOperator.LessThan](x, y)) return -1;
+if (_comparers[CompareOperator.Equal](x, y)) return 0;
+if (_comparers[CompareOperator.GreaterThan](x, y)) return 1;
+</code></pre>
+</blockquote>
+
+<p>will potentially give another result than:</p>
+
+<pre><code>    if (_comparers[CompareOperator.Equal](x, y)) return 0;
+    if (_comparers[CompareOperator.LessThan](x, y)) return -1;
+    if (_comparers[CompareOperator.GreaterThan](x, y)) return 1;
+</code></pre>
+
+<p>but which one is right?</p>
+
+<hr>
+
+<p>If you extent the <code>Product</code> class to:</p>
+
+<pre><code>  public class Product
+  {
+    public int Id { get; set; }
+    public string Name { get; set; }
+    public int Price { get; set; }
+    public string Category { get; set; }
+
+    public override string ToString()
+    {
+      return $"{Name} -&gt; {Id} -&gt; {Price} -&gt; {Category}";
+    }
+  }
+
+  var products = new[]
+  {
+    new Product {Name = "Car", Price = 7, Category = "Vehicle" },
+    new Product {Name = "Table", Price = 3, Category = "Furniture" },
+    new Product {Name = "Orange", Price = 1, Category = "Fruit" },
+  };
+</code></pre>
+
+<p>and define the comparer as: </p>
+
+<pre><code>  var comparer = ComparerFactory&lt;Product&gt;.Create(
+    x =&gt; new { x.Name.Length, x.Price, CategoryLitra = x.Category[0] },
+    (builder, x, y) =&gt;
+    {
+      builder
+      .LessThen(() =&gt; x.Length &lt; y.Length)
+      .Equal(() =&gt; x.CategoryLitra == y.CategoryLitra)
+      .GreaterThan(() =&gt; x.Price &gt; y.Price);
+    });
+</code></pre>
+
+<p>then the <code>comparer</code> should fall through to </p>
+
+<blockquote>
+<pre><code>    ...
+    // Makes the compiler very happy.
+    return 0;
+  }
+</code></pre>
+</blockquote>
+
+<p>for <code>"Table" (x)</code>  and <code>"Car" (y)</code> because none of the operators return <code>true</code> - but it doesn't. It evaluates them as <code>Equal</code></p>
+
+<p>The problems relates to this:</p>
+
+<blockquote>
+<pre><code>protected override Expression VisitBinary(BinaryExpression node)
+{
+    if (node.NodeType == ExpressionType.Equal) return base.VisitBinary(node);
+    ...
+</code></pre>
+</blockquote>
+
+<p>But I'm not the one to explain why (or why you make this exception), but if you remove that if-statement it works.</p>
+
+<hr>
+
+<p>I can only agree with Peter Taylor in his comment and strongly recommend only to compare in one "dimension" - otherwise I only see trouble as shown above. </p>
+
+<hr>
+
+<p>If you insist on this design a more straight forward and naive solution could be:</p>
+
+<pre><code>  public class StrangeComparer&lt;T&gt; : IComparer&lt;T&gt;
+  {
+    Func&lt;T, T, bool&gt; m_lessThan;
+    Func&lt;T, T, bool&gt; m_equals;
+    Func&lt;T, T, bool&gt; m_greaterThan;
+
+    public StrangeComparer(Func&lt;T, T, bool&gt; lessThan, Func&lt;T, T, bool&gt; equals, Func&lt;T, T, bool&gt; greaterThan)
+    {
+      m_lessThan = lessThan;
+      m_equals = equals;
+      m_greaterThan = greaterThan;
+    }
+
+    public int Compare(T x, T y)
+    {
+      if (ReferenceEquals(x, y)) return 0;
+      if (x == null) return -1;
+      if (y == null) return 1;
+
+      if (m_lessThan(x, y)) return -1;
+      if (m_equals(x, y)) return 0;
+      if (m_greaterThan(x, y)) return 1;
+
+      throw new InvalidOperationException($"Compare of {x} and {y}");
+    }
+  }
+</code></pre>
+
+<p>but IMO you're better off with something like:</p>
+
+<pre><code>  public class StrangeComparer&lt;T&gt; : IComparer&lt;T&gt;
+  {
+    Func&lt;T, T, int&gt; m_comparer;
+
+    public StrangeComparer(Func&lt;T, T, int&gt; comparer)
+    {
+      m_comparer = comparer;
+    }
+
+    public int Compare(T x, T y)
+    {
+      if (ReferenceEquals(x, y)) return 0;
+      if (x == null) return -1;
+      if (y == null) return 1;
+
+      return m_comparer(x, y);
+    }
+  }
+</code></pre>
+    </div>

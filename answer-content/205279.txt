@@ -1,0 +1,117 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Firstly, there's a memory leak possible, because <code>strlist</code> performs two allocations using <code>new[]</code>.  If the first succeeds, but the second throws <code>std::bad_alloc</code>, then we have no reference to <code>*result</code> with which to <code>delete[]</code> it.</p>
+<p>The <a href="/a/205271">answer by Incomputable</a> shows how the interface can be greatly improved.</p>
+<p>I have a minor point that might be overlooked when reading that answer, and an efficiency improvement that can be incorporated into the original or into the proposed RAII object.</p>
+<p>The minor point is that <code>strlist()</code> requires a reference to a <em>mutable</em> vector for no good reason - the signature should be</p>
+<pre><code>char ** strlist(const std::vector&lt;std::string&gt; &amp;input);
+//              ^^^^^
+</code></pre>
+<p>The efficiency improvement is that we know the total storage requirement for all the strings at the start of the function/constructor, so we can make a single allocation and place all our strings within that block instead of making separate allocations for each string to be accessed.  See example code below.</p>
+<p>From C++11 onwards, we could go further, and make our object be a <em>view object</em>, simply storing pointers to the <code>data()</code> of the input strings (which would now need to be mutable - consider pass-by-value, and call it using <code>std::move()</code> where that's useful).</p>
+<p>Finally, is there a good reason that this should work only with <code>std::vector</code> and not with other containers?</p>
+<hr>
+<h2>Single-allocation method</h2>
+<p>Here's how to make two passes over <code>input</code> to save making several small allocations.  I'm keeping (nearly) the original interface to make the changes more obvious, but I really recommend you create a type to ensure that the memory management is automatic.</p>
+<pre><code>#include &lt;cstring&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+char *const *strlist(const std::vector&lt;std::string&gt;&amp; input)
+{
+    char **result = new char*[input.size() + 1];
+    std::size_t storage_size = 0;
+    for (auto const&amp; s: input) {
+        storage_size += s.size() + 1;
+    }
+
+    try {
+        char *storage = new char[storage_size];
+        char *p = storage;
+        char **q = result;
+        for (auto const&amp; s: input) {
+            *q++ = std::strcpy(p, s.c_str());
+            p += s.size() + 1;
+        }
+        *q = nullptr;               // terminate the list
+
+        return result;
+    }
+    catch (...) {
+        delete[] result;
+        throw;
+    }
+}
+
+void del_strlist(char *const *strings)
+{
+    // First string is the allocated storage
+    delete[] strings[0];
+    delete[] strings;
+}
+</code></pre>
+
+<pre><code>#include &lt;iostream&gt;
+int main()
+{
+    std::vector&lt;std::string&gt; args{ "/bin/ls", "ls", "-l" };
+
+    auto v = strlist(args);
+    for (auto p = v;  *p;  ++p) {
+        std::cout &lt;&lt; '\'' &lt;&lt; *p &lt;&lt; "'\n";
+    }
+
+    del_strlist(v);
+}
+</code></pre>
+<hr>
+<h2>Single-allocation method, with smart pointer</h2>
+<p>We can use <code>std::unique_ptr</code> to hold our data, if we don't mind using a custom deleter:</p>
+<pre><code>#include &lt;cstring&gt;
+#include &lt;memory&gt;
+#include &lt;string&gt;
+#include &lt;vector&gt;
+
+auto strlist(const std::vector&lt;std::string&gt;&amp; input)
+{
+    static auto const deleter = [](char**p) {
+        // First string is the allocated storage
+        delete[] p[0];
+        delete[]p;
+    };
+    std::unique_ptr&lt;char*[], decltype(deleter)&gt;
+        result{new char*[input.size() + 1], deleter};
+    // Ensure that destructor is safe (in case next 'new[]' fails)
+    result[0] = nullptr;
+
+    std::size_t storage_size = 0;
+    for (auto const&amp; s: input) {
+        storage_size += s.size() + 1;
+    }
+
+    char *p = result[0] = new char[storage_size];
+    char **q = result.get();
+    for (auto const&amp; s: input) {
+        *q++ = std::strcpy(p, s.c_str());
+        p += s.size() + 1;
+    }
+    *q = nullptr;               // terminate the list
+
+    return result;
+}
+</code></pre>
+
+<pre><code>#include &lt;iostream&gt;
+int main()
+{
+    std::vector&lt;std::string&gt; args{ "/bin/ls", "ls", "-l" };
+
+    auto v = strlist(args);
+    for (auto p = v.get();  *p;  ++p) {
+        std::cout &lt;&lt; '\'' &lt;&lt; *p &lt;&lt; "'\n";
+    }
+}
+</code></pre>
+<p>You should see that this is a bit simpler to write and to use than my first version.</p>
+<hr>
+<p>P.S. Both demos compile with <code>g++ -std=c++17 -Wall -Wextra -Wwrite-strings -Wno-parentheses -Wpedantic -Warray-bounds -Weffc++</code> and run under Valgrind with no warnings or errors, in case that's not already assumed.</p>
+    </div>

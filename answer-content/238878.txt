@@ -1,0 +1,99 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Construction and destruction of non-trivial types</h1>
+
+<p>Unfortunately, your class does not really support non-trivial types, because your class copies the <em>representation</em> of the supplied values and instead of invoking the proper copy constructor.  In other words, you create no object in the <code>Either</code> class, so the behavior of <code>reinterpret_cast</code>ing the storage and calling the destructor is undefined.</p>
+
+<p>Interestingly, you store the <code>destructor</code> function object but never actually call it, so the class ends up working for trivial types, which do not require invocations to the corresponding constructor or destructor.  However, making your code work by letting two errors cancel out each other is not really a good idea.</p>
+
+<p>The copy and move semantics of your class is also broken.  We'll try to fix this problem later.</p>
+
+<h1>Use of runtime type information (<code>typeid</code>)</h1>
+
+<p>The usage of <code>typeid</code> is a bit overkill here and not optimal, because it forces the user to pass exactly the same type as one of the stored types, disallowing conversions.  In fact, simply storing an index seems to suffice.</p>
+
+<p><code>std::variant</code> <a href="https://timsong-cpp.github.io/cppwp/n4659/variant.ctor#12" rel="nofollow noreferrer">uses overload resolution</a> to deduce the type, which is hard to implement.  You may consider supporting <code>in_place</code> construction.  (On the other hand, <code>std::variant</code> is typically implemented with unions because of <code>constexpr</code> requirements.)</p>
+
+<h1>The storage</h1>
+
+<blockquote>
+<pre><code>using Bigest = std::conditional_t&lt;sizeof(T1) &lt;= sizeof(T2), T1, T2&gt;;
+alignas(sizeof(Bigest)) std::byte storage[sizeof(Bigest)];
+std::optional&lt;std::type_index&gt; conatinedType;
+std::function&lt;void(std::byte*)&gt; destructor;
+</code></pre>
+</blockquote>
+
+<p>Consider using <a href="https://en.cppreference.com/w/cpp/types/aligned_storage" rel="nofollow noreferrer"><code>std::aligned_storage</code></a>.  As I said above, we can simply store an index.</p>
+
+<pre><code>using storage_type = std::aligned_storage_t&lt;std::max( sizeof(T1),  sizeof(T2)),
+                                            std::max(alignof(T1), alignof(T2))&gt;;
+storage_type storage;
+std::size_t index;
+</code></pre>
+
+<p>For valueless variants, we can provide a special index:</p>
+
+<pre><code>static constexpr std::size_t npos = std::numeric_limits&lt;std::size_t&gt;::max();
+</code></pre>
+
+<h1>The constructors</h1>
+
+<p>The default constructor of <code>std::variant</code> default-constructs the first alternative type.  You can go into the valueless state instead:</p>
+
+<pre><code>Either() noexcept
+    : index{npos}
+{
+}
+</code></pre>
+
+<p>Here's how you'd support in place constructors:</p>
+
+<pre><code>template &lt;std::size_t I, typename... Args&gt;
+explicit Either(std::in_place_t&lt;I&gt;, Args&amp;&amp;... args)
+{
+    construct&lt;I&gt;(std::forward&lt;Args&gt;(args)...);
+}
+
+template &lt;std::size_t I, typename U, typename... Args&gt;
+explicit Either(std::in_place_t&lt;I&gt;, std::initializer_list&lt;U&gt; ilist, Args&amp;&amp;... args)
+{
+    construct&lt;I&gt;(ilist, std::forward&lt;Args&gt;(args)...);
+}
+</code></pre>
+
+<p>where the private member function template <code>construct</code> is defined like</p>
+
+<pre><code>template &lt;std::size_t I&gt;
+struct alternative_type {
+    static_assert(I &lt; 2);
+    using type = std::conditional_t&lt;I == 0, T1, T2&gt;;
+};
+template &lt;std::size_t I&gt;
+using alternative_type_t = typename alternative_type&lt;I&gt;::type;
+
+// not exception safe
+template &lt;std::size_t I, typename... Args&gt;
+void construct(Args&amp;&amp;... args)
+{
+    index = I;
+    ::new (static_cast&lt;void*&gt;(&amp;storage))
+        alternative_type_t&lt;I&gt;(std::forward&lt;Args&gt;(args));
+}
+</code></pre>
+
+<h1>Special member functions</h1>
+
+<p>As I said before, you need to implement the copy/move/destruction operations.  Here's the copy constructor for example: (SFINAE and <code>explicit</code> issues are omitted for simplicity.)</p>
+
+<pre><code>Either(const Either&amp; other)
+{
+    if (other.index == 0) {
+        construct&lt;T1&gt;(other.get&lt;0&gt;());
+    } else if (other.index == 1) {
+        construct&lt;T2&gt;(other.get&lt;1&gt;());
+    } else {
+        index = npos;
+    }
+}
+</code></pre>
+    </div>

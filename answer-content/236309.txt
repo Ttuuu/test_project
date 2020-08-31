@@ -1,0 +1,144 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You have several answers showing alternative solutions, or describing what's wrong with your existing code. I'm going to try to show how I'd get from <em>here</em> (your current code) to something I'd actually be happy using.</p>
+
+<h2>1. The Declaration</h2>
+
+<pre><code>bool checksum(char card[])
+</code></pre>
+
+<p>is already kind of a problem. There's no way to communicate to the caller that conversion failed. This might be OK if it's only used inside a module that already guarantees our pre-requisites, but we should at least say very clearly what they are.</p>
+
+<p>The function name actually isn't great either, because a <em>checksum</em> is a noun, which means this function sounds like it should calculate and return one of those.</p>
+
+<p>I'm using Doxygen markdown just to get in the mood of writing real code.</p>
+
+<pre><code>/**
+ * Validate a checksummed card number.
+ * The format is 12 hex digits, with the last two representing
+ * a single-octet checksum of the first 10 chars/5 octets.
+ *
+ * @param card must contain 12 hex digits.
+ *
+ * @note This function will not check for short (or NULL)
+ * arguments and will not gracefully handle invalid digits.
+ *
+ * @return true if the input is valid
+ */
+bool validate_checksum(const char *card)
+</code></pre>
+
+<h2>2. The Repetition</h2>
+
+<p>You have five identical loops populating five variables with numbers in their names - this should always <em>always</em> be factored out somehow. Variables with numbers in their names (ordinal numbers, rather than say <code>point3d</code>) are a particular red flag - they should either be an array, or a loop.</p>
+
+<p>Even when we know we should move the repeated code into a function, it isn't always obvious how best to structure it. One approach is to work backwards from the desired result, and see how to get <em>there</em>.</p>
+
+<h2>2.a The End Result</h2>
+
+<p>We want something equivalent to the expression</p>
+
+<pre><code>return (b0 ^ b1 ^ b2 ^ b3 ^ b4 ^ b5) == 0;
+</code></pre>
+
+<p>(note that if <code>b0 ^ ... ^ b4 == b5</code> then <code>b0 ^ ... ^ b4 ^ b5</code> must be zero, and grouping all the input values together makes it easy to naturally avoid the operator precedence problem in your original code)</p>
+
+<p>... but ideally without those numbered variables I called out earlier. We don't really need to keep all six values around at one time either, so we could write</p>
+
+<pre><code>unsigned long result = 0;
+/* 5 is NUM_OCTETS_IN_CARD or similar */
+for (int octnum = 0; octnum &lt; 6; ++octnum)
+{
+    result ^= hex_octet(card);
+    card += 2;
+    /* 2 is CHARS_PER_OCTET */
+}
+return result == 0;
+</code></pre>
+
+<p>I made a note of things that should probably be clearly-defined constants instead of magic numbers, but I'm not writing the whole program here.</p>
+
+<h2>2.b The Repetition pt.2</h2>
+
+<p>Now we know what we want the interface to our factored-out code to look like, it's easier to write:</p>
+
+<pre><code>/**
+ * Convert two hexadecimal characters to an integer.
+ * The parameter must point to a string with at least two valid
+ * hex characters.
+ */
+unsigned long hex_octet(const char *o)
+{
+    char tmp[3] = { o[0], o[1], 0 };
+    return strtoul(tmp, NULL, 16);
+}
+</code></pre>
+
+<p>Note that the only reason for using <code>unsigned long</code> above was to avoid extra work converting from <code>strtoul</code> - otherwise we could have just used <code>uint8_t</code> for the octet values.</p>
+
+<p>Writing our own hex conversion is certainly feasible, but not immediately necessary. If lots of (well, six) calls to <code>strtoul</code> look expensive during profiling, it might be less work to replace them with a single call to <code>strtoull</code> returning all six octets in a single <code>unsigned long long</code>, and then work on the low six bytes of that (the minimum allowed size for <code>unsigned long</code> is 32 bits or 4 bytes, which isn't enough).</p>
+
+<p>After all that, we should have something that works up to the constraints we imposed on the input.</p>
+
+<h2>3. Interface Improvements</h2>
+
+<p>We could actually check our pre-requisites, either just with</p>
+
+<pre><code>assert(isxdigit(c)==0)
+</code></pre>
+
+<p>for every character, or perhaps with</p>
+
+<pre><code>char *end;
+unsigned long long whole = strtoull(card, &amp;end, 16);
+assert(end == card+12);
+</code></pre>
+
+<p>if <code>card</code> is guaranteed to be null-terminated.</p>
+
+<p>Either way, if we don't want to just abort (in debug builds, and continue blithely on in release builds), we need a different interface to tell the caller about errors. With all those constants I mentioned earlier, and proper error-checking, we might end up with</p>
+
+<pre><code>/**
+ * Validate a checksummed card number.
+ * The format is 12 hex digits, representing 6 octets.
+ * The last octet is a checksum for the first five.
+ *
+ * @param card must contain 12 hex digits. If it is not null-terminated, only the
+ * first 12 digits are used.
+ *
+ * @return 0 (zero) if the checksum is correct, or
+ *         a positive integer if the checksum is incorrect
+ *         a negative integer if the input format is invalid
+ */
+int validate_checksum(const char *card)
+{
+    static const int BITS_PER_OCTET = 8;
+    static const unsigned long long LOW_OCTET_MASK = 0xFF;
+    static const int CHARS_PER_OCTET = 2;
+    static const int EXPECTED_OCTETS = 6;
+    static const int EXPECTED_CHARS = EXPECTED_OCTETS * CHARS_PER_OCTET;
+
+    char tmp[EXPECTED_CHARS + 1];
+    memcpy(tmp, card, EXPECTED_CHARS);
+    tmp[EXPECTED_CHARS] = 0;
+
+    char *end;
+    unsigned long long value = strtoull(tmp, &amp;end, 16);
+    if (end != tmp + EXPECTED_CHARS)
+    {
+        /* error: got (end-tmp) hex digits instead of EXPECTED_CHARS */
+        return -1;   
+    }
+
+    uint8_t octet = 0;
+    for (int i = 0; i &lt; EXPECTED_OCTETS; ++i)
+    {
+        octet ^= (uint8_t)(value &amp; LOW_OCTET_MASK);
+        value &gt;&gt;= BITS_PER_OCTET;
+    }
+
+    return octet; /* zero is correct, non-zero must be +ve */
+}
+</code></pre>
+
+<p>Things like <code>BITS_PER_OCTET</code> are probably overkill when "octet" literally means "eight bits", but I decided to eliminate magic numbers from the code almost entirely. Conversely, the integer constant <code>0xFF</code> could have been written <code>(1 &lt;&lt; BITS_PER_OCTET) - 1</code>, but I'm used to reading this sort of value in hex - YMMV.</p>
+    </div>

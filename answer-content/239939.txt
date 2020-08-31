@@ -1,0 +1,195 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Performance</h1>
+<p>The main source of slowness is the <em>lack</em> of something: when an empty square is found and all possibilities for it have been tried, <code>getSolutionCountRecursively</code> does <em>not</em> return, it tries to fill in some other empty square. Filling in the board in a different order just results in the same boards being created but with a different "move history", which doesn't matter, so equal solutions are created many times over.</p>
+<p>To make it explicit, the fix is this: (scroll to bottom)</p>
+<pre><code>getSolutionCountRecursively(recursionTracker) {
+    
+    const RECURSION_LIMIT = 500000;
+    
+    if ( recursionTracker.getNumberOfSolutions() &gt; 500 ) {
+        return recursionTracker;
+    }
+    
+    if ( recursionTracker.getBoardsChecked() &gt; RECURSION_LIMIT ) {
+        recursionTracker.markEarlyExit();
+        return recursionTracker;
+    }
+    
+    const currentSudoku = recursionTracker.getSudokuToCheck();
+    
+    // foreach boardsquare
+    for ( let square of currentSudoku.getSquaresOnBoard() ) {
+        // if square is empty
+        if ( square.getValue() === 0 ) {
+            // for each possible number 1-9
+            for ( let i = 1; i &lt;= 9; i++ ) {
+                if ( recursionTracker.getBoardsChecked() &gt; RECURSION_LIMIT ) {
+                    recursionTracker.markEarlyExit();
+                    return recursionTracker;
+                }
+                
+                const row = square.getRow();
+                const col = square.getCol();
+                
+                if ( currentSudoku.is_legal_move(row, col, i, false) ) {
+                    recursionTracker.incrementBoardsChecked();
+                    
+                    // create new Sudoku
+                    let nextSudoku = new SudokuBoard();
+                    
+                    const board = SudokuBoard.cloneBoard(currentSudoku.board);
+                    nextSudoku.setBoard(board);
+                    
+                    // make move
+                    nextSudoku.make_move(row, col, i);
+                    
+                    if ( nextSudoku.puzzleIsSolved() ) {
+                        recursionTracker.addSolution(nextSudoku);
+                        recursionTracker.incrementBoardsChecked();
+                    } else {
+                        recursionTracker.setSudokuToCheck(nextSudoku);
+                        recursionTracker = this.getSolutionCountRecursively(recursionTracker);
+                    }
+                }
+            }
+            return recursionTracker;  // &lt;------------------- add this
+        }
+    }
+    
+    return recursionTracker;
+}
+</code></pre>
+<p>With this, "Solution count 2" runs in around 2ms on my PC. A handful of minor tricks could be used to get the time down a bit more, I could go into them if you want, but nothing else is even in the same league as adding that extra <code>return</code>.</p>
+<hr>
+<p>For fast solving of more dificult puzzles, also incorporate constraint propagation into the recursive solver. These are the techniques that you are already implementing in <code>process_of_elimination</code>, and more of them. Every time the recursive solver fills in a cell, iteratively apply these elimination steps to fill in as much of the board as possible.</p>
+<p>What tends to happen then is that for an easy puzzle, the solution is found without any search, the iterative solving steps just finish it. For harder puzzles, once the resursive solver has filled some cells, the puzzle either becomes an easy puzzle or a conflict is detected.</p>
+<p>Just filling in Naked Singles, the easiest propagation to implement, is already enough to solve your hard puzzle (300ms on my PC):</p>
+<pre><code>400030000
+000600800
+000000001
+000050090
+080000600
+070200000
+000102700
+503000040
+900000000 
+</code></pre>
+<p>But not yet enough for this other hard puzzle:</p>
+<pre><code>000000000
+000003085
+001020000
+000507000
+004000100
+090000000
+500000073
+002010000
+000040009
+</code></pre>
+<p>For example, filling in Naked Singles might look like this:</p>
+<pre><code>  propagate() {
+    // For each row, column and block,
+    // get a mask indicating which values are already present in it.
+    let rowmask = new Int32Array(9);
+    let colmask = new Int32Array(9);
+    let blockmask = new Int32Array(9);
+    for ( let i = 0; i &lt; 9; i++ ) {
+      for ( let j = 0; j &lt; 9; j++ ) {
+        rowmask[i] |= 1 &lt;&lt; this.board[i][j];
+        colmask[j] |= 1 &lt;&lt; this.board[i][j];
+        blockmask[(i / 3 | 0) * 3 + (j / 3 | 0)] |= 1 &lt;&lt; this.board[i][j];
+      }
+    }
+    
+    // For each cell, get a mask indicating
+    // which values are valid to fill in into it.
+    // Excludes zero, as zero is the lack of a value.
+    // For a filled cell, the only value it can have is the value it already has.
+    // For empty cells, the possible values are values that
+    // are not already used in the same row/column/block.
+    let cellmask = new Int32Array(81);
+    for ( let i = 0; i &lt; 9; i++ ) {
+      for ( let j = 0; j &lt; 9; j++ ) {
+        var mask = rowmask[i] | colmask[j] | blockmask[(i / 3 | 0) * 3 + (j / 3 | 0)];
+        // invert to take the *unused* values
+        // 0x3FE = 0011_1111_1110 (bits 1 to 9 are set)
+        cellmask[i * 9 + j] = ~mask &amp; 0x3FE;
+        if ( this.board[i][j] !== 0 )
+          cellmask[i * 9 + j] = 1 &lt;&lt; this.board[i][j];
+      }
+    }
+
+    var changed = false;
+    do {
+      changed = false;
+
+      for ( let i = 0; i &lt; 9; i++ ) {
+        for ( let j = 0; j &lt; 9; j++ ) {
+          let mask = cellmask[i * 9 + j];                    
+          if ( this.board[i][j] !== 0 ) continue;
+          if ( mask === 0 ) return false;
+          if ( this.isSingleSetBit(mask) ) {
+            let move = this.getSetBitPos(mask);
+            this.make_move(i, j, move);
+            changed = true;
+            
+            // we just filled a cell with the value 'move' 
+            // remove that as a possible value from cells in
+            // the same row/column/block
+            for ( let k = 0; k &lt; 9; k++ ) {
+              cellmask[i * 9 + k] &amp;= ~(1 &lt;&lt; move);
+              cellmask[k * 9 + j] &amp;= ~(1 &lt;&lt; move);
+            }
+            for ( let k = 0; k &lt; 3; k++ ) {
+              for ( let l = 0; l &lt; 3; l++ ) {
+                cellmask[((i / 3 | 0) * 3 + k) * 9 + (j / 3 | 0) * 3 + l] &amp;= ~(1 &lt;&lt; move);
+              }
+            }
+          }
+        }
+      }
+
+    } while (changed);
+    return true;
+  }
+
+  isSingleSetBit(x) {
+    return x !== 0 &amp;&amp; (x &amp; -x) === x;
+  }
+
+  getSetBitPos(x) {
+    for ( let i = 0; i &lt; 31; i++ ) {
+      if ((x &amp; (1 &lt;&lt; i)) !== 0)
+        return i;
+    }
+    return -1;
+  }
+</code></pre>
+<p>Though I'm not saying that this is the nicest way to do it.</p>
+<p>The intended usage is:</p>
+<pre><code>// make move
+nextSudoku.make_move(row, col, i);
+// propagate forced-moves
+if (!nextSudoku.propagate())
+    continue;
+</code></pre>
+<p>Hidden Singles can be filtered with some more bitwise trickery. For example this filters them out of the rows only, turning them into Naked Singles which will immediately be detected:</p>
+<pre><code>  for ( let i = 0; i &lt; 9; i++ ) {
+    var m1 = 0;
+    var m2 = 0;
+    for ( let j = 0; j &lt; 9; j++ ) {
+      var m = cellmask[i * 9 + j];
+      m2 |= m1 &amp; m;
+      m1 |= m;
+    }
+    for ( let j = 0; j &lt; 9; j++ ) {
+      var m = cellmask[i * 9 + j];
+      m &amp;= ~m2;
+      if ( m !== 0 )
+        cellmask[i * 9 + j] = m &amp; -m;
+    }
+  }
+</code></pre>
+<p>(<a href="https://jsfiddle.net/d0moLejz/" rel="nofollow noreferrer">fiddle</a>)</p>
+<p>A similar thing can be done for columns and blocks.</p>
+<p>Perhaps these bitwise tricks are not your style, of course the same effects can be accomplished with sets.</p>
+    </div>

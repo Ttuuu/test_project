@@ -1,0 +1,179 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Your design doesn't make sense, to me.</p>
+
+<blockquote>
+<pre><code>[&lt;Struct&gt;]
+type LogInfo =
+    {
+        Message: string
+        Error: exn option
+        Date: DateTime
+        StackTrace: StackTrace
+    }
+
+type LogMessage = 
+| Debug of LogInfo
+| Info of LogInfo
+| Warning of LogInfo
+| Error of LogInfo
+| Fatal of LogInfo
+    member this.Message = 
+        match this with
+        | Debug info -&gt; info.Message
+        | Info info -&gt; info.Message
+        | Warning info -&gt; info.Message
+        | Error info -&gt; info.Message
+        | Fatal info -&gt; info.Message
+    member this.Exception =
+        match this with
+        | Debug info -&gt; info.Error
+        | Info info -&gt; info.Error
+        | Warning info -&gt; info.Error
+        | Error info -&gt; info.Error
+        | Fatal info -&gt; info.Error
+</code></pre>
+</blockquote>
+
+<p>This looks backwards. Instead of the <code>LogMessage</code> being a DU, make it an enumeration and a value on the <code>LogInfo</code> record:</p>
+
+<pre><code>type MessageType = | Debug | Info | Warning | Error | Fatal
+type LogInfo = {
+    Message : string
+    Error : exn option
+    Date : DateTime
+    StackTrace : StackTrace
+    Type : MessageType
+}
+</code></pre>
+
+<p>Then you can just drop into <code>LogInfo.Message</code> or <code>LogInfo.Error</code>.</p>
+
+<p>Additionally, the design <em>still</em> doesn't make sense as much as I'd think it would, because <code>Error</code> really shouldn't be a property of the record, but should be a union case:</p>
+
+<pre><code>type MessageType = | Debug | Info | Warning | Error | Fatal
+type LogInfo = {
+    Message : string
+    Date : DateTime
+    Type : MessageType
+}
+type ErrorInfo = {
+    Error : exn
+    StackTrace : StackTrace
+}
+type LogMessage =
+    | Error of ErrorInfo * LogInfo
+    | Standard of LogInfo
+    member this.Message =
+        match this with | Error (_, i) | Standard i -&gt; i.Message
+    member this.Exception =
+        match this with | Error (e, _) -&gt; Some e.Error | _ -&gt; None
+</code></pre>
+
+<p>This makes more sense to me, because it means we can represent the <code>LogMessage</code> for what it <em>is</em>: an <code>Error</code> or a <code>Standard</code> message. Additionally, I'd consider splitting out the cases at this point to represent the valid states as a DU <em>now</em> that we know what they are:</p>
+
+<pre><code>type LogInfo = {
+    Message : string
+    Date : DateTime
+}
+type ErrorInfo = {
+    Error : exn
+    StackTrace : StackTrace
+}
+
+type LogMessage =
+    | Debug of LogInfo
+    | Info of LogInfo
+    | Warning of LogInfo
+    | Error of ErrorInfo * LogInfo
+    | Fatal of ErrorInfo * LogInfo
+    member this.Message =
+        match this with | Debug i | Info i | Warning i | Error (_, i) | Fatal (_, i) -&gt; i.Message
+    member this.Exception =
+        match this with | Error (e, _) | Fatal (e, _) -&gt; Some e.Error | _ -&gt; None
+</code></pre>
+
+<p>There, that looks better.</p>
+
+<p>I don't know why you put the <code>StackTrace</code> on the <code>LogInfo</code> member, I would think you only care in the case of an exception (typically getting the stack trace is the longest part of this type of thing), but if you absolutely need it on <em>all</em> messages then you can simply move it back.</p>
+
+<p>A couple of fun-facts about F#:</p>
+
+<ul>
+<li><p>When <code>match</code>ing DU's / Records, if you include multiple matches with the same alias with the same type (<code>| Debug i | Info i</code>) you can have one handler for them:</p>
+
+<pre><code>match this with | Debug i | Info i | Warning i | Error (_, i) | Fatal (_, i) -&gt; i.Message
+</code></pre></li>
+<li><p>It's subjective, but I like to format records in a single line, or with the Java-style braces when opening:</p>
+
+<pre><code>let LogInfo = {
+</code></pre></li>
+</ul>
+
+<p>Using those tricks, we can take:</p>
+
+<blockquote>
+<pre><code>let logAgent = MailboxProcessor.Start &lt;| fun inbox -&gt; 
+    let rec logLoop () = async {
+        let! message = inbox.Receive()            
+        match message with
+        | Debug info -&gt; writeLog Level.Debug info.Message info.Error info.Date info.StackTrace
+        | Info info -&gt; writeLog Level.Info info.Message info.Error info.Date info.StackTrace
+        | Warning info -&gt; writeLog Level.Warn info.Message info.Error info.Date info.StackTrace
+        | Error (err, info) -&gt; writeLog Level.Error info.Message info.Error info.Date info.StackTrace
+        | Fatal (err, info) -&gt; writeLog Level.Fatal info.Message info.Error info.Date info.StackTrace
+        return! logLoop()
+    }
+    logLoop ()
+</code></pre>
+</blockquote>
+
+<p>And rewrite it with a little less duplication, keeping things concise and readable:</p>
+
+<pre><code>let logAgent = MailboxProcessor.Start &lt;| fun inbox -&gt; 
+    let rec logLoop () = async {
+        let! message = inbox.Receive()       
+        let level, info, error =
+            match message with
+            | Debug info -&gt; Level.Debug, info, None
+            | Info info -&gt; Level.Info, info, None
+            | Warning info -&gt; Level.Warn, info, None
+            | Error (err, info) -&gt; Level.Error, info, (Some err.Error)
+            | Fatal (err, info) -&gt; Level.Fatal, info, (Some err.Error)
+        writeLog level info.Message error info.Date info.StackTrace
+        return! logLoop()
+    }
+    logLoop ()
+</code></pre>
+
+<p>But at this point I find myself asking "why have <code>this.Message</code> or <code>this.Exceptoin</code> on the <code>LogMessage</code>?" We don't use them.</p>
+
+<p>So with that thought, why not add a <code>this.Level</code> and <code>this.Info</code> and make life a lot easier?</p>
+
+<pre><code>type LogMessage =
+    | Debug of LogInfo
+    | Info of LogInfo
+    | Warning of LogInfo
+    | Error of ErrorInfo * LogInfo
+    | Fatal of ErrorInfo * LogInfo
+    member this.Message =
+        match this with | Debug i | Info i | Warning i | Error (_, i) | Fatal (_, i) -&gt; i.Message
+    member this.Exception =
+        match this with | Error (e, _) | Fatal (e, _) -&gt; Some e.Error | _ -&gt; None
+    member this.Level =
+        match this with | Debug _ -&gt; Level.Debug | Info _ -&gt; Level.Info | Warning _ -&gt; Level.Warn | Error _ -&gt; Level.Error | Fatal _ -&gt; Level.Fatal
+    member this.LogInfo =
+        match this with | Debug i | Info i | Warning i | Error (_, i) | Fatal (_, i) -&gt; i
+
+let logAgent = MailboxProcessor.Start &lt;| fun inbox -&gt; 
+    let rec logLoop () = async {
+        let! (message : LogMessage) = inbox.Receive()
+        writeLog message.Level message.LogInfo.Message message.Exception message.LogInfo.Date message.LogInfo.StackTrace
+        return! logLoop()
+    }
+    logLoop ()
+</code></pre>
+
+<p>Sure we'll have multiple match expressions, but that's the price to pay for OOP-F#. If we did it entirely functionally, we would remove those members and put the entire burden on the caller.</p>
+
+<p>I guess all this info exists to say that typically, in something like this, we can evaluate different options and come up with a domain representation that makes things easier to use, more representative, and more fool-proof. (Especially with people like me, who can break anything.)</p>
+    </div>

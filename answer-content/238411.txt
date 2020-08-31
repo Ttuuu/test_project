@@ -1,0 +1,89 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Double Counting</h1>
+
+<p>Your packet class has both a <code>String</code> and a <code>byte</code> representation of its data:</p>
+
+<pre><code>private final String content;
+private final byte[] raw;
+</code></pre>
+
+<p>This seems unnecessary to me.  Unless you're expecting multiple calls to fetch the content/raw from the class then caching the answer seems unnecessary.  I'd store either the <code>String</code> value, or the <code>byte</code> value, but not both.  I'm on the fence as to which is the best approach since it probably depends on the environment.  On the one hand, using <code>String</code> internally removes mutability concerns around the caller changing the byte array.  On the other, the internal byte array seems more intuitive for a <code>Packet</code>.</p>
+
+<h1>Testing</h1>
+
+<p>You haven't included unit tests in your review.  To facilitate the review, I wrote a simple test to validate that given a message, it can be encoded, decoded and end up with the same message.  The test looks something like this:</p>
+
+<pre><code>String messageToSend = "This is a string to send";
+
+Packet encodedMessage = new Packet(messageToSend);
+
+assertThat(encodedMessage.getContent()).isEqualTo(messageToSend);
+
+Packet decodedMessage = new Packet(encodedMessage.getRaw());
+
+assertThat(decodedMessage.getContent()).isEqualTo(messageToSend);
+</code></pre>
+
+<p>This is really several tests in one, which is why it's got multiple asserts.</p>
+
+<h1>String Encoding + Length</h1>
+
+<p>As @VisualMelon said, supplying an encoding to the <code>getBytes</code> call is almost certainly necessary, unless both sides of the communication are on the same machine.  I think it's also worth pointing out that you're assuming one-byte encoding.  When you're deciding the length of the packet, you use <code>content.length()</code>, where <code>content</code> is the <code>String</code>.  However you should really be using the length of the byte array returned from <code>content.getBytes(StandardCharsets.UTF_8)</code> or similar... Whilst the lengths are possibly the same (standard ASCII in the String), as soon as you start using extended characters in the String the length of the <code>byte</code> array and the String length start to diverge.  To demonstrate it, you can try a <code>messageToSend</code> like <code>"This is a string to send \u0207!"</code>.</p>
+
+<h1>Array copying</h1>
+
+<p>It feels to me like you are doing unnecessary copying of sections of the array.  Most of the methods that you're calling are quite happy working from the original array, using offsets.  The only reason you might want to copy the buffer is if you don't own it (you don't trust the caller not to change it after supplying it to the constructor) and you continue to store it internally in which case you want to build a single buffer of the correct size.  So, instead of:</p>
+
+<blockquote>
+<pre><code>byte[] lengthByte = new byte[2];
+System.arraycopy(data, 0, lengthByte, 0, LENGTH_OFFSET);
+int contentLength = getLength(lengthByte);
+if (contentLength &gt; data.length-LENGTH_OFFSET) {
+    throw new IllegalArgumentException("corrupted data - length &gt; data");
+}
+raw = new byte[contentLength];
+System.arraycopy(data, LENGTH_OFFSET, raw, 0, contentLength);
+content = new String(raw);
+</code></pre>
+</blockquote>
+
+<p>You can do this:</p>
+
+<pre><code>int contentLength = getLength(data);
+int messageLength = HEADER_SIZE + contentLength;
+if (messageLength &gt; data.length) {
+    throw new IllegalArgumentException("corrupted data - length &gt; data");
+}
+raw = new byte[messageLength];
+System.arraycopy(data, 0, raw, 0, messageLength);
+content = new String(raw, HEADER_SIZE, contentLength, StandardCharsets.UTF_8)
+</code></pre>
+
+<p>Few things to note:
+* <code>getLength</code> is nondestructive and just operates on the first two bytes, it doesn't really care that the byte array may be bigger, so we don't need to give it its own array to work with.
+* I've renamed <code>LENGTH_OFFSET</code> to <code>HEADER_SIZE</code>, which makes more sense to me since it represents the size of the length field, which is effectively the header for the packet being sent.
+* I've used <code>messageLength</code> as the size of the header + the size of the content to make subsequent statements more readable
+* I'm passing the complete <code>byte</code> array, including its length, to the <code>String</code> constructor, but I'm specifying a start position (after the header) and the number of bytes to use.</p>
+
+<h1>Bytes and Signs</h1>
+
+<p>I don't think this does what you think it does:</p>
+
+<pre><code>private static byte trimSignum(int byteWithSignum) {
+    if (byteWithSignum &gt; 127) {
+        return (byte)(0xFF - byteWithSignum);
+    }
+    return (byte)byteWithSignum;
+}
+</code></pre>
+
+<p>I <em>think</em> you're trying to accommodate for byte being signed and you don't want 130 to be represent by in a signed byte as '-126', but the result is that you're doing 255 - 130, which is 125.  You're effectively removing the sign without putting the information anywhere (when you decode how do you know if it's 125 or 125 representing 130?).  This gets worse the closer <code>byteWithSigNum</code> gets to 255.  The function is fine just being:</p>
+
+<pre><code>return (byte)byteWithSignum;
+</code></pre>
+
+<p>You can demonstrate the error with:</p>
+
+<pre><code>String messageToSend = "This is a string to send 5555555555555555555555555555555555555555555555555555665555555555555555555555555555555555555555555555550";
+</code></pre>
+    </div>

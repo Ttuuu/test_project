@@ -1,0 +1,141 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'm not particularly knowledgeable on Rust, so this will be a light review.</p>
+<p>I would suggest leaning on the Rust tooling quite a bit, especially when new to a language. I've heard nothing but praise for the format tool, compiler warnings, and linters.</p>
+<p>Running the code through rustfmt only moves newlines and comments around, so good job on having a clean starting point.</p>
+<hr>
+<p>Clippy (the linter) points out that there are unecessary explicit returns. You can remove the return keyword (and trailing semicolon) from lines at the end of functions like <code>return RGB(...);</code>. For example</p>
+<pre><code>if ans &lt; tmax &amp;&amp; ans &gt; tmin {
+    hit_record.t = ans;
+    hit_record.p = ray.at(ans);
+    hit_record.n = Unit::new_normalize(self.center - hit_record.p);
+    true
+} else {
+    // is putting this in an else block necessary? I tried without the else
+    // and the compiler said 'if may be missing an else clause', and I'm
+    // still not completely sure why that is.
+    let ans = (-b + root) / a;
+    if ans &lt; tmax &amp;&amp; ans &gt; tmin {
+        hit_record.t = ans;
+        hit_record.p = ray.at(ans);
+        hit_record.n = Unit::new_normalize(self.center - hit_record.p);
+        true
+    } else {
+        false
+    }
+}
+</code></pre>
+<p>If you don't like the implicit returns, you can write code with guard clauses instead of if/else (BTW I couldn't reproduce the compiler error you get removing the else block).</p>
+<pre><code>if ans &lt; tmax &amp;&amp; ans &gt; tmin {
+    hit_record.t = ans;
+    hit_record.p = ray.at(ans);
+    hit_record.n = Unit::new_normalize(self.center - hit_record.p);
+    return true;
+}
+
+if ans &lt; tmax &amp;&amp; ans &gt; tmin {
+    hit_record.t = ans;
+    hit_record.p = ray.at(ans);
+    hit_record.n = Unit::new_normalize(self.center - hit_record.p);
+    return true;
+}
+false
+</code></pre>
+<p>The final warning clippy gives is on the cast of a literal, it suggests changing <code>255 as f64</code> to <code>255_f64</code>, including the type directly in the literal.</p>
+<hr>
+<pre><code>// get quadratic equation, calculate discriminant
+let a = ray.dir.dot(&amp;ray.dir);
+let b = diff.dot(&amp;ray.dir);
+let c = diff.dot(&amp;diff) - self.r * self.r;
+let disc = b * b - a * c;
+</code></pre>
+<p>Do you have a link/diagram/short explanation for this? I don't know the derivation, so I don't know why the discriminant is not the usual <code>disc = b * b - 4 * a * c</code>. Where did the 4 go?</p>
+<hr>
+<pre><code>let ans = (-b - root) / a;
+if ans &lt; tmax &amp;&amp; ans &gt; tmin {
+    // Block that involves ans
+}
+
+let ans = (-b + root) / a;
+if ans &lt; tmax &amp;&amp; ans &gt; tmin {
+    // Block that involves ans
+}
+</code></pre>
+<p>I can't tell if this suggestion is actually an improvement without profiling, but if most of the time these conditions fail, you could trade two divisions for two multiplications by scaling tmin and tmax, and only dividing if it passes the checks.</p>
+<pre><code>let a_tmin = a * tmin;
+let a_tmax = a * tmax;
+let scaled_ans = -b - root;
+if a_tmin &lt; scaled_ans &amp;&amp; scaled_ans &lt; a_tmax {
+    let ans = scaled_ans / a;
+    // Block that involves ans
+}
+
+let scaled_ans = -b + root;
+if a_tmin &lt; scaled_ans &amp;&amp; scaled_ans &lt; a_tmax {
+    let ans = scaled_ans / a;
+    // Block that involves ans
+}
+</code></pre>
+<hr>
+<p>I think changing the intersects function to return an optional hit_record would solve two problems. It can save you from initialising a dummy hit_record, and also removes the output variable. I'm not sure if this code is exactly correct, but something along the lines of</p>
+<pre><code>trait Hittable {
+    fn intersects(&amp;self, ray: &amp;Ray, tmin: f64, tmax: f64) -&gt; Option&lt;HitRecord&gt;;
+}
+
+...
+
+fn intersects(&amp;self, ray: &amp;Ray, tmin: f64, tmax: f64) -&gt; Option&lt;HitRecord&gt; {
+    let diff: Vector3&lt;f64&gt; = ray.origin - self.center;
+    // get quadratic equation, calculate discriminant
+    let a = ray.dir.dot(&amp;ray.dir);
+    let b = diff.dot(&amp;ray.dir);
+    let c = diff.dot(&amp;diff) - self.r * self.r;
+    let disc = b * b - a * c;
+    if disc &lt; 0.0 {
+        return None; // no need to fill data
+    }
+    let root = disc.sqrt();
+    let ans = (-b - root) / a; // try first solution to equation
+    if ans &lt; tmax &amp;&amp; ans &gt; tmin {
+        let p = ray.at(ans);
+        return Some(HitRecord {
+            t: ans,
+            p,
+            n: Unit::new_normalize(self.center - p),
+        });
+    }
+
+    let ans = (-b + root) / a;
+    if ans &lt; tmax &amp;&amp; ans &gt; tmin {
+        let p = ray.at(ans);
+        return Some(HitRecord {
+            t: ans,
+            p,
+            n: Unit::new_normalize(self.center - p),
+        });
+    }
+    None
+}
+
+
+...
+
+
+    for sphere in array.iter() {
+    let result = sphere.intersects(ray, 0.0, 10.0);
+    match result {
+        Some(record) =&gt; {
+            hit_record = record;
+            break;
+        }
+        None =&gt; continue,
+    }
+</code></pre>
+<p>This does highlight that there is repeated code for both potential roots, maybe a quick function to deduplicate would be appropriate here.</p>
+<p>This then means the pattern in cast_rays is now "loop over an iterator until the first value is found", so we can turn to the standard library if we would like to. Usually deferring to the standard library is a good idea, the implementation will be well tested, and will require less maintenance on our behalf. I think find_map is the algorithm we want in this case. This is where my Rust knowledge fails me, I think the code would be something like</p>
+<pre><code>let hit_record = array
+    .iter()
+    .find_map(|sphere| sphere.intersects(ray, 0.0, 10.0))
+    .unwrap();  // What should happen in there is no intersecting spheres?
+</code></pre>
+<p>But at this point I'm out of my depth.</p>
+    </div>

@@ -1,0 +1,162 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Okay, what's the deal with <code>#define ezs(x) (x)</code>? Is it some kind of trick to either hide C-style casts, or make them more greppable? If the latter, why such a short name? How about <code>#define CAST_TO(x) (x)</code>?</p>
+
+<hr>
+
+<p>Other naming comments:</p>
+
+<ul>
+<li><p><code>was_read</code> sounds like a boolean. I think you mean <code>bytes_read</code> or even <code>num_bytes_read</code>.</p></li>
+<li><p>Your function names are all tersified according to different conventions. You've got <code>interpret_brainfuck</code> (verb-noun), <code>perror_and_exit</code> (verb-and-verb), and <code>read_file</code> (verb-noun) — but you've tersified them as <code>bf_interp</code> (noun-abbrverb), <code>exit_perr</code> (reversed the order of the verbs for some reason), and... okay, <code>read_file</code> is a good name. :)</p></li>
+</ul>
+
+<hr>
+
+<pre><code>#define exit_if_true(x, y) if(x) exit_perr(y)
+</code></pre>
+
+<p>(A) Why is this not a (<code>static</code>) <code>inline</code> function? I don't think the macro is buying you anything.</p>
+
+<p>(B) Consider:</p>
+
+<pre><code>if (cond1)
+    exit_if_true(cond2, "message");
+else
+    puts("cond1 was false");  // LIES!
+</code></pre>
+
+<p>Always, always, always use proper macro hygiene in C and C++! It costs nothing, and it shows the reader that you know what you're doing, and every so often it avoids a really sneaky bug.
+What you should have written was:</p>
+
+<pre><code>#define exit_if_true(x, y) do { if (x) exit_perr(y); } while (0)
+</code></pre>
+
+<p>or, even better,</p>
+
+<pre><code>static inline void exit_if_true(bool b, const char *message) {
+    if (b) {
+        exit_perr(message);
+    }
+}
+</code></pre>
+
+<hr>
+
+<pre><code>size_t file_size,
+       mem_size = DEF_MEM_SIZE;
+unsigned char *file, *mem;
+</code></pre>
+
+<p>Please, for the sake of your readers, write each declaration on its own line. I mean, it costs literally <em>one</em> more line of source code to write</p>
+
+<pre><code>size_t file_size;
+size_t mem_size = DEF_MEM_SIZE;
+unsigned char *file;
+unsigned char *mem;
+</code></pre>
+
+<p>This also calls attention to the fact that you failed to initialize three of these variables. That smells like a bug. Let's see...</p>
+
+<pre><code>file = read_file(argv[1], &amp;file_size);
+mem = calloc(sizeof(*mem), mem_size);
+</code></pre>
+
+<p>Ah. So it actually would have <em>saved</em> you several lines of code to write simply</p>
+
+<pre><code>if (argc != 2) {
+    fprintf(stderr, "Error: Incorrect number of arguments\n"
+                    "  Usage: %s [file] (args...)\n", argv[0]);
+    return 1;
+}
+size_t file_size;
+unsigned char *file = read_file(argv[1], &amp;file_size);
+
+size_t mem_size = DEF_MEM_SIZE;
+unsigned char *mem = calloc(mem_size, 1);
+exit_if_true(mem == NULL, "calloc()");
+</code></pre>
+
+<p>I notice in passing that <code>return 1;</code> is quite natural and correct and POSIX-compliant — it's a really good idea to specify exactly what integral value your process returns on error — but <em>technically</em> it's not "ANSI C" to do that. ANSI C wants you to use <code>return EXIT_FAILURE;</code>, which returns an implementation-defined "failure" result.</p>
+
+<p>More importantly, you accidentally swapped the arguments to <code>calloc</code>. <a href="https://linux.die.net/man/3/calloc" rel="noreferrer">They go <code>nmemb, size</code>.</a> And yes, I had to look it up. I know that I <em>always</em> have to look it up. This, IMVHO, is a reason never to use <code>calloc</code> — I'd use <code>malloc</code> and then do an explicit <code>memset</code> if for some reason I <em>needed</em> zero-initialization.</p>
+
+<p>Notice that <code>sizeof(char)</code> is <code>1</code> by definition.</p>
+
+<hr>
+
+<pre><code>long spc = 0, ipc = 0;
+</code></pre>
+
+<p>Again, I strongly recommend one declaration per line.</p>
+
+<p>What's weird here is that you're carefully defining these variables as <code>long</code>... but then casting them to <code>size_t</code> everywhere they're used! Why not just define them as <code>size_t</code>?</p>
+
+<p>I also personally dislike seeing <code>long</code> because its size varies from platform to platform. "Everyone knows" that on common desktop systems <code>int</code> is 32 bits and <code>long long</code> is 64, but the size of <code>long</code> might be one or the other, depending on architecture and operating system. Using <code>long</code> is like saying, "I <em>want</em> to have portability problems a year from now."</p>
+
+<hr>
+
+<pre><code>free(mem);
+</code></pre>
+
+<p>This is a double-free and crash bug. <code>bf_interp</code> will have freed the <em>original</em> value of <code>mem</code> the very first time it does a <code>realloc</code>. Either</p>
+
+<ul>
+<li>pass <code>mem</code> by address to <code>bf_interp</code> so that <code>bf_interp</code> can modify it, or</li>
+<li>transfer the responsibility for freeing <code>mem</code> into <code>bf_interp</code> — turn <code>bf_interp</code> into a "sink."</li>
+</ul>
+
+<p>Since <code>bf_interp</code> uses <code>mem</code> as scratch space, trashing its semantic <em>contents</em> as well as its physical pointer value, I think the second option above makes quite a bit of sense.</p>
+
+<p>The one thing that might change my mind is if you could demonstrate that <code>bf_interp</code> does not "trash" <code>mem</code>'s contents, but rather updates them in a meaningful way. For example, if <code>bf_interp</code> took a parameter <code>num_steps</code>, and ran the program for that many steps, and then returned, so that you could "resume" the interpretation later — well, then it would make sense that <code>bf_interp</code> needs a way to pass <code>mem</code> back out to its caller. (But then <code>bf_interp</code> would also need a way to pass the rest of its state — <code>ipc</code> and <code>spc</code>. And now you're halfway to inventing object-oriented programming.)</p>
+
+<hr>
+
+<p>Oh hey — your entire use of <code>realloc</code> is wrong!</p>
+
+<pre><code>                tmp = realloc(sp, sp_size + DEF_MEM_SIZE);
+                exit_if_true(tmp == NULL, "realloc()");
+
+                memset(tmp+sp_size, 0, DEF_MEM_SIZE);
+                memcpy(tmp, sp, sp_size);
+
+                sp_size += DEF_MEM_SIZE;
+
+                free(sp);
+                sp = tmp;
+</code></pre>
+
+<p>This should be simply</p>
+
+<pre><code>                sp = realloc(sp, sp_size + DEF_MEM_SIZE);
+                exit_if_true(sp == NULL, "realloc()");
+
+                memset(sp + sp_size, 0, DEF_MEM_SIZE);
+                sp_size += DEF_MEM_SIZE;
+</code></pre>
+
+<p>Your version would become correct (but still inefficient) if you replaced <code>realloc</code> with simply <code>malloc</code>. The point of <code>realloc</code> is that it does the <em>re</em>-allocation for you; you don't have to manually free the old buffer or copy over the data.</p>
+
+<p>If you used something like <code>gcov</code> to look at your code coverage, you'd see that your test cases (you have test cases, right?) never hit this codepath. That's why you didn't find the bug. If you had hit this codepath, the program definitely would have crashed.</p>
+
+<hr>
+
+<pre><code>    /* I would put this inside the switch
+     * but clang warns about "unreachable code".
+     */
+    int nest;
+</code></pre>
+
+<p>The declaration of this variable should go at the variable's point of use. Like this:</p>
+
+<pre><code>                for (int nest = 1; nest != 0; )
+</code></pre>
+
+<hr>
+
+<p>Your usage message says:</p>
+
+<pre><code>Usage: ./a.out [file] (args...)
+</code></pre>
+
+<p>This isn't right, is it? I mean, <code>file</code> is not optional, and there is no such thing as <code>args...</code>.</p>
+    </div>

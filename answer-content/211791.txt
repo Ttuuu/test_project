@@ -1,0 +1,89 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Here's a generic solution I created to solve these sorts of issues, and the specifics for this particular one. It uses an <code>Attribute</code> class to mark methods (normally extension methods) as needing special processing for LINQ to SQL/EF and an <code>ExpressionVisitor</code> to re-write the queries for each marked method.</p>
+
+<p>First, the <code>Attribute</code> class:</p>
+
+<pre><code>[AttributeUsage(AttributeTargets.Method)]
+public class ExpandMethodAttribute : Attribute {
+    private string methodName;
+
+    public ExpandMethodAttribute(string aMethodName = null) =&gt; methodName = aMethodName;
+
+    public MethodInfo ExpandingMethod(MethodInfo mi) {
+        var methodType = mi.DeclaringType;
+        var origMethodName = mi.Name;
+        var argTypes = new[] { typeof(Expression) }.Concat(mi.GetParameters().Skip(1).Select(pi =&gt; pi.ParameterType)).ToArray();
+        var bf = BindingFlags.Public | BindingFlags.NonPublic | (mi.IsStatic ? BindingFlags.Static : BindingFlags.Instance);
+
+        var expandMethodName = methodName ?? $"{origMethodName}Expander";
+        var em = methodType.GetMethod(expandMethodName, bf, null, argTypes, null);
+        if (em == null)
+            throw new NullReferenceException($"Unable to find MethodInfo for {methodType.Name}.{expandMethodName}");
+        else
+            return em;
+    }
+}
+</code></pre>
+
+<p>Now, an <code>IQueryable</code> extension to trigger the expansion:</p>
+
+<pre><code>public static class IQueryableExt {
+    private static object Evaluate(this Expression e) =&gt; (e is ConstantExpression c) ? c.Value : Expression.Lambda(e).Compile().DynamicInvoke();
+
+    /// &lt;summary&gt;
+    /// ExpressionVisitor to replace x.method("x..z") to methodexpander(x, "x..z")
+    /// &lt;/summary&gt;
+    private class ExpandableMethodVisitor : ExpressionVisitor {
+        public override Expression Visit(Expression node) {
+            if (node?.NodeType == ExpressionType.Call) {
+                var callnode = node as MethodCallExpression;
+                var ema = callnode.Method.GetCustomAttribute&lt;ExpandMethodAttribute&gt;();
+                if (ema != null)
+                    return (Expression)ema.ExpandingMethod(callnode.Method).Invoke(callnode.Object, callnode.Arguments.Select((ae, n) =&gt; n == 0 ? ae : ae.Evaluate()).ToArray());
+            }
+
+            return base.Visit(node);
+        }
+    }
+
+    private static T ExpandMethods&lt;T&gt;(this T orig) where T : Expression =&gt; (T)(new ExpandableMethodVisitor().Visit(orig));
+
+    public static IQueryable&lt;T&gt; Expand&lt;T&gt;(this IQueryable&lt;T&gt; q) =&gt; q.Provider.CreateQuery&lt;T&gt;(q.Expression.ExpandMethods());
+}
+</code></pre>
+
+<p>Finally, the specific extension needed to filter characters from a field expression:</p>
+
+<pre><code>public static class LINQExt {
+    // body only for LINQ to Objects use
+    [ExpandMethod("CleanUp")]
+    public static string RemoveAll(this string src, string removeChars) =&gt; removeChars.Aggregate(src, (ans, ch) =&gt; ans.Replace(ch.ToString(), ""));
+
+    private static Expression CleanUp(this Expression dbFn, string charsToRemove) {
+        var toCharE = Expression.Constant(String.Empty);
+        var replaceMI = typeof(string).GetMethod("Replace", new[] { typeof(string), typeof(string) });
+
+        var methodBody = dbFn;
+        foreach (var ch in charsToRemove)
+            methodBody = Expression.Call(methodBody, replaceMI, Expression.Constant(ch.ToString()), toCharE);
+
+        return methodBody;
+    }    
+}
+</code></pre>
+
+<p>Now you can use the <code>RemoveAll</code> extension in a query, and process the query with <code>Expand</code> before instantiating it.</p>
+
+<p>So, for the example:</p>
+
+<pre><code>var filter = "filter";
+var removals = "'\"#/-";
+
+query = query.Where(x =&gt;
+                    x.Name.RemoveAll(removals).Contains(filter) ||
+                    x.Full.RemoveAll(removals).Contains(filter))
+              .Expand();
+</code></pre>
+
+<p>This could probably be added to LINQKit to be handled with their <code>IQueryable</code>/<code>IProvider</code> wrappers.</p>
+    </div>

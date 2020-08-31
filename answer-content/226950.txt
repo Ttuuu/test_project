@@ -1,0 +1,140 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Python review</h2>
+
+<p>This could make better use of docstrings and functions; for example, your comment about the <code>Quote</code> class should be a well-formatted docstring instead. Additionally, each of your different comment blocks would be best suited as a function, and then piece them together inside of a <code>__main__</code> block.</p>
+
+<p>I would also do my best to remove any of your magic values, and instead use constants. This makes it easier if they come from somewhere else (e.g. a config file, or somewhere on the database) to adjust.</p>
+
+<p>When formatting, prefer <a href="https://docs.python.org/3.7/library/stdtypes.html#str.format" rel="nofollow noreferrer"><code>str.format</code></a> over <code>%</code> formatting. If you're on a high-enough Python version, <code>f</code>-strings are even nicer.</p>
+
+<p>This line is very magic: <code>for x in range(3,len(row))</code>. I would strongly prefer that you document what is going on here using non-magic numbers (and maybe a code comment). I <em>think</em> that what you're doing is getting the value from every column after the first 4; if that is what you're doing, then </p>
+
+<ol>
+<li>Improving the SQL query is good to do here (see #1 in the SQL review below)</li>
+<li>There are better variable names to use here</li>
+</ol>
+
+<p>Generators are a good thing to use, as are list comprehensions. You can also use tuple-unpacking to make trivial assignments easier.</p>
+
+<p>Instead of iteratively building a string, which performs poorly, use <a href="https://docs.python.org/3.7/library/stdtypes.html#str.join" rel="nofollow noreferrer"><code>str.join</code></a>. Similarly, instead of repeatedly <code>list.append</code>ing, use <code>list.extend</code> or a list comprehension.</p>
+
+<p>Instead of cascading your <code>if</code>/<code>elif</code>/<code>else</code>, use a dictionary and a default value.</p>
+
+<h2>SQL review</h2>
+
+<p>In general, your SQL is pretty straightforward so there isn't a ton to say. Overall, you should:</p>
+
+<ol>
+<li>When <code>SELECT</code>ing something, only get what you need. <code>SELECT *</code> should always be considered suspect.</li>
+<li>Avoid embedding raw SQL in your source code; if the desired behavior ever changes, now you're needing to update this code for no reason. A stored procedure (or table-valued function) is likely going to be a better option.</li>
+<li>Always use your language/libraries tools for parameterizing SQL; you seem to switch back and forth between this and using string formatting. Always remember that no input is trusted, <em>even if it comes from your own database</em>.</li>
+<li>Instead of inserting <code>VALUES</code> row-by-row, investigate if there is a bulk <code>INSERT</code> option for your library. If not, consider other options (as row-by-row is going to perform poorly)</li>
+<li>Consider deleting and inserting in a single commit so as to avoid leaving the database in an unusual state in-between operations.</li>
+</ol>
+
+<h2>Updated code</h2>
+
+<p>I came up with the following updates (that assume you have created the appropriate stored procedures, and I didn't bother with fully making all literals constants). I think there are a few more places for improvement here; for example, some of the formatting you do before instantiating the class could be done in the class itself (for example, a property that returns the formatted value, or a setter on that property that sets it in a formatted way). I also think you could likely break this up into a few more classes if you really wanted to make it OOP, but that is probably overkill for your use-case.
+    """
+    Gets barchart codes for a given year, then loads them into an array
+    using BarChart's API. From there, the quotes are pushed to the database 
+    using the current date
+    """</p>
+
+<pre><code>import datetime
+
+import ondemand
+import pyodbc
+
+
+CONNECTION_STRING = "DRIVER={SQL Server};SERVER=MyComputer\\SQLEXPRESS;DATABASE=MarketDB"
+API_KEY = "123"
+END_POINT = "https://marketdata.websol.barchart.com/"
+NAME_TO_CROP_MAPPING = {
+    "Corn": (1, lambda price: price / 100),
+    "Soybean Meal": (2, lambda price: price)
+}
+DEFAULT_CROP_MAPPING = (3, lambda price: price)
+
+
+class Quote():
+    """Stores the quotes as objects"""
+
+    def __init__(self, seq_dimDate, symbol, month, year, price, crop, ficalYear):
+        self.seq_dimDate = seq_dimDate
+        self.symbol = symbol
+        self.month = month
+        self.year = year
+        self.price = price
+        self.crop = crop
+        self.fiscalYear = ficalYear
+
+
+def get_today_formatted():
+    return datetime.datetime.now().strftime("%m/%d/%Y")
+
+
+def get_sequence_date(cursor):
+    now = get_today_formatted()
+    row = cursor.execute("EXECUTE dbo.RetrieveDateAndFiscalYear @dateFilter = ?", now).fetchone()
+    return (now, dateRow.Sequence, dateRow.FiscalYear)
+
+
+def get_codes(cursor, fiscal_year):
+    FIRST_CODE_INDEX = 3
+
+    all_codes = cursor.execute("EXECUTE dbo.RetrieveBarchartCodesByYear = ?", fiscal_year)    
+    for row in all_codes.fetchall():
+        for code in range(FIRST_CODE_INDEX, len(row)): 
+            yield row[code]
+
+
+def get_date_from_timestamp(timestamp):
+    date = datetime.datetime.strptime(timestamp, '%Y-%m-%dT00:00:00-%H:%M')
+    return (date.month, date.year)
+
+
+def get_quotes(od_connection, seq_dim_date, fiscal_year, quotes_to_query):
+    raw_quotes = od_connection.quote(quotes_to_query)["results"]
+
+    for raw_quote in raw_quotes:
+        symbol = raw_quote["symbol"]
+        month, year = get_date_from_timestamp(quote["tradeTimestamp"])
+        base_price = q["lastPrice"]
+
+        crop_id, adjusted_price = get_crop_sequence(q["name"], base_price)
+
+        yield Quote(seq_dim_date, symbol, month, year, adjusted_price, crop_id, fiscal_year)
+
+
+def get_crop_sequence(crop, base_price):
+    crop_id, price_adjustor = NAME_TO_CROP_MAPPING.get(crop, DEFAULT_CROP_MAPPING)
+    return (crop_id, price_adjustor(base_price))
+
+
+def update_invalid_prices(cursor, seq_dim_date, quotes):
+    cursor.execute("EXECUTE dbo.DeleteHistoricalPricesByDate @Date = ?", seq_dim_date)
+
+    for quote in quotes:
+        cursor.execute("EXECUTE dbo.UpdatePricesForQuote &lt;&lt;Fill in your parameters here&gt;&gt;", &lt;&lt;Fill in your parameters here&gt;&gt;)
+
+    cursor.commit()
+
+    print(f"MarketPrice table cleared of records with Date Sequence {seq_dim_date}...")
+    print("\n".join([f"{q.symbol} Uploaded to MarketPrice Table in Hedging2" for q in quotes]))
+
+if __name__ == "__main__":
+    sql_connection = pyodbc.connect(CONNECTION_STRING)
+    cursor = sql_connection.cursor()
+
+    now, seq_dim_date, fiscal_year = get_sequnce_date(cursor)
+    print(f"Sequence for {now} is {seq_dim_date} with a fiscal year of {fiscal_year}"))
+
+    quotes_to_query = ",".join(get_codes(cursor, fiscal_year))
+    ondemand_connection = ondemand.OnDemandClient(api_key=API_KEY, end_point=API_END_POINT)    
+    all_quotes = list(get_quotes(ondemand_connection, seq_dim_date, fiscal_year, quotes_to_query))    
+    print(f"{len(all_quotes)} total Quotes Collected")
+
+    update_invalid_prices(cursor, seq_dim_date, all_quotes)
+</code></pre>
+    </div>

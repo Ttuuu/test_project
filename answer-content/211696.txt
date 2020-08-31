@@ -1,0 +1,53 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>A factor of 3 is large, but in my opinion not unexpected or abnormal. The functions that can handle a variable size matrix in their natural form (ie as they would be compiled without knowledge of the size, for example if the functions are defined in a different compilation unit than they are used in and LTO is not applied) have a lot of overhead: non-linear control flow (3 nested loops), more complicated address computation (involving multiplication by a variable).</p>
+
+<p>Basically, that is the cost of generality .. but there is more to it.</p>
+
+<p>From your use of QueryPerformanceCounter I assume you use MSVC (other compilers aren't much different for the following considerations). MSVC likes to unroll loops such as the one in <code>dotMatrix</code> by 4. It does not like to unroll such loops by 3, though it can be persuaded to do so anyway, for example by giving it a loop that makes exactly 3 iterations. So the cost of generality would work out much differently if the relevant matrix was of size 4x4 or 8x8, as in those cases only the faster unrolled codepath would be used (this still comes with overhead, but less). 3 is a bad case, only ever using the fallback codepath.</p>
+
+<p>Additionally, the general matrix multiply implemented by <code>multiplyMatrix</code> is not scalable: it does not implement cache blocking, so for any matrix that does not fit in L1 cache it will perform badly (and even more badly when going beyond the L2 and L3 sizes). That is normal for code in general, but matrix multiplication is special in that it does not have to suffer significantly from that common effect thanks to its "O(n<sup>2</sup>) data in O(n<sup>3</sup>) time" property.</p>
+
+<p>Both the general matrix multiply and the special 3x3 one could use SIMD intrinsics for extra efficiency. 3x3 is an awkward size that would cause some "wasted lanes", but it would still help. For example, it could be done like this (not tested):</p>
+
+<pre><code>#include &lt;xmmintrin.h&gt;
+
+class Matrix3x3
+{
+public:
+float32 m11, m21, m31, 
+        m12, m22, m32, 
+        m13, m23, m33, padding;
+
+void multiply(float32 ma11, float32 ma12, float32 ma13,
+              float32 ma21, float32 ma22, float32 ma23,
+              float32 ma31, float32 ma32, float32 ma33) {
+
+    __m128 col1 = _mm_loadu_ps(&amp;m11);
+    __m128 col2 = _mm_loadu_ps(&amp;m12);
+    __m128 col3 = _mm_loadu_ps(&amp;m13);
+    __m128 t1 = _mm_add_ps(_mm_add_ps(
+        _mm_mul_ps(col1, _mm_set1_ps(ma11)),
+        _mm_mul_ps(col2, _mm_set1_ps(ma21))),
+        _mm_mul_ps(col3, _mm_set1_ps(ma31)));
+    __m128 t2 = _mm_add_ps(_mm_add_ps(
+        _mm_mul_ps(col1, _mm_set1_ps(ma12)),
+        _mm_mul_ps(col2, _mm_set1_ps(ma22))),
+        _mm_mul_ps(col3, _mm_set1_ps(ma32)));
+    __m128 t3 = _mm_add_ps(_mm_add_ps(
+        _mm_mul_ps(col1, _mm_set1_ps(ma13)),
+        _mm_mul_ps(col2, _mm_set1_ps(ma23))),
+        _mm_mul_ps(col3, _mm_set1_ps(ma33)));
+
+    _mm_storeu_ps(&amp;m11, t1);
+    _mm_storeu_ps(&amp;m12, t2);
+    _mm_storeu_ps(&amp;m13, t3);
+}
+};
+</code></pre>
+
+<p>The <code>padding</code> is a bit unfortunate (and shouldn't be private, because that makes its positioning relative to the actual matrix elements undefined), but simplifies the SIMD logic, chunks of 16 bytes are easier to deal with. It is possible to avoid the padding if required. Anyway, this results in a <a href="https://gcc.godbolt.org/z/2YUHOy" rel="nofollow noreferrer">significant reduction in code</a> and should be more efficient (without AVX the <code>set1</code>s cost more, that shouldn't be enough to undo the improvement but I didn't try it). The dllexport in the code on godbolt is not really part of the code, I just put that there to force code to be generated for an otherwise unused method.</p>
+
+<p>Column-major order is used here because the columns of the result are a linear combination of the columns of the left hand matrix, which we have access to in packed memory. Similarly, the rows of the output are a linear combination of the rows of the right hand side, but we have no packed access to the rows of the right hand side, so they would be inefficient to gather. A row-oriented version of the above could be arranged for example if the right hand side was passed in as a reference to a <code>Matrix3x3</code>.</p>
+
+<p>Passing the right hand side as matrix is probably a nicer interface anyway, with 9 separate arguments there is no choice but to write them all out separately even if the RHS is available as a matrix object, as you already experienced in your benchmark code.</p>
+    </div>

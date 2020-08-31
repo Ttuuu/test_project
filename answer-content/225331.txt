@@ -1,0 +1,186 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p>See my <a href="https://codereview.stackexchange.com/q/225642">A standard-conforming C++17 std::optional implementation</a>, partly inspired by this post.</p>
+</blockquote>
+
+<hr>
+
+<p>(Note: C++17-only features like <code>inline</code> variables are ignored in this answer.)</p>
+
+<h1>The cryptic <code>const &amp;&amp;</code> signature</h1>
+
+<p>First, let me answer your question:</p>
+
+<blockquote>
+  <p>I am also still puzzling about a few of the signatures e.g.</p>
+
+<pre><code>constexpr const T&amp;&amp; operator*() const&amp;&amp; noexcept { return std::move(*reinterpret_cast&lt;const T*&gt;(&amp;storage_)); }
+</code></pre>
+  
+  <p>This seems to silently discard const by letting the user move the
+  content out of the optional (if it is an rvalue).</p>
+</blockquote>
+
+<p>Good question.  Your implementation is correct.  <code>optional</code> is designed to be completely transparent with regard to value category, so that calling <code>*</code> on an rvalue <code>optional</code> returns an rvalue.  Given that we allow <code>&amp;</code>, <code>const &amp;</code>, and <code>&amp;&amp;</code> work correctly, there is not a reason to treat <code>const &amp;&amp;</code> unfairly.  A <code>const &amp;&amp;</code> cannot actually be moved from.</p>
+
+<p>I would implement it as</p>
+
+<pre><code>constexpr const T&amp;&amp; operator*() const&amp;&amp; noexcept
+{
+    return std::move(**this);
+}
+</code></pre>
+
+<p>to reduce code duplication.  Here, <code>**this</code> calls the <code>const &amp;</code> overload because <code>*this</code> is always considered an lvalue expression.   I have yet to see a practical use of this overload.</p>
+
+<p>You can test it like this:</p>
+
+<pre><code>const optional&lt;int&gt; x{42};
+static_assert(std::is_same&lt;decltype(*std::move(x)), const int&amp;&amp;&gt;::value);
+</code></pre>
+
+<p>Same for <code>value()</code>.</p>
+
+<h1><code>constexpr</code> friendliness</h1>
+
+<p>Your implementation is not <code>constexpr</code> friendly.  Something as basic as:</p>
+
+<pre><code>constexpr hs::optional&lt;int&gt; x{42};
+</code></pre>
+
+<p>fails because your <code>optional</code> has a non-trivial destructor.  Let's look up the definition of <em>trivial destructor</em> in C++14: (<a href="https://timsong-cpp.github.io/cppwp/n4140/class.dtor#5" rel="nofollow noreferrer">[class.dtor]/5</a>, emphasis mine)</p>
+
+<blockquote>
+  <p>[...]</p>
+  
+  <p>A destructor is trivial if <strong>it is not user-provided</strong> and if:</p>
+  
+  <ul>
+  <li><p>the destructor is not <code>virtual</code>,</p></li>
+  <li><p>all of the direct base classes of its class have trivial destructors, and</p></li>
+  <li><p>for all of the non-static data members of its class that are of class type (or array thereof), each such class has a trivial
+  destructor. </p></li>
+  </ul>
+  
+  <p>Otherwise, the destructor is <em>non-trivial</em>.</p>
+</blockquote>
+
+<p>Your destructor is user-provided, hence non-trivial.</p>
+
+<p>The only way to properly implement a <code>constexpr</code> friendly <code>optional</code>, I suppose, is to use a union.  That's how <code>constexpr</code> machinery work under the hood.  And that also explains the connection between the <code>constexpr</code>-ness of the copy / move operations on <code>optional</code> and the trivially of the corresponding operations on the value type as specified in the standard.</p>
+
+<h1><code>destruct</code></h1>
+
+<p>(The verb is formally called "destroy" in C++, not "destruct", although the nouns are "destructor" and "destruction" and the adjective is "destructible".)</p>
+
+<p>The <code>destruct</code> function exists to optimize out trivial destructor calls.  However, a competent compiler should be able to optimize such calls on itself.  Therefore, I suggest removing the function altogether.</p>
+
+<h1><code>nullopt_t</code></h1>
+
+<p>Per <a href="https://timsong-cpp.github.io/cppwp/n4659/optional.nullopt#2" rel="nofollow noreferrer">[optional.nullopt]/2</a>:</p>
+
+<blockquote>
+  <p>Type <code>nullopt_­t</code> shall not have a default constructor or an
+  initializer-list constructor, and shall not be an aggregate.</p>
+</blockquote>
+
+<p>Your <code>nullopt_t</code> is default constructible.  Simple fix:</p>
+
+<pre><code>struct nullopt_t {
+    explicit constexpr nullopt_t(int) {}
+};
+constexpr nullopt_t nullopt{42};
+</code></pre>
+
+<h1>Constructors</h1>
+
+<p>The copy constructor is not defined as deleted when it should.  The move constructor is missing noexcept specification and participates in overload resolution when it shouldn't.  Implementing the special member functions (copy/move constructor/assignment) correctly requires the use of base classes and template specialization (you don't want to duplicate the whole class just to dispatch on <code>is_move_constructible</code>).</p>
+
+<p>(You may ask: can't we use SFINAE?  For constructors, we can add default arguments; for assignment operators, we can play with the return type.  The answer is no.  SFINAE only with templates (member functions in a class template are not automatically templates), and the special member functions cannot be templates.  If you write a templates as an attempt to implement them, the default (wrong) versions will still be generated and take precedence over the templates.)</p>
+
+<p>This also affects the other constructors / constructor templates and their <code>explicit</code>ness.  They are easier to implement because SFINAE can be used.  Usually, the way to implement conditional <code>explicit</code> before C++20 is to declare two constructors and use SFINAE to ensure that they do not participate in overload resolution at the same time.</p>
+
+<p>Incidentally, your constructors repeat a lot of code.  I suggest extracting a separate function to deal with construction: (note that you are not supposed to forward <code>initializer_list</code>s)</p>
+
+<pre><code>private:
+    template &lt;typename... Args&gt;
+    void construct(Args&amp;&amp;... args)
+    {
+        assert(!has_value);
+        new (&amp;storage_) T(std::forward&lt;Args&gt;(args)...);
+        has_value_ = true;
+    }
+
+    template &lt;typename U, typename... Args&gt;
+    void construct(std::initializer_list&lt;U&gt; init, Args&amp;&amp;... args)
+    {
+        assert(!has_value);
+        new (&amp;storage_) T(init, std::forward&lt;Args&gt;(args)...);
+        has_value_ = true;
+    }
+</code></pre>
+
+<p>and use it to simplify the constructors:</p>
+
+<pre><code>optional(const optional&amp; other)
+{
+    if (!other)
+        construct(*other);
+}
+
+optional(optional&amp;&amp; other)
+{
+    if (!other)
+        construct(std::move(*other));
+}
+
+// etc.
+</code></pre>
+
+<h1>Assignment</h1>
+
+<p>The copy/move assignment operators should also be defined as deleted / excluded from overload resolution as required by the standard.  Similar for other assignment operators.  See the previous point about copy/move constructors and other constructors.</p>
+
+<pre><code>// Don't know why the following two overloads (2/3) are separate from copy-op 5/6
+</code></pre>
+
+<p>Because the default versions of the copy assignment operator and move assignment operator automatically generate (as deleted) and take precedence over the templates if you don't implement them.</p>
+
+<p>The logic of the assignment operators can probably be unified / simplified somehow.  Something like:</p>
+
+<pre><code>template &lt;typename U&gt;
+void construct_or_assign(U&amp;&amp; val)
+{
+    if (*this)
+        **this = std::forward&lt;U&gt;(val);
+    else
+        construct(std::forward&lt;U&gt;(val));
+}
+</code></pre>
+
+<p>(with apologies to Thomas Köppe [<a href="https://wg21.link/n4279" rel="nofollow noreferrer">1</a>] for stealing the name.)</p>
+
+<h1>Observers</h1>
+
+<p>The dereference operators look nice.</p>
+
+<p><code>operator bool</code> should be <code>explicit</code>.</p>
+
+<pre><code>// This is on an r-value Do we need to do anything different here ???
+</code></pre>
+
+<p>No, I think you are doing fine.</p>
+
+<h1>Emplace</h1>
+
+<p><code>emplace</code> should call <code>reset()</code> before constructing the new element, or the original element will not be properly destroyed.</p>
+
+<h1>Miscellaneous</h1>
+
+<p>You are missing a few <code>#include</code>s (<code>&lt;type_traits&gt;</code>, <code>&lt;typeindex&gt;</code> for <code>std::hash</code>, etc.).</p>
+
+<p>The <code>typename</code> before <code>enable_if_t</code> is redundant:</p>
+
+<pre><code>template &lt;typename T, /*typename*/ std::enable_if_t&lt;std::is_trivially_destructible&lt;T&gt;::value, int&gt; = 0&gt;
+</code></pre>
+    </div>

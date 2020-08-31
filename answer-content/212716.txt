@@ -1,0 +1,142 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The way you keep track of lists which you are currently exploring is a bit inefficient. You basically have a stack which contains the first argument of the function for each recursive call. This exact information is also stored on the execution stack of the Python interpreter, so it's duplicated.</p>
+
+<p>A more efficient way would be to <strong>abandon recursion</strong> and use a cycle instead, since you are already using a stack. That way, you will also save some more space by not duplicating the constant (non-changing) arguments <code>f</code> and <code>seen</code> on the execution stack.</p>
+
+<p>Another, even more significant way to improve efficiency is by observing that the check <code>if lst[idx] not in seen</code> <strong>takes linear time</strong>, although this <strong>can be done in constant time</strong>.</p>
+
+<p><strong>1. <em>Removing recursion</em></strong></p>
+
+<p>We can start with the existing stack of lists and extend it as necessary. Since we are basically doing a dept-first search, upon descent to the deeper level we need to remember the list which we are currently iterating over, as well as the position within that list (so we can later return and continue where we left off). This can be done for example by having two lists, one containing the lists and the other one containing the positions. Or we can have just one list containing 2-tuples of the form <code>(list, position)</code>.</p>
+
+<p><strong>2. <em>Faster cyclic reference detection</em></strong></p>
+
+<p>Instead of searching through the stack, item by item, we can use a <code>set</code> as you suggested in a comment. This will allow us to detect cyclic references in constant time and the whole issue will be settled.</p>
+
+<p>An even better approach would be to combine the position-tracking with fast membership checking: we could have a list of lists (the stack), and a dictionary mapping each list to our position within that list. Then a list will be used as a key in the dictionary if and only if it is in the stack. Note that adding, updating and deleting items in a hashed dictionary are all essentially constant time operations, and so is checking whether a key is present. So we achieve constant time cycle detection, much like we would with a <code>set</code>, but in a more elegant way.</p>
+
+<p>One "problem" here may be that if we have the same list in the stack twice, with two different positions, which position do we put in the dictionary? Or can we somehow put both of them there? The answer is, we don't care, because this will never happen. Since we don't want to visit the same list twice on our path down the tree, the stack will never contain the same list twice. Now the only problem is that <strong>Python doesn't allow us to use <code>list</code> objects as keys in <code>dict</code></strong>.</p>
+
+<p><strong>3. <em>Using lists as keys in a dictionary</em></strong></p>
+
+<p>Since <code>list</code> is not a hashable type, it cannot be used as a key in <code>dict</code> (which is a hashed dictionary). However, the solution is quite simple: we use <code>id(lst)</code> instead of the <code>lst</code> itself as the key. We can do this, since we only care about identity, not equality. As a side note, this is another case in which your program behaves incorrectly. It compares lists with the items in <code>seen</code> based on equality, not identity: <code>if lst[idx] not in seen: …</code>. Consider following code:</p>
+
+<pre><code>&gt;&gt;&gt; a = []
+&gt;&gt;&gt; a.append(a)
+&gt;&gt;&gt; b = [a]
+&gt;&gt;&gt; a == b
+True
+&gt;&gt;&gt; id(a) == id(b)
+False
+&gt;&gt;&gt; a in [b]
+True
+</code></pre>
+
+<p>What should happen if you call <code>rTraverse(b)</code>? I suppose you would want to traverse both <code>a</code> and <code>b</code>.</p>
+
+<p><br></p>
+
+<hr>
+
+<h3>Refactored code</h3>
+
+<p>The code contains a (very basic) implementation of a custom data structure which facilitates the above-proposed approach. This data structure is then employed in the modified <code>traverse</code> function.</p>
+
+<pre><code>class CustomStack(list):
+  """
+  Our custom data structure to facilitate position-tracking
+  and provide constant time membership checking for cycle detection.
+
+  This data structure serves as the stack, hence inherits from `list`.
+  It has an `item_pos` attribute which serves as the dictionary.
+  """
+
+  def __init__(self, *args, **kwargs):
+    super().__init__((item for item, pos in args), **kwargs)
+    self.item_pos = {id(item): pos for item, pos in args}
+
+  def append(self, item, pos):
+    if item not in self:
+      super().append(item)
+      self.item_pos[id(item)] = pos
+
+  def pop(self):
+    del self.item_pos[id(self.top)]
+    return super().pop()
+
+  def __contains__(self, item):
+    return id(item) in self.item_pos
+
+  def __getitem__(self, idx):
+    item = super().__getitem__(idx)
+    pos = self.item_pos[id(item)]
+    return item, pos
+
+  @property
+  def top(self):
+    return super().__getitem__(-1)
+
+  def setpos(self, pos):
+    """
+    This functions allows us to update the saved position within the list
+    which is being currently explored (= is last in the stack).
+    """
+    self.item_pos[id(self.top)] = pos
+
+
+def traverse(lst, f = lambda x: x):
+
+  stk = CustomStack((lst, 0))  # initial position in the list is 0
+
+  while stk:
+    curr_list, curr_pos = stk[-1]  # don't pop the top of the stack yet
+
+    for idx in range(curr_pos, len(curr_list)):  # continue from the saved position
+
+      item = curr_list[idx]
+
+      if isinstance(item, list) and item not in stk:
+        stk.setpos(idx+1)    # update the current position to restore it later
+        stk.append(item, 0)  # push the new list onto the stack
+        break  # we are going depth-first into the new, deeper list
+      else:
+        curr_list[idx] = f(item)
+
+    else:
+      # we did not break out of the `for` loop. that means we're done
+      # with this list and we are returning to the previous level.
+      stk.pop()
+​
+</code></pre>
+
+<hr>
+
+<h3>Recursive version</h3>
+
+<p>Since the code got a bit too long for such a simple task, we can try going back to using recursion, and use a <code>set</code> as you proposed. Similarly to the case with a dictionary, we have to use <code>id(lst)</code> instead of <code>lst</code>, because items in a <code>set</code> are hashed. Considering AJNeufeld's remarks on thread and exception safety, we can use a dummy default value for the <code>seen</code> parameter, and if we see that <code>seen</code> has this dummy value (as opposed to a "real" value, eg. a <code>set</code> instance), then we create a <code>set</code> instance as a local variable on the function's stack frame. Upon recursively calling the function, we pass a reference to this local variable, therefore no thread safety or exception safety issues ensue.</p>
+
+<pre><code>def traverse_simple(lst, f=lambda x: x, seen=None):
+
+  if seen is None:
+    seen = set()
+
+  seen.add(id(lst))
+
+  for i, item in enumerate(lst):
+
+    if isinstance(item, list) and id(item) not in seen:
+      traverse_simple(item, f, seen)
+    else:
+      lst[i] = f(item)
+
+  seen.remove(id(lst))
+​
+</code></pre>
+
+<p>By using <code>id(lst)</code>, we are able to not only use a set and therefore detect cyclic references in constant time; we are also able to compare lists by identity instead of equality. This means the function does not fail on inputs on which your original function does fail, such as this:</p>
+
+<pre><code>&gt;&gt;&gt; a = []
+&gt;&gt;&gt; b = [a]
+&gt;&gt;&gt; a.append(b)
+</code></pre>
+    </div>

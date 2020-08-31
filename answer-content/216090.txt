@@ -1,0 +1,161 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I have to second <a href="https://codereview.stackexchange.com/a/106622/93149">Joop Eggen</a> and put <em>providing a proper interface</em> first. With Java botching it right from the start (ab)using an abstract class in pre-<em>Collections Framework</em> times to go and  <em>not</em> create <code>FIFO</code>, but decorate <code>Deque</code>, I guess there is no way getting an <code>interface Stack</code> right. I ended up on the <strong>fat</strong> side:</p>
+
+<pre><code>/** &lt;code&gt;Stack&lt;/code&gt; with quintessential &lt;code&gt;push()&lt;/code&gt;
+ * and &lt;code&gt;pop()&lt;/code&gt;. */
+public interface Stack&lt;E&gt;
+    extends Iterable&lt;E&gt; // don't know how else to provide a default iterator() 
+    // java.util.Collection&lt;E&gt; if that wasn't FAT
+{
+    /** A &lt;code&gt;Stack&lt;/code&gt; with a buddy allowing access to the latter. */
+    interface Buddy&lt;E&gt; extends Stack&lt;E&gt; {
+        Buddy&lt;E&gt; buddy();
+    }
+ // essential
+    E pop();
+    /** @throws IllegalStateException if &lt;code&gt;element&lt;/code&gt; not accepted */
+    default void push(E element) {
+        checkRecursion();
+        if (!offer(element))
+            throw new IllegalStateException("element offered not accepted");
+    }
+ // important if pop() throws when empty
+    default boolean isEmpty() { return size() &lt;= 0; }
+
+ // secondary
+    /** &lt;em&gt;Not&lt;/em&gt; specifying overrides not to throw the likes of
+     *  &lt;code&gt;IllegalStateException&lt;/code&gt; instead,
+     *   the default implementation returns &lt;code&gt;null&lt;/code&gt; if empty.
+     * Fails catastrophically if pop() or push()
+     *  fail in between modifying and restoring state. */
+    default E peek() {
+        if (isEmpty())
+            return null;
+        E top = pop();
+        push(top);
+        return top;
+    }
+
+    /** @return accepted */
+    default boolean offer(E element) { push(element); return true; }
+    int size();
+
+ // support
+    /** For consistency, the &lt;code&gt;Iterator&lt;E&gt;&lt;/code&gt; returned
+     *  should &lt;em&gt;not&lt;/em&gt; allow &lt;code&gt;remove()&lt;/code&gt;
+     *  (but, possibly, for the top element). */
+    @Override
+    default java.util.Iterator&lt;E&gt; iterator() {
+        throw new UnsupportedOperationException();
+    }
+
+    default void checkRecursion() {
+        try {
+            if (Stack.class == getClass().getMethod("offer",
+                    new Class [] { Object.class }).getDeclaringClass())
+                throw new IllegalStateException(
+                    "neither offer nor push implemented");
+        } catch (NoSuchMethodException | SecurityException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+}
+
+
+// for the hell of it: an implementation
+// Don't do as I do: Do as I say (regarding doc comment _everything_ public)
+/** Not synchronised. */
+public class Stack_&lt;E&gt; implements Stack.Buddy&lt;E&gt; {
+    protected final AtomicInteger total;
+    protected Object[] elements; // might be final but for resizing
+    protected Stack.Buddy&lt;E&gt; buddy;
+    @Override
+    public Stack.Buddy&lt;E&gt; buddy() {
+        if (null == buddy)
+            buddy = new Stack_.Buddy&lt;&gt;(this, elements, total);
+        return buddy;
+    }
+
+    protected int top;
+    @Override
+    public int size() { return top + 1; }
+    protected int nextTop() { return ++top; }
+    protected int prevTop() { return --top; }
+ // Alternative to overridden &lt;code&gt;top&lt;code&gt; manipulation:
+ //  overridden accessors
+ // E at(int i) { return (E) elements[i]; }
+ // void set(int i, E e) { elements[i] = e; }
+
+ // An implementation growing elements on demand should conceivably
+ //  provide a default constructor (using a default capacity).
+    public Stack_(int arraysize) {
+        elements = new Object[arraysize];
+        total = new AtomicInteger();
+        buddy = null;
+        top = -1;
+    }
+    protected Stack_(Object[] elements, AtomicInteger total) {
+        this.elements = elements;
+        this.total = total;
+    }
+    public void push(E x) {
+        if (total.incrementAndGet() &lt;= elements.length)
+            elements[nextTop()] = x;
+        else {
+            total.decrementAndGet();
+            throw new IllegalStateException(
+//          System.err.println(
+                "no space");
+        }
+    }
+    @Override
+    public E pop() {
+        E value = peek();
+        elements[top] = null;  // long lived containers should support GC
+        prevTop();
+        return value;
+    }
+    @Override
+    public E peek() { return (E) elements[top]; }
+    @Override
+    public String toString() {  // might cache asList
+        return java.util.Arrays.asList(elements).subList(0, top).toString();
+    }
+
+
+    static class Buddy&lt;E&gt; extends Stack_&lt;E&gt; {
+        public Buddy(Stack_&lt;E&gt; buddy, Object[] elements, AtomicInteger total) {
+            super(elements, total);
+            this.buddy = buddy;
+            top = elements.length;
+        }
+        @Override
+        protected int nextTop() { return --top; }
+        @Override
+        protected int prevTop() { return ++top; }
+        @Override
+        public int size() { return elements.length - top; }
+
+        @Override
+        public String toString() {
+            StringBuffer sb = new StringBuffer(2+4*size());
+            String sep = "[";
+            for (int i = elements.length ; top &lt;= --i ; sep = ", ")
+                sb.append(sep).append(String.valueOf(elements[i]));
+            return sb.append(']').toString();
+        }
+    }
+}
+</code></pre>
+
+<p>(Considering what is ranked <em>secondary</em>, the remaining difference may be)<br>
+<code>Stack.Buddy&lt;E&gt;</code>: a stack supporting getting a <em>buddy</em>.<br>
+Using a proper interface gets "the member naming issue" out of the way.</p>
+
+<p>Next comes my hobby horse: comment, at least <em>doc comment everything public</em>.</p>
+
+<p>Then, there is <em>code duplication</em> between <code>push[12]()</code> &amp; <code>pop[12]()</code><br>
+- for 1½ exercises in avoiding it, see the implementation above.  </p>
+
+<p>Avoid having business functions communicate, e.g. using <code>System.in/out</code>.  </p>
+    </div>

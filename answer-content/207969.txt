@@ -1,0 +1,146 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Nice code; I didn't find any serious issues, so my comments are mostly limited to mere nitpicking.</p>
+
+<h1>namespace <code>math::util</code></h1>
+
+<p>In <code>has_extra_empty_blocks()</code>, there's no need to continue searching if we don't have a match to begin with:</p>
+
+<blockquote>
+<pre><code>        template&lt;class block_t&gt;
+        bool has_extra_empty_blocks(big_uint&lt;block_t&gt; const&amp; a)
+        {
+            return
+                (std::find_if(a.data().rbegin(), a.data().rend(),
+                    [] (block_t b) { return b != block_t{ 0 }; }).base() !=
+                    a.data().end());
+        }
+</code></pre>
+</blockquote>
+
+<p>(Also, it's simpler to just compare the reverse iterator against <code>a.data().rbegin()</code> than to convert to forward iterator).  We just want to check that the last element (if there is one) is zero:</p>
+
+<pre><code>        template&lt;class block_t&gt;
+        bool has_extra_empty_blocks(big_uint&lt;block_t&gt; const&amp; a)
+        {
+            return !a.empty() &amp;&amp; a.back() == block_t{0};
+        }
+</code></pre>
+
+<p>That looks much more readable, as well as being more efficient.</p>
+
+<p>I think that <code>has_extra_empty_blocks()</code> and <code>trim()</code> would probably make more sense as member functions of <code>big_uint</code>.</p>
+
+<h1>namespace <code>math::ops</code></h1>
+
+<p>These functions all look like they should be members of <code>big_uint</code> (generally, inlined into the respective operators); that should obviate the need to expose <code>data()</code> publicly.</p>
+
+<p>Loops like this:</p>
+
+<blockquote>
+<pre><code>            for (auto i = std::size_t{ 0 }; i != min_size; ++i)
+                a.data()[i] &amp;= b.data()[i];
+</code></pre>
+</blockquote>
+
+<p>look like they would be more naturally written using <code>std::transform()</code>:</p>
+
+<pre><code>        template&lt;class block_t&gt;
+        void bit_and_assign(big_uint&lt;block_t&gt;&amp; a, big_uint&lt;block_t&gt; const&amp; b)
+        {
+            if (a.data().size() &gt; b.data().size())
+                a.data().resize(b.data().size());
+
+            std::transform(a.data().begin(), a.data().end(), b.data().begin(),
+                           a.data().begin(), std::bit_and&lt;block_t&gt;{});
+        }
+
+        template&lt;class block_t&gt;
+        void bit_or_assign(big_uint&lt;block_t&gt;&amp; a, big_uint&lt;block_t&gt; const&amp; b)
+        {
+            if (a.data().size() &lt; b.data().size())
+                a.data().resize(b.data().size());
+
+            std::transform(b.data().begin(), b.data().end(), a.data().begin(),
+                           a.data().begin(), std::bit_or&lt;block_t&gt;{});
+        }
+
+        template&lt;class block_t&gt;
+        void bit_xor_assign(big_uint&lt;block_t&gt;&amp; a, big_uint&lt;block_t&gt; const&amp; b)
+        {
+            if (a.data().size() &lt; b.data().size())
+                a.data().resize(b.data().size());
+
+            std::transform(b.data().begin(), b.data().end(), a.data().begin(),
+                           a.data().begin(), std::bit_xor&lt;block_t&gt;{});
+
+            utils::trim(a);
+        }
+</code></pre>
+
+<p>The shift operators repeat the test of <code>n == 0</code> before and after shifting by units of <code>block_digits</code>.  This could be simplified:</p>
+
+<pre><code>            if (a.is_zero())
+                return;
+
+            if (n &gt;= block_digits)
+            {
+                 ... shift whole blocks
+            }
+
+            if (n == bit_index_t{ 0 })
+                return;
+</code></pre>
+
+<p>Addition and subtraction don't need twice the width of <code>block_t</code>.  Carry is only ever one bit, and unsigned overflow is well-defined:</p>
+
+<pre><code>            for (auto i = std::size_t{ 0 }; i != min_size; ++i)
+            {
+                bool carry_out = a_data[i] &gt;= ~b_data[i] + !carry;
+                a_data[i] += b_data[i] + carry;
+                carry = carry_out;
+            }
+</code></pre>
+
+<p>It is possible to implement multiplication without <code>double_block_t</code>, but I'm not sure that it's worth the effort.  Something to consider, perhaps only when <code>double_block_t</code> isn't defined?</p>
+
+<p>Both <code>div_assign</code> and <code>mod_assign</code> declare <code>double_block_t</code>, but never use it.</p>
+
+<h1>class <code>math::big_uint</code></h1>
+
+<p>I'm not convinced that <code>double_block_type</code> ought to be public.</p>
+
+<p>I'd prefer constraints to <code>static_assert</code> for the template constructors.  For example:</p>
+
+<pre><code>        template&lt;class uint_t, typename = std::enable_if_t&lt;utils::is_uint_v&lt;uint_t&gt;&gt;&gt;
+        explicit big_uint(uint_t n);
+</code></pre>
+
+<p>with </p>
+
+<pre><code>    template&lt;class block_t&gt;
+        template&lt;class uint_t, typename&gt;
+    big_uint&lt;block_t&gt;::big_uint(uint_t n):
+        big_uint()
+    {
+</code></pre>
+
+<p>I'm not convinced that this should be <code>explicit</code> - it's a natural, expected conversion.  That said, allowing it to be an implicit conversion wouldn't allow us to reduce the overloads of the binary operators, given that they are all template functions.</p>
+
+<p>Consider adding an overload that accepts <code>block_type</code>:</p>
+
+<pre><code>    template&lt;class block_t&gt;
+    big_uint&lt;block_t&gt;::big_uint(block_t n)
+    {
+        if (n)
+            m_data.push_back(n);
+    }
+</code></pre>
+
+<p>With that in place, the template constructor could be constrained further, accepting only wider types, and letting the <code>block_t</code> constructor be used for narrower types - which can be achieved by adding <code>&amp;&amp; !std::is_assignable_v&lt;block_type, uint_t&gt;</code> to the <code>std::enable_if</code> condition.</p>
+
+<p>It might be useful to also have a converting constructor from <code>big_uint</code> with different block type.</p>
+
+<h1>Missing functionality</h1>
+
+<p>For RSA operations, you'll want to add a modular exponentiation function.  That's fairly easily done using the existing functions, but may be more efficient with a modular multiply.</p>
+    </div>

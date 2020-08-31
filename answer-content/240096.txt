@@ -1,0 +1,219 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>the two loops of the main function are problematic. </p>
+
+<p>It is uselessly complicated to use indices over the two slices assuming they are same length etc. </p>
+
+<p>The first loop is unbounded, meaning that if i pass a large amount of words it will start that many routines, requests and so on. Which will definitely creates troubles for some users.</p>
+
+<p>Also, the second loop is sub-optimal because it does not wait for the fastest result to begin output the results, it wait for the fist item of its slice. Which means that if the first request is, for whatever reason, slow, all other results that could come faster will not appear until that first item finished. This is definitely undesired behavior in concurrent programming.</p>
+
+<p>The rest of the code is okish, I have not dug it that much.</p>
+
+<p>Here is an updated version of your main function with a more idiomatic way to transport the data (input word, output results including possible error) in and out the routines with more casual synchronizations mechanisms. It also limit the number of concurrent requests to 4, for the purposes of demonstration.</p>
+
+<pre class="lang-golang prettyprint-override"><code>package main
+
+import (
+    "errors"
+    "fmt"
+    "net/http"
+    "os"
+    "sort"
+    "strings"
+    "sync"
+    "text/tabwriter"
+
+    "github.com/PuerkitoBio/goquery"
+    "github.com/gookit/color"
+)
+
+// definition is a struct for storing simple word definitions.
+type definition struct {
+    wordType string // noun, verb, interjection, intransitive verb, etc
+    text     string // The actual definition itself
+}
+
+// ctxDefinition includes additional info about a definition.
+type ctxDefinition struct {
+    dict string // The dictionary the definition comes from
+    rank uint8  // Where this definition is compared to the others
+    def  definition
+}
+
+// byDictionary sorts ctxDefintions by rank and dictionary.
+// Returns a map with dictionary names as keys, and definition slices as values
+func byDictionary(cDs []ctxDefinition) map[string][]definition {
+    pre := make(map[string][]ctxDefinition) // Used for ranking, not returned
+    // Add all the defintions to the map
+    for _, cD := range cDs {
+        pre[cD.dict] = append(pre[cD.dict], cD)
+    }
+    // Sort by rank
+    for k := range pre {
+        sort.Slice(pre[k], func(i, j int) bool {
+            return pre[k][i].rank &lt; pre[k][j].rank
+        })
+    }
+    // Convert to hold definitions only, not context
+    m := make(map[string][]definition)
+    for dict, cDs := range pre {
+        for _, cD := range cDs {
+            m[dict] = append(m[dict], cD.def)
+        }
+    }
+    return m
+}
+
+// render returns a formatted definition, optionally with color.
+// This contains some opinionted color defaults, as opposed to renderOps
+func (d *definition) render(c bool) string {
+    if c {
+        return color.New(color.OpItalic).Render(d.wordType) + "\t" + d.text
+    }
+    return d.wordType + "\t" + d.text
+}
+
+// renderOps returns a formatted color definition, according to the provided styles.
+func (d *definition) renderOps(wordType, text color.Style) string {
+    return wordType.Render(d.wordType) + "\t\t" + text.Render(d.text)
+}
+
+// pprintCtxDefs pretty prints multiple context definitions, optionally with color.
+func pprintCtxDefs(cDs []ctxDefinition, c bool) {
+    m := byDictionary(cDs)
+    w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+    //esc := string(tabwriter.Escape)
+    for dict, defs := range m {
+        if c {
+            // Bracket dict name with escape characters so it's not part of the tabbing
+            fmt.Fprintln(w, color.New(color.BgGray).Render(dict))
+            // Print first definition differently
+            fmt.Fprintf(w, "%s\n", defs[0].renderOps(color.New(color.OpItalic, color.OpBold), color.New(color.Cyan)))
+            for _, def := range defs[1:] {
+                fmt.Fprintf(w, "%s\n", def.render(true))
+            }
+        } else {
+            fmt.Fprintf(w, dict+"\n")
+            for _, def := range defs {
+                fmt.Fprintf(w, "%s\n", def.render(false))
+            }
+        }
+        fmt.Fprintln(w)
+    }
+    w.Flush()
+}
+
+// wordnikLookup returns a slice of ctxDefinitions for the provided word.
+// Looks up words using wordnik.com
+func wordnikLookup(w string, client *http.Client) ([]ctxDefinition, error) {
+    req, err := http.NewRequest("GET", "https://www.wordnik.com/words/"+w, nil)
+    if err != nil {
+        return nil, errors.New("couldn't connect to wordnik")
+    }
+    req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/74.0.3729.169 Safari/537.36")
+    resp, err := client.Do(req)
+    if err != nil {
+        return nil, errors.New("couldn't connect to wordnik")
+    }
+    defer resp.Body.Close()
+    if resp.StatusCode != 200 {
+        return nil, errors.New("200 not returned, likely a non-word like '../test' was passed")
+    }
+    doc, err := goquery.NewDocumentFromReader(resp.Body)
+    if err != nil {
+        return nil, errors.New("malformed HTML from wordnik")
+    }
+    ret := make([]ctxDefinition, 0)
+    s := doc.Find(".word-module.module-definitions#define .guts.active").First()
+    dicts := s.Find("h3")
+    lists := s.Find("ul")
+    // Go through each list of defs., then each def., and add them
+    lists.Each(func(i int, list *goquery.Selection) {
+        list.Find("li").Each(func(j int, def *goquery.Selection) {
+            // wordType
+            wT := def.Find("abbr").First().Text() + " " + def.Find("i").First().Text()
+            wT = strings.TrimSpace(wT)
+            // dictionary
+            d := dicts.Get(i).FirstChild.Data[5:]             // strip the "from " prefix
+            d = strings.ToUpper(string(d[0])) + string(d[1:]) // Capitalize first letter
+            if string(d[len(d)-1]) == "." {                   // Remove ending period
+                d = string(d[:len(d)-1])
+            }
+            // definition text - remove the wordType at the beginning of the definition
+            t := strings.TrimSpace(def.Text()[len(wT):])
+            t = strings.ToUpper(string(t[0])) + string(t[1:]) // Capitalize first letter
+            ret = append(ret, ctxDefinition{
+                dict: d,
+                rank: uint8(j),
+                def: definition{
+                    wordType: wT,
+                    text:     t,
+                },
+            })
+        })
+    })
+    return ret, nil
+
+}
+
+type scrapRes struct {
+    word string
+    defs []ctxDefinition
+    err  error
+}
+
+func scrapWordnik(client *http.Client, input chan string, output chan scrapRes) {
+    for w := range input {
+        defs, err := wordnikLookup(w, client)
+        output &lt;- scrapRes{
+            word: w,
+            defs: defs,
+            err:  err,
+        }
+    }
+}
+
+func main() {
+    if len(os.Args) &lt;= 1 {
+        fmt.Println("Provide a word to lookup.")
+        return
+    }
+
+    words := os.Args[1:]
+
+    // TODO: Support multiple words concurrently
+    client := http.DefaultClient // prefer default http client if you are not configuring it.
+
+    // prepare async communication pipes
+    input := make(chan string)
+    output := make(chan scrapRes)
+
+    // start async workers
+    var wg sync.WaitGroup
+    for i := 0; i &lt; 4; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            scrapWordnik(client, input, output)
+        }()
+    }
+    go func() {
+        wg.Wait()
+        close(output)
+    }()
+
+    //feed input communication pipe
+    for _, word := range words {
+        input &lt;- word
+    }
+    close(input)
+
+    //read output to get results
+    for r := range output {
+        color.New(color.BgRed, color.White).Println(r.word)
+        pprintCtxDefs(r.defs, true)
+    }
+}
+<span class="math-container">```</span>
+</code></pre>
+    </div>

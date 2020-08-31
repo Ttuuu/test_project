@@ -1,0 +1,192 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>First of all, there is an error</h3>
+
+<p>Not a fatal error though since the algorithm still sorts the collection properly, but it actually means that the algorithm doesn't perform as few comparisons as it should. The line <code>std::advance(it, dist);</code> advances the iterator one step too far, so the binary insertion is sometimes done in a main chain too big compared to what it should be (more than \$2^n-1\$ elements). The obvious solution is to advance the iterator by <code>dist - 1</code> instead of <code>dist</code>; however, removing <code>1</code> from every element in <code>jacobsthal_diff</code> is also a solution.</p>
+
+<h3>We don't need to remove elements from <code>pend</code></h3>
+
+<p>Instead of erasing elements from <code>pend</code> once they have been inserted into <code>chain</code>, we can instead track the first used iterator in <code>pend</code> corresponding to a Jacobsthal diff, add the next Jacobsthal diff to find the next such iterator, and decrease that iterator until it encounters the previous remembered Jacobsthal diff iterator. Not having to remove the elements from <code>pend</code> means that we don't need to store <code>node</code>s in a container supporting fast deletion from the beginning. Basically, since we don't remove anything, we can switch to an <code>std::vector&lt;node&gt;</code> for <code>pend</code>.</p>
+
+<h3>Use the original iterators</h3>
+
+<p>Since we only have to add a Jacobsthal diff number to find the next element of <code>pend</code>, it means that we can perform the same operation on the original collection to find the iterator to insert into the main chain (every element with an even index in <code>[first, last)</code> is a pend iterator). It means that we can drop this information from <code>pend</code> and only store an <code>std::vector&lt;typename std::list&lt;RandomAccessIterator&gt;::value_type&gt;</code> instead of an <code>std::vector&lt;node&gt;</code>. The maximal size of the vector should be <code>(size + 1) / 2 - 1</code> so we can directly reserve that amount of elements.</p>
+
+<h3>We can insert the remaining elements in any order</h3>
+
+<p>At first I thought that the remaining <code>pend</code> elements had to be inserted in reverse order (the elements left when the farthest pend element whose index corresponds to a Jacobsthal number has been inserted). However, it appears that we can insert them in any order thanks to the properties of binary search. Therefore, inserting them in ascending order shoud probably ease the CPU's task.</p>
+
+<h3>Smaller things</h3>
+
+<ul>
+<li><p><strong><code>iter_swap</code> isn't right:</strong> the overload of <code>iter_swap</code> for <code>group_iterator</code> is designed to swap several <code>group_iterator</code> of different types, which isn't quite right. Not only does it look like it can cause problems, but apparently it can also cause ADL problems: in a more complex case, the compiler found the unqualified call to <code>iter_swap</code> ambiguous. The solution was to make <code>iter_swap</code> work only with <code>group_iterator</code>s of the same type:</p>
+
+<pre><code>template&lt;typename Iterator&gt;
+auto iter_swap(group_iterator&lt;Iterator&gt; lhs, group_iterator&lt;Iterator&gt; rhs)
+    -&gt; void
+{
+    std::swap_ranges(lhs.base(), lhs.base() + lhs.size(), rhs.base());
+}
+</code></pre></li>
+<li><p><strong>The recursion is needlessly complicated:</strong> <code>merge_insertion_sort_impl</code> calls <code>merge_insertion_sort</code> which calls... <code>merge_insertion_sort_impl</code> without adding anything significant while it introduces yet another indirection. While it is likely to get elided by the compiler, making a direct recursive call of <code>merge_insertion_sort_impl</code> makes things easier for everyone.</p></li>
+<li><p>There is still a small error in <code>operator&gt;=</code> for <code>group_iterator</code>: the parenthesis after <code>lhs.base</code> are missing, which is likely to cause a compilation error if the function is ever called.</p></li>
+</ul>
+
+<h3>Putting it all together</h3>
+
+<p>Once we stick all these remarks together, <code>merge_insertion_sort_impl</code> looks like this:</p>
+
+<pre><code>template&lt;
+    typename RandomAccessIterator,
+    typename Compare
+&gt;
+auto merge_insertion_sort_impl(RandomAccessIterator first, RandomAccessIterator last,
+                               Compare compare)
+{
+    // Cache all the differences between a Jacobsthal number and its
+    // predecessor that fit in 64 bits, starting with the difference
+    // between the Jacobsthal numbers 4 and 3 (the previous ones are
+    // unneeded)
+    static constexpr std::uint_fast64_t jacobsthal_diff[] = {
+        2u, 2u, 6u, 10u, 22u, 42u, 86u, 170u, 342u, 682u, 1366u,
+        2730u, 5462u, 10922u, 21846u, 43690u, 87382u, 174762u, 349526u, 699050u,
+        1398102u, 2796202u, 5592406u, 11184810u, 22369622u, 44739242u, 89478486u,
+        178956970u, 357913942u, 715827882u, 1431655766u, 2863311530u, 5726623062u,
+        11453246122u, 22906492246u, 45812984490u, 91625968982u, 183251937962u,
+        366503875926u, 733007751850u, 1466015503702u, 2932031007402u, 5864062014806u,
+        11728124029610u, 23456248059222u, 46912496118442u, 93824992236886u, 187649984473770u,
+        375299968947542u, 750599937895082u, 1501199875790165u, 3002399751580331u,
+        6004799503160661u, 12009599006321322u, 24019198012642644u, 48038396025285288u,
+        96076792050570576u, 192153584101141152u, 384307168202282304u, 768614336404564608u,
+        1537228672809129216u, 3074457345618258432u, 6148914691236516864u
+    };
+
+    using std::iter_swap;
+
+    auto size = std::distance(first, last);
+    if (size &lt; 2) return;
+
+    // Whether there is a stray element not in a pair
+    // at the end of the chain
+    bool has_stray = (size % 2 != 0);
+
+    ////////////////////////////////////////////////////////////
+    // Group elements by pairs
+
+    auto end = has_stray ? std::prev(last) : last;
+    for (auto it = first ; it != end ; it += 2)
+    {
+        if (compare(it[1], it[0]))
+        {
+            iter_swap(it, it + 1);
+        }
+    }
+
+    ////////////////////////////////////////////////////////////
+    // Recursively sort the pairs by max
+
+    merge_insertion_sort_impl(
+        make_group_iterator(first, 2),
+        make_group_iterator(end, 2),
+        compare
+    );
+
+    ////////////////////////////////////////////////////////////
+    // Separate main chain and pend elements
+
+    // The first pend element is always part of the main chain,
+    // so we can safely initialize the list with the first two
+    // elements of the sequence
+    std::list&lt;RandomAccessIterator&gt; chain = { first, std::next(first) };
+
+    // Upper bounds for the insertion of pend elements
+    std::vector&lt;typename std::list&lt;RandomAccessIterator&gt;::iterator&gt; pend;
+    pend.reserve((size + 1) / 2 - 1);
+
+    for (auto it = first + 2 ; it != end ; it += 2)
+    {
+        auto tmp = chain.insert(std::end(chain), std::next(it));
+        pend.push_back(tmp);
+    }
+
+    // Add the last element to pend if it exists; when it
+    // exists, it always has to be inserted in the full chain,
+    // so giving it chain.end() as end insertion point is ok
+    if (has_stray)
+    {
+        pend.push_back(std::end(chain));
+    }
+
+    ////////////////////////////////////////////////////////////
+    // Binary insertion into the main chain
+
+    auto current_it = first + 2;
+    auto current_pend = std::begin(pend);
+
+    for (int k = 0 ; ; ++k)
+    {
+        // Should be safe: in this code, std::distance should always return
+        // a positive number, so there is no risk of comparing funny values
+        using size_type = std::common_type_t&lt;
+            std::uint_fast64_t,
+            typename std::list&lt;RandomAccessIterator&gt;::difference_type
+        &gt;;
+
+        // Find next index
+        auto dist = jacobsthal_diff[k];
+        if (dist &gt; static_cast&lt;size_type&gt;(std::distance(current_pend, std::end(pend)))) break;
+
+        auto it = std::next(current_it, dist * 2);
+        auto pe = std::next(current_pend, dist);
+
+        do
+        {
+            --pe;
+            it -= 2;
+
+            auto insertion_point = std::upper_bound(
+                std::begin(chain), *pe, *it,
+                [=](const auto&amp; lhs, const auto&amp; rhs) {
+                    return compare(lhs, *rhs);
+                }
+            );
+            chain.insert(insertion_point, it);
+        } while (pe != current_pend);
+
+        std::advance(current_it, dist * 2);
+        std::advance(current_pend, dist);
+    }
+
+    // If there are pend elements left, insert them into
+    // the main chain, the order of insertion does not
+    // matter so forward traversal is ok
+    while (current_pend != std::end(pend))
+    {
+        auto insertion_point = std::upper_bound(
+            std::begin(chain), *current_pend, *current_it,
+            [=](const auto&amp; lhs, const auto&amp; rhs) {
+                return compare(lhs, *rhs);
+            }
+        );
+        chain.insert(insertion_point, current_it);
+        current_it += 2;
+        ++current_pend;
+    }
+
+    ////////////////////////////////////////////////////////////
+    // Move values in order to a cache then back to origin
+
+    std::vector&lt;typename std::iterator_traits&lt;RandomAccessIterator&gt;::value_type&gt; cache;
+    cache.reserve(size);
+
+    for (auto&amp;&amp; it: chain)
+    {
+        auto begin = it.base();
+        auto end = begin + it.size();
+        std::move(begin, end, std::back_inserter(cache));
+    }
+    std::move(std::begin(cache), std::end(cache), first.base());
+}
+</code></pre>
+
+<p>The algorithm remains several orders of magnitude slower than most common sorting algorithms, but it's more correct and a bit faster than the original version in the question.</p>
+    </div>

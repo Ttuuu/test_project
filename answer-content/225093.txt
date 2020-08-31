@@ -1,0 +1,121 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Despite its being incomplete, I think there are a few points that can be made about the current code.</p>
+
+<h3>Naming</h3>
+
+<p>Naming is always difficult, and this gives quite a few examples. Somebody who already knows the purpose of the code can probably figure out that "FCFS" means "first come, first served", but to anybody else it's probably pretty opaque.</p>
+
+<p>At least to me, a name like <code>computeResult</code> is more problematic though. This could apply about equally to essentially any function in existence, so it tells us nothing about what this particular <code>computeResult</code> actually is or does.</p>
+
+<h3>Library Usage</h3>
+
+<p>Your <code>displayResult</code> basically writes a collection of <code>process</code> objects to a stream. I'd prefer a stream inserter that writes a single object to a stream, then using a standard alorithm (or ranged for loop) to apply that to a collection of objects.</p>
+
+<pre><code>std::ostream &amp;operator&lt;&lt;(std::ostream &amp;os, process const &amp;p) { 
+
+    return os &lt;&lt; "PID: " &lt;&lt; x.m_procId &lt;&lt; ", "
+            &lt;&lt; "Waiting Time: " &lt;&lt; x.m_waitingTime &lt;&lt; ", "
+            &lt;&lt; "Turnaround Time: " &lt;&lt; x.m_turnaroundTime &lt;&lt; ", "
+            &lt;&lt; "Response Time: " &lt;&lt; x.m_responseTime &lt;&lt; ", "
+            &lt;&lt; "Completion Time: " &lt;&lt; x.m_completionTime;
+}
+</code></pre>
+
+<h3>Structure</h3>
+
+<p>It seems to me that your <code>FCFS</code> combines what are really a couple of separate functions. One is deciding the order in which to schedule the tasks. The other is going through the tasks in their chosen order, and setting the member variables for each. The initial <code>sort</code> is the only part that's really devoted to the <code>first-come-first-served</code> part. The rest would apply equally to other orders of execution.</p>
+
+<p>As such, it seems to me that this should be split into two separate things. This could be done in a number of different ways. One would be to require the code that currently calls <code>FCFS</code> to make two separate calls, one to sort the tasks, and the other to simulate executing them. Another (that I think I'd generally prefer) would be for the caller to pass a comparator object that specifies the order it wants.</p>
+
+<pre><code>template &lt;class Order&gt;
+void schedule(std::vector&lt;process&gt; &amp;processes, Order order) { 
+
+    std::sort(processes.begin(), processes.end(), order);
+
+    unsigned int clock {0};
+    auto computeResult = [&amp;clock] (process&amp; pr) {
+        pr.m_responseTime = clock - pr.m_arrivalTime;
+        pr.m_waitingTime = (pr.m_turnaroundTime = 
+            (pr.m_completionTime = (clock += pr.m_burstTime)) - pr.m_arrivalTime)
+            - pr.m_burstTime;
+    };
+
+    std::for_each(procList.begin(), procList.end(), computeResult);
+}
+</code></pre>
+
+<p>Another that might be worth considering would be to have the <code>process</code> class itself specify the sorting order by defining <code>bool operator&lt;</code> for itself. This would be particularly attractive if you were going to use an inheritance hierarchy. In this case, the base class would probably define <code>operator&lt;</code> as a pure virtual function, and each derived <code>process</code> class would define <code>operator&lt;</code> to specify the order it's going to use. This strikes me as problematic though--it would allow things like passing one vector of <code>process</code>es to the scheduler, where different <code>process</code> objects tried to specify different scheduling algorithms. Unless you really want that (and are prepared for the complexity it's likely to add) this probably isn't the best option.</p>
+
+<p>In some cases this would be a pointless embellishment, but this is a scheduling simulator, so it seems nearly inevitable that you'd want to test different scheduling algorithms.</p>
+
+<h3>Clarity</h3>
+
+<p>IMO, one of the core computations is quite a bit less readable than it should be:</p>
+
+<pre><code>    pr.m_waitingTime = (pr.m_turnaroundTime = 
+        (pr.m_completionTime = (clock += pr.m_burstTime)) - pr.m_arrivalTime)
+        - pr.m_burstTime;
+</code></pre>
+
+<p>At least in my opinion, it would probably be better to break this up into a couple of pieces:</p>
+
+<pre><code>pr.m_waitingTime = clock - pr.m_arrivalTime;
+pr.m_completionTime = clock + pr.m_burstTime;
+pr.m_turnaroundTime = pr.m_completionTime - pr.m_arrivalTime;
+clock += pr.m_burstTime;
+</code></pre>
+
+<p>[I think I may have gotten that a little wrong--as it stands, waiting time seems to be the same as response time--sorry, I really did find the nested assignments confusing.]</p>
+
+<h3>Encapsulation</h3>
+
+<p>Being tempted to provide accessors for member variables usually points toward having gotten the functionality in the wrong places. At least to me, that seems to be the case here.</p>
+
+<p>At least in my opinion, most of the code to access the members of <code>process</code> should be in <code>process</code> itself. I'd have the <code>scheduler</code> tell the <code>process</code> to <code>execute</code> at a particular time, and the <code>process</code> would keep track of how that worked out for it:</p>
+
+<pre><code>class Process { 
+    unsigned int m_procId;
+    unsigned int m_arrivalTime;
+    unsigned int m_burstTime;
+
+    unsigned int m_responseTime;
+    unsigned int m_completionTime;
+    unsigned int m_turnaroundTime;
+    unsigned int m_waitingTime;
+public:
+    process(unsigned int pid, unsigned int at, unsigned int bt)
+        : m_procId {pid}, m_arrivalTime {at}, m_burstTime {bt}
+    {
+        m_waitingTime = m_turnaroundTime = m_completionTime = m_responseTime = notYetComputed;
+    }
+
+    int execute(int clock) { 
+        m_responseTime = clock - m_arrivalTime;
+        m_waitingTime = clock - m_arrivalTime;
+        m_completionTime = clock + m_burstTime;
+        m_turnaroundTime = m_completionTime - m_arrivalTime;
+        return m_burstTime;
+    }
+};
+</code></pre>
+
+<p>This makes our scheduler look something like this:</p>
+
+<pre><code>template &lt;class Order&gt;
+void schedule(std::vector&lt;process&gt; &amp;processes, Order order) { 
+
+    std::sort(processes.begin(), processes.end(), order);
+
+    unsigned int clock {0};
+
+    for (auto &amp;process : processes)
+        clock += process.execute(clock);
+}
+</code></pre>
+
+<p>Now we have a clear separation of concerns. The scheduler is responsible for telling each task when to start executing. The task is responsible for doing its own book-keeping based on when it was told to execute. It then tells the scheduler how much clock time it used.</p>
+
+<p>Accessors tend to give what I'd term "fake" encapsulation--we've hidden the variables themselves, but the client code still knows about the internals of what it's working with. </p>
+
+<p>What we have here is closer to what I'd term "honest" encapsulation: we've created a really narrow interface where the scheduler and the process only know the tiniest bit about each other: the scheduler knows how to <code>execute</code> a <code>process</code>, and the <code>process</code> knows when it executes, it has to tell the caller how much clock time it used. But that's it.</p>
+    </div>

@@ -1,0 +1,99 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>General Guidelines</h2>
+
+<ol>
+<li>Please put any technical restrictions in the initial post. Like, for instance, <strong>framework 3.5</strong> :-(</li>
+<li>Declare variables as <code>var</code> rather than their type for readability.</li>
+<li>Split big methods into smaller ones for readability and testibility.</li>
+</ol>
+
+<h2>Performance</h2>
+
+<p>Your biggest bottleneck is the sequential loop of 7000 users. You could use the <a href="https://docs.microsoft.com/en-us/dotnet/standard/parallel-programming/task-parallel-library-tpl" rel="nofollow noreferrer">TPL</a> to maximize performance.</p>
+
+<blockquote>
+<pre><code> foreach (SearchResult result in objResults)
+ {
+    // your code ..
+    // var adUser = new User(// your code..
+    allUsers.Add(adUser);
+ }
+</code></pre>
+</blockquote>
+
+<p><code>tasks</code> run in a different <em>synchronization context</em>. By default, the .NET ThreadPool is used to dispatch your 7000 operations.</p>
+
+<pre><code> var allUsers = new ConcurrentBag&lt;User&gt;();
+ var tasks = objResults.OfType&lt;SearchResult&gt;().Select(item =&gt; Task.Factory.StartNew((arg) =&gt;
+    {
+        var objResult = (SearchResult)arg;
+        // .. your code
+        var adUser = new User(// your code..
+        allUsers.Add(adUser);
+
+ }, item)).ToArray();
+
+ Task.WaitAll(tasks);
+
+ var faultedTasks = tasks.Where(x =&gt; x.IsFaulted);
+ //Log(faultedTasks); // if you decide to do something when certain tasks failed
+</code></pre>
+
+<h2>Explanation</h2>
+
+<p>Since we now work with multiple threads, a synchronized collection should be used to store your users.</p>
+
+<pre><code>var allUsers = new ConcurrentBag&lt;User&gt;();
+</code></pre>
+
+<p>The <code>foreach</code> is replaced with a TPL factory method. Each operation gets queued to a background thread and will run when scheduled. Since we run over a collection, it is best practise to marshal the elements <code>item</code> to the operation <code>arg</code>.</p>
+
+<pre><code>var tasks = objResults.OfType&lt;SearchResult&gt;().Select(item =&gt; Task.Factory.StartNew((arg) =&gt;
+   {
+       // ..
+   }, item)).ToArray();
+</code></pre>
+
+<p>You can await all the operations to finish. This could be extended to use a timeout and <code>CancellationToken</code>. I leave this augmentation up to you to discover :-)</p>
+
+<pre><code>Task.WaitAll(tasks);
+</code></pre>
+
+<p>Once all operations have finished, you can obtain the users from your bag and continue processing. Note that you could decide to log any operations that did not succeed, or even propagate any error up the stack.</p>
+
+<pre><code>var faultedTasks = tasks.Where(x =&gt; x.IsFaulted);
+//Log(faultedTasks); // if you decide to do something when certain tasks failed
+</code></pre>
+
+<hr>
+
+<h2>Proposed Solution Framework 3.5</h2>
+
+<p>Use a combination of <code>ThreadPool</code> and <code>WaitHandle</code> instead of <code>Task</code>. Rather than waiting on tasks to complete, you now wait on the wait handles to complete. You should add in your own exception handling though. </p>
+
+<pre><code>var allUsers = new List&lt;User&gt;();
+const int size = 64;
+var population = objResults.OfType&lt;SearchResult&gt;();
+for (var j = 0; j &lt; population.Count(); j += size) {
+    var samples = population.Skip(j).Take(size).ToArray();
+    var waitHandles = samples.Select(item =&gt; new ManualResetEvent(false)).ToArray();
+    for (var k = 0; k &lt; samples.Count(); k++) {
+         ThreadPool.QueueUserWorkItem((arg) =&gt; 
+         {
+             var kvp = (KeyValuePair&lt;SearchResult, int&gt;)arg;
+             var objResult = kvp.Key;
+             var index = kvp.Value;
+
+             // your code ..
+             var adUser = new User(); // your code ..
+             lock (allUsers) {
+                 allUsers.Add(adUser);
+                 waitHandles[index].Set();
+             }
+
+         }, new KeyValuePair&lt;SearchResult, int&gt;(samples[k], k));
+    }
+    WaitHandle.WaitAll(waitHandles);
+}
+</code></pre>
+    </div>

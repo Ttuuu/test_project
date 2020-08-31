@@ -1,0 +1,205 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Here are some things that may help you improve your code.</p>
+
+<h2>Fix the bug</h2>
+
+<p>The program starts reading the header as though the file pointer were already pointing to location 0x100.  That's an error because in all of the Gameboy files I've ever seen, the first 0x100 bytes are present and needed for calculating the checksum.</p>
+
+<h2>Use a <code>struct</code> where appropriate</h2>
+
+<p>This code could be made much simpler just by using a <code>struct</code> to represent the header.  I'd use this:</p>
+
+<pre><code>struct CartridgeHeader {
+    uint8_t filler[0x100];
+    uint8_t entry[4];
+    uint8_t logo[0x30];
+    uint8_t title[0x10];
+    uint8_t licensee[2];
+    uint8_t SGB;
+    uint8_t cart_type;
+    uint8_t ROM_size;
+    uint8_t RAM_size;
+    uint8_t dest_code;
+    uint8_t old_licensee_code;
+    uint8_t mask_ROM_version;
+    uint8_t header_checksum;
+    uint8_t checksum_hi;
+    uint8_t checksum_lo;
+};
+</code></pre>
+
+<p>We can ignore most of these for the purposes of this program, but it only takes a minute to create the whole thing and parts of it might be useful for other purposes.</p>
+
+<p>As noted in some of the comments, this assumes that the structure is not padded and that is not guaranteed by the standard.  Many compilers include something like <a href="https://www.google.com/search?client=firefox-b-1-d&amp;q=pragma+packed" rel="nofollow noreferrer"><code>#pragma pack</code></a>.  If yours does, use it.  Also, if your compiler supports C11, add this line to assure (at compile time) that the <code>struct</code> is what it needs to be:</p>
+
+<pre><code>static_assert(sizeof(struct CartridgeHeader) == 0x150, 
+         "Code relies on struct having no padding");
+</code></pre>
+
+<h2>Be efficient in file I/O</h2>
+
+<p>Instead of jumping around back and forth in the file, I'd suggest that a much cleaner approach would be to simply read the file once and then make a single write to update the file if needed.</p>
+
+<h2>Understand the header specification</h2>
+
+<p>The header specification says that the offset <em>usually</em> contains "NOP; JP 0150h" but not always.  For that reason, it's not technically correct to check for those specific instructions there.  The only thing the Gameboy checks for is the logo portion.</p>
+
+<h2>Avoid <code>goto fail</code></h2>
+
+<p>While it may seem appealing, the <code>goto fail</code> as a technique is hazardous especially, as in this program, if you don't always use <code>{}</code> with <code>if</code> and <code>for</code>.  It's difficult to make sure it is done correctly and easy to make a catastrophic error that makes international news as with <a href="https://www.synopsys.com/blogs/software-security/understanding-apple-goto-fail-vulnerability-2/" rel="nofollow noreferrer">Apple's infamous <code>goto fail</code> error</a>.  That's not something you want to be known for!</p>
+
+<h2>Avoid <code>#define</code> if you can</h2>
+
+<p>The problem with using a <code>#define</code> for data is that there is no type and therefore no type checking.  Instead, you can better accomplish what you need with something like this:</p>
+
+<pre><code>static const uint8_t logo[] = {
+/* Nintendo logo */ \
+    0xce,0xed,0x66,0x66,0xcc,0x0d,0x00,0x0b,0x03,0x73,0x00,0x83,0x00,0x0c,0x00,0x0d, 
+    0x00,0x08,0x11,0x1f,0x88,0x89,0x00,0x0e,0xdc,0xcc,0x6e,0xe6,0xdd,0xdd,0xd9,0x99,
+    0xbb,0xbb,0x67,0x63,0x6e,0x0e,0xec,0xcc,0xdd,0xdc,0x99,0x9f,0xbb,0xb9,0x33,0x3e
+};
+</code></pre>
+
+<h2>Separate I/O from calculations where practical</h2>
+
+<p>If, as suggested above, we already have a <code>struct</code>, it would make sense to do the calculations on it in memory rather than as the values are being read.  Here's one way to implement such a function:</p>
+
+<pre><code>static uint8_t cart_header_checksum(const struct CartridgeHeader *ch) {
+    uint8_t sum = 0;
+    for (uint8_t *ptr = (uint8_t *)&amp;ch-&gt;title; ptr != &amp;ch-&gt;header_checksum; ++ptr) {
+        sum += ~*ptr;
+    }
+    return sum;
+}
+</code></pre>
+
+<h2>Think about more informative error return values</h2>
+
+<p>Most modern operating systems employ the use of an error value that can be returned from <code>main</code>.  I'd suggest that instead of just pass/fail it might be useful if the program returned an error code suggesting what the problem was.  It might look like this as an <code>enum</code>:</p>
+
+<pre><code>enum error_code { ERROR_NONE, ERROR_READ, ERROR_LOGO, ERROR_WRITE };
+</code></pre>
+
+<h2>Think of the user</h2>
+
+<p>Rather than exiting the program with an error, I think it would be more useful to a user if the program simply told me that the checksums were correct already (if they are).  If they're not, one might also want to know what values were originally and what the corrected values are.  There's no need for the values to be required to be zero.</p>
+
+<h2>Putting it all together</h2>
+
+<p>Here's an alternative version that uses all of these ideas:</p>
+
+<pre><code>#include &lt;assert.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdint.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;stdbool.h&gt;
+
+struct CartridgeHeader {
+    uint8_t filler[0x100];
+    uint8_t entry[4];
+    uint8_t logo[0x30];
+    uint8_t title[0x10];
+    uint8_t licensee[2];
+    uint8_t SGB;
+    uint8_t cart_type;
+    uint8_t ROM_size;
+    uint8_t RAM_size;
+    uint8_t dest_code;
+    uint8_t old_licensee_code;
+    uint8_t mask_ROM_version;
+    uint8_t header_checksum;
+    uint8_t checksum_hi;
+    uint8_t checksum_lo;
+};
+
+static_assert(sizeof(struct CartridgeHeader) == 0x150, "Code relies on struct having no padding");
+
+
+static uint8_t cart_header_checksum(const struct CartridgeHeader *ch) {
+    uint8_t sum = 0;
+    for (uint8_t *ptr = (uint8_t *)&amp;ch-&gt;title; ptr != &amp;ch-&gt;header_checksum; ++ptr) {
+        sum += ~*ptr;
+    }
+    return sum;
+}
+
+static bool cart_check_logo(const struct CartridgeHeader *ch) {
+    static const uint8_t logo[] = {
+    /* Nintendo logo */ \
+        0xce,0xed,0x66,0x66,0xcc,0x0d,0x00,0x0b,0x03,0x73,0x00,0x83,0x00,0x0c,0x00,0x0d, 
+        0x00,0x08,0x11,0x1f,0x88,0x89,0x00,0x0e,0xdc,0xcc,0x6e,0xe6,0xdd,0xdd,0xd9,0x99,
+        0xbb,0xbb,0x67,0x63,0x6e,0x0e,0xec,0xcc,0xdd,0xdc,0x99,0x9f,0xbb,0xb9,0x33,0x3e
+    };
+    return memcmp(&amp;ch-&gt;logo, logo, sizeof(logo)) == 0;
+}
+
+enum error_code { ERROR_NONE, ERROR_READ, ERROR_LOGO, ERROR_WRITE };
+
+int main(const int argc, const char *const *const argv)
+{
+    if(argc != 2)
+    {
+        printf("Usage: %s gb-file\n", argv[0]);
+        return ERROR_READ;
+    }
+
+    FILE *const fp = fopen(argv[1], "r+b");
+    if(fp == NULL)
+    {
+        perror(argv[1]);
+        return ERROR_READ;
+    }
+
+    struct CartridgeHeader header;
+    if (fread(&amp;header, 1, sizeof(header), fp) != sizeof(header)) {
+        puts("Short file: header read failed");
+        fclose(fp);
+        return ERROR_READ;
+    }
+    if (!cart_check_logo(&amp;header)) {
+        puts("Logo verification failed; is this a valid file?");
+        fclose(fp);
+        return ERROR_LOGO;
+    }
+
+    // calculate header checksum
+    uint8_t mysum = cart_header_checksum(&amp;header);
+
+    // calculate global checksum
+    uint16_t global_sum = mysum;
+    // first over part we alredy read
+    for (uint8_t *ptr = (uint8_t *)&amp;header; ptr != &amp;header.header_checksum; ++ptr) {
+        global_sum += *ptr;
+    }
+    // then continue with rest of file
+    for (int ch = fgetc(fp); ch != EOF; ch = fgetc(fp)) {
+        global_sum += ch;
+    }
+
+    if (mysum == header.header_checksum &amp;&amp; global_sum == header.checksum_hi * 256 + header.checksum_lo) {
+        puts("Cartridge already has valid checksums: nothing to do");
+    } else {
+        printf("calculated header checksum = %2.2x\n", mysum);
+        printf("file header checksum = %2.2x\n", header.header_checksum);
+        printf("calculated global sum = %4.4x\n", global_sum);
+        printf("file global sum = %2.2x%2.2x\n", header.checksum_hi, header.checksum_lo);
+        puts("Updating checksums");
+        header.header_checksum = mysum;
+        header.checksum_hi = global_sum &gt;&gt; 8;
+        header.checksum_lo = global_sum &amp;&amp; 0xff;
+        if (fseek(fp, 0L, SEEK_SET) || fwrite(&amp;header, 1, sizeof(header), fp) != sizeof(header)) {
+            perror("Unable to write to file");
+            return ERROR_WRITE;
+        }
+    }
+    fclose(fp);
+    return ERROR_NONE;
+}
+</code></pre>
+
+<h2>A few more notes</h2>
+
+<p>The code above reads most of the file using <code>fgetc</code> character at a time.  While this may seem slow, modern operating systems typically use buffering and so this is not as slow as it might first seem.  Another note is the code above does not attempt to distinguish between <code>EOF</code> and an actual file read error.  This might happen, if, for example, the file is on removeable media and gets ejected during the process.  This would lead to a failure of the <code>fseek</code> which is the next operation and so while the error message might be a bit misleading, it seemed to me not worth the bother to do anything differently.  Such error checking could be added with a call to <code>ferror</code> if desired.</p>
+    </div>

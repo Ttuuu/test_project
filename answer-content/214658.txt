@@ -1,0 +1,163 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First off, nice work overall. It's apparent from the way you set up your interfaces and implementations that you "get it". Given that, most? of this can probably be classified as "nitpicking". I'm also not going to <em>specifically</em> address your second question, but the answers should be apparent based on the review itself (if not, feel free to ask in the comments). I'm completely ambivalent as to your 1st question (and can't really compare them without seeing the alternative structure), although others may have opinions there.</p>
+
+<hr>
+
+<p><code>AssetInfoService</code>'s internal <code>Collection</code> is not properly encapsulated. You expose it like this...</p>
+
+<blockquote>
+<pre><code>Friend Property Get Assets() As Collection
+    Set Assets = this.AssetColl
+End Property 
+</code></pre>
+</blockquote>
+
+<p>...but that is relying on the caller to hold a reference to its interface instead of a hard reference to prevent a call like <code>AssetInfoService.Assets.Remove</code> or <code>AssetInfoService.Assets.Add</code> from anywhere in the same project. The <code>Friend</code> modifier obviously prevents other <em>projects</em> from doing this, but it isn't clear from the code provided why you would want a caller to be able to mess with the internals of the class like that.  If the intention of the <code>IAssetInfoService</code> is to wrap a <code>Collection</code> (as evidenced by the <code>Exists</code> method), then I'd provide a complete wrapper.</p>
+
+<hr>
+
+<p>Related to the above, I'd say it's overkill to provide an internal <code>Type</code> that contains a single member:</p>
+
+<blockquote>
+<pre><code>Private Type TAssetsTable
+    AssetColl As Collection
+End Type
+Private this As TAssetsTable
+</code></pre>
+</blockquote>
+
+<p>Nitpick, but I'd also prefer an empty line after <code>End Type</code> - that makes it more readable.</p>
+
+<hr>
+
+<p>The factory <code>Create</code> methods are much, much clearer in the calling code if you implement them on the base class also.  That's why you have to write code like this:</p>
+
+<blockquote>
+<pre><code>Set assetSvc = AssetInfoService.IAssetInfoService_Create(assetTbl)
+Set testAssetSvc = AssetInfoService.IAssetInfoService_Create(testAssetTbl)
+</code></pre>
+</blockquote>
+
+<p>The best way to think of a class's implementation is the same way that it would be viewed in a COM TypeLib - internally, <code>AssetInfoService</code> is more or less treated as an implicit interface (let's call it <code>_AssetInfoService</code> to follow MS convention). Unlike .NET, the implemented interfaces are not aggregated back into the "base" interface implicitly - that's why you need to use the explicit interface version when you have an instance of the concrete class. If the intention is to have the procedure accessible from the implementing class, the standard way of doing this in VBA is to wrap the base method with the interface's implementation:</p>
+
+<pre><code>Public Function Create(ByRef assetTbl As IAssetTableProxy) As IAssetInfoService
+    Dim twoDArr() As Variant
+
+    twoDArr = assetTbl.GetAssetTableData
+
+    With New AssetInfoService
+
+    '... etc.
+End Function
+
+Public Function IAssetInfoService_Create(ByRef assetTbl As IAssetTableProxy) As IAssetInfoService
+    Set IAssetInfoService_Create = Me.Create(assetTbl)
+End Function
+</code></pre>
+
+<p>That makes the calling code much more readable:</p>
+
+<pre><code>Set assetSvc = AssetInfoService.Create(assetTbl)
+Set testAssetSvc = AssetInfoService.Create(testAssetTbl)
+</code></pre>
+
+<hr>
+
+<p>I don't see a reason for the <code>Self</code> properties of your factories to be public.  If you're only intending to provide access to them via their interfaces, there isn't a reason to expose this on the concrete instances.  The reason for this is that there is no restriction on "up-casting".  This is perfectly legal:</p>
+
+<pre><code>Sub Foo()
+    Dim bar As IAssetInfoService
+    Set assetSvc = AssetInfoService.IAssetInfoService_Create(assetTbl)
+
+    Dim upCast As AssetInfoService
+    Set upCast = assetSvc
+    With upCast.Self
+        'Uhhhh...
+    End With
+End Sub
+</code></pre>
+
+<p>The other side of this is related to the discussion of the "base" interface above.  If for some reason a caller up-casts to <code>AssetTableProxy</code>, they'll find that it has no public members...</p>
+
+<hr>
+
+<p><code>AssetTableProxy</code> has what I would consider to be a bug. This code is implicitly using the ActiveWorkbook and the ActiveSheet:</p>
+
+<blockquote>
+<pre><code>Public Function IAssetTableProxy_GetAssetTableData() As Variant()
+
+    Dim tblName As String
+    tblName = "AssetInfoTable"
+
+    IAssetTableProxy_GetAssetTableData = Worksheets(Range(tblName).Parent.Name).ListObjects(tblName).DataBodyRange.value
+
+End Function
+</code></pre>
+</blockquote>
+
+<p>If this is always supposed to reference the current workbook, I'd use <code>ThisWorkbook.Worksheets</code> (or the equivalent code name). The unqualified <code>Range</code> will throw if the <code>ActiveSheet</code> isn't a <code>Worksheet</code>, so your method of finding the <code>ListObject</code> this way puts you in kind of a catch 22 because you're <em>only</em> using the name of the table, which means that you need to get its parent worksheet to find... its worksheet?  Just skip all of this and use the code name of the sheet directly.  Also, <code>tblName</code> is functionally a constant. I'd declare it as one.</p>
+
+<pre><code>Private Const TABLE_NAME As String = "AssetInfoTable"
+
+Public Function IAssetTableProxy_GetAssetTableData() As Variant()
+    'Replace Sheet1 with the actual code name of the worksheet.
+    IAssetTableProxy_GetAssetTableData = Sheet1.ListObjects(TABLE_NAME).DataBodyRange.value
+End Function
+</code></pre>
+
+<hr>
+
+<p>Nitpick - I would remove the underscores in your test names (i.e. <code>GivenAssetInTable_GetTicker()</code>).  The underscore has special meaning in VBA for procedure names - it's treated as kind of an "interface or event delimiter". This is probably our fault (as in Rubberduck's - I'm a project contributor) in that the "Add test module with stubs" used to do this when it was naming tests. This has been corrected in the current build, and TBH I'd like to see an inspection for use of an underscore in a procedure name that isn't an interface member or event handler (but I digress). The main take-away here is that when you see an underscore in a procedure name, you shouldn't need to ask yourself if it has meaning outside the name.</p>
+
+<hr>
+
+<p>Another nitpick - there's no reason to <code>Set assetTbl = Nothing</code> in <code>ModuleCleanup()</code>. The reason that the <code>Assert</code> and <code>Fakes</code> are explicitly set to <code>Nothing</code> has to do with the internal architecture of Rubberduck's testing engine. In your case it doesn't matter in the least if the reference to your <code>IAssetTableProxy</code> isn't immediately freed.</p>
+
+<hr>
+
+<p>Specifically regarding your third question. The reason Rubberduck suggests not using <code>Option Base 1</code> is that it is a per module option that overrides the default array base of the <em>language</em>. If you specify the lower bound like you do here... </p>
+
+<blockquote>
+<pre><code>Option Explicit
+Option Base 1
+Implements IAssetTableProxy
+
+Public Function IAssetTableProxy_GetAssetTableData() As Variant()
+
+    Dim twoDArr(1 To 3, 1 To 3) As Variant
+
+    '...
+
+    IAssetTableProxy_GetAssetTableData = twoDArr
+
+End Function
+</code></pre>
+</blockquote>
+
+<p>...it is superfluous - you're <em>always</em> creating an array with base 1 and doing it explicitly. You should be doing this anyway if you're using a non-zero base because it's clear that the lower bound is "non-standard" without requiring the person looking at the code to scroll all the way to the top of the module and catch the fact that you have a non-standard option defined. I can see it at the point of the declaration.</p>
+
+<p>The other place it appears is in <code>AssetInfoService</code>, but it is completely unneeded there also.  The only place you are assigning an array is here...</p>
+
+<blockquote>
+<pre><code>Dim twoDArr() As Variant
+
+twoDArr = assetTbl.GetAssetTableData
+</code></pre>
+</blockquote>
+
+<p>...and that module doesn't control the actual creation of the array.  You can remove <code>Option Base 1</code> everywhere in your code and it will have no effect what-so-ever.</p>
+
+<p>If you're using arrays from an external source (i.e. Excel), you should be using <code>LBound</code> anyway - VBA has a zero default, but a COM <code>SAFEARRAY</code> allows the lower bound to be an arbitrary number. Pedantically, this code... </p>
+
+<blockquote>
+<pre><code> For rw = 1 To UBound(twoDArr, 1) 
+</code></pre>
+</blockquote>
+
+<p>...should be: </p>
+
+<pre><code>For rw = LBound(twoDArr, 1) To UBound(twoDArr, 1) 
+</code></pre>
+
+<p>That decouples your interface from the representation of the array that is supplied by the <code>IAssetTableProxy</code>. This is just like any other form of coupling in that it makes the implementation "brittle" to the extent that it makes assumptions about the form of the data.</p>
+    </div>

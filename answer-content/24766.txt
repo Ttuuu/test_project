@@ -1,0 +1,577 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>0: Keep class members <code>private</code> unless there is a darn good reason to expose them. And then, if you have to, use properties.</p>
+
+<p>1: Use <code>readonly</code> on class declarations which are considered unmodifiable after construction. Example:</p>
+
+<pre><code>public readonly ManualResetEvent connected = new ManualResetEvent(false);
+</code></pre>
+
+<p>This declares intent and keeps other code from accidentally modifying an invariant. Plus, the runtime can sometimes perform certain optimizations knowing a field is <code>readonly</code>.</p>
+
+<p>2: Develop to interfaces. This allows for decoupling of implementation plus ease of testing/mocking.</p>
+
+<p>So this being said, here's how I refactored it:</p>
+
+<blockquote>
+  <p>IStateObject:</p>
+</blockquote>
+
+<pre><code>public interface IStateObject
+{
+    int BufferSize { get; }
+
+    int Id { get; }
+
+    bool Close { get; set; }
+
+    byte[] Buffer { get; }
+
+    Socket Listener { get; }
+
+    string Text { get; }
+
+    void Append(string text);
+
+    void Reset();
+}
+</code></pre>
+
+<blockquote>
+  <p>StateObject:</p>
+</blockquote>
+
+<pre><code>public sealed class StateObject : IStateObject
+{
+    /* Contains the state information. */
+
+    private const int Buffer_Size = 1024;
+    private readonly byte[] buffer = new byte[Buffer_Size];
+    private readonly Socket listener;
+    private readonly int id;
+    private StringBuilder sb;
+
+    public StateObject(Socket listener, int id = -1)
+    {
+        this.listener = listener;
+        this.id = id;
+        this.Close = false;
+        this.Reset();
+    }
+
+    public int Id
+    {
+        get
+        {
+            return this.id;
+        }
+    }
+
+    public bool Close { get; set; }
+
+    public int BufferSize
+    {
+        get
+        {
+            return Buffer_Size;
+        }
+    }
+
+    public byte[] Buffer
+    {
+        get
+        {
+            return this.buffer;
+        }
+    }
+
+    public Socket Listener
+    {
+        get
+        {
+            return this.listener;
+        }
+    }
+
+    public string Text
+    {
+        get
+        {
+            return this.sb.ToString();
+        }
+    }
+
+    public void Append(string text)
+    {
+        this.sb.Append(text);
+    }
+
+    public void Reset()
+    {
+        this.sb = new StringBuilder();
+    }
+}
+</code></pre>
+
+<blockquote>
+  <p>IAsyncSocketListener:</p>
+</blockquote>
+
+<pre><code>public interface IAsyncSocketListener : IDisposable
+{
+    event MessageReceivedHandler MessageReceived;
+
+    event MessageSubmittedHandler MessageSubmitted;
+
+    void StartListening();
+
+    bool IsConnected(int id);
+
+    void OnClientConnect(IAsyncResult result);
+
+    void ReceiveCallback(IAsyncResult result);
+
+    void Send(int id, string msg, bool close);
+
+    void Close(int id);
+}
+</code></pre>
+
+<blockquote>
+  <p>AsyncSocketListener:</p>
+</blockquote>
+
+<pre><code>public delegate void MessageReceivedHandler(int id, string msg);
+public delegate void MessageSubmittedHandler(int id, bool close);
+
+public sealed class AsyncSocketListener : IAsyncSocketListener
+{
+    private const ushort Port = 8080;
+    private const ushort Limit = 250;
+
+    private static readonly IAsyncSocketListener instance = new AsyncSocketListener();
+
+    private readonly ManualResetEvent mre = new ManualResetEvent(false);
+    private readonly IDictionary&lt;int, IStateObject&gt; clients = new Dictionary&lt;int, IStateObject&gt;();
+
+    public event MessageReceivedHandler MessageReceived;
+
+    public event MessageSubmittedHandler MessageSubmitted;
+
+    private AsyncSocketListener()
+    {
+    }
+
+    public static IAsyncSocketListener Instance
+    {
+        get
+        {
+            return instance;
+        }
+    }
+
+    /* Starts the AsyncSocketListener */
+    public void StartListening()
+    {
+        var host = Dns.GetHostEntry(string.Empty);
+        var ip = host.AddressList[3];
+        var endpoint = new IPEndPoint(ip, Port);
+
+        try
+        {
+            using (var listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp))
+            {
+                listener.Bind(endpoint);
+                listener.Listen(Limit);
+                while (true)
+                {
+                    this.mre.Reset();
+                    listener.BeginAccept(this.OnClientConnect, listener);
+                    this.mre.WaitOne();
+                }
+            }
+        }
+        catch (SocketException)
+        {
+            // TODO:
+        }
+    }
+
+    /* Gets a socket from the clients dictionary by his Id. */
+    private IStateObject GetClient(int id)
+    {
+        IStateObject state;
+
+        return this.clients.TryGetValue(id, out state) ? state : null;
+    }
+
+    /* Checks if the socket is connected. */
+    public bool IsConnected(int id)
+    {
+        var state = this.GetClient(id);
+
+        return !(state.Listener.Poll(1000, SelectMode.SelectRead) &amp;&amp; state.Listener.Available == 0);
+    }
+
+    /* Add a socket to the clients dictionary. Lock clients temporary to handle multiple access.
+     * ReceiveCallback raise a event, after the message receive complete. */
+    #region Receive data
+    public void OnClientConnect(IAsyncResult result)
+    {
+        this.mre.Set();
+
+        try
+        {
+            IStateObject state;
+
+            lock (this.clients)
+            {
+                var id = !this.clients.Any() ? 1 : this.clients.Keys.Max() + 1;
+
+                state = new StateObject(((Socket)result.AsyncState).EndAccept(result), id);
+                this.clients.Add(id, state);
+                Console.WriteLine("Client connected. Get Id " + id);
+            }
+
+            state.Listener.BeginReceive(state.Buffer, 0, state.BufferSize, SocketFlags.None, this.ReceiveCallback, state);
+        }
+        catch (SocketException)
+        {
+            // TODO:
+        }
+    }
+
+    public void ReceiveCallback(IAsyncResult result)
+    {
+        var state = (IStateObject)result.AsyncState;
+
+        try
+        {
+            var receive = state.Listener.EndReceive(result);
+
+            if (receive &gt; 0)
+            {
+                state.Append(Encoding.UTF8.GetString(state.Buffer, 0, receive));
+            }
+
+            if (receive == state.BufferSize)
+            {
+                state.Listener.BeginReceive(state.Buffer, 0, state.BufferSize, SocketFlags.None, this.ReceiveCallback, state);
+            }
+            else
+            {
+                var messageReceived = this.MessageReceived;
+
+                if (messageReceived != null)
+                {
+                    messageReceived(state.Id, state.Text);
+                }
+
+                state.Reset();
+            }
+        }
+        catch (SocketException)
+        {
+            // TODO:
+        }
+    }
+    #endregion
+
+    /* Send(int id, String msg, bool close) use bool to close the connection after the message sent. */
+    #region Send data
+    public void Send(int id, string msg, bool close)
+    {
+        var state = this.GetClient(id);
+
+        if (state == null)
+        {
+            throw new Exception("Client does not exist.");
+        }
+
+        if (!this.IsConnected(state.Id))
+        {
+            throw new Exception("Destination socket is not connected.");
+        }
+
+        try
+        {
+            var send = Encoding.UTF8.GetBytes(msg);
+
+            state.Close = close;
+            state.Listener.BeginSend(send, 0, send.Length, SocketFlags.None, this.SendCallback, state);
+        }
+        catch (SocketException)
+        {
+            // TODO:
+        }
+        catch (ArgumentException)
+        {
+            // TODO:
+        }
+    }
+
+    private void SendCallback(IAsyncResult result)
+    {
+        var state = (IStateObject)result.AsyncState;
+
+        try
+        {
+            state.Listener.EndSend(result);
+        }
+        catch (SocketException)
+        {
+            // TODO:
+        }
+        catch (ObjectDisposedException)
+        {
+            // TODO:
+        }
+        finally
+        {
+            var messageSubmitted = this.MessageSubmitted;
+
+            if (messageSubmitted != null)
+            {
+                messageSubmitted(state.Id, state.Close);
+            }
+        }
+    }
+    #endregion
+
+    public void Close(int id)
+    {
+        var state = this.GetClient(id);
+
+        if (state == null)
+        {
+            throw new Exception("Client does not exist.");
+        }
+
+        try
+        {
+            state.Listener.Shutdown(SocketShutdown.Both);
+            state.Listener.Close();
+        }
+        catch (SocketException)
+        {
+            // TODO:
+        }
+        finally
+        {
+            lock (this.clients)
+            {
+                this.clients.Remove(state.Id);
+                Console.WriteLine("Client disconnected with Id {0}", state.Id);
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        foreach (var id in this.clients.Keys)
+        {
+            this.Close(id);
+        }
+
+        this.mre.Dispose();
+    }
+}
+</code></pre>
+
+<blockquote>
+  <p>IAsyncClient:</p>
+</blockquote>
+
+<pre><code>public interface IAsyncClient : IDisposable
+{
+    event ConnectedHandler Connected;
+
+    event ClientMessageReceivedHandler MessageReceived;
+
+    event ClientMessageSubmittedHandler MessageSubmitted;
+
+    void StartClient();
+
+    bool IsConnected();
+
+    void Receive();
+
+    void Send(string msg, bool close);
+}
+</code></pre>
+
+<blockquote>
+  <p>AsyncClient:</p>
+</blockquote>
+
+<pre><code>public delegate void ConnectedHandler(IAsyncClient a);
+public delegate void ClientMessageReceivedHandler(IAsyncClient a, string msg);
+public delegate void ClientMessageSubmittedHandler(IAsyncClient a, bool close);
+
+public sealed class AsyncClient : IAsyncClient
+{
+    private const ushort Port = 8080;
+
+    private Socket listener;
+    private bool close;
+
+    private readonly ManualResetEvent connected = new ManualResetEvent(false);
+    private readonly ManualResetEvent sent = new ManualResetEvent(false);
+    private readonly ManualResetEvent received = new ManualResetEvent(false);
+
+    public event ConnectedHandler Connected;
+
+    public event ClientMessageReceivedHandler MessageReceived;
+
+    public event ClientMessageSubmittedHandler MessageSubmitted;
+
+    public void StartClient()
+    {
+        var host = Dns.GetHostEntry(string.Empty);
+        var ip = host.AddressList[3];
+        var endpoint = new IPEndPoint(ip, Port);
+
+        try
+        {
+            this.listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            this.listener.BeginConnect(endpoint, this.OnConnectCallback, this.listener);
+            this.connected.WaitOne();
+
+            var connectedHandler = this.Connected;
+
+            if (connectedHandler != null)
+            {
+                connectedHandler(this);
+            }
+        }
+        catch (SocketException)
+        {
+            // TODO:
+        }
+    }
+
+    public bool IsConnected()
+    {
+        return !(this.listener.Poll(1000, SelectMode.SelectRead) &amp;&amp; this.listener.Available == 0);
+    }
+
+    private void OnConnectCallback(IAsyncResult result)
+    {
+        var server = (Socket)result.AsyncState;
+
+        try
+        {
+            server.EndConnect(result);
+            this.connected.Set();
+        }
+        catch (SocketException)
+        {
+        }
+    }
+
+    #region Receive data
+    public void Receive()
+    {
+        var state = new StateObject(this.listener);
+
+        state.Listener.BeginReceive(state.Buffer, 0, state.BufferSize, SocketFlags.None, this.ReceiveCallback, state);
+    }
+
+    private void ReceiveCallback(IAsyncResult result)
+    {
+        var state = (IStateObject)result.AsyncState;
+        var receive = state.Listener.EndReceive(result);
+
+        if (receive &gt; 0)
+        {
+            state.Append(Encoding.UTF8.GetString(state.Buffer, 0, receive));
+        }
+
+        if (receive == state.BufferSize)
+        {
+            state.Listener.BeginReceive(state.Buffer, 0, state.BufferSize, SocketFlags.None, this.ReceiveCallback, state);
+        }
+        else
+        {
+            var messageReceived = this.MessageReceived;
+
+            if (messageReceived != null)
+            {
+                messageReceived(this, state.Text);
+            }
+
+            state.Reset();
+            this.received.Set();
+        }
+    }
+    #endregion
+
+    #region Send data
+    public void Send(string msg, bool close)
+    {
+        if (!this.IsConnected())
+        {
+            throw new Exception("Destination socket is not connected.");
+        }
+
+        var response = Encoding.UTF8.GetBytes(msg);
+
+        this.close = close;
+        this.listener.BeginSend(response, 0, response.Length, SocketFlags.None, this.SendCallback, this.listener);
+    }
+
+    private void SendCallback(IAsyncResult result)
+    {
+        try
+        {
+            var resceiver = (Socket)result.AsyncState;
+
+            resceiver.EndSend(result);
+        }
+        catch (SocketException)
+        {
+            // TODO:
+        }
+        catch (ObjectDisposedException)
+        {
+            // TODO;
+        }
+
+        var messageSubmitted = this.MessageSubmitted;
+
+        if (messageSubmitted != null)
+        {
+            messageSubmitted(this, this.close);
+        }
+
+        this.sent.Set();
+    }
+    #endregion
+
+    private void Close()
+    {
+        try
+        {
+            if (!this.IsConnected())
+            {
+                return;
+            }
+
+            this.listener.Shutdown(SocketShutdown.Both);
+            this.listener.Close();
+        }
+        catch (SocketException)
+        {
+            // TODO:
+        }
+    }
+
+    public void Dispose()
+    {
+        this.connected.Dispose();
+        this.sent.Dispose();
+        this.received.Dispose();
+        this.Close();
+    }
+}
+</code></pre>
+    </div>

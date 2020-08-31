@@ -1,0 +1,220 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Scanning your description: The idea of this <code>value_ptr</code> sounds perfectly reasonable. You have a pointer to a polymorphic object, and then you want to be able to make a copy of that object, without necessarily knowing what its "most derived type" is. You can't do that without help; so we ask the derived type to help us out: we give the base type a virtual method <code>clone()</code> through which we can ask the derived type to copy itself.</p>
+
+<p>Your example shows <code>clone()</code> returning an <em>owning raw pointer:</em></p>
+
+<pre><code>struct Base { virtual Base* clone() const { return new Base(*this); } };  
+struct Derived : Base { Base* clone() const { return new Derived(*this); };
+</code></pre>
+
+<p>I strongly recommend making the signature <code>std::unique_ptr&lt;Base&gt; clone() const</code>, so that the owning nature of the return value (and the fact that it is the <em>sole</em> owner) is expressed directly in the code instead of implicitly.
+The one possible downside of using <code>unique_ptr</code> is that you can no longer use covariant return types:</p>
+
+<pre><code>struct Base { virtual Base* clone() const; };
+struct Derived : Base { Derived* clone() const override; };  // OK
+
+struct Base { virtual std::unique_ptr&lt;Base&gt; clone() const; };
+struct Derived : Base { std::unique_ptr&lt;Derived&gt; clone() const override; };  // error!
+</code></pre>
+
+<p>But this isn't a big downside in your case.</p>
+
+<hr>
+
+<p>The other stylistic thing to notice about my example code above is that I'm using <code>override</code> to tell the compiler that I <em>intend</em> to override a virtual method from one of my base classes, and so it should complain if my intention isn't being carried out for some reason.</p>
+
+<pre><code>struct Base { virtual Base* clone() const; };
+struct Derived : Base { Derived* clone(); };  // Does The Wrong Thing at runtime
+
+struct Base { virtual Base* clone() const; };
+struct Derived : Base { Derived* clone() override; };  // error! hooray!
+</code></pre>
+
+<hr>
+
+<p>Finally — although I'm sure this was just an oversight in toy example code — don't forget that <code>Base</code>'s destructor should be <code>virtual</code>, given that you're eventually going to be deleting a <code>Derived</code> object via a pointer of type <code>Base*</code>.</p>
+
+<hr>
+
+<pre><code>    // is_defined&lt;T&gt;, from https://stackoverflow.com/a/39816909
+    template &lt;class, class = void&gt; struct is_defined : std::false_type { };
+    template &lt;class T&gt; struct is_defined&lt;
+        T
+        , typename std::enable_if&lt;std::is_object&lt;T&gt;::value &amp;&amp; !std::is_pointer&lt;T&gt;::value &amp;&amp; ( sizeof( T ) &gt; 0 )&gt;::type
+        &gt;
+        : std::true_type{}
+    ;
+</code></pre>
+
+<p>Ooh. You <em>really</em> don't want to be doing this. First of all, I think the "proper" name for this type-trait would be (the inverse of) <code>is_incomplete&lt;T&gt;</code>; types don't really get "defined" per se. Or, okay, class types do; but for example <code>void</code> and <code>int[]</code> are types that are "defined" but still "incomplete," and they're the kinds of types you're catching with this type-trait.</p>
+
+<p>Secondly, why don't you want to be doing this? Well, because the intended value of this trait can <em>change</em> over the course of a translation unit; but the actual value of the static data member cannot change.</p>
+
+<pre><code>struct A;
+static_assert(is_incomplete&lt;A&gt;::value, "If this assertion succeeds...");
+struct A {};
+static_assert(not is_incomplete&lt;A&gt;::value, "...then this one MUST fail!");
+</code></pre>
+
+<p><a href="https://godbolt.org/z/bbNWWB" rel="noreferrer">(Godbolt.)</a></p>
+
+<p>So don't do this. Trust your library-user to use your type correctly, and trust the compiler to give them a reasonable diagnostic if they misuse it. Don't try to dispatch on evanescent properties such as "completeness."</p>
+
+<p>Finally, a nit on whitespace:</p>
+
+<pre><code>        : std::true_type{}
+    ;
+</code></pre>
+
+<p>The construct <code>std::true_type{}</code> has a well-known meaning to C++11 metaprogrammers: it means "give me an object of type <code>std::true_type</code>." What you mean in this case is <em>not</em> that — you mean "...inherits from <code>true_type</code>, and here's the class body, which happens to be empty." So use your whitespace to indicate that.</p>
+
+<pre><code>    : std::true_type {};
+
+// or even
+
+    : std::true_type
+{};
+</code></pre>
+
+<hr>
+
+<pre><code>template &lt;typename, template &lt;typename&gt; class, typename = void_t&lt;&gt;&gt;
+struct detect : std::false_type {};
+</code></pre>
+
+<p>That first line is a complicated way of writing</p>
+
+<pre><code>template&lt;class, template&lt;class&gt; class, class = void&gt;
+</code></pre>
+
+<hr>
+
+<p>Let's look at this whole snippet:</p>
+
+<pre><code>    // Class function/type detection
+    //  https://stackoverflow.com/a/30848101
+
+    // Primary template handles all types not supporting the operation.
+    template &lt;typename, template &lt;typename&gt; class, typename = void_t&lt;&gt;&gt;
+    struct detect : std::false_type {};
+
+    // Specialization recognizes/validates only types supporting the archetype.
+    template &lt;typename T, template &lt;typename&gt; class Op&gt;
+
+    struct detect&lt;T, Op, void_t&lt;Op&lt;T&gt;&gt;&gt; : std::true_type {};
+
+    // clone function
+    template &lt;typename T&gt; using fn_clone_t = decltype( std::declval&lt;T&gt;().clone() );
+
+    // has_clone
+    template &lt;typename T&gt; using has_clone = detect&lt;T, fn_clone_t&gt;;
+</code></pre>
+
+<p>This is an <em>insanely</em> complicated way of writing what should be a two-liner:</p>
+
+<pre><code>    template&lt;class T, class = void&gt; struct has_clone : std::false_type {};
+    template&lt;class T&gt; struct has_clone&lt;T, decltype(void(std::declval&lt;T&gt;().clone()))&gt; : std::true_type {};
+</code></pre>
+
+<hr>
+
+<p>Consider this line of metaprogramming. (I'm not going to worry about what it <em>does</em>, for now.)</p>
+
+<pre><code>    template &lt;typename T, typename U, bool IsDefaultCopier&gt;
+    struct slice_test : std::conditional&lt;
+        std::is_same&lt;T, U&gt;::value   // if U==T, no need to check for slicing
+        || std::is_same&lt;std::nullptr_t, U&gt;::value   // nullptr is fine
+        || !IsDefaultCopier // user provided cloner, assume they're handling it
+        || has_clone&lt;typename std::remove_pointer&lt;U&gt;::type&gt;::value  // using default cloner, clone method must exist in U
+        , std::true_type
+        , std::false_type
+    &gt;::type {};
+</code></pre>
+
+<p>Would you ever write</p>
+
+<pre><code>return ((t == u) || (nullptr == u) || !isdefaultcopier || has_clone(u))
+    ? true : false;
+</code></pre>
+
+<p>? No? Then you shouldn't write the metaprogramming equivalent of <code>return x ? true : false;</code> either. Just return the original boolean condition itself:</p>
+
+<pre><code>    template &lt;typename T, typename U, bool IsDefaultCopier&gt;
+    struct slice_test : std::bool_constant&lt;
+        std::is_same_v&lt;T, U&gt;   // if U==T, no need to check for slicing
+        || std::is_same_v&lt;std::nullptr_t, U&gt;   // nullptr is fine
+        || !IsDefaultCopier // user provided cloner, assume they're handling it
+        || has_clone&lt;std::remove_pointer_t&lt;U&gt;&gt;::value  // using default cloner, clone method must exist in U
+    &gt; {};
+</code></pre>
+
+<p>(For C++11, use <code>std::integral_constant&lt;bool, XYZ&gt;</code> in place of <code>std::bool_constant&lt;XYZ&gt;</code>, and re-expand all my <code>_t</code>s and <code>_v</code>s. I shrank them here just to demonstrate how code should look <em>if</em> portability-to-C++11 is not a concern.)</p>
+
+<hr>
+
+<pre><code>        struct
+#ifdef _MSC_VER
+        //  https://blogs.msdn.microsoft.com/vcblog/2016/03/30/optimizing-the-layout-of-empty-base-classes-in-vs2015-update-2-3/
+        __declspec( empty_bases )   // requires vs2015 update 2
+#endif
+        ptr_data
+</code></pre>
+
+<p>I <em>strongly</em> recommend that you move the preprocessor logic to the top of the file, use it to set a macro, and use just the macro down here. It'll be easier to read and easier to maintain.</p>
+
+<pre><code>#ifdef _MSC_VER
+#define USE_EMPTY_BASE_OPTIMIZATION __declspec(empty_bases)
+#else
+#define USE_EMPTY_BASE_OPTIMIZATION
+#endif
+
+// ...
+
+struct USE_EMPTY_BASE_OPTIMIZATION ptr_data
+</code></pre>
+
+<hr>
+
+<pre><code>        : public std::unique_ptr&lt;T, Deleter&gt;
+</code></pre>
+
+<p>Inheriting (either publicly or privately) from standard-library types is <em>never</em> a good idea. I strongly recommend that you just implement the three special members (move-constructor, move-assignment, and destructor) yourself, rather than trying to reuse the STL's versions. ...Oh look, you <em>do</em> reimplement them, anyway!</p>
+
+<pre><code>        ptr_data&amp; operator=( const ptr_data&amp; that ) {
+            if ( this == &amp;that )
+                return *this;
+            *this = that.clone();  // R
+            return *this;
+        }
+</code></pre>
+
+<p>It's been a while since you wrote this code. How long will it take you to prove to yourself that the line marked <code>// R</code> is not a recursive call to this <code>operator=</code>? (Or is it? ;) Remember <em>all</em> of the behaviors of <code>unique_ptr</code>!)</p>
+
+<hr>
+
+<p>Speaking of which, inheriting from <code>unique_ptr&lt;T, Deleter&gt;</code> is also kind of silly since <code>unique_ptr&lt;T, Deleter&gt;</code> will have a data member of type <code>Deleter::pointer</code> (which may be a fancy pointer type), whereas your <code>clone()</code> methods seem to deal only in raw <code>T*</code>. If you don't want the fancy-pointer behavior, you shouldn't drag it in. Yet another reason to implement the special members yourself instead of inheriting from <code>unique_ptr</code>.</p>
+
+<hr>
+
+<pre><code>        // tag dispatch on has_clone
+        return this-&gt;operator()( what
+            , typename std::conditional&lt;detail::has_clone&lt;T&gt;::value, _clone, _copy&gt;::type() 
+            );
+</code></pre>
+
+<p>You seem to be a bit <code>operator()</code>-happy in this code. There's no reason for this overload set to be named <code>operator()</code>; I'd recommend something descriptive such as <code>copy_or_clone</code>.</p>
+
+<p>General rule of thumb: If you find yourself writing <code>this-&gt;operator()(...)</code> instead of <code>(*this)(...)</code>, then you are definitely doing it wrong. (And if you find yourself writing <code>(*this)(...)</code>, you are <em>probably</em> doing it wrong, anyway.)</p>
+
+<p>I also strongly recommend to avoid leading underscores. In this case, since they are tag types, <code>_copy</code> should be spelled <code>copy_tag</code> and <code>_clone</code> should be spelled <code>clone_tag</code>.</p>
+
+<hr>
+
+<p>Did you consider using <code>std::function&lt;Base*(Base*)&gt; m_clone</code> and <code>std::function&lt;void(Base*)&gt; m_destroy</code> instead of rolling your own type-erasure? I mean, I love rolling my own type-erasure, and do it all the time; but if you're just practicing metaprogramming and want the shortest possible code, you might find that <code>std::function</code> would be useful.</p>
+
+<p>You could even use <code>std::function&lt;Base*(Base*, enum CloneOrDestroy)&gt;</code> to wrap up both behaviors into a single function, to shrink the size of your <code>value_ptr</code> object.</p>
+
+<p>Did you consider what should happen if <code>Base</code>'s destructor is <em>not</em> <code>virtual</code>? There is actually a type-trait for <code>has_virtual_destructor&lt;T&gt;</code>, not that I would recommend using it (see my above advice about trusting your user). But consider how <code>shared_ptr</code> works even with non-virtual destructors; should you do similarly?</p>
+
+<p>This has been a long review already, and I didn't even really get to the meat of it. I would recommend simplifying the code a lot and re-posting for another round.</p>
+    </div>

@@ -1,0 +1,288 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p>Are there any hidden race conditions?</p>
+</blockquote>
+
+<p>No. All racy code is protected with mutexes and there are no send/receive operations that may deadlock.</p>
+
+<blockquote>
+  <p>Is there a better way to structure the code?</p>
+</blockquote>
+
+<p>Sure.</p>
+
+<p>Actually I don't like the way you've done several parts and I'll point out them as the post continues. So lets focus on writing idiomatic Go code here.</p>
+
+<h1><code>init</code></h1>
+
+<p><code>init</code> function originally landed in Go to support initializations of various packages.</p>
+
+<p>Some example uses of <code>init</code> from Go standard packages source code:</p>
+
+<ul>
+<li><a href="https://golang.org/src/compress/bzip2/bzip2.go#L479" rel="nofollow noreferrer">compress/bzip2</a> initializes crctab</li>
+<li><a href="https://golang.org/src/net/http/pprof/pprof.go#L71" rel="nofollow noreferrer">net/http/pprof</a> registers <code>/debug/pprof/*</code> routes</li>
+<li>image/png, image/jpeg and image/gif register image formats</li>
+<li><a href="https://golang.org/pkg/database/sql/#Register" rel="nofollow noreferrer">sql.Register</a> which is used
+to register SQL drivers typically reside in <code>init</code>.</li>
+</ul>
+
+<p>You can find out more usages of <code>init</code> with this command:</p>
+
+<pre><code>grep -noRzP 'func init\(\) \{[\s\S]+?\n\}' "$(go env GOROOT)"
+</code></pre>
+
+<p>So <code>init</code> is mostly used for package level initialization, there is no point in using one for an executable command. We already have <code>main</code> for these things.</p>
+
+<p>Nice thing about <code>main</code>: it is established and common entry point in many programming languages. We should not abuse it adding yet another program entry point.</p>
+
+<p>To be honest I was able to find usages of <code>init</code> with <code>package main</code> within the standard library code. And it just feels super wrong to me. I see <code>init</code> as a nice feature for initializating the library package, but it doesn't make sense when used in executable one.</p>
+
+<p><strong><code>init</code> is not second <code>main</code>.</strong></p>
+
+<h1>Sheduler</h1>
+
+<p>Your sheduler on it's own works fine. I can't see any possible errors or racy parts. The code is solid.</p>
+
+<p>But the code structure, initialization and usage are in a big mess. There is no sheduler constructor and there is no way to stop sheduler routine. Exported and unexported identifiers doesn't make sense. That's how I see it.</p>
+
+<p>In your <a href="https://codereview.stackexchange.com/questions/194922/python-task-scheduler">previous question</a> you've implemented same functionality with Python. Sheduler is implemented as a class with required methods. Let's make same thing here with Go.</p>
+
+<p>I like your post <a href="https://blog.yangmillstheory.com/posts/concurrent-memo/" rel="nofollow noreferrer">Concurrent memo: mutexes vs. channels</a> and the conclusion part you've done. Channels are nice language primitive. Let's focus on implementing sheduler with channels instead of mutexes and see how far we can go with it.</p>
+
+<p><strong>Note:</strong> I won't use <code>package main</code> here. All tests will reside in separate file so we can run them with <code>go test</code>.</p>
+
+<p>This is the interface we'll be doing:</p>
+
+<pre><code>func NewSheduler() *Sheduler {}
+func NewShedulerContext(context.Context) *Sheduler {}
+func (*Sheduler) Stop()
+func (*Sheduler) Wait()
+func (*Sheduler) Shedule(time.Time, func()) *Task
+func (*Task) Cancel(*Task)
+</code></pre>
+
+<p><code>NewSheduler</code> will create a sheduler instance and run the background routine which can be stopped with <code>Stop</code>. <code>Wait</code> method will wait for sheduler to stop. <code>Shedule</code> will add new tasks and return them. <code>Cancel</code> will remove the task from sheduling queue. <code>NewShedulerContext</code> is a nice addition to stop sheduler with <a href="https://golang.org/pkg/context" rel="nofollow noreferrer">context</a>.</p>
+
+<p>Here follows a possible rewrite so it will be simpler to show particular parts of implementation.</p>
+
+<p><strong>sheduler.go</strong> contains annotated sheduler implementaion.</p>
+
+<pre><code>package sheduler
+
+import (
+    "time"
+    "context"
+    "sort"
+)
+
+type (
+
+    Task struct {
+        at time.Time
+        fn func()
+    }
+
+    Sheduler struct {
+        ctx context.Context
+        cancel func()
+
+        // chans to process tasks
+        addC, removeC chan *Task
+    }
+)
+
+// start is the main sheduler routine that handles the queue.
+// All mutations happen here so we are race free by default.
+func (s *Sheduler) start() {
+
+    defer s.cancel()
+
+    // Note: `never` should not be closed or used, except for reading
+    var next &lt;- chan time.Time
+    var timer *time.Timer
+    never := make(&lt;- chan time.Time)
+
+    tasks := []*Task{}
+
+    for {
+
+        // Every loop iteration tasks[0] is checked and called
+        // if it's time to
+        if len(tasks) &gt; 0 {
+            if time.Now().After(tasks[0].at) {
+
+                // Time to call a task
+                t := tasks[0]
+                tasks = tasks[1:]
+
+                // Task may call sheduler.Add,
+                // so it's wise to use `go` here
+                go t.fn()
+
+                continue
+
+            } else if timer == nil {
+
+                // There is a task,
+                // but timer is nil, creating one
+                timer = time.NewTimer(time.Until(tasks[0].at))
+                next = timer.C
+            }
+        } else {
+
+            // There is no a single task
+            next = never
+        }
+
+
+
+
+        select {
+
+        // Stop was called
+        case &lt;- s.ctx.Done():
+            return
+
+        // Wait for next task to shedule
+        case &lt;- next:
+            timer = nil
+
+        // Wait for new task
+        case task := &lt;- s.addC:
+            tasks = append(tasks, task)
+
+            sort.Slice(tasks, func (i, j int) bool {
+                return tasks[i].at.Before(tasks[j].at)
+            })
+
+            if tasks[0] == task &amp;&amp; timer != nil {
+                timer.Stop()
+                timer = nil
+            }
+
+        // Wait for task to remove
+        case task := &lt;- s.removeC:
+            for i, t := range tasks {
+                if t == task {
+                    if i == 0 &amp;&amp; timer != nil {
+                        timer.Stop()
+                        timer = nil
+                    }
+                    tasks = append(tasks[:i],tasks[i+1:]...)
+                    break
+                }
+            }
+        }
+    }
+}
+
+// Wait waits untill sheduler stops.
+func (s *Sheduler) Wait() {
+    &lt;- s.ctx.Done()
+}
+
+// Stop stops sheduler routine.
+func (s *Sheduler) Stop() {
+    s.cancel()
+}
+
+// Shedule adds shedules new task.
+// It will return nil if sheduler was stopped.
+func (s *Sheduler) Shedule(at time.Time, fn func()) *Task {
+    task := &amp;Task{at, fn}
+    select {
+    case &lt;- s.ctx.Done():
+        return nil
+    case s.addC &lt;- task:
+        return task
+    }
+}
+
+// Cancel cancels sheduled task.
+func (s *Sheduler) Cancel(task *Task) {
+    select {
+    case &lt;- s.ctx.Done():
+    case s.removeC &lt;- task:
+    }
+}
+
+// NewShedulerContext is like NewSheduler but includes context.
+// The provided context is used to stop the sheduler.
+func NewShedulerContext(parentCtx context.Context) *Sheduler {
+
+    ctx, cancel := context.WithCancel(parentCtx)
+    s := &amp;Sheduler{
+        ctx:     ctx,
+        cancel:  cancel,
+        addC:    make(chan *Task),
+        removeC: make(chan *Task),
+    }
+    go s.start()
+    return s
+}
+
+// NewSheduler creates new sheduler and starts it.
+// Stop must be called to stop sheduler routine free resources.
+func NewSheduler() *Sheduler {
+    return NewShedulerContext(context.Background())
+}
+</code></pre>
+
+<p><strong>sheduler_test.go</strong> contains several test cases. Use it with <code>go test</code>.</p>
+
+<pre><code>package sheduler
+
+import (
+    . "testing"
+    "time"
+)
+
+func TestShedulerStops(t *T) {
+
+    s := NewSheduler()
+
+    go func() {
+        s.Stop()
+    }()
+
+    s.Wait()
+}
+
+func TestShedulerShedulesInOrder(t *T) {
+
+    s := NewSheduler()
+
+    x := 0
+
+    s.Shedule(time.Now().Add(time.Second), func() {
+        if x++; x != 1 { t.Error("Expected to run first") }
+    })
+
+    s.Shedule(time.Now().Add(time.Second * 2), func() {
+        if x++; x != 2 { t.Error("Expected to run second") }
+    })
+
+    s.Shedule(time.Now().Add(time.Second * 3), func() {
+        if x++; x != 3 { t.Error("Expected to run last") }
+        s.Stop()
+    })
+
+    s.Wait()
+}
+</code></pre>
+
+<p>It's always important to annotate the source code. Golang has super nice toolchain that will use your comments to produce a package documentation.</p>
+
+<p>I've decided to use channels here. <code>addC</code> and <code>removeC</code> from <code>Sheduler</code> struct are used to send tasks into running routine. The sheduler routine <code>start</code> will <code>select</code> from both of them and mutate <code>tasks</code> slice. The implementation is race free as all mutations happen in a single routine.</p>
+
+<p>Note: functions <code>Shedule</code> and <code>Cancel</code> both write to channel. This may block forever when sheduler routine is stopped. To protect ourselfs from deadlocks we'll use <code>Done</code> from <code>context.Context</code>. Both functions use <code>select</code> with <code>&lt;- s.ctx.Done</code> case to exit, when sheduler routine stops.</p>
+
+<p>To keep the code short implementation uses simple slice of tasks as a queue. This can be changed to heap or similar container.</p>
+
+<h3>Afterwords</h3>
+
+<p>In this review I've tried to address the ideas of writing idiomatic Go code. Apart from yours I've added several other problems like sheduler cancelation, use of channels, etc. This review may not be one you've actually wanted to see so let me know.</p>
+
+<p>Feel free to ping me in the <a href="https://chat.stackexchange.com/rooms/8595/the-2nd-monitor">chat</a> and comments if there is an issue or so.</p>
+    </div>

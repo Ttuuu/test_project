@@ -1,0 +1,138 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The callback supplied to <code>geocode</code> has a lot of code in it. This becomes difficult to test independently of testing the rest of <code>getRegion</code> but the more immediate pressing issue is that it makes things harder to visually parse.</p>
+
+<p>A nice fix to kick things off would be to extract the call to <code>geocode</code> to a separate function that yields a promise and then pass the result of that promise to the function that handles the business logic of your code, like this:</p>
+
+<pre><code>function getLatitudeAndLongitude(latitude, longitude) {
+  return new Promise((resolve, reject) =&gt; {
+    geocoder.geocode({
+      latLng: new google.maps.LatLng(latitude, longitude)
+    }, (results, status) =&gt; {
+      if (status === google.maps.GeocoderStatus.OK) {
+        resolve(results);
+      }
+
+      // Otherwise you'll want to reject in a way that makes sense to you.
+      reject();
+    }
+  })
+}
+</code></pre>
+
+<p>I also changed the following about the above code:</p>
+
+<ul>
+<li>Changed function expressions to arrow functions. This is mostly for terseness' sake.</li>
+<li>Removed the quotation marks around latLng - It's not necessary to do this in object literals unless there is a symbol in the object literal that would cause a syntax error (like a space).</li>
+<li>Changed the returned Promise to only resolve with the results if the status is OK and fail otherwise.</li>
+</ul>
+
+<p>Now let's look at the remainder of your code. The first thing we should do is place this in a function:</p>
+
+<pre><code>function getRegion(results) {
+  const details = results[0].address_components; //Returns the users location
+  const invalidAreaTypes = ["country", "postal_code", "route"];
+  const typesWithBackupRegion = [
+    "postal_town",
+    "locality",
+    "sublocality",
+    "neighborhood"
+  ];
+  const initialState = {
+    region: null,
+    gotOptimal: false,
+    backupRegion: null,
+    outerRegion: null
+  };
+
+  let {
+    region,
+    outerRegion,
+    backupRegion
+  } = details.reduce((accumulator, entry) =&gt; {
+    return entry.types.reduce((accumulator, areaType) =&gt; {
+      const longName = entry.long_name;
+      if (invalidAreaTypes.includes(areaType) || parseInt(longName)) {
+        return { ...accumulator, invalidAreaType: true };
+      }
+
+      const { gotOptimal } = accumulator;
+      const useBackupRegion =
+        typesWithBackupRegion.includes(areaType) &amp;&amp; gotOptimal;
+      const isOptimalName = areaType === "administrative_area_level_2";
+      const isOuterRegion = areaType === "administrative_area_level_1";
+
+      return {
+        region: gotOptimal === false ? longName : accumulator.region,
+        outerRegion: isOuterRegion ? longName : accumulator.outerRegion,
+        gotOptimal: isOptimalName || accumulator.gotOptimal,
+        backupRegion: useBackupRegion ? longName : accumulator.backupRegion
+      };
+    }, accumulator);
+  }, initialState);
+
+  //This is used for cases when very little info is returned or a number region eg. '3'
+  if (region === null &amp;&amp; details.length &gt; 1) {
+    region = details[Math.floor(details.length / 2)].long_name;
+    region = parseInt(region)
+      ? details[Math.floor(details.length / 2) - 1].long_name
+      : region;
+    region = parseInt(region)
+      ? details[Math.floor(details.length / 2) + 1].long_name
+      : region;
+    region = parseInt(region) ? null : region;
+    //Ive had number regions returned before, this is to rule it out as a reigion called '3' is too broad
+  }
+
+  //eg Utah, Utah  --&gt; change the region to a county or town
+  region = region === outerRegion ? backupRegion : region;
+
+  region =
+    outerRegion &amp;&amp; !parseInt(outerRegion)
+      ? region + ", " + outerRegion
+      : region;
+
+  return region;
+}
+</code></pre>
+
+<p>Above:</p>
+
+<ul>
+<li>I changed any uses of <code>var</code> to <code>let</code> or <code>const</code> in case they were not mutated. It's good practice to use these keywords as they communicate your intent more clearly than <code>var</code>.</li>
+<li>I moved your comparison of <code>invalidAreaType</code> to within the loop you had, which prevents iterating the area types multiple times.</li>
+<li>Every branch of your if statements when checking area types requires that <code>parseInt(entry.long_name)</code> is truthy, so I put that at the front of the loop.</li>
+<li>Your large numbers of if statements can be simplified to be a reducer function. This has the added benefit of not having to track so much state, which can be confusing.</li>
+<li>Several of your if statements regarding sublocality, neighbourhood etc can be condensed into one, since they all do the same thing.</li>
+<li>I changed your outer numeric for loop into a reduce function, since that entire segment of code is just determining which region to use. As far as I can tell my reduce function is faithful to the original code since your original code iterates through all the details and types and then returns only a single region.</li>
+<li>I changed instances of <code>==</code> to <code>===</code>. <code>==</code> is loose equality and is almost never what you want.</li>
+<li>I changed "Unknown" to <code>null</code>. Use <code>null</code> to signify absence of a value. You should let your display layer display "Unknown" when it encounters a null response from <code>getRegion</code>.</li>
+<li>I'm not sure where <code>userLocation</code> came from, but it's not defined in your function so I've removed it. It looks like it used two regions from the function but only one was returned. You should consider returning those two regions instead and having the caller set <code>userLocation</code>.</li>
+</ul>
+
+<p>I'm not sure how to refactor the rest of your code, particularly the bit that handles when there's a lack of data, but this is what I came up with. This doesn't reduce the LOC very much (although you would score additional savings by simplifying the logic after the bit I refactored), however it definitely has a readability improvement - plus, the newly extracted <code>getRegion</code> function is more testable and can be tested in isolation now.</p>
+
+<p>It would be used like this:</p>
+
+<pre><code>getLatitudeAndLongitude(lat, long)
+  .then(getRegion);
+</code></pre>
+
+<h1>Key takeaways</h1>
+
+<p>Embrace the S.R.P. Your function should do one thing and one thing well.</p>
+
+<p>You could argue that your original <code>getRegion</code> function does only one thing - getting the region. That's true, but your function can be broken down into several logical units that each do 'one thing':</p>
+
+<ul>
+<li>Get information about a particular long/lat from Google Maps</li>
+<li>Find the most relevant Region information to display to the user</li>
+<li>Format the region information for display</li>
+</ul>
+
+<p>Use ES6. It's been out for a long time now; every evergreen browser at least supports <code>const</code>, <code>let</code> and arrow functions. If your browser supports <code>Promise</code>, it supports these things. They communicate intent and increase terseness.</p>
+
+<p>If you need to reduce an Array into a single value, instead of using nested for loops with multiple 'tracking' variables, use <code>reduce</code>. It's a lot easier to read and reason about.</p>
+
+<p>If you make multiple calls to a function with the same value, extract it to a common variable unless that value changes (like your <code>region</code> code).</p>
+    </div>

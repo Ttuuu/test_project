@@ -1,0 +1,221 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>The code looks nice!  Here are my suggestions.</p>
+
+<h1>Testing</h1>
+
+<p>Your code passes your test, but there are quite a few bugs that can be easily caught by testing!  Make sure that <em>every functionality is tested</em> so you don't miss some bugs.</p>
+
+<h1>The compiler flags</h1>
+
+<p>Right now, you are using this command to compile the code:</p>
+
+<pre class="lang-none prettyprint-override"><code>g++ -std=c++17 -g -Wall main.cpp -o main
+</code></pre>
+
+<p>There are three additional flags that you should normally use:</p>
+
+<ul>
+<li><p><code>-pedantic-errors</code> — raises errors on non-standard GCC extensions, which are enabled by default.</p></li>
+<li><p><code>-Werror</code> — turns warning into errors.  It forces you to ensure that your code is warning-free.</p></li>
+<li><p><code>-Wextra</code> — enables additional warnings that help catch common bugs.</p></li>
+</ul>
+
+<h1>Allocators</h1>
+
+<p>I see that you are playing a bit with allocators in the insertion functions.  However, allocators are a way for users to customize the allocation, deallocation, construction, and destruction behavior of the container.  Using a default allocator + allocator traits to allocate the nodes is a big overkill if you don't want to support allocators.  Simply use <code>new</code> and <code>delete</code>:</p>
+
+<pre><code>new Node{T(std::forward&lt;Args&gt;(args)...), prev, next}; // instead of create_node
+delete node;                                          // instead of destroy_node
+</code></pre>
+
+<p>If you <em>do</em> want to support allocators, though, then the data model of the class has to be changed.  The node will consist of raw memory instead of a subobject: (just the idea, not tested)</p>
+
+<pre><code>struct Node {
+    Node* prev{nullptr};
+    Node* next{nullptr};
+    std::aligned_storage_t&lt;sizeof(T), alignof(T)&gt; storage;
+
+    T* address()
+    {
+        return std::launder(reinterpret_cast&lt;T*&gt;(&amp;storage));
+    }
+    T&amp; value()
+    {
+        return *address();
+    }
+};
+</code></pre>
+
+<p>Then, you use</p>
+
+<ul>
+<li><p><code>allocate</code> to allocate a node,</p></li>
+<li><p>placement new to construct the node,</p></li>
+<li><p><code>construct</code> to construct the element,</p></li>
+<li><p><code>destroy</code> to destroy the element,</p></li>
+<li><p><code>~Node</code> to destroy the node (not needed if your <code>Node</code> class is trivially destructible), and</p></li>
+<li><p><code>deallocate</code> to deallocate a node: (just the idea, not tested)</p></li>
+</ul>
+
+
+
+<pre><code>auto node_allocator()
+{
+    return NodeAlloc(alloc);
+}
+
+template &lt;typename... Args&gt;
+Node* create_node(Node* prev, Node* next, Args&amp;&amp;... args)
+{
+    auto n_alloc = node_allocator();
+
+    auto* node = NTraits::allocate(n_alloc, 1);
+    ::new (node) Node{prev, next};
+    NTraits::construct(n_alloc, node.address(), std::forward&lt;Args&gt;(args)...);
+
+    return node;
+}
+
+void destroy_node(Node* node)
+{
+    NTraits::destroy(n_alloc, node.address());
+    NTraits::deallocate(n_alloc, node);
+}
+</code></pre>
+
+<p>where <code>Allocator</code> is the allocator template parameter, <code>alloc</code> is the <code>Allocator</code> member, and</p>
+
+<pre><code>using Traits  = std::allocator_traits&lt;Allocator&gt;;
+using NAlloc  = typename Traits::template rebind_alloc&lt;Node&gt;;
+using NTraits = typename Traits::template rebind_traits&lt;Node&gt;;
+</code></pre>
+
+<h1>The node class</h1>
+
+<p>The node class is <em>way</em> too convoluted.  Since we have aggregate initialization, the node class can be as simple as</p>
+
+<pre><code>struct Node {
+    T value;
+    Node* prev{nullptr};
+    Node* next{nullptr};
+};
+</code></pre>
+
+<p>And this is even more powerful than the constructors:</p>
+
+<pre><code>Node{T(args)} //      initializes value from '(args)'
+Node{T{args}} //      initializes value from '{args}'
+Node{{args}}  // copy-initializes value from '{args}'
+</code></pre>
+
+<p>In all cases, you can append the prev and next pointers.  There is no redundant move involved here, thanks to guaranteed copy elision introduced in C++17.</p>
+
+<h1>The iterator classes</h1>
+
+<p><strong>BUG</strong> This is wrong:</p>
+
+<pre><code>using difference_type = List::size_type;
+</code></pre>
+
+<p><code>difference_type</code> has to be a signed type.  Use <code>std::ptrdiff_t</code> instead.</p>
+
+<p>When swapping builtin pointers, you can call <code>std::swap</code> directly.  And the swap function of the iterator classes can be removed — <code>std::swap</code> works correctly.</p>
+
+<p><code>operator!=</code> is generally implemented in terms of <code>operator==</code>.  Similarly, the postfix <code>++</code> and <code>--</code> are implemented in terms of the prefix <code>++</code> and <code>--</code>.  <code>operator*</code> and <code>operator-&gt;</code> can be noexcept.  <code>operator-&gt;</code> should return a pointer, not a reference.</p>
+
+<p><strong>BUG</strong> <code>const reference</code> doesn't do what you expect.  It is an attempt to add a top-level const to a reference type, and thus is equivalent to <code>reference</code>.  What you want is <code>const T&amp;</code>.</p>
+
+<p>I don't really like making <code>iterator</code> derive from <code>const_iterator</code> — especially considering the added <code>this-&gt;</code> clutter.  Just writing two independent classes and adding a <code>iterator(const_iterator)</code> constructor seems good enough.  That's primarily a matter of taste, though.</p>
+
+<h1>The constructors, destructor, and assignment operators</h1>
+
+<p><strong>BUG</strong> The <code>(it, it)</code> constructor should be constrained with SFINAE.  Right now <code>List&lt;unsigned int&gt;(5, 5)</code> will call the <code>(it, it)</code> version instead of the <code>(size, value)</code> version.  Like this:</p>
+
+<pre><code>template &lt;typename InputIt, typename = typename std::iterator_traits&lt;InputIt&gt;::iterator_category&gt;
+List(InputIt first, InputIt last);
+</code></pre>
+
+<p>Note: It's better to just define everything in the class IMO.  Otherwise, the out-of-class definition will look like this:</p>
+
+<pre><code>template &lt;typename T&gt;
+template &lt;typename InputIt, typename&gt;      // note: default template argument is not repeated
+List&lt;T&gt;::List(InputIt first, InputIt last)
+{
+    insert(begin(), first, last);
+}
+</code></pre>
+
+<p>The copy and move assignment operators can be unified with the <a href="https://stackoverflow.com/q/3279543">copy-and-swap idiom</a>:</p>
+
+<pre><code>// note: 1. take by value; 2. noexcept
+List&amp; operator=(List list) noexcept
+{
+    swap(list);
+    return *this;
+}
+</code></pre>
+
+<p>The <code>noexcept</code> here makes move assignment <code>noexcept</code>, but not copy assignment.</p>
+
+<p><code>inital_size</code> is a misspell.</p>
+
+<h1><code>begin</code> and <code>end</code></h1>
+
+<p><code>cbegin</code> and <code>cend</code> should delegate to <code>begin</code> and <code>end</code>.</p>
+
+<p>When defining the functions out of class, you can use a trailing return type instead of <code>typename List&lt;T&gt;::</code>:</p>
+
+<pre><code>template&lt;typename T&gt;
+auto List&lt;T&gt;::begin() noexcept -&gt; iterator
+</code></pre>
+
+<h1><code>assign</code></h1>
+
+<p>The <code>assign</code> functions can be modified to provide strong exception guarantee:</p>
+
+<pre><code>template &lt;typename InputIt&gt; // also SFINAE this
+void assign(InputIt first, InputIt last)
+{
+    *this = List(first, last); // creates new list first, destroys old elements after
+}
+
+void assign(std::initializer_list&lt;T&gt; ilist)
+{
+    *this = List(ilist);
+}
+</code></pre>
+
+<h1>Insertion</h1>
+
+<p>You can implement <code>insert_internal</code> in <code>emplace</code> directly.  No need to separate.</p>
+
+<p><code>push_back</code> can use <code>emplace_back</code> directly.</p>
+
+<h1>Deletion</h1>
+
+<p>This feels wrong:</p>
+
+<pre><code>if (first == begin() &amp;&amp; last == end())
+{
+    clear();
+}
+</code></pre>
+
+<p>Special-casing <code>begin</code> and <code>end</code> really doesn't feel right.  It should be possible to treat all iterators equally, so <code>clear()</code> can just be <code>erase(begin(), end())</code>.</p>
+
+<h1><code>resize</code></h1>
+
+<p>I can see why you extract a separate <code>_internal</code> here, but this is really an <s>absurd</s> <em>unusual</em> but creative usage of perfect forwarding.  More seriously, <code>insert_internal(end(), ...)</code> can be simplified to <code>emplace_back(...)</code>.</p>
+
+<h1><code>remove</code> &amp; <code>unique</code></h1>
+
+<p>Again, there is no need to have an <code>_internal</code> when it is the same as the non-<code>_internal</code> version.  <code>[&amp;value = value]</code> can be simplified to <code>[&amp;value]</code> in the lambda capture.</p>
+
+<p><strong>BUG</strong> There is a big problem with the <code>remove</code>: when an element from the list is passed as a <code>const T&amp;</code> argument, it will be accessed after destruction.</p>
+
+<pre><code>List&lt;int&gt; list{1, 2, 1, 2};
+list.remove(list.front()); // undefined behavior
+</code></pre>
+
+<p>One solution is to collect the removed elements as another <code>List</code> and destroy them together at the end.</p>
+    </div>

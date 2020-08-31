@@ -1,0 +1,246 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>To connect with RabbitMQ using C# code kindly follow below steps.</p>
+
+<ol>
+<li>You should have valid Host Name that you may get it from RabbitMQ URL</li>
+<li>Virtual Domain name </li>
+<li>User name and Password if you are connecting with remote RabbitMQ server</li>
+</ol>
+
+<p>Please see below code,</p>
+
+<pre><code>using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+ using System.Text;
+using System.Threading.Tasks;
+using Newtonsoft.Json;
+using System.IO;
+using System.Reflection;
+namespace RMQConnect
+{
+public class RabbitMQQueueManager
+   {   
+       private const string ORIGINAL_QUEUENAME_KEY = "originalQueueName";
+      private const ushort PREFETCH_SIZE = 50;
+
+    public IConnection GetRabbitMqConnection()
+    {
+        ConnectionFactory factory = new ConnectionFactory
+        {
+            HostName = "d1vmrmqtrv01.oldev.arol.shell.com",
+            VirtualHost = "TRV_ANDD",
+            UserName = "ol_sqlmaint_trv",
+            Password = "P@ssw0rd",
+
+        };
+        return factory.CreateConnection();
+    }
+
+    public List&lt;Message&gt; GetMessagesFromQueueNoAck(string queueName, int 
+    messageCount = -1)
+    {
+        QueueingBasicConsumer consumer = null;
+        var responseMessages = new List&lt;Message&gt;();
+        BasicDeliverEventArgs result = null;
+        using (var rmqConnection = GetRabbitMqConnection())
+        {
+            using (var channel = rmqConnection.CreateModel())
+            {
+                try
+                {
+                    var queueMessageCount = (int)channel.MessageCount(queueName);
+                    var count = messageCount &gt; -1 ? messageCount &lt;= 
+                    queueMessageCount ? messageCount : queueMessageCount : 
+                    queueMessageCount;
+                var pfCount = count &gt;= PREFETCH_SIZE ? PREFETCH_SIZE : count;
+                channel.BasicQos(0, (ushort)pfCount, false);
+                consumer = new QueueingBasicConsumer(channel);
+                channel.BasicConsume(queueName, false, consumer);
+                for (int i = 0; i &lt; pfCount; i++)
+                {
+                    if (!channel.IsOpen)
+                    {
+                        throw new ApplicationException("Channel is closed");
+                    }
+                    result = consumer.Queue.Dequeue();
+                    try
+                    {
+                        string messageData = 
+                        System.Text.Encoding.UTF8.GetString(result.Body);
+                        var rMessage = new Message(messageData);
+                        rMessage.Header = new MessageHeader();
+
+
+
+    RmqHeaderHandler.ReadRmqMessageProperties(result.BasicProperties, rMessage);
+                        channel.BasicNack(result.DeliveryTag, false, true);                         
+                        responseMessages.Add(rMessage);
+                    }
+                    catch (Exception ex)
+                    {     
+                        channel.BasicNack(result.DeliveryTag, false, true);
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                ////Nack the message back to queue in case of exception
+                if (result != null)
+                {
+                    channel.BasicNack(result.DeliveryTag, false, true);
+                }
+                throw;
+            }
+        }
+    }
+    return responseMessages;
+    } 
+   }
+    public static class RmqHeaderHandler
+    {
+    private const byte NonPersistentDeliveryMode = 1;
+  private const byte PersistentDeliveryMode = 2;
+   private const string SecurityTokenKey = "SecurityToken";
+  private const string Properties = "properties";
+  private const string MessageNameKey = "MessageName";
+  private const string SystemPropertiesKey = "SystemProperties";
+  private const string ApplicationPropertiesKey = "ApplicationProperties";
+  #region Public Methods
+   public static void ReadDynamicMessageProperties(dynamic messageProperties, 
+   Message message)
+   {
+      try
+      {
+          message.Header.AppId = messageProperties.appId;
+          message.Header.MessageId = messageProperties.messageId;
+          message.Header.GeneratedAtUtc = messageProperties.generatedAtUtc;
+          message.Header.ExpirationInMilliseconds = 
+          messageProperties.expirationInMilliseconds;
+          message.Header.IsPersistent = messageProperties.isPersistent;
+          message.Header.Delete = Convert.ToBoolean(messageProperties.delete);
+          message.Header.Move = Convert.ToBoolean(messageProperties.move);
+          if (messageProperties.ContainsKey("messageName"))
+        {
+            message.Header.MessageName = messageProperties.messageName;
+        }
+        if (messageProperties.ContainsKey("properties"))
+        {
+            var customProperties = 
+        Newtonsoft.Json.JsonConvert.DeserializeObject&lt;Dictionary&lt;string, string&gt;&gt; 
+       (Convert.ToString(messageProperties.properties));
+            foreach (var propPair in customProperties)
+            {
+                message.Header.Properties.Add(propPair.Key, propPair.Value);
+            }
+        }
+    }
+    catch (Exception)
+    {
+        throw;
+    }
+}
+public static void ReadRmqMessageProperties(IBasicProperties messageProperties, 
+Message message)
+{
+    //message.Header.AppId = messageProperties.AppId;
+    message.Header.MessageId = messageProperties.MessageId;
+    message.Header.GeneratedAtUtc = new 
+    DateTime(messageProperties.Timestamp.UnixTime);
+    message.Header.ExpirationInMilliseconds = messageProperties.Expiration;
+    message.Header.IsPersistent = messageProperties.DeliveryMode == 
+    PersistentDeliveryMode;
+    if (messageProperties.Headers!=null &amp;&amp; 
+     messageProperties.Headers.ContainsKey(SystemPropertiesKey))
+    {
+        var systemProperties = 
+        DeserializeMessageProperties((byte[])
+      messageProperties.Headers[SystemPropertiesKey]);
+        if (systemProperties.ContainsKey(MessageNameKey))
+        {
+            message.Header.MessageName = systemProperties[MessageNameKey];
+        }
+    }
+    if (messageProperties.Headers!=null &amp;&amp; 
+     messageProperties.Headers.ContainsKey(ApplicationPropertiesKey))
+    {
+        var applicationProperties = 
+       DeserializeMessageProperties((byte[])
+       messageProperties.Headers[ApplicationPropertiesKey]);
+        foreach (var propPair in applicationProperties)
+        {
+            message.Header.Properties.Add(propPair.Key, propPair.Value);
+        }
+    }
+}
+#endregion
+#region private methods
+private static Dictionary&lt;string, string&gt; DeserializeMessageProperties(byte[] 
+  properties)
+{
+    //var serializer = new .JsonMessageSerializer();
+    var serializedText = JsonConvert.SerializeObject(properties);
+    return JsonConvert.DeserializeObject&lt;Dictionary&lt;string, string&gt;&gt; 
+   (serializedText);
+ }
+#endregion
+}
+public class QueueInfoModel
+{
+    public string Environment { get; set; }
+  public string ApplicationGroup { get; set; }
+  public string ApplicationName { get; set; }
+public string ErrorQueueName { get; set; }
+public string OriginalQueueName { get; set; }
+public int MessageCount { get; set; }
+}
+  [Serializable]
+  public class MessageHeader
+ {
+     public MessageHeader()
+     {
+        this.MessageId = Guid.NewGuid().ToString();
+        this.Properties = new Dictionary&lt;string, string&gt;();
+        this.IsPersistent = true;
+    }
+    public string AppId { get; set; }
+    public string MessageId { get; set; }
+    public string MessageName { get; set; }
+    public DateTime GeneratedAtUtc { get; set; }
+    public string ExpirationInMilliseconds { get; set; }
+    public bool IsPersistent { get; set; }
+    public bool Delete { get; set; }
+    public bool Move { get; set; }
+    public IDictionary&lt;string, string&gt; Properties { get; private set; }
+ }
+[Serializable]
+ public class Message
+{
+    private readonly string serializableBody;
+    public Message(string serializableBody)
+    {
+        this.serializableBody = serializableBody;
+    }
+public MessageHeader Header
+{
+    get;
+    set;
+}
+public string MessageBody
+{
+    get
+    {
+        return this.serializableBody;
+    }
+}
+public byte[] GetBody()
+{
+    return (byte[])((object)Encoding.ASCII.GetBytes(this.MessageBody));
+   }
+ }
+
+ }
+</code></pre>
+    </div>

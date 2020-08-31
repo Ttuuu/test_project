@@ -1,0 +1,152 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Idiomatic Rust</h2>
+
+<h3>Standard utilities</h3>
+
+<p>Much of your code is contained in the std function <code>std::io::copy</code>, which you can use to avoid handling each side of the pipe:</p>
+
+<pre><code>match io::copy(&amp;mut reader, &amp;mut writer) {
+    Ok(0) =&gt; return (),
+    Err(e) if e.kind() != io::ErrorKind::WouldBlock =&gt; return (),
+    _ =&gt; ()
+}
+</code></pre>
+
+<p>And you can also use a for loop to avoid repeating yourself here:</p>
+
+<pre><code>let pipes = [
+    (&amp;stream, &amp;tunnel),
+    (&amp;tunnel, &amp;stream)
+];
+
+loop {
+    for (mut reader, mut writer) in pipes.iter() {
+        // ...
+    }
+}
+</code></pre>
+
+<h3>Error Handling</h3>
+
+<p>You have a pattern repeating in your code for handling errors:</p>
+
+<pre><code>let value = match expression {
+    Ok(value) =&gt; value,
+    Err(_) =&gt; return ()
+};
+</code></pre>
+
+<p>This pattern is actually so common that Rust provides the <a href="https://doc.rust-lang.org/edition-guide/rust-2018/error-handling-and-panics/the-question-mark-operator-for-easier-error-handling.html" rel="nofollow noreferrer"><code>?</code> operator</a> which behaves the same way:</p>
+
+<pre><code>let values = expression?;
+</code></pre>
+
+<p>Okay, it's actually a little different: When using the <code>?</code> operator, Rust needs to know how to convert the value to your return type. It does this using an implementation of <code>E: Into&lt;ReturnType::Error&gt;</code>, and so your function will need to return a compatible type. For small applications, using a crate like <code>anyhow</code> makes this easy:</p>
+
+<pre><code>use anyhow::*;
+
+fn handle_client(...) -&gt; Result&lt;()&gt; {
+    // Read the CONNECT request's bytes into the buffer
+    let mut buf = [0; 4096];
+    let nbytes = stream.read(&amp;mut buf)?;
+}
+</code></pre>
+
+<p>Now that we are receiving errors from the handler, we can let the user know about them</p>
+
+<pre><code>thread::spawn(move || {
+    if let Err(error) = handle_client(stream) {
+        error!("error while handling stream: {}", error);
+    }
+});
+</code></pre>
+
+<p>Also, returning an error from <code>main</code> uses a default implementation that isn't very user friendly:</p>
+
+<pre><code>Error: Os { code: 10048, kind: AddrInUse, message: "Only one usage of each socket address (protocol/network address/port) is normally permitted." }
+</code></pre>
+
+<p>It might be better to provide a more descriptive error message:</p>
+
+<pre><code>let server = TcpListener::bind(("localhost", PORT)).unwrap_or_else(|e| {
+    if e.kind() == io::ErrorKind::AddrInUse {
+        error!("Port {} is already being used by another program", PORT);
+        std::process::exit(1);
+    } else {
+        panic!("{:?}", e);
+    }
+});
+</code></pre>
+
+<h3>Logging</h3>
+
+<p>The [<code>log</code>] crate is a pretty conventional way of writing log messages in Rust - many libraries support it directly, letting you see what's happening inside their code too. Just set up a logger using a crate like [<code>env_logger</code>] and output messages using its' macros.</p>
+
+<pre><code>use log::*;
+
+fn main() {
+    env_logger::init();
+    // ...
+    info!("Listening on port {}", PORT);
+}
+</code></pre>
+
+<h3>And in no particular order...</h3>
+
+<ul>
+<li><code>TcpListener::bind</code> takes a <code>ToSocketAddrs</code>. You can avoid allocating with <code>bind(("localhost", PORT))</code>.</li>
+<li>You can write a <code>match</code> with one arm as an <a href="https://doc.rust-lang.org/stable/rust-by-example/flow_control/if_let.html" rel="nofollow noreferrer"><code>if let</code> statement</a></li>
+<li>You can get the 2nd item in an <em>iterator</em> with <code>nth</code>: 
+
+<blockquote>
+<pre><code>let website = req
+     .split_whitespace()
+     .nth(1)
+</code></pre>
+</blockquote></li>
+<li>Personally, I don't use top level imports for items I only use a single time,
+preferring to use <code>let req = std::str::from_utf8(&amp;buf)?;</code></li>
+<li>Speaking of that line, you might want to convert <code>&amp;buf[..nbytes]</code> instead, to
+avoid checking the empty part of the buffer.</li>
+</ul>
+
+<h2>Comments</h2>
+
+<p>If you ask me, the code is easier to read with <em>less</em> comments - you should be
+describing the conceptual purpose of a block of code. "Read the bytes from the
+stream" doesn't tell me anything more about <em>why</em> you are calling <code>stream.read</code>.</p>
+
+<p>Rather, I think this is more helpful</p>
+
+<pre><code>// Read the CONNECT request's bytes into the buffer
+let mut buf = [0; 4096];
+let nbytes = stream.read(&amp;mut buf)?;
+</code></pre>
+
+<p>There is also no problem treating log messages as documentation - they can
+teach the reader about the behaviour of the code just as well.</p>
+
+<p>Another example would be the request parsing:</p>
+
+<pre><code>// Split the text on whitespace and get the hostname
+let website : &amp;str = req.split_whitespace().collect::&lt;Vec&lt;_&gt;&gt;()[1];
+</code></pre>
+
+<p>I can already see that you are splitting the string on whitespace - it says it
+right there in the method name. It's more helpful to know what this line is
+doing. It could be "Parse the hostname from the request", but I'd be happy just
+using the variable name to document this line.</p>
+
+<p>On the other hand, abbreviations can get in the way of a reader's understanding
+- try to avoid them when they describe an important part of the code:</p>
+
+<pre><code>// Send an acknowledgement to the client
+stream.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")?;
+</code></pre>
+
+<h3>Performance</h3>
+
+<p>Each thread is currently using a busy loop to wait for data on the sockets, and isn't gaining much in performance from it. You can make it much easier on your computer by adding a small <code>std::thread::sleep</code> between each iteration of the loop.</p>
+
+<p>Even better though: this kind of application is particularly suited to <code>async</code>: The proxy will be able to handle many more clients without choking on the heavyweight threads, and wake up each task the moment data is ready on the socket. With <code>smol</code> and <code>futures</code>, you can write code that'll look nearly identical to the sync code (and actually fix a problem where packets can get dropped if the write socket is full). Altogether, these changes look like this: <a href="https://gist.github.com/Plecra/d95f170bc8f42ed80158f3dcc19bcc9a/c6feec657343b05123ba58d56b784846497a64bc#file-proxy-rs-L53" rel="nofollow noreferrer">proxy.rs</a></p>
+    </div>

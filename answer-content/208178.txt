@@ -1,0 +1,273 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>If you should respect that not all <code>Enumerators</code> implement <code>Reset()</code> then it is not possible to use <code>using</code> statements for the two <code>IEnumerators</code>. But you could introduce an <code>IEnumerator&lt;TResult&gt;</code> for the zipped result and use it like this:</p>
+
+<pre><code>public static IEnumerable&lt;TResult&gt; ZipNew&lt;TFirst, TSecond, TResult&gt;(
+this IEnumerable&lt;TFirst&gt; first,
+IEnumerable&lt;TSecond&gt; second,
+Func&lt;TFirst, TSecond, TResult&gt; resultSelector)
+{
+  if (first == null) throw new ArgumentNullException(nameof(first));
+  if (second == null) throw new ArgumentNullException(nameof(second));
+  if (resultSelector == null) throw new ArgumentNullException(nameof(resultSelector));
+
+  return InnerZipNew(first, second, resultSelector);
+}
+
+private static IEnumerable&lt;TResult&gt; InnerZipNew&lt;TFirst, TSecond, TResult&gt;(
+this IEnumerable&lt;TFirst&gt; first,
+IEnumerable&lt;TSecond&gt; second,
+Func&lt;TFirst, TSecond, TResult&gt; resultSelector)
+{
+  using (ZipEnumerator&lt;TFirst, TSecond, TResult&gt; zipEnumerator = new ZipEnumerator&lt;TFirst, TSecond, TResult&gt;(first, second, resultSelector))
+  {
+    while (zipEnumerator.MoveNext())
+    {
+      yield return zipEnumerator.Current;
+    }
+  }
+}
+</code></pre>
+
+<p>As JAD writes in his comment it is necessary to catch possible invalid input as the first thing and then call a private shadow method to do the actual iteration in order to make the exceptions be thrown when the extension is called rather than when the enumeration is performed.</p>
+
+<p>In this way you're back on the using track.</p>
+
+<p>The <code>ZipEnumerator</code> it self could be something like:</p>
+
+<pre><code>  public class ZipEnumerator&lt;T, S, TResult&gt; : IEnumerator&lt;TResult&gt;
+  {
+    IEnumerable&lt;T&gt; m_dataT;
+    IEnumerable&lt;S&gt; m_dataS;
+    IEnumerator&lt;T&gt; m_enumerT;
+    IEnumerator&lt;S&gt; m_enumerS;
+    List&lt;IDisposable&gt; m_disposables = new List&lt;IDisposable&gt;();
+    Func&lt;T, S, TResult&gt; m_selector;
+    bool m_secondReloaded = false;
+    bool m_first = true;
+
+    public ZipEnumerator(IEnumerable&lt;T&gt; dataT, IEnumerable&lt;S&gt; dataS, Func&lt;T, S, TResult&gt; selector)
+    {
+      m_dataT = dataT ?? throw new ArgumentNullException(nameof(dataT));
+      m_dataS = dataS ?? throw new ArgumentNullException(nameof(dataS));
+      m_selector = selector ?? throw new ArgumentNullException(nameof(selector));
+
+    }
+
+    public TResult Current =&gt; m_selector(m_enumerT.Current, m_enumerS.Current);
+
+    object IEnumerator.Current =&gt; Current;
+
+    public void Dispose()
+    {
+      foreach (IDisposable disposable in m_disposables)
+      {
+        disposable.Dispose();
+      }
+      m_disposables.Clear();
+    }
+
+    private IEnumerator&lt;T&gt; GetTEnumerator()
+    {
+      var enumerator = m_dataT.GetEnumerator();
+      m_disposables.Add(enumerator);
+      return enumerator;
+    }
+
+    private IEnumerator&lt;S&gt; GetSEnumerator()
+    {
+      var enumerator = m_dataS.GetEnumerator();
+      m_disposables.Add(enumerator);
+      return enumerator;
+    }
+
+    public bool MoveNext()
+    {
+      m_enumerT = m_enumerT ?? GetTEnumerator();
+      m_enumerS = m_enumerS ?? GetSEnumerator();
+
+      if (m_first)
+      {
+        if (m_enumerT.MoveNext())
+        {
+          if (!m_enumerS.MoveNext())
+          {
+            m_enumerS = GetSEnumerator();
+            m_secondReloaded = true;
+            if (!m_enumerS.MoveNext())
+              return false;
+          }
+          return true;
+        }
+        else
+        {
+          m_first = false;
+        }
+      }
+
+      if (!m_first &amp;&amp; !m_secondReloaded)
+      {
+        if (m_enumerS.MoveNext())
+        {
+          if (!m_enumerT.MoveNext())
+          {
+            m_enumerT = GetTEnumerator();
+            if (!m_enumerT.MoveNext())
+              return false;
+          }
+
+          return true;
+        }
+      }
+
+      return false;
+    }
+
+    public void Reset()
+    {
+      m_secondReloaded = false;
+      m_first = true;
+      m_enumerT = null;
+      m_enumerS = null;
+      Dispose();
+    }
+  }
+</code></pre>
+
+<p>It's a little more code than other suggestions, but it encapsulates the problems with the disposal of intermediate enumerators without the necessity of a try-catch-statement. You could discuss if the disposal should be immediately when the enumerator is done or as I do collect them for disposal when the <code>ZipEnumerator</code> itself is disposed off?</p>
+
+<p>The <code>MoveNext()</code> method went a little more complicated than I like, so feel free to edit or suggest improvements.</p>
+
+<hr>
+
+<p><strong>Edit</strong></p>
+
+<p>A refactored version of <code>ZipEnumerator</code>:</p>
+
+<pre><code>  public class ZipEnumerator&lt;T, S, TResult&gt; : IEnumerator&lt;TResult&gt;
+  {
+    IEnumerable&lt;T&gt; m_dataT;
+    IEnumerable&lt;S&gt; m_dataS;
+    IEnumerator&lt;T&gt; m_enumeratorT;
+    IEnumerator&lt;S&gt; m_enumeratorS;
+    List&lt;IDisposable&gt; m_disposables = new List&lt;IDisposable&gt;();
+    Func&lt;T, S, TResult&gt; m_selector;
+    bool m_secondReloaded = false;
+    bool m_isInitilized = false;
+
+    public ZipEnumerator(IEnumerable&lt;T&gt; dataT, IEnumerable&lt;S&gt; dataS, Func&lt;T, S, TResult&gt; selector)
+    {
+      m_dataT = dataT ?? throw new ArgumentNullException(nameof(dataT));
+      m_dataS = dataS ?? throw new ArgumentNullException(nameof(dataS));
+      m_selector = selector ?? throw new ArgumentNullException(nameof(selector));
+    }
+
+    public TResult Current =&gt; m_selector(m_enumeratorT.Current, m_enumeratorS.Current);
+    object IEnumerator.Current =&gt; Current;
+
+    public void Dispose()
+    {
+      DoDispose();
+    }
+
+    private void RegisterDisposable(IDisposable disposable)
+    {
+      m_disposables.Add(disposable);
+      if (m_disposables.Count &gt; 10)
+      {
+        DoDispose();
+      }
+    }
+
+    private void DoDispose()
+    {
+      foreach (IDisposable disposable in m_disposables)
+      {
+        disposable.Dispose();
+      }
+      m_disposables.Clear();
+    }
+
+    private IEnumerator&lt;T&gt; GetTEnumerator()
+    {
+      var enumerator = m_dataT.GetEnumerator();
+      RegisterDisposable(enumerator);
+      return enumerator;
+    }
+
+    private IEnumerator&lt;S&gt; GetSEnumerator()
+    {
+      var enumerator = m_dataS.GetEnumerator();
+      RegisterDisposable(enumerator);
+      return enumerator;
+    }
+
+    private Func&lt;bool&gt; CurrentMover = null;
+
+    private bool FirstMover()
+    {
+      if (m_enumeratorT.MoveNext())
+      {
+        if (!m_enumeratorS.MoveNext())
+        {
+          m_enumeratorS = GetSEnumerator();
+          m_secondReloaded = true;
+          if (!m_enumeratorS.MoveNext())
+            return false;
+        }
+        return true;
+      }
+      else if (!m_secondReloaded)
+      {
+        CurrentMover = SecondMover;
+        return CurrentMover();
+      }
+
+      return false;
+    }
+
+    private bool SecondMover()
+    {
+      if (m_enumeratorS.MoveNext())
+      {
+        if (!m_enumeratorT.MoveNext())
+        {
+          m_enumeratorT = GetTEnumerator();
+          if (!m_enumeratorT.MoveNext())
+            return false;
+        }
+
+        return true;
+      }
+
+      return false;
+    }
+
+    private void Initialize()
+    {
+      m_enumeratorT = GetTEnumerator();
+      m_enumeratorS = GetSEnumerator();
+      CurrentMover = FirstMover;
+      m_isInitilized = true;
+    }
+
+    public bool MoveNext()
+    {
+      if (!m_isInitilized)
+      {
+        Initialize();
+      }
+      return CurrentMover();
+    }
+
+    public void Reset()
+    {
+      m_isInitilized = false;
+      m_secondReloaded = false;
+      CurrentMover = null;
+      m_enumeratorT = null;
+      m_enumeratorS = null;
+      DoDispose();
+    }
+  }
+</code></pre>
+    </div>

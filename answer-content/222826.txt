@@ -1,0 +1,408 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Since this is Code Review, and not Stack Overflow where you'd just want an answer... first a couple comments on your code:</p>
+
+<ol>
+<li><p>First off, this is not a monad with 4 shapes. This is a monad with 6 shapes. "maybe with" indicates you have more than one shape. This is a <em>lot</em> of shapes to keep track of with a single class. The data class is really: <code>Maybe&lt;OneOf&lt;Maybe&lt;Error&gt;, Maybe&lt;Percent&gt;, Data&gt;&gt;</code>... and that's bound to be messy.</p></li>
+<li><p>If you declare the type of the variable, TypeScript will not infer a more specific type. There's no cast needed here.</p>
+
+<pre><code>// I cast to make typescript forget about the fact that the data is loaded
+const data: Data&lt;number&gt; = Data.loaded(3) as any as Data&lt;number&gt;
+</code></pre></li>
+<li><p>Don't lie to the compiler. The <code>flatMap</code> implementation has:</p>
+
+<pre><code>case 'failed':
+    return Data.failed&lt;R, E&gt;((this.error as unknown) as E);
+</code></pre>
+
+<p>This can (and likely will) result in an error which isn't correct. You should either return <code>Data&lt;R, E | E2&gt;</code> or force the callback to return <code>Data&lt;R, E&gt;</code> where <code>E</code> is the same as the container.</p></li>
+<li><p>Does it make sense to have a <code>Data&lt;Data&lt;number, Error&gt;, Error&gt;</code>? I don't think it does... this is the same problem that the authors of the <code>Promise</code> spec had to solve, and they decided to solve it by breaking the monad laws. It may make sense to do the same. <code>Data</code> seems conceptually closer to <code>Promise</code> than <code>Either</code> to me.</p></li>
+<li><p>Since you have the <code>join</code> accessor, I would make <code>data</code> private. You can then use the <code>this</code> parameter to force an error if TS doesn't <em>know</em> that there is data present.</p>
+
+<pre><code>static getData&lt;T, E&gt;(wrapped: Data&lt;T, E&gt; &amp; { kind: "loaded", data: T }) {
+    return wrapped.join();
+}
+
+join(this: { data: T }) {
+    return this.data;
+}
+</code></pre></li>
+<li><p>I would expect the <code>get*OrElse</code> functions to return <code>NonNullable</code> types. When I call <code>getPercentOrElse(5)</code> I'd expect to receive a number, but I still might get <code>undefined</code>.</p></li>
+<li><p>It might be worth making a <code>const enum DataState { initial, loading, loaded, failed }</code> to avoid typing strings everywhere. As <code>const enum</code>s are inlined by the compiler, there will be no performance loss (and you can still use strings if you like).</p></li>
+</ol>
+
+<hr>
+
+<p>Here's one possible fix for your <code>Data.getData</code> function. I assume you don't want it to work unless you know <code>Data&lt;T, E&gt;</code> is actually <code>loaded</code>, so make that explicit, and your <code>number | undefined</code> issue goes away.</p>
+
+<pre><code>static getData&lt;T, E&gt;(wrapped: Data&lt;T, E&gt; &amp; { kind: "loaded", data: T }) {
+    wrapped.data;
+}
+</code></pre>
+
+<p>Alternatively, you can use conditional types to optionally include <code>undefined</code> in the return type, but this would be messier.</p>
+
+<hr>
+
+<p>Putting this last as it is more of a frame challenge than a review of your code:</p>
+
+<p>I believe the <code>Data</code> class does too much. I'd rather deal with multiple less complicated objects.</p>
+
+<p>What is the problem we are trying to solve here? We are pulling data from a back end API. This API might return the data we want, an error, or the network response itself might error. Thus, we have <code>Either&lt;NetworkError | APIError, Data&gt;</code>.</p>
+
+<p>Now, before the request resolves (either with data or an error) we will be in a loading state. We <em>could</em> overload our <code>Either&lt;NetworkError | APIError, Data&gt;</code> with another possible state, or we could let our caller deal with that, and only call this class once a concrete result is available.</p>
+
+<p>I prefer the second option. This will be achieved with a <code>Request</code> which will always have a "percent" completion (just 0 if not updated by the user) and a result. For convenience, a <code>Request</code> (unlike <code>Either</code>) will be mutable. Also for convenience, it will include the <code>Left</code> side of an <code>Either</code> result as its own <code>Error</code> state.</p>
+
+<p>If you might not have actually made a request yet, we might not have a percent completion or a result. Instead of adding an "initial" state, I'll just wrap cases which require this in <code>Maybe</code>.</p>
+
+<p>With these changes, here's what a simple app that makes an API request when the user clicks a button and displays the result could look like. </p>
+
+<pre><code>// This would be nicer to do with a React component
+let state: Maybe&lt;Request&lt;string, string&gt;&gt; = Maybe.nothing();
+
+const button = document.querySelector('button')!;
+const result = document.querySelector('#result') as HTMLDivElement;
+function render() {
+    state.match({
+        nothing() {
+            button.hidden = false;
+            result.hidden = true;
+        },
+        just(request) {
+            button.hidden = true;
+            result.hidden = false;
+
+            request.match({
+                loading(percent) {
+                    result.textContent = `Loading: ${percent * 100}%`;
+                },
+                error(error) {
+                    result.textContent = `ERROR: ${error}`;
+                },
+                result(data) {
+                    result.textContent = data;
+                }
+            });
+        }
+    });
+}
+
+// Todo
+function makeResponse(): Request&lt;string, string&gt; {}
+
+button.addEventListener('click', () =&gt; {
+    state = Maybe.just(makeResponse());
+    render();
+});
+
+render();
+</code></pre>
+
+<p>I don't actually need fully fleshed out <code>Maybe</code> and <code>Either</code> classes, so here's what I'll use:</p>
+
+<pre><code>export class Maybe&lt;T&gt; {
+    static nothing&lt;T&gt;() { return new Maybe&lt;T&gt;(undefined) }
+    static just&lt;T&gt;(value?: T) { return new Maybe(value) }
+
+    private constructor(private value?: T) {}
+
+    match&lt;A, B&gt;({ nothing, just }: {
+        nothing: () =&gt; A,
+        just: (value: T) =&gt; B
+    }): A | B {
+        return this.value == null ? nothing() : just(this.value)
+    }
+}
+
+// It isn't safe to use `undefined` as an empty signal since we could have `Either&lt;undefined, number&gt;`
+// Technically this applies to Maybe&lt;T&gt; as well, but I find it useful to allow undefined to signal nothing.
+const EMPTY: unique symbol = Symbol()
+type Empty = typeof EMPTY
+
+export class Either&lt;Left, Right&gt; {
+    private constructor(private data: [Left, Empty] | [Empty, Right]) {}
+
+    static left&lt;Left = unknown, Right = unknown&gt;(value: Left): Either&lt;Left, Right&gt; {
+        return new Either&lt;Left, Right&gt;([value, EMPTY]);
+    }
+
+    static right&lt;Left = unknown, Right = unknown&gt;(value: Right): Either&lt;Left, Right&gt; {
+        return new Either&lt;Left, Right&gt;([EMPTY, value]);
+    }
+
+    match&lt;T&gt;(left: (left: Left) =&gt; T, right: (right: Right) =&gt; T) {
+        return this.data[0] !== EMPTY ?
+            left(this.data[0]) :
+            right(this.data[1] as Right) // Unfortunately TS isn't smart enough to infer
+    }
+}
+</code></pre>
+
+<p>Now to implement our <code>Request</code>... it is surprisingly easy to model! This is an indication that the design is a good idea, since good design should make it easy to achieve our goals.</p>
+
+<pre><code>import { Either } from "./either";
+
+export class Request&lt;TData, TError = unknown&gt; {
+    private constructor(private percent: number, private data: Either&lt;TError, TData&gt; | undefined) {}
+
+    static incomplete() {
+        return new Request(0, undefined);
+    }
+
+    match&lt;T&gt;({ loading, error, result }: {
+        loading: (percent: number) =&gt; T,
+        error: (error: TError) =&gt; T,
+        result: (result: TData) =&gt; T
+    }) {
+        if (this.data === undefined) {
+            return loading(this.percent);
+        }
+        return this.data.match(error, result);
+    }
+
+    setPercent(percent: number) {
+        this.percent = percent;
+    }
+
+    setResult(result: TData) {
+        this.data = Either.right(result);
+    }
+
+    setError(error: TError) {
+        this.data = Either.left(error);
+    }
+}
+</code></pre>
+
+<p>With everything at once, here's our little demo app.</p>
+
+<pre><code>class Maybe&lt;T&gt; {
+    static nothing&lt;T&gt;() { return new Maybe&lt;T&gt;(undefined) }
+    static just&lt;T&gt;(value?: T) { return new Maybe(value) }
+
+    private constructor(private value?: T) {}
+
+    match&lt;A, B&gt;({ nothing, just }: {
+        nothing: () =&gt; A,
+        just: (value: T) =&gt; B
+    }): A | B {
+        return this.value == null ? nothing() : just(this.value)
+    }
+}
+
+const EMPTY: unique symbol = Symbol()
+type Empty = typeof EMPTY
+
+class Either&lt;Left, Right&gt; {
+    private constructor(private data: [Left, Empty] | [Empty, Right]) {}
+
+    static left&lt;Left = unknown, Right = unknown&gt;(value: Left): Either&lt;Left, Right&gt; {
+        return new Either&lt;Left, Right&gt;([value, EMPTY]);
+    }
+
+    static right&lt;Left = unknown, Right = unknown&gt;(value: Right): Either&lt;Left, Right&gt; {
+        return new Either&lt;Left, Right&gt;([EMPTY, value]);
+    }
+
+    match&lt;T&gt;(left: (left: Left) =&gt; T, right: (right: Right) =&gt; T) {
+        return this.data[0] !== EMPTY ?
+            left(this.data[0]) :
+            right(this.data[1] as Right); // Unfortunately TS isn't smart enough to infer
+    }
+}
+
+class Request&lt;TData, TError = unknown&gt; {
+    private constructor(private percent: number, private data: Either&lt;TError, TData&gt; | undefined) {}
+
+    static incomplete&lt;TData, TError&gt;() {
+        return new Request&lt;TData, TError&gt;(0, undefined);
+    }
+
+    match&lt;T&gt;({ loading, error, result }: {
+        loading: (percent: number) =&gt; T,
+        error: (error: TError) =&gt; T,
+        result: (result: TData) =&gt; T
+    }) {
+        if (this.data === undefined) {
+            return loading(this.percent);
+        }
+        return this.data.match(error, result);
+    }
+
+    setPercent(percent: number) {
+        this.percent = percent;
+    }
+
+    setResult(result: TData) {
+        this.data = Either.right(result);
+    }
+
+    setError(error: TError) {
+        this.data = Either.left(error);
+    }
+}
+
+// This would be nicer to do with a React component
+let state: Maybe&lt;Request&lt;string, string&gt;&gt; = Maybe.nothing();
+
+const button = document.querySelector('button')!;
+const result = document.querySelector('#result') as HTMLDivElement;
+function render() {
+    state.match({
+        nothing() {
+            button.hidden = false;
+            result.hidden = true;
+        },
+        just(request) {
+            button.hidden = true;
+            result.hidden = false;
+
+            request.match({
+                loading(percent) {
+                    result.textContent = `Loading: ${percent * 100}%`;
+                },
+                error(error) {
+                    result.textContent = `ERROR: ${error}`;
+                },
+                result(data) {
+                    result.textContent = data;
+                }
+            });
+        }
+    });
+}
+
+function makeResponse(): Request&lt;string, string&gt; {
+    const response = Request.incomplete&lt;string, string&gt;();
+    setTimeout(function () {
+        response.setPercent(.99);
+        render();
+    }, 500)
+    setTimeout(function () {
+        if (Math.random() &lt; 0.5) {
+            response.setResult('Got a result!')
+        } else {
+            response.setError('Got an error!')
+        }
+        render();
+    }, 2000)
+    return response;
+}
+
+button.addEventListener('click', () =&gt; {
+    state = Maybe.just(makeResponse());
+    render();
+});
+
+render();
+</code></pre>
+
+<p>And here's the app with the compiled source.</p>
+
+<p></p><div class="snippet" data-lang="js" data-hide="false" data-console="true" data-babel="false">
+<div class="snippet-code">
+<pre class="snippet-code-js lang-js prettyprint-override"><code>class Maybe {
+    constructor(value) {
+        this.value = value;
+    }
+    static nothing() { return new Maybe(undefined); }
+    static just(value) { return new Maybe(value); }
+    match({ nothing, just }) {
+        return this.value == null ? nothing() : just(this.value);
+    }
+}
+const EMPTY = Symbol();
+class Either {
+    constructor(data) {
+        this.data = data;
+    }
+    static left(value) {
+        return new Either([value, EMPTY]);
+    }
+    static right(value) {
+        return new Either([EMPTY, value]);
+    }
+    match(left, right) {
+        return this.data[0] !== EMPTY ?
+            left(this.data[0]) :
+            right(this.data[1]);
+    }
+}
+class Request {
+    constructor(percent, data) {
+        this.percent = percent;
+        this.data = data;
+    }
+    static incomplete() {
+        return new Request(0, undefined);
+    }
+    match({ loading, error, result }) {
+        if (this.data === undefined) {
+            return loading(this.percent);
+        }
+        return this.data.match(error, result);
+    }
+    setPercent(percent) {
+        this.percent = percent;
+    }
+    setResult(result) {
+        this.data = Either.right(result);
+    }
+    setError(error) {
+        this.data = Either.left(error);
+    }
+}
+let state = Maybe.nothing();
+const button = document.querySelector('button');
+const result = document.querySelector('#result');
+function render() {
+    state.match({
+        nothing() {
+            button.hidden = false;
+            result.hidden = true;
+        },
+        just(request) {
+            button.hidden = true;
+            result.hidden = false;
+            request.match({
+                loading(percent) {
+                    result.textContent = `Loading: ${percent * 100}%`;
+                },
+                error(error) {
+                    result.textContent = `ERROR: ${error}`;
+                },
+                result(data) {
+                    result.textContent = data;
+                }
+            });
+        }
+    });
+}
+function makeResponse() {
+    const response = Request.incomplete();
+    setTimeout(function () {
+        response.setPercent(.99);
+        render();
+    }, 500);
+    setTimeout(function () {
+        if (Math.random() &lt; 0.5) {
+            response.setResult('Got a result!');
+        }
+        else {
+            response.setError('Got an error!');
+        }
+        render();
+    }, 2000);
+    return response;
+}
+button.addEventListener('click', () =&gt; {
+    state = Maybe.just(makeResponse());
+    render();
+});
+render();</code></pre>
+<pre class="snippet-code-html lang-html prettyprint-override"><code>&lt;button&gt;Click me!&lt;/button&gt;
+&lt;div id="result"&gt;&lt;/div&gt;</code></pre>
+</div>
+</div>
+
+    </div>

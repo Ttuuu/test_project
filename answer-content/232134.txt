@@ -1,0 +1,98 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I did quite a lot of testing and trialling with this. For almost any size of container (both in elements and bytes), despite what one might think, a vector is much faster than a linked list for this job.  The linked list move out/in (using something like <code>std::list::splice</code>)  should be faster than vector, but the <a href="https://kjellkod.wordpress.com/2012/02/25/why-you-should-never-ever-ever-use-linked-list-in-your-code-again/" rel="nofollow noreferrer">linear search for the elements is far slower</a>. </p>
+
+<p>So I have specialised my template for <code>std::vector</code>. </p>
+
+<p>Also <code>std::sort</code> is comparatively slow, about 10x slower than <code>std:stable_partition</code>. <code>std::partition</code> was only marginally faster again in my testing. So preserving order seems reasonable. </p>
+
+<p>I believe my code may be cleaner and easier to read than @hoffmale version, using 3 standard STL algorithms . I am also not convinced that his version will be faster than stable_partition. That is because he makes N calls to <code>std::move</code> and N calls to <code>std::vector::erase</code>. I make only one "bulk" call to each. CPU L1 cache and all that...</p>
+
+<pre class="lang-cpp prettyprint-override"><code>template &lt;typename T, typename F&gt;
+void move_append_if(std::vector&lt;T&gt;&amp; vorig, std::vector&lt;T&gt;&amp; vdest, F&amp;&amp; p) {
+  auto part_it = std::stable_partition(vorig.begin(), vorig.end(), [p](T e) -&gt; bool { return !p(e); });
+  std::move(part_it, vorig.end(), std::back_inserter(vdest));
+  vorig.erase(part_it, vorig.end());
+}
+</code></pre>
+
+<p><strong>EDIT</strong>: Interesting news!</p>
+
+<p>Did some more testing with list. Firstly I found @hoffmale 's code not to work. I don't think you can do <code>*out = std::move(*iter);</code> because that doesn't match any signature <a href="https://en.cppreference.com/w/cpp/algorithm/move" rel="nofollow noreferrer">here</a>: and therefore it is just one of these "<a href="https://en.cppreference.com/w/cpp/utility/move" rel="nofollow noreferrer">static casts to rValueReference</a>". And I don't think the list container is properly aware of what is happening. My <code>out</code> ended up with "no content" anyway. </p>
+
+<p>So I did it with <code>std::list::splice</code> which is really the list specific precision missile for this job. Here is the list specialised template (didn't bother to make it generic for the container type):</p>
+
+<pre><code>template &lt;typename T, typename UnaryPredicate&gt;
+void move_append_if(std::list&lt;T&gt;&amp; in, std::list&lt;T&gt;&amp; vdest, UnaryPredicate&amp;&amp; predicate) {
+  for(auto iter = std::find_if(in.begin(), in.end(), predicate);
+      iter != in.end();
+      iter = std::find_if(iter, in.end(), predicate))
+    {
+      auto iter_next = std::next(iter);
+      vdest.splice(vdest.end(), in, iter);
+      iter = iter_next;
+    }
+}
+
+</code></pre>
+
+<p>And the performance? Very interesting. Despite the many individual calls to <code>std:list:splice</code> we get 40% better performance on move_append_if between 2 lists than between 2 vectors:</p>
+
+<pre><code>size=10
+vector=move_append_if=0.002295ms
+list  =move_append_if=0.00079ms
+
+size=100
+vector=move_append_if=0.00402ms
+list  =move_append_if=0.000895ms
+
+size=1000
+vector=move_append_if=0.011038ms
+list  =move_append_if=0.007606ms
+
+size=10000
+vector=move_append_if=0.06839ms
+list  =move_append_if=0.07759ms
+
+size=100000
+vector=move_append_if=1.2147ms
+list  =move_append_if=0.92521ms
+
+size=1000000
+vector=move_append_if=9.17283ms
+list  =move_append_if=6.51675ms
+
+size=10000000
+vector=move_append_if=109.566ms
+list  =move_append_if=61.7614ms
+
+size=100000000
+vector=move_append_if=1006.51ms
+list  =move_append_if=618.1ms
+
+</code></pre>
+
+<p>It turns out that the <code>std::move</code> part of the <code>std::vector</code> specific version is exactly the time difference with the list version. If the predicate is true more often and we do more moves, vectors slows down; list doesn't. The above figures are for containers full of random long ints with a 50% probability of the predicate being true. </p>
+
+<p>final code I settled on. A generic version for all Containers and a partially  specialised one for lists, which can take advantage of <code>std::list::splice</code>. I thought that was cleaner than all that constexpr std::is_same_v type juggling, since there is zero shared code between them.</p>
+
+<pre><code>template &lt;template &lt;typename...&gt; class Container, typename T, typename UnaryPredicate&gt;
+void move_append_if(Container&lt;T&gt;&amp; origin, Container&lt;T&gt;&amp; destination, UnaryPredicate&amp;&amp; predicate) {
+
+  auto part_it = std::stable_partition(origin.begin(), origin.end(), [&amp;](auto&amp;&amp; elem) { return !predicate(elem); });
+  std::move(part_it, origin.end(), std::back_inserter(destination));
+  origin.erase(part_it, origin.end());
+}
+
+template &lt;typename T, typename UnaryPredicate&gt;
+void move_append_if(std::list&lt;T&gt;&amp; origin, std::list&lt;T&gt;&amp; destination, UnaryPredicate&amp;&amp; predicate) {
+
+  for(auto iter = std::find_if(origin.begin(), origin.end(), predicate);
+      iter != origin.end();
+      iter = std::find_if(iter, origin.end(), predicate)) {
+    auto iter_next = std::next(iter);
+    destination.splice(destination.end(), origin, iter);
+    iter = iter_next;
+  }
+}
+</code></pre>
+    </div>

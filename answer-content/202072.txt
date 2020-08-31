@@ -1,0 +1,371 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I see a number of things that may help you improve your program.</p>
+
+<h2>Include relevant <code>#include</code> files</h2>
+
+<p>The code uses <code>std::mutex</code> which is defined in <code>&lt;mutex&gt;</code> and <code>std::condition_variable</code> which is in <code>&lt;condition_variable&gt;</code> but the code doesn't include those headers.  It should.</p>
+
+<h2>Avoid compiler extensions</h2>
+
+<p>The current code includes this code:</p>
+
+<pre><code>constexpr char complement[] = {
+    ['A']='T', ['a']='T',
+    // etc.
+    ['N']='N', ['n']='N'};
+</code></pre>
+
+<p>The problem with that is that designated initialization is, at this time <a href="http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2017/p0329r4.pdf" rel="nofollow noreferrer">a C++20 proposal</a> and even if adopted, would not support this syntax.</p>
+
+<h2>Add error handling</h2>
+
+<p>At the moment, the <code>getFileSize</code> function returns <code>-1</code> if the call to <code>stat</code> fails.  This results in <code>malloc</code> being called with <code>-1</code> which is translated, on my 64-bit machine, into 18446744073709551615 and so, of course, <code>malloc</code> fails.  Unfortunately, the return value of <code>malloc</code> is also not checked for error and this causes a crash.  Similarly, <code>fread</code> and <code>fopen</code> can fail; their return values should be checked.</p>
+
+<h2>Fix the bugs</h2>
+
+<p>The <code>main</code> code includes this check:</p>
+
+<pre><code>if(*(cursor+1)!='&gt;') // when not a sequence header
+    while(*cursor != '\n') cursor++;  //  skip the line
+</code></pre>
+
+<p>However, because <code>cursor</code> goes all the way to the end of the buffer, this will inevitably access one byte beyond the end of the buffer which is a bug.  Further, there is no bound on the inner loop which is also suspect.</p>
+
+<h2>Don't <code>detach</code> threads</h2>
+
+<p>This code deploys multiple threads and then detaches them all.  This is not a good idea generally, and is definitely a problem here.  Here's how it's used within the code:</p>
+
+<pre><code>for(unsigned i=0; i&lt;numberOfThreads; i++)
+    threads[i].detach();
+
+free(buffer);
+
+auto duration = std::chrono::duration_cast&lt; std::chrono::milliseconds&gt;
+(std::chrono::steady_clock::now() - start);
+</code></pre>
+
+<p>This is exactly why <code>detach</code> should only be used in rare circumstances!  Each of the threads was launched with a pair of pointers into <code>buffer</code>.  After all threads are detached, the <code>buffer</code> is destroyed, so those pointers that the threads are possibly still using are no longer valid.  This is a serious error!  Better is to restructure so that the threads end when they are finished with their data and then use <code>join</code> to wait for all threads to complete.  It also means that with the code as it is, you're only timing the amount of time to <em>launch</em> the threads and have no way to tell if they've completed or not.</p>
+
+<h2>Encapsulate in an object</h2>
+
+<p>Right now the code to handle file structure details is partly in some free-standing functions and partly in <code>main</code>.  It would be much neater and easier to understand if something like a <code>DNASequence</code> object were used.  That way all of the ugly details about how the file is processed would be neatly encapsulated within a single object implementation, and even details about how many threads to launch could reasonably be delegated.</p>
+
+<h2>Consider using standard library functions</h2>
+
+<p>There are two essential components to the task of converting a DNA sequence to its reverse complement: reversing and complementing.  These could be done in either order.  Using objects, here's how I'd write write a <code>main</code> loop:</p>
+
+<pre><code>int main(int argc, char *argv[]) {
+    if (argc != 3) {
+        std::cerr &lt;&lt; "Usage: revdna inputfile outputfile\n";
+        return 1;
+    }
+    std::ifstream in{argv[1]};
+    std::ofstream out{argv[2]};
+    DNASequence dna;
+    while (in &gt;&gt; dna) {
+        out &lt;&lt; dna.reverse_complement();
+    }
+}
+</code></pre>
+
+<p>Note that there is no mention of tasks or threads here, since the reading of the file is sequential anyway.  Given the simplicity of the transformation required, I would expect that the program would largely be I/O bound and not computationally bound, so speeding the transformation is unlikely to benefit the overall performance as much as simply having faster hardware (e.g. solid-state drives).</p>
+
+<p>I'd probably write the <code>reverse_complement</code> function using <code>std::reverse</code> and <code>std::toupper</code> with a custom locale.</p>
+
+<h2>An example</h2>
+
+<p>I reworked the code using most of the suggestions above except using <code>std::reverse</code> and a custom locale.  Here is the result:</p>
+
+<pre><code>#include &lt;iostream&gt;
+#include &lt;fstream&gt;
+#include &lt;string&gt;
+#include &lt;limits&gt;
+#include &lt;algorithm&gt;
+
+class DNASequence {
+public:
+    friend std::istream&amp; operator&gt;&gt;(std::istream&amp; in, DNASequence&amp; dna);
+    friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; out, const DNASequence&amp; dna);
+    DNASequence&amp; reverse_complement();
+    static constexpr char delim = '&gt;';
+private:
+    static char complement(char ch);
+    std::string header;
+    std::string dna; 
+};
+
+std::istream&amp; operator&gt;&gt;(std::istream&amp; in, DNASequence&amp; dna) {
+    // look for a header
+    in.ignore(std::numeric_limits&lt;std::streamsize&gt;::max(), dna.delim); 
+    std::getline(in, dna.header);
+    // fetch the DNA sequence
+    std::getline(in, dna.dna, dna.delim);
+    in.putback(dna.delim);
+    return in;
+}
+
+std::ostream&amp; operator&lt;&lt;(std::ostream&amp; out, const DNASequence&amp; dna) {
+    return out &lt;&lt; dna.delim &lt;&lt; dna.header &lt;&lt; '\n' &lt;&lt; dna.dna;
+}
+
+char DNASequence::complement(char ch) {
+    switch (ch) {
+        case 'A':
+        case 'a':
+            ch = 'T';
+            break;
+        case 'C':
+        case 'c':
+            ch ='G';
+            break;
+        case 'G':
+        case 'g':
+            ch ='C'; 
+            break;
+        case 'T':
+        case 't':
+            ch ='A';
+            break;
+        case 'U':
+        case 'u':
+            ch ='A';
+            break;
+        case 'M':
+        case 'm':
+            ch ='K';
+            break;
+        case 'R':
+        case 'r':
+            ch ='Y';
+            break;
+        case 'W':
+        case 'w':
+            ch ='W';
+            break;
+        case 'S':
+        case 's':
+            ch ='S';
+            break;
+        case 'Y':
+        case 'y':
+            ch ='R';
+            break;
+        case 'K':
+        case 'k':
+            ch ='M';
+            break;
+        case 'V':
+        case 'v':
+            ch ='B';
+            break;
+        case 'H':
+        case 'h':
+            ch ='D';
+            break;
+        case 'D':
+        case 'd':
+            ch ='H';
+            break;
+        case 'B':
+        case 'b':
+            ch ='V';
+            break;
+        case 'N':
+        case 'n':
+            ch ='N';
+            break;
+        default:
+            ch = '?';  // this is an error!
+    }
+    return ch;
+}
+
+DNASequence&amp; DNASequence::reverse_complement() {
+    auto front = dna.begin();
+    auto back = front + dna.size() - 1;
+    while (back &gt; front) {
+        if (*front == '\n') {
+            ++front;
+        } else if (*back == '\n') {
+            --back;
+        } else {
+            *back = complement(*back);
+            *front = complement(*front);
+            std::swap(*back, *front);
+            ++front;
+            --back;
+        }
+    }
+    return *this;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 3) {
+        std::cerr &lt;&lt; "Usage: revdna inputfile outputfile\n";
+        return 1;
+    }
+    std::ifstream in{argv[1]};
+    std::ofstream out{argv[2]};
+    DNASequence dna;
+    while (in &gt;&gt; dna) {
+        out &lt;&lt; dna.reverse_complement();
+    }
+}
+</code></pre>
+
+<h2>Results</h2>
+
+<p>I downloaded a FASTA format file for <a href="https://www.ncbi.nlm.nih.gov/nuccore/CM000368.1?report=fasta" rel="nofollow noreferrer">Monodelphis domestica chromosome 1</a> which is a 724M file.  Running this program on my machine, (a 64-bit Linux box),  I get the following times:</p>
+
+<pre><code>real    0m5.988s
+user    0m0.802s
+sys     0m1.123s
+</code></pre>
+
+<p>I think you'll find that when actually measured, <code>iostream</code>s, when implemented and used in a rational way, are not necessarily any slower than the old <code>FILE</code> I/O.  See <a href="https://stackoverflow.com/questions/18688763/why-is-istream-ostream-slow">this question</a> and as always, <strong>don't assume; measure!</strong></p>
+
+<h2>More measurements and notes</h2>
+
+<p>In the interests of further investigating timing implications, I've done some more investigation.  Specifically, I've concatenated the FASTA file above with that of <a href="https://www.ncbi.nlm.nih.gov/nuccore/AE014296.5?report=fasta" rel="nofollow noreferrer">Drosophila melanogaster chromosome 3L</a> to obtain a file 787253613 byte long (751Mib).  I altered the original as little as possible to create a single-threaded version that compiles cleanly with <code>gcc</code>.  That version is here:</p>
+
+<pre><code>#include &lt;iostream&gt;
+#include &lt;chrono&gt;
+#include &lt;cstdio&gt;
+#include &lt;sys/stat.h&gt;
+
+static char complement[256];
+
+void comp_init() {
+    complement['A']='T'; complement['a']='T';
+    complement['C']='G'; complement['c']='G';
+    complement['G']='C'; complement['g']='C';
+    complement['T']='A'; complement['t']='A';
+    complement['U']='A'; complement['u']='A';
+    complement['M']='K'; complement['m']='K';
+    complement['R']='Y'; complement['r']='Y';
+    complement['W']='W'; complement['w']='W';
+    complement['S']='S'; complement['s']='S';
+    complement['Y']='R'; complement['y']='R';
+    complement['K']='M'; complement['k']='M';
+    complement['V']='B'; complement['v']='B';
+    complement['H']='D'; complement['h']='D';
+    complement['D']='H'; complement['d']='H';
+    complement['B']='V'; complement['b']='V';
+    complement['N']='N'; complement['n']='N';
+}
+
+namespace helpers {
+    size_t getFileSize(const char *filename)
+    {
+        struct stat stat_buf;
+        int rc = stat(filename, &amp;stat_buf);
+        return rc == 0 ? stat_buf.st_size : -1;
+    }
+}
+
+static inline void staticTransformation(char* front, char *back) {
+    char help;
+    while(front &lt; back) {
+        if(*front=='\n') {
+            front++;
+        }
+        if(*back=='\n') {
+           back--;
+        }
+        // swap after complement
+        help = complement[(*front)];
+        *front = complement[(*back)];
+        *back = help;
+        front++;
+        back--;
+    }
+}
+
+int main(int argc, const char * argv[]) {
+    if (argc != 3) {
+        std::cerr &lt;&lt; "Usage: revdna inputfile outputfile\n";
+        return 1;
+    }
+    comp_init();
+    size_t buffer_size = 0;
+    auto start = std::chrono::steady_clock::now();
+    buffer_size = helpers::getFileSize(argv[1]);
+    char* buffer = static_cast&lt;char*&gt;(malloc(buffer_size));
+    // Read the file and close
+    FILE *file = fopen(argv[1],"r");
+    fread(buffer, sizeof(char), buffer_size, file);
+    fclose(file);
+    char* sequence_start = 0;  // start of the plain base codes, excl. header and first nl
+    char* sequence_end = 0;    // end of the plain base codes, eccl. the last nl
+
+    for(char* cursor = buffer; cursor &lt; buffer+buffer_size; cursor++) {
+        if(*cursor == '&gt;') {   // found header of a sequence
+            if(sequence_end &gt; sequence_start) { // Sequenz fertig gecodet
+                staticTransformation(sequence_start, sequence_end);
+            }
+            while(*cursor != '\n') cursor++;  //  skip the header
+            cursor++;  // skip the newline at the end of the header
+            sequence_start = cursor;   // store address of first letter code
+        }
+        if(*cursor == '\n') { // potential end of a sequence
+            sequence_end = cursor-1;
+            if(*(cursor+1)!='&gt;') // when not a sequence header
+                while(*cursor != '\n') cursor++;  //  skip the line
+        }
+    }
+    staticTransformation(sequence_start,sequence_end);
+    file = fopen(argv[2],"w");
+    fwrite(buffer, sizeof(char), buffer_size, file);
+    fclose(file);
+    free(buffer);
+    auto duration = std::chrono::duration_cast&lt; std::chrono::milliseconds&gt;(
+            std::chrono::steady_clock::now() - start);
+    std::cout &lt;&lt; "\n\nZeit: " &lt;&lt; duration.count() &lt;&lt; " ms\n";
+}
+</code></pre>
+
+<h3>g++ vs clang++ and <code>iostream</code> vs <code>FILE</code></h3>
+
+<p>Compiled with -O3 using g++ 8.1.1 on a 64-bit Linux (Redhat distribution) the <code>iostream</code> version of the code:</p>
+
+<pre><code>real    0m6.846s
+user    0m0.862s
+sys     0m1.095s
+</code></pre>
+
+<p>These numbers are fairly consistent across multiple runs.</p>
+
+<p>Using clang++ 6.0.1 </p>
+
+<pre><code>real    0m6.776s
+user    0m1.156s
+sys     0m1.188s
+</code></pre>
+
+<p>With the <code>FILE</code>-based code above with g++:</p>
+
+<pre><code>real    0m6.362s
+user    0m0.780s
+sys     0m0.842s
+</code></pre>
+
+<p>And with clang++:</p>
+
+<pre><code>real    0m6.298s
+user    0m0.790s
+sys     0m0.832s
+</code></pre>
+
+<p>All were compiled with the same flags (<code>-O3</code> and <code>-lstdc++</code>) so were using the same optimization level and library.  Also, all versions of the program produced identical outputs which were then verified by running again on the output and comparing the doubly-transformed file to the original (they were, as expected, identical.)  As measured by <code>perf</code>, the <code>iostream</code> versions varied by about 3%, and had around 446,000 page faults, while the <code>FILE</code> versions varied by around 1% and had around 116 page faults.</p>
+
+<p>Differences which may account for timing differences are that the <code>iostream</code> version reads in one block at a time (8K by default on this machine) and uses a <code>std::string</code> which is resized multiple times during the read, while the <code>FILE</code> version reads the whole file at once (unless it can't and then it fails with a segfault) and performs the reversing in-place on a single buffer.</p>
+
+<h2>Significant speed-up</h2>
+
+<p>Curiously, if I insert this line within main (in any version):</p>
+
+<pre><code>std::remove(argv[2]);
+</code></pre>
+
+<p>The <code>real</code> time drops from around 6.5 to around 1.7 seconds.</p>
+    </div>

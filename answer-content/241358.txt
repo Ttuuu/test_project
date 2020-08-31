@@ -1,0 +1,149 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>template&lt;typename T&gt;
+class IFile: public FileBase&lt;std::ifstream, T&gt; { ... };
+
+template&lt;typename T&gt;
+class OFile: public FileBase&lt;std::ofstream, T&gt; { ... };
+
+template&lt;typename T&gt;
+class File: public FileBase&lt;std::fstream, T&gt; { ... };
+</code></pre>
+
+<p>Read and write functions are both accessible in the <code>FileBase</code> interface for all three of these anyway, right? So we could delete these classes, use <code>std::fstream</code> all the time, and just pass in the appropriate open mode. (Perhaps adding an <code>enum class WriteMode { Read, Write, ReadWrite };</code> to pass into the FileBase constructor).</p>
+
+<hr>
+
+<pre><code>FileBase(std::string fileName = "", openmode mode = 0);
+</code></pre>
+
+<p>Not sure having default arguments here makes sense.</p>
+
+<hr>
+
+<pre><code>template&lt;typename S, typename T&gt;
+class FileBase: public FileMembers&lt;S, T&gt;
+</code></pre>
+
+<p>Yiiiiikes. Are all the <code>FileMembers</code> functions publicly accessible to users of <code>FileBase</code> too? So we have three different open functions, a close function that hides the close function in the <code>FileMembers</code> class, etc. Seems like a recipe for confusion.</p>
+
+<p>We should be using composition, not inheritance:</p>
+
+<pre><code>struct FileBase
+{
+public:
+    FileBase(...);
+
+    void open(...);
+    void close();
+    ...
+
+private:
+    IndexFile index;
+    FileMembers members;
+};
+</code></pre>
+
+<p>Maybe we have to forward some function calls from the <code>FileBase</code> interface, but it's much, much simpler.</p>
+
+<hr>
+
+<pre><code>    bool            fileOpened;
+</code></pre>
+
+<p>Seems unnecessary. We can just check if the files are opened, and not have to worry about updating a variable if something changes.</p>
+
+<p>e.g.</p>
+
+<pre><code>template&lt;typename S, typename T&gt;
+void FileBase&lt;S, T&gt;::open(openmode mode)
+{
+    if (baseFileName == "")
+    {
+        return;
+    }
+    fileOpened = true;
+    FileMembers&lt;S, T&gt;::clear();
+
+    Impl::OpenState&lt;T&gt; state = FileMembers&lt;S, T&gt;::doOpenTry(fileOpened, baseFileName, mode);
+    FileMembers&lt;S, T&gt;::doOpenFin(fileOpened, baseFileName, mode, state);
+
+    if (!fileOpened)
+    {
+        FileMembers&lt;S, T&gt;::setstate(failbit);
+    }
+    else
+    {
+        index.open(baseFileName + "/$index", mode);
+        getPos  = index.tellg();
+        putPos  = index.tellp();
+    }
+}
+</code></pre>
+
+<p>What if the index file doesn't open? We already set <code>fileOpened</code> to <code>true</code>...</p>
+
+<hr>
+
+<pre><code>    streampos       getPos;
+    streampos       putPos;
+</code></pre>
+
+<p>Same again. Are these actually used anywhere? Can't we get them from the <code>index</code> file stream (<code>tellg</code>, <code>tellp</code>) whenever we need to?</p>
+
+<hr>
+
+<p>Opening seems over-complicated.</p>
+
+<p>I don't think there's much point in a "pre-check". It seems like optimizing the rare fail-case, and making our common best-case slower.</p>
+
+<p>Our check can be wrong / obsolete immediately anyway. So just open it! If it fails, it fails.</p>
+
+<hr>
+
+<p>It might be worth specifying a separate <code>enum class MissingMode { Create, Fail }</code> we can use when opening the database, separate from the <code>WriteMode</code>. So if we expect to open an existing database at a given point, and it's not there, we can avoid creating a new empty database if we want to.</p>
+
+<hr>
+
+<p>There's a lot of state stuff based on the C++ <code>std::fstream</code> states:</p>
+
+<pre><code>        void setstate(iostate extraState)       {setstateLocalOnly(extraState); setstateMembers(extraState, Index{});}
+        void clear(iostate newState = goodbit)  {clearLocalOnly(newState);      clearMembers(newState, Index{});}
+
+        // https://en.cppreference.com/w/cpp/io/ios_base/iostate
+        bool good()                             const   {return !(state &amp; (eofbit | badbit | failbit));}
+        bool eof()                              const   {return state &amp; eofbit;}
+        bool bad()                              const   {return state &amp; badbit;}
+        bool fail()                             const   {return state &amp; (failbit | badbit);}
+        operator bool()                         const   {return !fail();}
+        bool operator!()                        const   {return !static_cast&lt;bool&gt;(*this);}
+        iostate rdstate()                       const   {return state;}
+</code></pre>
+
+<p>Managing that state member flag is probably quite complicated and error prone. And is it really better to keep track of it, instead of calculating it on demand?</p>
+
+<p>I suspect that some of these errors should only happen when the database implementation is buggy, or an underlying file is corrupted, or something is Seriously Wrong. In that case, I don't think providing separate <code>eof()</code>, <code>bad()</code>, <code>fail()</code> methods makes sense. i.e. That <code>eof</code> error happened in a single file; we don't know which, and we don't know why, we only really care that our database is borked.</p>
+
+<p>We have no access to the underlying streams. The user probably doesn't even care that there <em>are</em> underlying file streams, let alone what state one of the files (and which one?) is in.</p>
+
+<p>I'd either return boolean values on specific actions (e.g. did our read work?) or throw specific error messages (e.g. `throw ReadError("Unexpected eof reading member {Foo} at index {I}");') when something goes wrong.</p>
+
+<p>So maybe two separate functions: <code>bool tryRead(foo);</code> and <code>void read(foo);</code>.</p>
+
+<hr>
+
+<p>We can avoid a some complexity by not providing an <code>open</code> function. :)</p>
+
+<p>We can provide:</p>
+
+<ul>
+<li>Default constructor (just a closed database).</li>
+<li>Value constructor (to open a database).</li>
+<li>Move constructor and move assignment operator.</li>
+</ul>
+
+<p>This means we don't have to care about logic for re-opening an already-open database. We just use the move assignment operator.</p>
+
+<hr>
+
+<p>Perhaps all the iteration over tuples could be abstracted into a separate function somehow?</p>
+    </div>

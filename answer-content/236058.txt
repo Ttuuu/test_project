@@ -1,0 +1,249 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>A refactored improved version taking on board many of the points from <a href="https://codereview.stackexchange.com/a/236042/212940">@G.Sliepen's answer</a> and then building on them:</p>
+
+<ul>
+<li>No more <code>void*</code> except for the general form <code>ctor</code> of <code>hd</code></li>
+<li>Main function <code>hex_dump()</code> totally refactored. Better. </li>
+<li><code>hd</code> ctor now has 2 overloads. </li>
+</ul>
+
+<p>There is a general form of hd ctor with <code>(adr, size)</code> and then a templated form which takes a reference. The general for of that template calls <code>sizeof()</code> and uses <code>&amp;var</code> for the address. </p>
+
+<p>But there are also specialisations for <code>std::string_view</code> and <code>std::string</code> which:</p>
+
+<ol>
+<li>do the same as the general form (gives the stack part of the obj)</li>
+<li>Then chain a new instance of hd for the heap part of the object</li>
+</ol>
+
+<p>I am still validating this design. It seems to work fine. Feedback welcome. When bedded down, I should be able to extend it to say <code>std::vector</code>: Printing the stack and heaps parts of the container. It might even be able to recurse down multiple layers. </p>
+
+<p>New code and output below. </p>
+
+<p><strong>Small surprise</strong>: libstd++ uses 32bytes of stack for a heap allocated string? A <code>.data()</code> ptr a <code>size()</code> and another size which turns out to be the <code>.capacity()</code>. The remaining 8 bytes are alignment junk? Anyway we adjusted code to show the whole <code>capacity</code> of buffer which has been <code>reserved()</code>. Not just the current <code>size()</code>.</p>
+
+<pre><code>#include &lt;bits/stdint-intn.h&gt;
+#include &lt;iomanip&gt;
+#include &lt;iostream&gt;
+#include &lt;memory&gt;
+
+// utility: keeps states of an ostream, restores on destruction
+template &lt;typename T&gt;
+struct ostream_state {
+  explicit ostream_state(std::basic_ostream&lt;T&gt;&amp; stream)
+      : stream_{stream}, flags_{stream.flags()}, fill_{stream.fill()} {}
+
+  ostream_state(const ostream_state&amp; other) = delete;
+  ostream_state&amp; operator=(const ostream_state&amp; other) = delete;
+
+  ostream_state(ostream_state&amp;&amp; other) = delete;
+  ostream_state&amp; operator=(ostream_state&amp;&amp; other) = delete;
+
+  ~ostream_state() {
+    stream_.flags(flags_);
+    stream_.fill(fill_);
+  }
+
+private:
+  std::basic_ostream&lt;T&gt;&amp;                    stream_;
+  std::ios_base::fmtflags                   flags_;
+  typename std::basic_ostream&lt;T&gt;::char_type fill_;
+};
+
+namespace detail {
+inline void print_adr(std::ostream&amp; os, const std::byte* adr) {
+  os &lt;&lt; std::setw(19) &lt;&lt; std::setfill(' ') &lt;&lt; adr; // NOLINT
+}
+
+inline void print_fill_advance(std::ostream&amp; os, const std::byte*&amp; buf, std::size_t cnt,
+                               const std::string&amp; str) {
+  while (cnt-- != 0U) {
+    ++buf; // NOTE: unusually this in passsed in by ref and we advance it. NOLINT
+    os &lt;&lt; str;
+  }
+}
+
+inline void print_hex(std::ostream&amp; os, const std::byte* buf, std::size_t linesize, std::size_t pre,
+                      std::size_t post) {
+  print_fill_advance(os, buf, pre, "-- ");
+  {
+    os &lt;&lt; std::setfill('0') &lt;&lt; std::hex;
+    auto cnt = linesize - pre - post;
+    while (cnt-- != 0U) os &lt;&lt; std::setw(2) &lt;&lt; static_cast&lt;unsigned&gt;(*buf++) &lt;&lt; ' '; // NOLINT
+  }
+  print_fill_advance(os, buf, post, "-- ");
+}
+
+inline void print_ascii(std::ostream&amp; os, const std::byte* buf, std::size_t linesize,
+                        std::size_t pre, std::size_t post) {
+  print_fill_advance(os, buf, pre, ".");
+  auto cnt = linesize - pre - post;
+  while (cnt-- != 0U) {
+    os &lt;&lt; (std::isprint(static_cast&lt;unsigned char&gt;(*buf)) != 0 ? static_cast&lt;char&gt;(*buf) : '.');
+    ++buf; // NOLINT
+  }
+  print_fill_advance(os, buf, post, ".");
+}
+} // namespace detail
+
+inline std::ostream&amp; hex_dump(std::ostream&amp; os, const std::byte* buffer, std::size_t bufsize) {
+  if (buffer == nullptr || bufsize == 0) return os;
+
+  constexpr std::size_t linesize{16};
+  const std::byte*      buf{buffer};
+  std::size_t           pre =
+      reinterpret_cast&lt;std::size_t&gt;(buffer) % linesize; // Size of pre-buffer area  NOLINT
+  bufsize += pre;
+  buf -= pre; // NOLINT
+
+  auto state = ostream_state{os}; // save stream setting and restore at end of scope
+  while (bufsize != 0U) {
+    std::size_t post = bufsize &lt; linesize ? linesize - bufsize : 0;
+
+    detail::print_adr(os, buf);
+    os &lt;&lt; ": ";
+    detail::print_hex(os, buf, linesize, pre, post);
+    os &lt;&lt; " | ";
+    detail::print_ascii(os, buf, linesize, pre, post);
+    os &lt;&lt; "\n";
+
+    buf += linesize; // NOLINT
+    bufsize -= linesize - post;
+    pre = 0;
+  }
+  return os;
+}
+
+class hd {
+public:
+  hd(const void* buf, std::size_t bufsz)
+      : buffer_{reinterpret_cast&lt;const std::byte*&gt;(buf)}, bufsize_{bufsz} {}
+
+  template &lt;typename T&gt;
+  explicit hd(const T&amp; buf)
+      : buffer_{reinterpret_cast&lt;const std::byte*&gt;(&amp;buf)}, bufsize_{sizeof(T)} {}
+
+  // It's UB to access `+ 1`th byte of a string_view so we don't, despite most
+  // targets of string_views (ie std::string or string literal) having '\0'.
+  template &lt;&gt;
+  explicit hd(const std::string_view&amp; buf)
+      : buffer_{reinterpret_cast&lt;const std::byte*&gt;(&amp;buf)}, bufsize_{sizeof(buf)} {
+    child_       = std::make_unique&lt;hd&gt;(buf.data(), buf.size());
+    child_label_ = "string viewed";
+  }
+
+  // There is some debate but we believe str[size()] is legal via [] or *
+  // but UB via iterator. So here we DO show the '`0' terminator.
+  template &lt;&gt;
+  explicit hd(const std::string&amp; buf)
+      : buffer_{reinterpret_cast&lt;const std::byte*&gt;(&amp;buf)}, bufsize_{sizeof(buf)} {
+    auto data_byte_ptr = reinterpret_cast&lt;const std::byte*&gt;(buf.data());
+    if (!(data_byte_ptr &gt; buffer_ &amp;&amp; data_byte_ptr &lt; buffer_ + bufsize_)) {
+      // not SBO, show the real string as well
+      child_ = std::make_unique&lt;hd&gt;(buf.data(), buf.size() + 1);
+      child_label_ = "heap string";
+    }
+  }
+
+  friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; os, const hd&amp; hd) {
+    hex_dump(os, hd.buffer_, hd.bufsize_); // NOLINT
+    if (hd.child_) os &lt;&lt; std::setw(19) &lt;&lt; hd.child_label_ &lt;&lt; ":\n" &lt;&lt; *(hd.child_);
+    return os;
+  }
+
+private:
+  const std::byte* buffer_;
+  std::size_t      bufsize_;
+
+  std::unique_ptr&lt;hd&gt; child_ = nullptr;
+  std::string         child_label_;
+};
+
+// start of demo/test
+
+struct Dummy {
+  int16_t a      = 0x1111;
+  int32_t b      = 0x22222222;
+  int32_t c      = 0x33333333;
+  void*   end    = (void*)0xffffffffffffffff; // NOLINT end of earth
+};
+
+int main() {
+  auto i1 = int{0x12345678}; // 4 bytes int, 4-byte aligned
+  std::cout &lt;&lt; os::hd(i1) &lt;&lt; '\n';
+
+  auto pi = 22/7.0; // 8bytes on stack
+  std::cout &lt;&lt; os::hd(pi) &lt;&lt; '\n';
+
+  auto sv1 = std::string_view{"1234567890"}; // in .text (ie code) segment =&gt; non-aligned
+  std::cout &lt;&lt; os::hd(sv1) &lt;&lt; '\n';
+
+  auto sv2 = std::string_view{"This is a much longer string view onto a string literal"};
+  std::cout &lt;&lt; os::hd(sv2) &lt;&lt; '\n'; // starts after sv1 with '\0' gap
+
+  auto i2 = short{0x1234};  // 2 bytes int, 4-byte aligned
+  std::cout &lt;&lt; os::hd(i2) &lt;&lt; '\n';
+
+  auto str1 = std::string{"123456789012345"}; // SBO on stack =&gt; 16-byte aligned??
+  std::cout &lt;&lt; os::hd(str1) &lt;&lt; '\n';
+
+  auto str2 = std::string{"1234567890123456"}; // too big for SBO =&gt; on heap =&gt; 16Byte aligned
+  std::cout &lt;&lt; os::hd(str2) &lt;&lt; '\n';
+
+  auto d1 = Dummy{}; // on stack 8-byte aligned with padding gaps
+  std::cout &lt;&lt; os::hd(d1) &lt;&lt; '\n';
+
+  auto d2 = std::make_unique&lt;Dummy&gt;(); // on heap 16byte aligned with padding gaps
+  std::cout &lt;&lt; os::hd(d2.get(), sizeof(*d2)) &lt;&lt; '\n';
+
+  auto d3 = std::make_unique&lt;Dummy[]&gt;(4); // array on heap 8-byte aligned: odd/even NOLINT
+  std::cout &lt;&lt; os::hd(d3.get(), 4 * sizeof(d3[0])) &lt;&lt; '\n';
+}
+</code></pre>
+
+<p>Output</p>
+
+<pre><code>     0x7ffcb8d3d350: -- -- -- -- 78 56 34 12 -- -- -- -- -- -- -- --  | ....xV4.........
+
+     0x7ffcb8d3d370: -- -- -- -- -- -- -- -- 49 92 24 49 92 24 09 40  | ........I.$I.$.@
+
+     0x7ffcb8d3d3a0: -- -- -- -- -- -- -- -- 0a 00 00 00 00 00 00 00  | ................
+     0x7ffcb8d3d3b0: 42 66 42 00 00 00 00 00 -- -- -- -- -- -- -- --  | BfB.............
+      string viewed:
+           0x426640: -- -- 31 32 33 34 35 36 37 38 39 30 -- -- -- --  | ..1234567890....
+
+     0x7ffcb8d3d390: -- -- -- -- -- -- -- -- 37 00 00 00 00 00 00 00  | ........7.......
+     0x7ffcb8d3d3a0: 4d 66 42 00 00 00 00 00 -- -- -- -- -- -- -- --  | MfB.............
+      string viewed:
+           0x426640: -- -- -- -- -- -- -- -- -- -- -- -- -- 54 68 69  | .............Thi
+           0x426650: 73 20 69 73 20 61 20 6d 75 63 68 20 6c 6f 6e 67  | s is a much long
+           0x426660: 65 72 20 73 74 72 69 6e 67 20 76 69 65 77 20 6f  | er string view o
+           0x426670: 6e 74 6f 20 61 20 73 74 72 69 6e 67 20 6c 69 74  | nto a string lit
+           0x426680: 65 72 61 6c -- -- -- -- -- -- -- -- -- -- -- --  | eral............
+
+     0x7ffcb8d3d320: -- -- -- -- -- -- -- -- -- -- -- -- -- -- 34 12  | ..............4.
+
+     0x7ffcb8d3d330: 40 d3 d3 b8 fc 7f 00 00 0f 00 00 00 00 00 00 00  | @...............
+     0x7ffcb8d3d340: 31 32 33 34 35 36 37 38 39 30 31 32 33 34 35 00  | 123456789012345.
+
+     0x7ffcb8d3d350: -- -- -- -- -- -- -- -- 90 f8 e1 01 00 00 00 00  | ................
+     0x7ffcb8d3d360: 10 00 00 00 00 00 00 00 10 00 00 00 00 00 00 00  | ................
+     0x7ffcb8d3d370: 08 e0 04 eb 00 7f 00 00 -- -- -- -- -- -- -- --  | ................
+        heap string:
+          0x1e1f890: 31 32 33 34 35 36 37 38 39 30 31 32 33 34 35 36  | 1234567890123456
+          0x1e1f8a0: 00 -- -- -- -- -- -- -- -- -- -- -- -- -- -- --  | ................
+
+     0x7ffcb8d3d380: 11 11 42 00 22 22 22 22 33 33 33 33 00 00 00 00  | ..B.""""3333....
+     0x7ffcb8d3d390: ff ff ff ff ff ff ff ff -- -- -- -- -- -- -- --  | ................
+
+          0x1e1f910: 11 11 00 00 22 22 22 22 33 33 33 33 00 00 00 00  | ....""""3333....
+          0x1e1f920: ff ff ff ff ff ff ff ff -- -- -- -- -- -- -- --  | ................
+
+          0x1e11eb0: 11 11 00 00 22 22 22 22 33 33 33 33 00 00 00 00  | ....""""3333....
+          0x1e11ec0: ff ff ff ff ff ff ff ff 11 11 00 00 22 22 22 22  | ............""""
+          0x1e11ed0: 33 33 33 33 00 00 00 00 ff ff ff ff ff ff ff ff  | 3333............
+          0x1e11ee0: 11 11 00 00 22 22 22 22 33 33 33 33 00 00 00 00  | ....""""3333....
+          0x1e11ef0: ff ff ff ff ff ff ff ff 11 11 00 00 22 22 22 22  | ............""""
+          0x1e11f00: 33 33 33 33 00 00 00 00 ff ff ff ff ff ff ff ff  | 3333............
+</code></pre>
+    </div>

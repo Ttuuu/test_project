@@ -1,0 +1,236 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I think you have a potential usage issue with wrapping these methods in a class. While it's convenient that the <code>Class_Terminate</code> method will automatically re-enable updating, it makes keeping track of the usage of such an object the responsibility of the caller (or calling module or of the entire project). Where you can easily get into trouble is when you start making calls to other objects or functions that might need to make the same disable/enable actions for speed. This is especially apparent if you create a personal library of routines that you can reuse.</p>
+
+<p>My preferred approach to this was to create a standalone module that I can easily import into any VBA project and use immediately. The public methods are <code>DisableUpdating</code> and <code>EnableUpdating</code>. In every day use I can now create:</p>
+
+<pre><code>Sub MainProgram()
+    DisableUpdating
+    ...
+    LibrarySub1 &lt;some vars&gt;
+    ...
+    EnableUpdating
+End Sub
+
+Sub LibrarySub1(&lt;some vars&gt;)
+    DisableUpdating
+    ...
+    EnableUpdating
+End Sub
+</code></pre>
+
+<p>But you can see the potential problem in nesting these calls.</p>
+
+<p>My solution in the standalone module is:</p>
+
+<pre><code>Option Explicit
+
+Private updateNestCount As Long
+Private calculationState As XlCalculation
+
+Public Sub DisableUpdating(Optional msg As String = vbNullString)
+    If updateNestCount = 0 Then
+        Application.ScreenUpdating = False
+        '--- save the current calculation state for later restoration
+        calculationState = Application.Calculation
+        Application.Calculation = xlCalculationManual
+    End If
+    updateNestCount = updateNestCount + 1
+
+    '--- print a debug message if the caller wants one
+    If Len(msg) &gt; 0 Then
+        Debug.Print "DisableUpdating(" &amp; updateNestCount &amp; "): " &amp; msg
+    End If
+End Sub
+
+Public Sub EnableUpdating(Optional msg As String = vbNullString)
+    If updateNestCount = 1 Then
+        Application.ScreenUpdating = False
+        '--- restore the calculation back to its original state
+        Application.Calculation = calculationState
+    End If
+    updateNestCount = updateNestCount - 1
+
+    '--- print a debug message if the caller wants one
+    If Len(msg) &gt; 0 Then
+        Debug.Print "EnableUpdating (" &amp; updateNestCount &amp; "): " &amp; msg
+    End If
+End Sub
+</code></pre>
+
+<p>Now I can liberally sprinkle these Disable/Enable calls in my libraries and other routines and the private variable takes care counting how deeply nested it might be. I've run into the need to track some debug on occasion, so the optional <code>msg</code> comes in handy.</p>
+
+<p>I think your class/object approach leaves too much of the burden on the calling program to keep track of the object lifetime and you might find this a simpler approach. Just make sure to always pair the calls in a single routine <strong>AND</strong> if you have an error handler, that the enable method is accessed within the error handling.</p>
+
+<blockquote>
+  <p><strong>UPDATE:</strong> In response to a comment below, I'm posting my updated code
+  module in its entirety (which includes a bonus high-performance timer,
+  just for fun). Copy and paste this code into a file outside of the VBA
+  Editor, then import it into your code and you'll get Intellisense to
+  help with the functions.</p>
+</blockquote>
+
+<pre><code>Attribute VB_Name = "Lib_PerformanceSupport"
+Attribute VB_Description = "Methods to control disabling/enabling of the Application level screen updates. Supports call nesting and debug messaging, plus high precision timer calls."
+'@Folder("Libraries")
+Option Explicit
+
+'------------------------------------------------------------------------------
+' For Update methods
+'
+Private Type SavedState
+    screenUpdate As Boolean
+    calculationType As XlCalculation
+    eventsFlag As Boolean
+    callCounter As Long
+End Type
+
+Private previousState As SavedState
+
+Private Const DEBUG_MODE As Boolean = False 'COMPILE TIME ONLY!!
+
+'------------------------------------------------------------------------------
+' For Precision Counter methods
+'
+Private Type LargeInteger
+    lowpart As Long
+    highpart As Long
+End Type
+
+#If VBA7 Then
+    Private Declare PtrSafe Function QueryPerformanceCounter Lib _
+                         "kernel32" (ByRef lpPerformanceCount As LargeInteger) As Long
+    Private Declare PtrSafe Function QueryPerformanceFrequency Lib _
+                         "kernel32" (ByRef lpFrequency As LargeInteger) As Long
+#Else
+    Private Declare Function QueryPerformanceCounter Lib _
+                         "kernel32" (ByRef lpPerformanceCount As LargeInteger) As Long
+    Private Declare Function QueryPerformanceFrequency Lib _
+                         "kernel32" (ByRef lpFrequency As LargeInteger) As Long
+#End If
+
+Private counterStart As LargeInteger
+Private crFrequency As Double
+
+Private Const TWO_32 As Double = 4294967296#               ' = 256# * 256# * 256# * 256#
+
+'==============================================================================
+' Screen and Event Update Controls
+'
+Public Sub ReportUpdateState()
+Attribute ReportUpdateState.VB_Description = "Prints to the immediate window the current state and values of the Application update controls."
+    Debug.Print ":::::::::::::::::::::::::::::::::::::::::::::::::::::"
+    Debug.Print "Application.ScreenUpdating      = " &amp; Application.ScreenUpdating
+    Debug.Print "Application.Calculation         = " &amp; Application.Calculation
+    Debug.Print "Application.EnableEvents        = " &amp; Application.EnableEvents
+    Debug.Print "--previousState.screenUpdate    = " &amp; previousState.screenUpdate
+    Debug.Print "--previousState.calculationType = " &amp; previousState.calculationType
+    Debug.Print "--previousState.eventsFlag      = " &amp; previousState.eventsFlag
+    Debug.Print "--previousState.callCounter     = " &amp; previousState.callCounter
+    Debug.Print "--DEBUG_MODE is currently " &amp; DEBUG_MODE
+End Sub
+
+Public Sub DisableUpdates(Optional ByVal debugMsg As String = vbNullString, _
+                          Optional ByVal forceZero As Boolean = False)
+Attribute DisableUpdates.VB_Description = "Disables Application level updates and events and saves their initial state to be restored later. Supports nested calls. Displays debug messages according to the module-global DEBUG_MODE flag."
+    With Application
+        '--- capture previous state if this is the first time
+        If forceZero Or (previousState.callCounter = 0) Then
+            previousState.screenUpdate = .ScreenUpdating
+            previousState.calculationType = .Calculation
+            previousState.eventsFlag = .EnableEvents
+            previousState.callCounter = 0
+        End If
+
+        '--- now turn it all off and count
+        .ScreenUpdating = False
+        .Calculation = xlCalculationManual
+        .EnableEvents = False
+        previousState.callCounter = previousState.callCounter + 1
+
+        '--- optional stuff
+        If DEBUG_MODE Then
+            Debug.Print "Updates disabled (" &amp; previousState.callCounter &amp; ")";
+            If Len(debugMsg) &gt; 0 Then
+                Debug.Print debugMsg
+            Else
+                Debug.Print vbCrLf
+            End If
+        End If
+    End With
+End Sub
+
+Public Sub EnableUpdates(Optional ByVal debugMsg As String = vbNullString, _
+                         Optional ByVal forceZero As Boolean = False)
+Attribute EnableUpdates.VB_Description = "Restores Application level updates and events to their state, prior to the *first* DisableUpdates call. Supports nested calls. Displays debug messages according to the module-global DEBUG_MODE flag."
+    With Application
+        '--- countdown!
+        If previousState.callCounter &gt;= 1 Then
+            previousState.callCounter = previousState.callCounter - 1
+        ElseIf forceZero = False Then
+            '--- shouldn't get here
+            Debug.Print "EnableUpdates ERROR: reached callCounter = 0"
+        End If
+
+        '--- only re-enable updates if the counter gets to zero
+        '    or we're forcing it
+        If forceZero Or (previousState.callCounter = 0) Then
+            .ScreenUpdating = True
+            .Calculation = xlCalculationAutomatic
+            .EnableEvents = True
+        End If
+
+        '--- optional stuff
+        If DEBUG_MODE Then
+            Debug.Print "Updates enabled (" &amp; previousState.callCounter &amp; ")";
+            If Len(debugMsg) &gt; 0 Then
+                Debug.Print debugMsg
+            Else
+                Debug.Print vbCrLf
+            End If
+        End If
+    End With
+End Sub
+
+'==============================================================================
+' Precision Timer Controls
+' based on https://stackoverflow.com/a/31387007/4717755
+'
+Private Function LI2Double(ByRef lgInt As LargeInteger) As Double
+Attribute LI2Double.VB_Description = "Converts LARGE_INTEGER to Double"
+    '--- converts LARGE_INTEGER to Double
+    Dim low As Double
+    low = lgInt.lowpart
+    If low &lt; 0 Then
+        low = low + TWO_32
+    End If
+    LI2Double = lgInt.highpart * TWO_32 + low
+End Function
+
+Public Sub StartCounter()
+Attribute StartCounter.VB_Description = "Captures the high precision counter value to use as a starting reference time."
+    '--- Captures the high precision counter value to use as a starting
+    '    reference time.
+    Dim perfFrequency As LargeInteger
+    QueryPerformanceFrequency perfFrequency
+    crFrequency = LI2Double(perfFrequency)
+    QueryPerformanceCounter counterStart
+End Sub
+
+Public Function TimeElapsed() As Double
+Attribute TimeElapsed.VB_Description = "Returns the time elapsed since the call to StartCounter in microseconds."
+    '--- Returns the time elapsed since the call to StartCounter in microseconds
+    If crFrequency = 0# Then
+        Err.Raise Number:=11, _
+                  Description:="Must call 'StartCounter' in order to avoid " &amp; _
+                                "divide by zero errors."
+    End If
+    Dim crStart As Double
+    Dim crStop As Double
+    Static counterEnd As LargeInteger
+    QueryPerformanceCounter counterEnd
+    crStart = LI2Double(counterStart)
+    crStop = LI2Double(counterEnd)
+    TimeElapsed = 1000# * (crStop - crStart) / crFrequency
+End Function
+</code></pre>
+    </div>

@@ -1,0 +1,59 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>First off, let's start with a simple assumption: SIMD is off the table. As such, your kernel computation (<code>update_block</code>) is mostly optimized, and instead, I ended up focusing on the rest.</p>
+
+<h1>Some bad news</h1>
+
+<p>After profiling, and as expected, the bulk of the CPU time of your SHA256 implementation is in <code>update_block()</code>. No real surprise there. As a result, we know ahead of time that we can do very little to ease the pains of the 64 rounds of operations without resorting to some devious trickery.</p>
+
+<p>We can, however, make one simple change. We're going to pull in the <code>byteorder</code> crate and use it to convert our <code>u8</code> arrays into <code>u32</code>s. This will both ease our pain and provide a better version of what you already had. Since we're always feeding it 4 bytes (verifiable by code logic), we can safely drop the slice size prefix and benefit from the blanket <code>&amp;[u8]</code> <code>Read</code> implementation.</p>
+
+<p>It also looks neat and inlinable:</p>
+
+<pre><code>fn transform_array_of_u8_big_endian_to_u32(mut arr_of_u8: &amp;[u8]) -&gt; u32 {
+    arr_of_u8.read_u32::&lt;BigEndian&gt;().unwrap()
+}
+</code></pre>
+
+<h1>Some good news</h1>
+
+<p>There's a <em>ton</em> of allocations we can remove!</p>
+
+<p>We're going to change the method signature of <code>consume</code> from <code>fn consume(&amp;mut self);</code> to <code>fn consume(&amp;mut self, bytes: &amp;[u8]);</code>. The reason for this is the pretty neat performance gain we can score by doing the following (<a href="https://play.rust-lang.org/?version=stable&amp;mode=debug&amp;edition=2018&amp;gist=fb9ec52bdd7ace8ceeb2e8d79c5ef051" rel="nofollow noreferrer"><strong>playground</strong></a>):</p>
+
+<pre class="lang-rust prettyprint-override"><code>fn consume(&amp;mut self, mut bytes: &amp;[u8]) {
+    let input_len_bytes = bytes.len();
+    let unprocessed_len = self.unprocessed_bytes.len();
+    self.total_bits += input_len_bytes * 8;
+    // Do we have bytes in the unprocessed buffer?
+    if unprocessed_len &gt; 0 {
+        if (unprocessed_len + input_len_bytes) &lt; 64 {
+            // Nothing to do, we just append
+            // Copy up to 63 bytes to our Vec
+            self.unprocessed_bytes.extend_from_slice(bytes);
+            return;
+        }
+        let (additional, new_bytes) = bytes.split_at(64 - unprocessed_len);
+        // Reassign
+        bytes = new_bytes;
+        // Copy up to 64 bytes from what we just took
+        self.unprocessed_bytes.extend_from_slice(additional);
+        // We can afford a 64-byte clone
+        self.update_block(self.unprocessed_bytes.clone().as_slice());
+        self.unprocessed_bytes.clear();
+        // Call ourselves
+        //return self.inner_consume(new_bytes);
+    }
+    let iter = bytes.chunks_exact(64);
+    let remainder_i = iter.clone();
+    for block in iter {
+        self.update_block(&amp;block)
+    }
+    let bytes = remainder_i.remainder();
+    self.unprocessed_bytes.extend_from_slice(bytes); // max 64bytes allocated
+}
+</code></pre>
+
+<p>This also opens up repeated calls to <code>update()</code>, something which the previous version fell over on (index out of bounds errors). The <code>chunks_exact()</code> iterator takes advantage that the slice is not mutable and quite literally just moves a pointer around. This both frees us from copies of the data and issues regarding ownership.</p>
+
+<p>Honestly, after having a proper look at profiling data, that's as far as you'll go without venturing into funky territory on the update function, namely <code>simd</code> (via <code>packed_simd</code>); as a learning experiment, I'd strongly recommend it. It is currently nightly-only (it was stable until Rust 1.33, then it broke, and it's on the way to being stable again), but it's worth the hassle - we're talking 10-15x speedups. Due to the nature of the repetitive operation in SHA256, it is ideal for a 256bit (u32x8) vector.</p>
+    </div>

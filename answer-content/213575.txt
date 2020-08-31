@@ -1,0 +1,145 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3>Use <code>$(...)</code> instead of <code>`...`</code></h3>
+
+<p><code>`...`</code> is archaic, error-prone, and harder to read than <code>$(...)</code>.</p>
+
+<p>For example, instead of <code>date=`(date +%Y%m%d%H%M)`</code>, write <code>date=$(date +%Y%m%d%H%M)</code>.
+Note that the extra <code>(...)</code> around the <code>date</code> command was unnecessary.</p>
+
+<h3>Double-quote variables used in command arguments</h3>
+
+<p>For example instead of <code>for user in ${!users[@]}</code>,
+write <code>for user in "${!users[@]}"</code>.</p>
+
+<p>This way, if the <code>users</code> array has keys with spaces in it,
+the program will still work correctly.
+In the current example none of the keys contain spaces (they are <code>user1</code> and <code>user2</code>),
+so you don't strictly need it,
+but it's a good habit to build.</p>
+
+<h3>Don't parse the output of find</h3>
+
+<p>This line shows a very bad practice:</p>
+
+<blockquote>
+<pre><code>directories=`find /var/www/$directory -maxdepth 1 -mindepth 1 -type d`
+</code></pre>
+</blockquote>
+
+<p>Let's first correct the form:</p>
+
+<pre><code>directories=$(find "/var/www/$directory" -maxdepth 1 -mindepth 1 -type d)
+</code></pre>
+
+<p>The problem here is that if any of the files printed by the command contain a newline character, then it will be impossible to tell complete filenames from partial filenames in <code>$directories</code>. If any of the filenames contain whitespace, then parsing the value of <code>$directories</code> will be complicated.</p>
+
+<p>It's best to avoid parsing the output of <code>find</code> when possible.
+Even if this code works in your example because <em>you know</em> that the filenames will be strictly alphanumeric, it's good to avoid such bad practices if possible.</p>
+
+<p>In this case there's a fairly simple alternative:</p>
+
+<pre><code>for directory in "/var/www/$directory"/*/
+</code></pre>
+
+<p>This is basically a simple glob expansion,
+with the small trick that the trailing <code>/</code> will make it match only directories.</p>
+
+<p>Notice that <code>*/</code> is outside the double-quoted part. This is because <code>*</code> would not be expanded within double-quotes. For the record, this is an equivalent way to write the above:</p>
+
+<pre><code>for directory in /var/www/"$directory"/*/
+</code></pre>
+
+<p>Finally, there is a small caveat: this is not exactly equivalent to the <code>find</code> command, because that would also find directories whose name starts with <code>.</code>,
+and the glob expansion won't, by default.
+If you need to support such filenames, then write <code>shopt -s dotglob</code> before the loop statement. That will enable matching filenames starting with <code>.</code> in glob expansions.</p>
+
+<h3>Avoid changing the working directory (with <code>cd</code>) in scripts</h3>
+
+<p>Changing directories with <code>cd</code> in scripts is error-prone:</p>
+
+<ul>
+<li><p>It may become confusing what is the current working directory, at any point in the script</p></li>
+<li><p>The <code>cd</code> command may fail, for example due to permission issues or filesystem errors. If such failures are not handled (as in the posted script), the program may happily continue executing the rest of the commands, which can have serious consequences. Consider for example what will happen to <code>cd "$foo"; rm -fr *</code> if the <code>cd</code> command fails: important stuff could get deleted!</p></li>
+</ul>
+
+<p>In the posted code, instead of this:</p>
+
+<blockquote>
+<pre><code>cd $directory
+
+if [ ! -d backups ]
+then
+    mkdir backups
+fi
+
+tar --exclude ./backups -czf backups/$date.tar.gz .
+</code></pre>
+</blockquote>
+
+<p>You could write without using <code>cd</code> like this:</p>
+
+<pre><code>mkdir -p "$directory/backups"
+tar -C "$directory" --exclude ./backups -czf "backups/$date.tar.gz" .
+</code></pre>
+
+<p>That is, use the <code>-C</code> flag of <code>tar</code> to specify its <em>effective directory</em>,
+and use the correct paths in other commands appropriately.
+Keep in mind that the rest of the commands in the loop body that rely on the path of <code>backups</code> will also need to be adjusted accordingly.
+For example change <code>gzip &gt; backups/$date.sql.gz</code> to <code>gzip &gt; "$directory/backups/$date.sql.gz"</code>.</p>
+
+<p>Notice that I double-quoted the parameters using the <code>$date</code> variable,
+as explained earlier in this posted.
+And I replaced a conditional statement by taking advantage of the <code>-p</code> flag of <code>mkdir</code>.</p>
+
+<h3>Don't give permissions willy-nilly</h3>
+
+<p>Using <code>chmod</code> with unnecessarily relaxed permissions is a very bad practice.
+Question every permission bit if it's really needed and why.</p>
+
+<p>Let's take a closer look at this:</p>
+
+<blockquote>
+<pre><code>chmod 770 backups -R
+chown $user:$user backups -R
+</code></pre>
+</blockquote>
+
+<p>The <code>chmod</code> gives read-write-execute permission to the user and the group of files and directories under <code>backups</code>, recursively.
+Why? The loop body creates <code>.gz</code> files under <code>backups</code>.
+These files don't need to be executable.
+Only the <code>backups</code> directory needs to be executable, so that the user can access its contents.</p>
+
+<p>It would be better to set an appropriate <code>umask</code> before the loop.
+You will be able to drop the <code>chmod</code> command,
+because the <code>umask</code>, combined with the <code>chown</code> will be enough to ensure correct permissions.</p>
+
+<p>Strictly speaking, the <code>chown</code> is only necessary for the newly created files and directories, instead of a blanket <code>chown -R</code> on the parent directory.
+But this level of laziness is probably acceptable in a Bash script,
+so until the <code>chown -R</code> becomes a practical concern (for example due to an excessively large number of files in the directory tree), I wouldn't complicate the script with more precise treatment.</p>
+
+<h3>Test your backup solutions</h3>
+
+<p>Can you spot the bug in this code?</p>
+
+<blockquote>
+<pre><code>for database in $databases
+do
+    if [ $database = ${directory##*/} ]
+    then
+        mysqldump -u $user -p$password $database | gzip &gt; backups/$date.sql.gz
+    fi
+done
+</code></pre>
+</blockquote>
+
+<p>The <code>$database</code> variable is not used in the output filename.
+If there are multiple databases,
+only the last one will be saved.
+A few months later, if you try to fix a corrupted database by recovering from backups,
+you would be in for a terrible surprise,
+discovering that some database backups are completely missing.</p>
+
+<p>Be sure to test thoroughly your backup solution, accounting for the most complex supported scenarios.</p>
+
+<p>(And as pointed out multiple times earlier, double-quote variables used in command arguments.)</p>
+    </div>

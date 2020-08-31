@@ -1,0 +1,161 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I was able to greatly simplify the code using <code>ADOX.Catalog</code> to pull sheets instead of trying to figure out what is or is not a sheet. I also added code that will allow you to open any type of Excel file and always have the correct SQL connection string.</p>
+<p>I have some general notes here for you:</p>
+<ul>
+<li>Use RubberDuck to format your code and help you review</li>
+<li>Never use underscore "_" in procedure name because those are reserved for VBA events.</li>
+<li>Only one declaration per <code>Dim</code></li>
+<li>Use Late-bound objects for code portablility</li>
+<li>Use <code>Option Explicit</code> to force you to declare all your variables</li>
+<li>Don't use <code>Goto</code> when you can use <code>If</code></li>
+</ul>
+<p>Here is my version of the code:</p>
+<pre><code>Option Explicit
+
+' Set all external enums for late bound compatibility
+Const adOpenStatic As Long = 3
+Const adLockReadOnly As Long = 1
+Const adCmdText As Long = 1
+Const adStateOpen As Long = 1
+
+Public Sub CopyWorkbookValuesOnly()
+    ' Handle requirements first
+    Dim excelFileFullPath As String
+    excelFileFullPath = PickFile
+    
+    If excelFileFullPath = vbNullString Then Exit Sub
+    
+    On Error GoTo ErrorHandler
+
+    Dim excelDB          As Object
+    Set excelDB = CreateObject("ADODB.Connection")
+    excelDB.Open GetConnectionString(excelFileFullPath)
+    
+    Dim wbnew       As Workbook
+    Set wbnew = Workbooks.Add(xlWBATWorksheet)   'should make just one sheet in new workbook
+
+    ' Get all the Sheets
+    Dim sheetTabs As Object
+    With CreateObject("ADOX.Catalog")
+        .ActiveConnection = excelDB
+        Set sheetTabs = .Tables
+    End With
+    
+    Dim firstSheet As Boolean
+    firstSheet = True
+    Dim tableSheet As Object
+    For Each tableSheet In sheetTabs
+        Dim trimmedname As String
+        If Left$(tableSheet.Name, 1) = Chr$(39) And Right$(tableSheet.Name, 1) = Chr$(39) Then ' the name has been wrapped in single quotes
+            trimmedname = Mid$(tableSheet.Name, 2, Len(tableSheet.Name) - 2)
+        Else ' start with just the name
+            trimmedname = tableSheet.Name
+        End If
+        
+        If Right$(trimmedname, 1) = "$" Then
+            trimmedname = SanitizeWorksheetName(trimmedname)
+            Dim currentSheet As Worksheet
+            If firstSheet Then
+                Set currentSheet = wbnew.Sheets(1)
+                firstSheet = False
+            Else
+                Set currentSheet = wbnew.Sheets.Add(After:=ActiveSheet)
+            End If
+            
+            currentSheet.Name = trimmedname
+            
+            'get data and write to worksheet
+            Dim sqlCompound As String
+            sqlCompound = "SELECT * FROM [" &amp; tableSheet.Name &amp; "]"
+            
+            Dim rsSheet As Object
+            Set rsSheet = CreateObject("ADODB.Recordset")
+            rsSheet.Open sqlCompound, excelDB, adOpenStatic, adLockReadOnly, adCmdText
+            currentSheet.Range("A1").CopyFromRecordset rsSheet
+            rsSheet.Close
+            Set rsSheet = Nothing
+        End If
+    Next tableSheet
+      
+ErrorHandler:
+    If Not excelDB Is Nothing Then
+        If excelDB.State = adStateOpen Then excelDB.Close
+        Set excelDB = Nothing
+    End If
+    
+    If Err.Number &lt;&gt; 0 Then
+        MsgBox Err.Source &amp; "Error number: " &amp; Err.Number &amp; "--&gt;" &amp; Err.Description, , "Error"
+    End If
+End Sub
+
+Private Function PickFile() As String
+    ' Create and set the file dialog object.
+    Dim specialFolder As Object
+    Set specialFolder = CreateObject("WScript.Shell").SpecialFolders
+    
+    With Application.FileDialog(msoFileDialogFilePicker)
+        .Filters.Clear                           ' Clear all the filters (if applied before).
+        
+        ' Give the dialog box a title, word for doc or Excel for excel files.
+        .Title = "Select an Excel File"
+        
+        ' Apply filter to show only a particular type of files.
+        .Filters.Add "Excel Files", "*.xls;*.xlsx;*.xlsm", 1
+        .Filters.Add "All Excel Files", "*.xlsx;*.xlsm;*.xlsb;*.xltx;*.xltm;*.xls;*.xlt;*.xls;*.xml;*.xml;*.xlam;*.xla;*.xlw;*.xlr", 2
+        .Filters.Add "All Files", "*.*", 3
+        
+        ' Do not allow users to select more than one file.
+        .AllowMultiSelect = False
+        
+        .InitialFileName = specialFolder("MyDocuments")
+        
+        ' Show the file.
+        If .Show = True Then
+            PickFile = .SelectedItems.Item(1)         ' Get the complete file path.
+        End If
+    End With
+End Function
+
+Private Function SanitizeWorksheetName(ByVal sheetName As String) As String
+    Dim result As String
+    result = sheetName
+
+    If Right$(result, 1) = "$" Then               'remove trailing $
+        result = Left$(result, Len(result) - 1)
+    End If
+    
+    ' Remove illegal characters using RegEx
+    Const IllegalCharacters As String = "\/\\\[\]\*:"
+    With CreateObject("VBScript.RegExp")
+        .Global = True
+        .Pattern = IllegalCharacters
+        result = .Replace(result, vbNullString)
+    End With
+    
+    ' keep only 31 characters
+    SanitizeWorksheetName = Left$(result, 31)
+End Function
+
+Public Function GetConnectionString(ByVal fileName As String) As String
+    Dim fileExtension As String
+    fileExtension = Right$(fileName, Len(fileName) - InStrRev(fileName, "."))
+    Dim provider As String
+    provider = "Provider=Microsoft.ACE.OLEDB.12.0;Data Source="
+    Dim connectionString As String
+    Select Case fileExtension
+    Case "xls"
+        connectionString = provider &amp; fileName &amp; ";Extended Properties=""Excel 8.0;HDR=NO;IMEX=1"";"
+    Case "xlsx"
+        connectionString = provider &amp; fileName &amp; ";Extended Properties=""Excel 12.0 Xml;HDR=NO;IMEX=1"";"
+    Case "xlsb"
+        connectionString = provider &amp; fileName &amp; ";Extended Properties=""Excel 12.0;HDR=NO;IMEX=1"";"
+    Case "xlsm"
+        connectionString = provider &amp; fileName &amp; ";Extended Properties=""Excel 12.0 Macro;HDR=NO;IMEX=1"";"
+    Case Else
+        connectionString = "Driver={Microsoft Excel Driver (*.xls, *.xlsx, *.xlsm, *.xlsb)};DBQ=" &amp; fileName &amp; ";"
+    End Select
+    
+    GetConnectionString = connectionString
+End Function
+</code></pre>
+    </div>

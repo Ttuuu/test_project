@@ -1,0 +1,303 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>OK, so a bit later than I expected, but here's some comments I have. I'll try to address the concerns you list to a reasonable degree:</p>
+
+<ul>
+<li>I didn't manage to mock DB, that's why I am using an in-memory DB</li>
+</ul>
+
+<p>This should be covered by the big section titled <em>"This is not a unit test"</em></p>
+
+<ul>
+<li>The verification code was too verbose, I extracted it into separate functions. Is it something you would do?</li>
+</ul>
+
+<p>I've also hinted at creating a package for this, so yes, this is most certainly something I'd separate out. Having said that, you might want to do some googling to find packages that generate validation code. A quick search came up with <a href="https://github.com/thedevsaddam/govalidator" rel="nofollow noreferrer">this <code>govalidator</code> package</a>. I've not used it myself, so I can't vouch for it, but there's plenty of packages out there that will allow you to write something like this:</p>
+
+<pre><code>type CreateUserRequest struct {
+    Name string `validate:type="string";min_len=5;regex="[A-Za-Z ]+"`
+    Age  int    `validate:min="18";max="120"`
+}
+</code></pre>
+
+<p>The syntax and example validation is completely made-up, so you'll have to see for yourself what you want and what makes sense.</p>
+
+<ul>
+<li>I didn't manage to test negative scenarios (as a result of the first concern).</li>
+</ul>
+
+<p>Like you said, this ties in with your first concern, and my breakdown of that problem addresses this, too.</p>
+
+<ul>
+<li>I don't like having to call <code>mux.SetURLVars</code> to inject a path variable. How to do this better?</li>
+</ul>
+
+<p>The golang standard library provides you with the <code>net/http/httptest</code> package, which probably can help you out with this. This is something I've not discussed yet, but I'm likely to revisit this review with some more details on this.</p>
+
+<ul>
+<li>I didn't manage to test the code that initializes Mux routers</li>
+</ul>
+
+<p>As mentioned in the comment I left: you shouldn't unit-test external packages. You should choose a dependency based on functionality, maturity, community support, performance, etc... depending on your needs, the weight you give each to of these factors can vary. Generally speaking, <code>gorilla.Mux</code>is a widely used, mature, and battle tested package. You can rely on the router component being well tested. It's not the user's job of a package to unit-test a dependency. That's a bit like trying to write unit-tests covering golang's standard library functions. That's the job of the people maintaining those packages. If you can test that requests to a given route land you in the correct handler function (which you can), then you know the routes have been configured correctly.</p>
+
+<p>Anyway: here's the actual code-review:</p>
+
+<h2>This is not a unit test</h2>
+
+<p>What you have is not a unit test. Plain and simple. A unit test is a type of test where you test the logic inside a given package. You want to control the input entirely so you can see if you're getting the desired output. Your tests rely on stuff like the database to function. In a real unit test, all dependencies that aren't essential to the business logic inside the code you're testing (which should be all dependencies) should be mocked.</p>
+
+<p>Looking at the code itself, there's fairly little in the way of business logic to test, but assuming you'll build on what you have, you might want to change the structure of things somewhat.</p>
+
+<h3>Separate into packages</h3>
+
+<p>It's good practice to move all the direct DB interactions into its own package. That will allow you to test the more complex logic without needing to setup an in-memory database all the time, and test basic stuff with arbitrary data. Let's assume you want'a CAS (Check And Set) or Upsert type functionality at some point. Let's create a type that has the logic to validate/check student data, and can call on the DB to store/update the records:</p>
+
+<pre><code>package persistence
+
+// DB interface we need, the package USING the dependency declares the interface it needs
+type DB interface {
+    Save(*Student) error
+    GetByID(id string) (*Student, error)
+    Update(*Student) error // this could be handled by Save,but you'll see why I'm making the destinction
+}
+
+// Logger interface, this should be an application wide thing, and needn't be an interface per package, but I'm including it here for completeness
+type Logger interface {
+    Debug(... interface{})
+    Info(... interface{})
+    Warn(... interface{})
+    Err(... interface{})
+    Fatal(... interface{})
+}
+
+// CAS I'm bad at naming things, but you get the gist
+type CAS struct {
+    db DB
+    log Logger
+}
+
+var (
+    // NameEmptyErr one of many predefined errors validation can return
+    NameEmptyErr    = errors.New("name for student missing")
+    IDAlreadySetErr = errors.New("new student record already has an ID, call Update/Upsert")
+    PersitenceErr   = errors.New("failed to persist data")
+)
+
+// New returns a new CAS validator, pass in dependencies here (DI)
+func New(log Logger, db DB) *CAS {
+    return &amp;CAS{
+        db: db,
+        log: log,
+    }
+}
+
+// CASStudent validates the student record, and if everything checks out, the record is stored
+func (c *CAS) CASStudent(student *Student) error {
+    if student.Name == "" {
+        return NameEmptyErr
+    }
+    // add all validation here
+    if student.ID != "" {
+        return IDAlreadySetErr
+    }
+    // validation complete, store. Let the db layer handle ID's
+    // we're passing a pointer to the data, so the ID can be set on the object
+    if err := c.db.Save(student); err != nil {
+        c.log.Err(err)
+        return PersistenceErr
+    }
+    return nil
+}
+</code></pre>
+
+<p>Great, now how does this help you get closer to mocking dependencies? Does this mean you have to manually create test types for all the interfaces you need to mock? Well actually, no. Thankfully, there's tools that can auto-generate all the mocks you need. If you update the interfaces, just running a single command will update the mocks to conform to the new interfaces. The best tool for this in my experience is <a href="https://github.com/golang/mock" rel="nofollow noreferrer">gomock and mockgen</a>. It's fantastically easy to use, just add a single line of comments above the interfaces you need mocking:</p>
+
+<pre><code>package persistence
+
+//go:generate go run github.com/golang/mock/mockgen -destination mocks/db_mock.go -package mocks github.com/your/repo/persistence DB
+type DB interface{}
+
+//go:generate go run github.com/golang/mock/mockgen -destination mocks/logger_mock.go -package mocks github.com/your/repo/persistence Logger
+type Logger interface{}
+</code></pre>
+
+<p>to generate the code, in your repo, simply run <code>go generate ./...</code>, and all mocks for all packages will be generated and you'll find the mocks for a given package under <code>path/to/package/mocks</code>. The mock package name will be <code>package mocks</code>.</p>
+
+<h3>Cool, let's write a unit test</h3>
+
+<p>So we have a package that takes care of validation, and uses mockable dependencies, let's set about writing a unit test for our new <code>persistence</code> package:</p>
+
+<pre><code>package persistence_test // yes, we're changing the package name
+
+import (
+    "testing"
+
+    "github.com/your/repo/persistence" // import the package to test
+    "github.com/your/repo/persistence/mocks" // import the mocks
+
+    "github.com/golang/mocks/gomock" // you'll see why I'm using these
+    "github.com/stretchr/testify/assert"
+)
+
+type testCAS struct {
+    *persistence.CAS // the type we're testing
+    ctrl *gomock.Controller
+    db   *mocks.MockDB
+    log  *mocks.MockLogger
+}
+
+// this func sets up everything we need to run a test with mocks
+func getCAS(t *testing.T) testCas {
+    ctrl := gomock.NewController(t)
+    db := mocks.NewDBMock(ctrl)
+    log := mocks.NewLoggerMock(ctrl)
+    return testCas{
+        CAS: persistence.New(log,db),
+        ctrl: ctrl,
+        db: db,
+        log: log,
+    }
+}
+
+func TestCASStudentSuccessSimple(t *testing.T) {
+    cas := getCAS(t)
+    defer cas.Finish()
+    id := "id set by mock"
+    student := &amp;persistence.Student{
+        Name: "this needs to be set",
+    }
+    // if our code is correct, we're expecting exactly 1 call to db.Save
+    // for this test we don't want it to return an error, so job done
+    // the DB package is going to set the ID, so we'll set up the mock to do the same
+    cas.db.EXPECT().Save(student).Times(1).Return(nil).Do(func(s *persitence.Student) {
+        s.ID = id // set the id to the var above
+    })
+    // Now let's call the code we want to test:
+    err := cas.CASStudent(student)
+    assert.NoError(t, err) // ensure no errors were returned
+    assert.Equal(t, id, student.ID) // the id should now be set
+}
+
+// Finish isn't required, but I add it for convenience, instead of writing foo.ctrl.Finish()
+func (c *testCas) Finish() {
+    c.ctrl.Finish()
+}
+</code></pre>
+
+<p>Great! Now That's a unit test. The only actual code we're executing is found in the persistence package, and it's only testing the unit of code that validates the data, and passes it on for storage. The added benefit of this is that you don't have to rewrite a bunch of test should you decide to change the underlying storage solution to, say, a key-value store, or some other DB. The interfaces can remain unchanged, so you can swap out a package, safe in the knowledge that all code will still behave as expected as long as the interface they're expecting is implemented. If there is a bug, you'll just know the bug is found in the package you're replaced the old one with, and nowhere else.</p>
+
+<h3>Just for fun, let's try a more complex test:</h3>
+
+<pre><code>func TestCASComplex(t *testing.T) {
+    cas := getCas(t)
+    defer cas.Finish()
+    // data contains the test-cases, expect contains the errors we may expect
+    data := map[strign]*persistence.Student{
+        "noName": {}, // no name set, we expect validation to fail
+        "idSet":  {
+            Name: "name is set",
+            ID: "but so is ID",
+        },
+        "dbFail": {
+            Name: "this is fine",
+        },
+    }
+    expect := map[string]error{
+        "noName": persistence.NameEmptyErr,
+        "idSet":  persistence.IDAlreadySetErr,
+        "dbFail": persistence.PersistenceErr,
+    }
+    // the first 2 calls won't call the DB/logger, only the last one will:
+    dbErr := errors.New("db error")
+    // you can change gomock.Any() with the data["dbFail"] value
+    cas.db.EXPECT().Save(gomock.Any()).Times(1).Return(dbErr)
+    cas.log.EXPECT().Err(dbErr).Times(1) // the error from the db should be logged
+    for k, student := range data {
+        expErr := expect[k] // get the error we're expecting
+        optionalID := student.ID // get ID before the call
+        err := cas.Save(student)
+        assert.Error(t, err) // make sure an error is returned
+        assert.Equal(t, expErr, err) // and check if it's the error we're expecting
+        assert.Equal(t, optionalID, student.ID) // make sure the ID wasn't changed
+    }
+}
+</code></pre>
+
+<p>So with these 2 example test functions, we're covering all possible code-paths in the <code>CASStudent</code> function:</p>
+
+<ul>
+<li>The student name is missing</li>
+<li>the student already has an ID</li>
+<li>the student data is valid and stored successfully</li>
+<li>The student data is valid, but the DB failed</li>
+</ul>
+
+<p>Neat!</p>
+
+<h3>Important note/rant on interfaces</h3>
+
+<p>A common thing to see people do, especially when they're coming from another language that is more, shall we say, <em>"traditionally OO"</em>, is to declare the interface for any given component/type in the package where the interface is implemented. In golang, the opposite approach is the way to go. A packackage handling DB interactions returns a "raw" type that can be passed to one or more types that depend on it. Each of these users might need different parts of the API this DB type exposes. If all of them use the same, big, interface, chances of tightly coupled code increase, and it becomes a lot harder to swap out dependencies on the fly (or even refactor on a package-by-package basis). Go's ducktype interfaces are a very powerful tool in your armory here. I've purposefully declared the <code>Logger</code> and <code>DB</code> interfaces in the <code>persistence</code> package above. Basic SOLID principles apply here (IoC and Liskov substitution principle specifically).</p>
+
+<p>A simple example:</p>
+
+<pre><code>package "contacts"
+
+type addressBook struct {
+    data map[string]Address
+}
+
+func NewAddressbook(addresses ...Address) *addressBook {
+    a := addressBook{
+        data: map[string]Address{}, // or make(map[string]Address, len(addresses)
+    }
+    for _, addr := range addresses {
+        a[addr.Person.Name] = addr
+    }
+    return &amp;a
+}
+
+func (a *addressBook) Add(addr Address) {
+    a.data[addr.Person.Name] = addr
+}
+
+func (a addressBook) Find(name string) (*Address, error) {
+    if addr, ok := a.data[name]; ok {
+        return &amp;addr, nil
+    }
+    return nil, AddressNotFoundErr
+}
+</code></pre>
+
+<p>Now this is all pretty clear, but what if I were to change the <code>NewAddressbook</code> func to return an interface that I defined in this package. The interface would, naturally, have to contain all exported functions, so it'd look like this:</p>
+
+<pre><code>type Addressbook interface {
+    Add(Address)
+    Find(string) (*Address, error)
+}
+</code></pre>
+
+<p>The package that's writing to the addressbook, then, will require its dependency to implement a <code>Find</code> function, too, but it simply never uses it. That's code-smell at best. In practice, it's a matter of time before some developer gets lazy, and implements something in that package real quick (e.g. a <code>Upsert</code> type call) using the <code>Find</code> function. This function, however, is using a value receiver, not a pointer receiver, and thus you've introduced a potential data-race.</p>
+
+<p>The same problem presents itself when you use this interface in the package responsible for displaying the addressbook data: it now has write access to the data. It shouldn't. Even back in the 70s, K&amp;R knew this wasn't right, and used the <code>const</code> qualifier to protect people against themselves.</p>
+
+<p>For these reasons (and separation of concern, modularity, testability, sanity, unicorn happiness, ...) the package writing should declare an interface only specifying the <code>Add()</code> func, and the display package should only specify the <code>Find()</code> function. If you change the addressbook from an in-memory map to a DB backed store, and want to write custom filters for the representation layer, you're likely to end up with the read and write dependencies being provided by different packages anyway.</p>
+
+<p>Sorry for the tangent, but it's a giant pet-peeve of mine. I've seen countless people implement a single, giant interface rather than being sensible. Trust me, it's a lot easier to find your way in a codebase when you open a file, and just see an explicit definition of all the interfaces that package/type depends on, instead of seeing a ton of imports, pointing you towards 1001 interfaces, and then having to through the code to work out which <em>parts</em> of the interfaces the code you're working on actually relies on. (rant over)</p>
+
+<h2>Cosmetics</h2>
+
+<p>Now lists like the ones above are nice to keep track of what you're testing. Wouldn't it be nice to have a way to have lists like that in our unit test? Thankfully, you can. Instead of having a <code>data</code> and <code>expect</code> map, or a <code>TestX</code> function per case, I tend to group tests per function like this:</p>
+
+<pre><code>func TestCASStudent(t *testing.T) {
+    t.Run("Student name is missing", studentNameMissing)
+    t.Run("Student ID already set", studentIDSet)
+    t.Run("Student CAS success", studentCASSuccess)
+    t.Run("Student valid, DB error", studentDBError)
+}
+</code></pre>
+
+<p>Then it's a simple matter of implementing the functions one by one.</p>
+
+<h2>Further reading/later update</h2>
+
+<p>I'm going to leave you with this to digest for now. I'll probably revisit this answer at a later date, because there's still stuff I haven't gotten to. For now, though, I'll point you to <a href="https://golang.org/pkg/net/http/httptest/" rel="nofollow noreferrer">the standard <code>httptest</code> package</a>, which could be useful when testing HTTP requests :)</p>
+    </div>

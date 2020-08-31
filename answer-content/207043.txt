@@ -1,0 +1,153 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+<pre><code>        builder
+            .LessThen(() =&gt; x.Length &lt; y.Length || x.Price &lt; y.Price)
+            .Equal(() =&gt; x.Length == y.Length || x.Price == y.Price)
+            .GreaterThan(() =&gt; x.Length &gt; y.Length || x.Price &gt; y.Price);
+</code></pre>
+</blockquote>
+
+<p>gives me a very bad feeling, which turned out to be justified when I saw</p>
+
+<blockquote>
+<pre><code>        public int Compare(T x, T y)
+        {
+            ...
+
+            if (_comparers[CompareOperator.LessThan](x, y)) return -1;
+            if (_comparers[CompareOperator.Equal](x, y)) return 0;
+            if (_comparers[CompareOperator.GreaterThan](x, y)) return 1;
+
+            // Makes the compiler very happy.
+            return 0;
+        }
+</code></pre>
+</blockquote>
+
+<p>Fundamentally, what you have here may implement the <code>IComparer&lt;T&gt;</code> interface but it is not a comparer, as shown by the following test:</p>
+
+<pre><code>    [TestMethod]
+    public void ComparerIsComparer()
+    {
+        var comparer = ComparerFactory&lt;Product&gt;.Create(
+            x =&gt; new { x.Name.Length, x.Price },
+            (builder, x, y) =&gt;
+            {
+                builder
+                    .LessThen(() =&gt; x.Length &lt; y.Length || x.Price &lt; y.Price)
+                    .Equal(() =&gt; x.Length == y.Length || x.Price == y.Price)
+                    .GreaterThan(() =&gt; x.Length &gt; y.Length || x.Price &gt; y.Price);
+            });
+
+        var products = new[]
+        {
+            new Product {Name = "Car", Price = 7 },
+            new Product {Name = "Table", Price = 3 },
+            new Product {Name = "Orange", Price = 1 },
+        };
+
+        foreach (var a in products)
+        {
+            foreach (var b in products)
+            {
+                var cmp1 = comparer.Compare(a, b);
+                var cmp2 = comparer.Compare(b, a);
+                Assert.IsTrue((cmp1 &lt; 0 &amp;&amp; cmp2 &gt; 0) || (cmp1 == 0 &amp;&amp; cmp2 == 0) || (cmp1 &gt; 0 &amp;&amp; cmp2 &lt; 0));
+            }
+        }
+    }
+</code></pre>
+
+<p>From the mention of "special comparers" in the question and "crazy comparers" in a comment on the question I assume that this is the intended behaviour, but it's still a violation of the principle of least surprise and should be very clearly commented in the code.</p>
+
+<p>Note that a further consequence is that the test <code>CanCreateCanonicalComparer</code> is unreliable. Microsoft could (they probably won't, but they could) change the implementation of <code>OrderByDescending</code> in such a way that it still respects its documented behaviour and continues working for code which uses reasonable comparers, but breaks your test. Perhaps more likely, a third party implementation of .Net might write <code>OrderByDescending</code> differently to Microsoft.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>            // Makes the compiler very happy.
+            return 0;
+</code></pre>
+</blockquote>
+
+<p>The compiler would be equally happy if you threw an exception, and in my opinion that would be a more honest fix. If execution reaches this line, there's a programming error either in this code or in the code which uses it.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>        internal Comparer([NotNull] IDictionary&lt;CompareOperator, Func&lt;T, T, bool&gt;&gt; comparers)
+        {
+            _comparers = comparers;
+        }
+
+        public int Compare(T x, T y)
+        {
+            ...
+
+            if (_comparers[CompareOperator.LessThan](x, y)) return -1;
+            if (_comparers[CompareOperator.Equal](x, y)) return 0;
+            if (_comparers[CompareOperator.GreaterThan](x, y)) return 1;
+
+            ...
+        }
+</code></pre>
+</blockquote>
+
+<p>I'm not entirely convinced that a dictionary is appropriate but, given the decision to use it, in my opinion the constructor should check that it contains all of the necessary keys.</p>
+
+<hr>
+
+<p>Postscript: my suggestion for a <code>ComparerBuilder</code> API would be the following:</p>
+
+<pre><code>public class ComparerBuilder&lt;T&gt;
+{
+    private ComparerBuilder() { }
+
+    public static ComparerBuilder&lt;T&gt; CompareBy&lt;TProjection&gt;(Func&lt;T, TProjection&gt; projection) =&gt;
+        new ComparerBuilder&lt;T&gt;().ThenBy(projection);
+
+    public static ComparerBuilder&lt;T&gt; CompareByDesc&lt;TProjection&gt;(Func&lt;T, TProjection&gt; projection) =&gt;
+        new ComparerBuilder&lt;T&gt;().ThenByDesc(projection);
+
+    public ComparerBuilder&lt;T&gt; ThenBy&lt;TProjection&gt;(Func&lt;T, TProjection&gt; projection);
+
+    public ComparerBuilder&lt;T&gt; ThenByDesc&lt;TProjection&gt;(Func&lt;T, TProjection&gt; projection);
+
+    public Comparer&lt;T&gt; Build();
+}
+</code></pre>
+
+<p>with a test to show usage:</p>
+
+<pre><code>    [TestMethod]
+    public void TestComparerChain()
+    {
+        var data = new ValueTuple&lt;string, int&gt;[]
+        {
+            ("A", 10),
+            ("B", 5),
+            ("C", 2),
+            ("C", 10),
+            ("B", 5),
+            ("A", 2),
+        };
+        var cmp = ComparerBuilder&lt;ValueTuple&lt;string, int&gt;&gt;.
+            CompareByDesc(tuple =&gt; tuple.Item2).
+            ThenBy(tuple =&gt; tuple.Item1).
+            Build();
+
+        data = data.OrderBy(x =&gt; x, cmp).ToArray();
+        Assert.IsTrue(data.SequenceEqual(new ValueTuple&lt;string, int&gt;[]
+        {
+            ("A", 2),
+            ("C", 2),
+            ("B", 5),
+            ("B", 5),
+            ("A", 10),
+            ("C", 10),
+        }));
+    }
+</code></pre>
+
+<p>This gives plenty of scope to use expression parsing and code generation...</p>
+    </div>

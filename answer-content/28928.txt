@@ -1,0 +1,55 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I'm not familiar with the libraries and types you're using here, but I see a few general Haskell things:</p>
+
+<ol>
+<li><p>Instead of <code>loopAction &lt;- atomically $ ...; loopAction</code>, you can use <code>join $ atomically $ ...</code>. This removes the need for the entire outer <code>do</code> block, simplifying the blocks/indentation.</p></li>
+<li><p>You're doing nearly-identical operations on <code>m</code> and <code>q</code>, just with different collection types. I would attempt to extract these to a higher-order function (e.g. one possible abstraction is <code>modifyTVar</code>, which doesn't exist in the library, but you can see how to write it analogously to <code>modifyMVar</code>), and perhaps define an ad-hoc typeclass to make Map and PSQ look the same.</p></li>
+<li><p>Your <code>case b of ...</code> has two nearly identical branches! Unless there's some non-obvious polymorphism, then just combine them:</p>
+
+<pre><code>let send = case b of
+    11 -&gt; sendq
+    72 -&gt; sendqr
+return $ case Map.lookup key mT of
+    Nothing -&gt; return ()
+    Just messages -&gt; send s (B.snoc (S.encode messages) b) (show a) 4711
+</code></pre></li>
+<li><p><code>let mT' = Map.delete key mT</code> is redundant because the following <code>insert</code> will always overwrite that key anyway; just use <code>Map.insert key [newmsgs] mT</code> and never define <code>mT'</code>.</p></li>
+<li><p>Assuming you're using <a href="http://hackage.haskell.org/packages/archive/PSQueue/1.1/doc/html/Data-PSQueue.html" rel="nofollow">Data.PSQueue</a>, and <em>the key already exists in the queue</em>, you can use <code>PSQ.adjust</code> instead of a delete followed by an insert.</p></li>
+</ol>
+
+<p>Taking all of my own advice except the last:</p>
+
+<pre><code>transMit :: Serialize a =&gt; Socket -&gt; POSIXTime -&gt; KEY -&gt; a -&gt; TPSQ -&gt; TMap a -&gt; IO ()
+transMit s time key newmsgs q m =
+    join $ atomically $ do
+        modifyTVar_ q $ (PSQ.insert key time . PSQ.delete key)
+        foo &lt;- modifyTVar m $ \mT -&gt; (Map.insert key [newmsgs] mT, Map.lookup key mT)
+        let (address, protocol) = key
+        let send = case protocol of
+            11 -&gt; sendq
+            72 -&gt; sendqr
+        return $ case foo of
+            Nothing -&gt; return ()
+            Just messages -&gt; send s (B.snoc (S.encode messages) protocol) (show address) 4711
+
+modifyTVar :: TVar a -&gt; (a -&gt; IO (a, b)) -&gt; IO b
+modifyTVar var f = do
+    x &lt;- readTVar var
+    (x', r) &lt;- f x
+    writeTVar var x'
+    return r
+modifyTVar_ :: TVar a -&gt; (a -&gt; IO a) -&gt; IO ()
+modifyTVar_ var f = do
+    x &lt;- readTVar var
+    writeTVar var (f x)
+</code></pre>
+
+<p>Further points about what I did:</p>
+
+<ul>
+<li><p>Note I called a variable <code>foo</code> because I don't know what it makes sense to name it in your application, not because that's a good name.</p></li>
+<li><p>I went and defined both <code>modifyTVar</code> and <code>modifyTVar_</code>; the latter is not needed but allows the action on <code>q</code> to be defined as a simple function composition. This is perhaps an excess of specialized utility functions, but I feel it is reasonable because the experienced Haskell programmer will understand what they do simply from seeing their names.</p></li>
+<li><p>I renamed <code>a</code> and <code>b</code> so the variable names actually communicate what they are; this is better than writing a comment to explain them, and so I removed the comment.</p></li>
+<li><p>I put <code>join $ atomically $ do</code> on a separate line so as to catch the reader's eye that this is not just a plain <code>do</code> block.</p></li>
+</ul>
+    </div>

@@ -1,0 +1,82 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>There are several improvement areas. Let's review them one-by-one from bottom up:</p>
+<h3>GetXYZ</h3>
+<pre><code>private static async Task GetXYZ(string parameter)
+{
+     await Task.Run(() =&gt; {
+         var svc = new WebApiService();
+         var msg1 = svc.GeXYZ(parameter);
+         if (string.IsNullOrWhiteSpace(parameter)) return;
+            Console.WriteLine($"XYZ {parameter}");
+     });
+}
+</code></pre>
+<p>A <code>Task</code> can represent either an asynchronous work or a parallel work. An async work can be considered as <strong>non-blocking I/O operation</strong>. Whereas the parallel work can be treated as <strong>(blocking) CPU operation</strong>. (It is oversimplified but it works for us now)</p>
+<p>In the above code the <code>Task.Run</code> tells to .NET runtime that this piece of code should run a dedicated thread (in reality this is not as simple as this, but let me simplify the model now). It means that the passed delegate should run a dedicated CPU core.</p>
+<p>But inside your delegate you are making a <strong>blocking I/O operation</strong>. So you have created a delegate, you have moved that code to a dedicated core, which will <strong>block</strong> and do nothing until the network driver will finish the I/O operation.</p>
+<p>You are just wasting a lot of valuable resources. A better alternative would look like this:</p>
+<pre><code>private static async Task GetXYZ(string parameter)
+{
+     var svc = new WebApiService();
+     var msg1 = await svc.GeXYZAsync(parameter);
+     if (string.IsNullOrWhiteSpace(parameter)) return;
+        Console.WriteLine($"XYZ {parameter}");
+}
+</code></pre>
+<p>Here you are making a non-blocking I/O operation. The network driver fires of a network call asynchronously and returns immediately. When it completes it will notify the ThreadPool. (Because here we are calling <code>await</code> against an asynchronous work that's why we are not blocking the caller Thread.)</p>
+<p>In short: Network driver can do let's say 1000 concurrent network operations at the same time. While the CPU can perform as many operations in parallel as many cores it has.</p>
+<h3>RunTasks</h3>
+<p>(I guess you can find a better name for this.)</p>
+<p>Here with the <code>Task.WhenAll</code> you are already asking the .NET runtime to run them in parallel. If they are asynchronous operations then the network driver will take care of them and try to run them in parallel. In case of parallel work CPU tries to schedule them on different cores but there is no guarantee that they will run in parallel. They might run only concurrently (with context-switches).</p>
+<h3>RunLoad</h3>
+<p>(I guess you can find a better name for this.)</p>
+<p>Here with the <code>Parallel.For</code> you try to create as many blocking parallel task as many the <code>loadSize</code> value. If you have 100 Tasks for 8 CPU cores then it is inevitable to have context-switches. Again your current implementation is highly CPU-bound even though you try to perform massive I/O operations.</p>
+<p>A better alternative:</p>
+<pre><code>private static async Task RunLoad(int loadSize)
+{
+    var clients = new List&lt;Task&gt;();
+    for (int j = 0; j &lt; loadSize; j++)
+    {
+        clients.Add(RunTasks());
+    }
+
+    await Task.WhenAll(clients);
+}
+</code></pre>
+<p>In this way all your client's all requests might run in parallel if your network driver supports that many outgoing requests.</p>
+<p>This <code>WhenAll</code> will be finished when all operation has finished. If you want to monitor them in "real-time" when any of them finished then you can rewrite your method in the following way:</p>
+<pre><code>static async Task Main(string[] args)
+{
+    Console.WriteLine("Press any key to start...");
+    Console.ReadKey();
+    Console.WriteLine();
+  
+    await foreach (var test in RunTests(10))
+    {
+        //NOOP
+    }
+
+    Console.WriteLine("Press any key to exit...");
+    Console.ReadKey();
+}
+
+
+private static async IAsyncEnumerable&lt;Task&gt; RunTests(int loadSize)
+{
+    var requests = new List&lt;Task&gt;();
+    for (int j = 0; j &lt; loadSize; j++)
+    {
+        requests.Add(GetLoanByLoanId("7000002050"));
+        requests.Add(GetEnvelopesForLoan("7000002077"));
+        requests.Add(GetLoanDataByLoanId("7000002072"));
+    }
+
+    while (requests.Any())
+    {
+        var finishedRequest = await Task.WhenAny(requests);
+        requests.Remove(finishedRequest);
+        yield return finishedRequest;
+    }
+}
+</code></pre>
+    </div>

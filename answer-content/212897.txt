@@ -1,0 +1,98 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Common biggest mistake.</h2>
+<p>The largest common problem is not ensuring ownership is taken during construction. The problem is that if the constructor does not complete (ie an exception is thrown out of the constructor) then the destructor will never be called.</p>
+<p>But so what you ask. Well if you blow up during construction you have definitely leaked the pointer you just promised to manage!</p>
+<pre><code>  explicit Shrd_ptr(T* managed_, destructor_type destructor_ = nullptr)
+    : Smart_pointer_base&lt;T&gt;(managed_)
+    , user_count(new size_type(1))
+    , destructor(std::move(destructor_))
+  { }
+</code></pre>
+<p>It looks so simple. How can that not complete? Well the you have a call to <code>new</code> in there. It is not exception safe and can throw. So what can you do about it?</p>
+<p>Two options. 1) Use a non throwing new: <code>new (std::nothrow) size_type(1)</code> 2) catch exceptions in the constructor using <code>Function try blocks</code>.</p>
+<pre><code># Option 1
+  explicit Shrd_ptr(T* managed_, destructor_type destructor_ = nullptr)
+    : Smart_pointer_base&lt;T&gt;(managed_)
+    , user_count(new (std::nothrow) size_type(1))
+    , destructor(std::move(destructor_))
+  {
+      if (user_count == nullptr) {
+          destructor(managed_);
+          throw std::bad_alloc("Failed");
+      }
+  }    
+
+# Option 2
+  explicit Shrd_ptr(T* managed_, destructor_type destructor_ = nullptr)
+    try
+        : Smart_pointer_base&lt;T&gt;(managed_)
+        , user_count(new size_type(1))
+        , destructor(std::move(destructor_))
+    {}
+    catch(...)
+    {
+         destructor_(managed_);
+         throw;   // re-throw current exception
+    }
+</code></pre>
+<h2>Virtual Functions</h2>
+<p>Calling virtual functions in the constructor or destructor is UB. Because it is implementation defined how virtual functions are implemented the standard has put restrictions on when they can be used. The can not be used during construction or destruction.</p>
+<pre><code>Shrd_ptr&lt;T&gt;::~Shrd_ptr()
+{
+  destruct();  // This is UB
+}
+</code></pre>
+<p>Since each shared pointer is unique. Just put the code you have in <code>destruct()</code> in the destructor for that type of object. That will do exactly what you expect:</p>
+<pre><code>Shrd_ptr&lt;T&gt;::~Shrd_ptr()
+{
+    if (safe_decrement(user_count) == 0) {
+        delete user_count;
+        destructor ? destructor(this-&gt;managed) : Smart_pointer_base&lt;T&gt;::destruct();
+    }
+}
+
+Unq_ptr&lt;T, destructor_type&gt;::~Unq_ptr()
+{
+    destructor(this-&gt;managed);
+}
+</code></pre>
+<h2>Optimization</h2>
+<p>You create an object to hold the count.</p>
+<p>In the shared pointer you keep a pointer to this count object and a destructor object. When you copy/move both these values need to be updated. Why not modify the count object to store all the accessory information about the shared pointer (both count and destructor object). That way when you copy/move you just need to move one pointer (in addition to the data).</p>
+<h2>Missing Functionality</h2>
+<p>When you have de-reference and de-refrence method functions you should really have a way to check that the object can be de-referenced. Otherwise you have to hope it does not blow up when you use these methods.</p>
+<p>Basically you need some way to check the pointer you are holding is not a nullptr.</p>
+<pre><code> explicit operator bool() const {return managed;}
+</code></pre>
+<h2>Inconsistent behavior</h2>
+<p>If you explicitly construct a shared pointer with a <code>nullptr</code> and you create a shared pointer using the default constructor (this internally it is nullptr) you have different internal structures (one has a user count the other does not).</p>
+<pre><code>Shrd_ptr&lt;int&gt;     data1(nullptr);
+Shrd_ptr&lt;int&gt;     data2;
+</code></pre>
+<p>I can not see any bugs with this. But as your class gets bigger having this inconsistency may cause unforeseen issues. No matter how the object is constructed it should have the same internal structure for the same data.</p>
+<h2>No <code>nullptr</code> constructor.</h2>
+<p>You don't have a constructor for explicitly taking <code>nullptr</code> as a parameter.</p>
+<p>But you say <code>nullptr</code> binds to any pointer type. Yes. But its not about the normal situation.</p>
+<p>This is a situation where you are passing a nullptr to function/method. If the function takes an r-value ref we can not construct the object (as the constructor is explicit) so you need to fully qualify the nullptr to make the call.</p>
+<pre><code>void workWithSP(Shrd_ptr&lt;int&gt;&amp;&amp; sp); // Some definition.
+
+
+int main()
+{
+    workWithSP(nullptr);                // Does not work.
+
+    workWithSP(Shrd_ptr&lt;int&gt;(nullptr)); // Works but seems verbose.
+}
+</code></pre>
+<p>Simply add a <code>nullptr_t</code> constructor.</p>
+<pre><code>Shrd_ptr::Shrd_ptr(std::nullptr_t): ....
+</code></pre>
+<h2>Missing Functionality</h2>
+<p>Assigning derived types.</p>
+<pre><code> class X {};
+ class Y: public X {};
+
+ Shrd_ptr&lt;Y&gt;    data(new Y);
+ Shrd_ptr&lt;X&gt;    dataNew(std::move(data));  // Why does that not work?
+</code></pre>
+    </div>

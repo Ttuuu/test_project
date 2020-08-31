@@ -1,0 +1,212 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>While continuing work on this code I have noticed that <code>ListNonArchiveDirectoresWithFiles()</code> already collects all the data retrieved by <code>ListFilesInDirectories()</code> and those methods could be one.</p>
+
+<p>I have also came across [Toub Stephen (2010). Patterns for Parallel Programming, Microsoft]. This book contains a very clear and concise implementation of <code>ParallelWhileNotEmpty()</code> which is exactly what I needed.</p>
+
+<p>Thanks to this the code could become:</p>
+
+<pre><code>using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using DC.Meteologica.Commons.Extensions;
+using DC.Meteologica.Commons.Helpers;
+using FluentFTP;
+using log4net;
+
+namespace DC.Meteologica.Commons.Ftp
+{
+    public class ParallelFtpClient : IDisposable
+    {
+        private readonly ILog _logger = LogManager.GetLogger(typeof(MeteologicaFtpSyncer).FullName);
+        private readonly int _maxConcurrentConnections;
+        private readonly Func&lt;IFtpClient&gt; _factory;
+        private readonly List&lt;IFtpClient&gt; _ftpClients;
+
+        public ParallelFtpClient(int maxConcurrentConnections, Func&lt;IFtpClient&gt; factory)
+        {
+            _maxConcurrentConnections = maxConcurrentConnections;
+            _factory = factory;
+            _ftpClients = new List&lt;IFtpClient&gt;();
+        }
+
+        public void Connect()
+        {
+            var tasks = new List&lt;Task&gt;();
+            for (var i = 0; i &lt; _maxConcurrentConnections; i++)
+            {
+                var ftpClient = _factory();
+                _ftpClients.Add(ftpClient);
+                var connectTask = ftpClient.ConnectAsync();
+                tasks.Add(connectTask);
+            }
+            Task.WaitAll(tasks.ToArray());
+        }
+
+        public void Disconnect()
+        {
+            var tasks = _ftpClients
+                .Select(x =&gt; x.DisconnectAsync())
+                .ToArray();
+            Task.WaitAll(tasks);
+        }
+
+        public DownloadResult DownloadFilesParallel(IEnumerable&lt;LocalRemotePathPair&gt; ftpPathLocalPathPairs)
+        {
+            var clients = new ConcurrentQueue&lt;IFtpClient&gt;(_ftpClients);
+            var downloadedFiles = new ConcurrentBag&lt;LocalRemotePathPair&gt;();
+            var failedDownloadsBag = new ConcurrentBag&lt;LocalRemotePathPair&gt;();
+
+            Parallel.ForEach(ftpPathLocalPathPairs,
+                new ParallelOptions() { MaxDegreeOfParallelism = _maxConcurrentConnections },
+                (pair) =&gt;
+                {
+                    clients.TryDequeue(out var client);
+
+                    _logger.Debug($"Downloading {pair.FtpFilePath} to {pair.LocalFilePath}...");
+                    try
+                    {
+                        var memoryStream = new MemoryStream();
+                        client.Download(memoryStream, pair.FtpFilePath);
+                        memoryStream.Position = 0;
+                        var destinationDirectory = Path.GetDirectoryName(pair.LocalFilePath);
+                        if (!Directory.Exists(destinationDirectory))
+                        {
+                            _logger.Info($"Creating new directory {destinationDirectory}");
+                            Directory.CreateDirectory(destinationDirectory);
+                        }
+
+                        File.WriteAllBytes(pair.LocalFilePath, memoryStream.ToArray());
+                        downloadedFiles.Add(pair);
+                    }
+                    catch (Exception e)
+                    {
+                        _logger.Warn($"An unhandled exception occured while downloading file {pair.FtpFilePath}", e);
+                        failedDownloadsBag.Add(pair);
+                    }
+
+                    clients.Enqueue(client);
+                }
+            );
+
+            return new DownloadResult(downloadedFiles.ToList(), failedDownloadsBag.ToList());
+        }
+
+        public List&lt;string&gt; ListNonArchivedFilesRecursively(string root, CancellationToken token)
+        {
+            try
+            {
+                return ListNonArchivedFilesRecursivelyInternal(root, token);
+            }
+            catch (AggregateException e) when (e.InnerExceptions.Single() is OperationCanceledException)
+            {
+                throw new OperationCanceledException(token);
+            }
+        }
+
+        private List&lt;string&gt; ListNonArchivedFilesRecursivelyInternal(string root, CancellationToken token)
+        {
+            var files = new ConcurrentBag&lt;string&gt;();
+            var clients = new ConcurrentQueue&lt;IFtpClient&gt;(_ftpClients);
+
+            Parallel2.WhileNotEmpty(
+                new []{root},
+                new ParallelOptions() { MaxDegreeOfParallelism = _maxConcurrentConnections },
+                (path, adder) =&gt;
+            {
+                token.ThrowIfCancellationRequested();
+                _logger.Debug($"Listing files and folders in {path}...");
+                clients.TryDequeue(out var client);
+                try
+                {
+                    var childItems = client.GetListing(path);
+                    var fileChildItems = childItems
+                        .Where(x =&gt; x.Type == FtpFileSystemObjectType.File)
+                        .Select(x =&gt; x.FullName);
+                    var subDirectoriesToQuery = childItems
+                        .Where(x =&gt; x.Type == FtpFileSystemObjectType.Directory)
+                        .Where(x =&gt; x.Name != "Archive");
+                    files.AddRange(fileChildItems);
+                    foreach (var ftpListItem in subDirectoriesToQuery)
+                    {
+                        adder(ftpListItem.FullName);
+                    }
+                }
+                catch (TimeoutException e)
+                {
+                    _logger.Info($"Exception while listing items for: {path}. Listing will be retried.", e);
+                    adder(path);
+                }
+                finally
+                {
+                    clients.Enqueue(client);
+                }
+            });
+
+            return files.ToList();
+        }
+
+        public void Dispose()
+        {
+            foreach (var ftpClient in _ftpClients)
+            {
+                ftpClient.Dispose();
+            }
+        }
+    }
+
+    // this is named Parallel2 so it ca coexist with System.Threading.Tasks.Parallel
+    internal static class Parallel2
+    {
+        // from Patterns_of_Parallel_Programming_CSharp.pdf 
+        public static void WhileNotEmpty&lt;T&gt;(IEnumerable&lt;T&gt; initialValues, ParallelOptions parallelOptions,
+            Action&lt;T, Action&lt;T&gt;&gt; body)
+        {
+            var from = new ConcurrentQueue&lt;T&gt;(initialValues);
+            var to = new ConcurrentQueue&lt;T&gt;();
+            while (!@from.IsEmpty)
+            {
+                Action&lt;T&gt; addMethod = v =&gt; to.Enqueue(v);
+                Parallel.ForEach(@from, parallelOptions, v =&gt; body(v, addMethod));
+                @from = to;
+                to = new ConcurrentQueue&lt;T&gt;();
+            }
+        }
+    }
+
+    public class DownloadResult
+    {
+        public DownloadResult(IReadOnlyList&lt;LocalRemotePathPair&gt; downloaded, IReadOnlyList&lt;LocalRemotePathPair&gt; failed)
+        {
+            Downloaded = downloaded;
+            Failed = failed;
+        }
+
+        public IReadOnlyList&lt;LocalRemotePathPair&gt; Downloaded { get; }
+        public IReadOnlyList&lt;LocalRemotePathPair&gt; Failed { get; }
+
+        public static DownloadResult AllFine(IReadOnlyList&lt;LocalRemotePathPair&gt; downloadedFiles) =&gt; new DownloadResult(downloadedFiles, new List&lt;LocalRemotePathPair&gt;());
+    }
+
+
+    public readonly struct LocalRemotePathPair
+    {
+        public LocalRemotePathPair(string ftpFilePath, string localFilePath) : this()
+        {
+            FtpFilePath = ftpFilePath;
+            LocalFilePath = localFilePath;
+        }
+
+        public string FtpFilePath { get; }
+        public string LocalFilePath { get; }
+
+        public override string ToString() =&gt; $"{FtpFilePath} =&gt; {LocalFilePath}";
+    }
+}
+
+<span class="math-container">```</span>
+</code></pre>
+    </div>

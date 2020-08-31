@@ -1,0 +1,300 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<ul>
+<li>There's a lot of duplication here for like items. A sign that loops and templates will
+reduce redundancy.</li>
+<li>There's a few distinct steps here. Better to separate each step to separate concerns. For example, there's 1. creating the payload 2. creating the CI, 3. describing what was created.</li>
+<li>It looks like you can re-use <code>UsdDBActions</code>. If so, it would be better to make one instance
+of <code>UsdDBActions</code> and re-use it within the function.</li>
+<li>If you have control over <code>UsdDBActions.create_ci</code> it would be better to have it raise
+an exception on error instead of returning <code>False</code>. I'm assuming you can't change it
+so I did not.</li>
+<li>Avoid temp variables like <code>response</code> if you're just going to immediately return it.</li>
+<li>Location should be in the DB payload, not coming from the validated_data. Otherwise
+you're likely not creating the DB with the correct location.</li>
+<li>All of the description information should come from the payload, not <code>validated_data</code> as
+there are slight differences.</li>
+<li>There are slight differences in output format between the different methods. I'm assuming
+this is unintentional and I've ignored them.</li>
+<li>Presumably, one CI could be created while others fail. So rather than checking that
+all were created, it might be useful to output the ones that were created and the
+ones that failed individually.</li>
+<li>I wasn't sure how the number of IP addresses was derived for HA clusters so I omitted
+that information from the description.</li>
+</ul>
+
+<p>Here's what I came up with:</p>
+
+<pre><code>from textwrap import dedent
+from pprint import pprint
+
+
+def group_number(i, total, groups):
+    """
+    For a zero based index item ``i`, of a list of ``total`` items,
+    group into ``groups`` number of groups.
+
+    For example, if there are 10 items and 3 groups, item 0 will
+    be in group 0 and item 2 will be in group 0. Item 3 will be in
+    group 1 and item 7 will be in group 2.
+    """
+    return (i // ceil(total / groups)) % groups
+
+
+def make_payload(validated_data, vms, dbs, clusters=None):
+    items = []
+
+    locations = [
+        validated_data['primary_location'],
+        validated_data['secondary_location']
+    ]
+
+    if clusters:
+        for i, cluster in enumerate(clusters):
+            group = validated_data[
+                'Active' if i &gt;= len(clusters) / 2 else 'Standby']
+
+            items.append({
+                'organization': validated_data['environment'].organization_cgkprimarykey,
+                'configuration': validated_data['environment'].configuration_cgkprimarykey,
+                'class': 'Cluster',
+                'status': 'To be installed',
+                'ci': cluster,
+                'hostname': f"{validated_data['database_name']} {group}",
+            },)
+
+    for i, (vm, db) in enumerate(zip(vms, dbs)):
+        # 0 for first half, 1 for second
+        half = group_number(i, len(vms), 2)
+
+        # First half of VMs are in primary location
+        location = locations[half]
+
+        # First half of VMs are in first cluster
+        cluster = None
+        if clusters:
+            cl = group_number(i, len(vms), len(clusters))
+            cluster = clusters[cl]
+
+
+        items.append({
+            'level': validated_data['level'],
+            'vlan': validated_data['environment'].vlan,
+            'storage_capacity': validated_data['storage_capacity'],
+            'configuration': validated_data['environment'].configuration_cgkprimarykey,
+            'hostname': vm,
+            'number_of_cpu': validated_data['cpu_licenses'],
+            'ram_gb': validated_data['compute_units'] * 7,
+            'resolver_group': 'SSC.Computing &amp; Internal Outsourcing',
+            'twenty_four_team': '24H STAID Computing and Internal Outsourcing',
+            'service_window': 'businesshours',
+            'ci': vm,
+            'status': 'To be installed',
+            'organization': validated_data['environment'].organization_cgkprimarykey,
+            'class': 'Virtual Server',
+            'location': location,
+            'attached_to_server': cluster,
+        })
+
+        items.append({
+            'level': validated_data['level'],
+            'hostname': validated_data['database_name'],
+            'attached_to_server': vm,
+            'resolver_group': 'SSC.Database Oracle',
+            'roleflagmanagement': 1,
+            'service_window':  'businesshours',
+            'model': 'Oracle 12.1.0.1',
+            'ci': db,
+            'status': 'To be installed',
+            'organization': validated_data['environment'].organization_cgkprimarykey,
+            'class': 'Database',
+            'configuration': validated_data['environment'].configuration_cgkprimarykey,
+            # Second half of DBs will be in secondary location
+            'location': location,
+            'license': validated_data['license'],
+            'character_set': validated_data['character_set'],
+            'national_character_set': validated_data['national_character_set'],
+            'dns': validated_data['dns']
+        })
+
+    return items
+
+
+def get_payload_description(payloads):
+    vms = [p for p in payloads if p['class'] == 'Virtual Server']
+    dbs = [p for p in payloads if p['class'] == 'Database']
+    clusters = [p for p in payloads if p['class'] == 'Cluster']
+
+    vm_s = 's' if len(vms) &gt; 1 else ''
+    db_s = 's' if len(dbs) &gt; 1 else ''
+    cluster_s = 's' if len(clusters) &gt; 1 else ''
+
+    description = dedent(f"""\
+        Created VM{vm_s}: {', '.join(i['ci'] for i in vms)}
+        Created DB{db_s}: {', '.join(i['ci'] for i in dbs)}
+    """)
+
+    if clusters:
+        description += f"Created Cluster{cluster_s}: {', '.join(i['ci'] for i in clusters)}"
+
+    description += dedent(f"""\
+
+        - Portal information
+        - Create network assets and log IP information in CMDB.
+            -&gt; {len(vms)} x IP address in VLAN {validated_data['environment'].vlan}
+    """)
+
+    for i, vm in enumerate(vms):
+        num = i + 1
+        if len(vms) == 1:
+            title = f"1 x OVM type {vm['level']}"
+        else:
+            title = f"Virtual server {num}"
+
+        description += dedent(f"""\
+            - Create {title}
+                -&gt; VLAN: {vm['vlan']}
+                -&gt; Primary Location: {vm['location']}
+                -&gt; vCPU = {vm['number_of_cpu']}
+                -&gt; vMEm = {vm['ram_gb']}
+                -&gt; vStorage = {vm['storage_capacity']}
+                -&gt; Attached = {vm['attached_to_server']}
+        """)
+
+    for db in dbs:
+        description += dedent(f"""\
+            - Create 1 x Database type {db['level']}
+                -&gt; Name: {db['hostname']}
+                -&gt; Character set: {db['character_set']}
+                -&gt; National Character set: {db['national_character_set']}
+                -&gt; Location: {db['location']}
+                -&gt; Type: {db['level']}
+                -&gt; License: {db['license']}
+                -&gt; DNS information: {db['dns'].server} - {db['dns'].domain}
+                -&gt; Attached = {db['attached_to_server']}
+        """)
+
+    x1 = '1 x ' if len(dbs) &gt; 1 else ''
+
+    description += dedent(f"""\
+        - CSC request to enable monitoring
+        - CSC request to enable backup with retention {validated_data['backup'].retention}
+        - Feedback
+            -&gt; Database Name{db_s} (SID)
+            -&gt; Database port{db_s}
+            -&gt; IP addresses
+            -&gt; Host name{db_s}
+            -&gt; {x1}User/password
+    """)
+    return description
+
+
+def create_cis(validated_data, num_vms_and_dbs=1, num_clusters=0):
+    """
+    Args:
+        num_vms_and_dbs (int): How many VMs and DBs to create. For
+            each VM, one Database will also be created.
+    """
+    actions = UsdDBActions()
+
+    # If it's cheap to do `reserve_ci`, then it would be better to do
+    # it for vm, db, cl separately. If it's expensive, it can be done
+    # this way.
+    names = actions.reserve_ci(num_vms_and_dbs * 2 + num_clusters)
+    clusters = [names.pop(0) for _ in range(num_clusters)]
+    vms = [names.pop(0) for _ in range(num_vms_and_dbs)]
+    dbs = [names.pop(0) for _ in range(num_vms_and_dbs)]
+
+    payloads = make_payload(validated_data, vms, dbs, clusters)
+
+    cis = [
+        actions.create_ci(payload['ci'], payload)
+        for payload in payloads
+    ]
+
+    if all(cis):
+        description = get_payload_description(payloads)
+    else:
+        description = 'Could not create ci'
+
+    return {
+        'description': description,
+        'created_vms': vms,
+        'created_dbs': dbs,
+        'created_clusters': clusters,
+    }
+
+
+class OrderDescription:
+    @staticmethod
+    def standalone(validated_data):
+        return create_cis(validated_data, num_vms_and_dbs=1)
+
+    @staticmethod
+    def cluster_dr(validated_data):
+        return create_cis(validated_data, num_vms_and_dbs=2)
+
+    @staticmethod
+    def geocluster_ha_dr(validated_data):
+        return create_cis(validated_data, num_vms_and_dbs=4, num_clusters=3)
+
+    def get_description(self, validated_data):
+        level = validated_data['level']
+
+        if level == 'Standalone':
+            return self.standalone(validated_data)
+        elif level == 'Cluster (DR)':
+            return self.cluster_dr(validated_data)
+        elif level == 'Geocluster (HA + DR)':
+            return self.geocluster_ha_dr(validated_data)
+        else:
+            return 'No description available'
+
+
+class UsdDBActions(object):
+    """
+    Stub for UsdDBActions
+    """
+    def reserve_ci(self, l):
+        return [string.ascii_lowercase[i] for i in range(l)]
+
+    def create_ci(self, name, payload):
+        return True
+
+
+class Mock(object):
+    """
+    Mock data that always returns an int value for missing key or
+    attribute.
+    """
+    def __init__(self, defaults=None):
+        self.defaults = defaults or {}
+        self.counter = 0
+
+    def __getitem__(self, item):
+        if item not in self.defaults:
+            self.counter += 1
+            self.defaults[item] = self.counter
+        return self.defaults[item]
+
+    def __getattr__(self, item):
+        return self[item]
+
+
+validated_data = Mock({
+    'environment': Mock(),
+    'dns': Mock(),
+    'backup': Mock(),
+    'cpu_licenses': 1,
+    'compute_units': 1,
+    'database_name': 'db',
+    'storage_capacity': 100,
+    'level': 1,
+    'license': 'foolicense',
+})
+
+
+pprint(OrderDescription.standalone(validated_data))
+pprint(OrderDescription.cluster_dr(validated_data))
+pprint(OrderDescription.geocluster_ha_dr(validated_data))
+</code></pre>
+    </div>

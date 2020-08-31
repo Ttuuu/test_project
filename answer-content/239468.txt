@@ -1,0 +1,728 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>In addition to the review you already have, I have a few more suggestions.</p>
+
+<h2>Fix the bug</h2>
+
+<p>As was already pointed out, the <em>assignment-in-condition</em> practice is problematic.  In this particular case, the problem is in <code>main</code>.  The current code has this:</p>
+
+<pre><code>if ((memory = calloc(memsize, sizeof *memory)) == NULL)
+        err(EXIT_FAILURE, NULL);
+if ((fp = fopen(*argv, "r")) == NULL)
+        err(EXIT_FAILURE, "%s", *argv);
+</code></pre>
+
+<p>The problem is that if the file doesn't exist, the memory just allocated will not be freed.  For that reason and for the fact that it's generally better to define variables when they are declared, I'd write that sequence like this instead:</p>
+
+<pre><code>FILE *fp = fopen(*argv, "r");
+if (fp == NULL) {
+    free(memory);
+    err(EXIT_FAILURE, "%s", *argv);
+}
+</code></pre>
+
+<h2>Think carefully about signed vs. unsigned numbers</h2>
+
+<p>What would it mean for the <code>memsize</code> to be a negative number?  I can't think of a rational interpretation for such a thing, so I'd recommend making that <code>size_t</code> which is unsigned.</p>
+
+<h2>Eliminate global variables</h2>
+
+<p>In this case there lot of global variables such as <code>memory</code> and <code>memsize</code> which are probably better gathered up into a structure and made part of <code>main</code> instead of global.  Then for each of the relevant functions such as <code>load</code> or <code>dump</code>, pass a pointer to the structure as one of the arguments.</p>
+
+<pre><code>struct Simpletron {
+    /* Simpletron's memory is simulated with a one-dimensional array */
+    int *memory;
+    size_t memsize;
+
+    /* Simpletron's registers are simulated with the following variables */
+    int acc;     /* accumulator register (value being processed) */
+    size_t pc;   /* program counter points to current instruction */
+    int opcode;  /* current opcode */
+    int operand; /* current operand */
+};
+</code></pre>
+
+<p>Note that I've also changed from <code>ireg</code> to <code>pc</code>.  More on that later.</p>
+
+<h2>Make the program data driven</h2>
+
+<p>Instead of the <code>operation</code> <code>enum</code>, a large <code>switch</code> statement, etc. I think it would be much neater to have a <code>struct</code> for instructions.  Here's how I'd define it:</p>
+
+<pre><code>struct Instruction {
+    int opcode;
+    const char *mnemonic;
+    const char *printstr;
+    int (*exec)(struct Simpletron* s);
+};
+</code></pre>
+
+<p>Now we can create an array of instructions.  Here's an example of one:</p>
+
+<pre><code>{ 52,"BRANCHZERO"," %2u", simple_instr_branchzero },
+</code></pre>
+
+<p>Now all that remains is to write the code that performs the instruction:</p>
+
+<pre><code>static int simple_instr_branchzero(struct Simpletron *s) {
+    if (s-&gt;acc == 0) {
+        s-&gt;pc = s-&gt;operand;
+    } else {
+        ++s-&gt;pc;
+    }
+    return WARN_NONE;
+}
+</code></pre>
+
+<h2>Make error messages and numbers neater</h2>
+
+<p>You may have noticed that the function above returns <code>WARN_NONE</code>.  This is somewhat easier for a programmer to read and understand than something like <code>return 0</code> and also has the advantage that we now have both a code and a message (which might be translated to other languages, for instance).  So instead of this inside the large <code>switch</code>:</p>
+
+<pre><code>case ADD_I:
+    if ((operand &gt; 0 &amp;&amp; acc &gt; MEM_MAX - operand) ||
+        (operand &lt; 0 &amp;&amp; acc &lt; MEM_MIN - operand)) {
+            warnx("integer overflow");
+            return 1;
+    } else {
+            acc += operand;
+    }
+    count++;
+    break;
+</code></pre>
+
+<p>We can write this:</p>
+
+<pre><code>static int simple_instr_add_i(struct Simpletron *s) {
+    int result = s-&gt;acc + s-&gt;operand;
+    if (isOutOfRange(result)) {
+        return WARN_OVERFLOW;
+    }
+    s-&gt;acc = result;
+    ++s-&gt;pc;
+    return WARN_NONE;
+}
+</code></pre>
+
+<p>This is enabled using this code:</p>
+
+<pre><code>enum warning { WARN_NONE, WARN_HALT, WARN_INPUT, WARN_OVERFLOW, WARN_DIVZERO, WARN_SIGNEDOVERFLOW, WARN_REMAINZERO, WARN_COUNT };
+static const struct Error {
+    enum warning value;
+    const char *text;
+} simpletron_errors[WARN_COUNT] = {
+    { WARN_NONE, "ok" },
+    { WARN_HALT, "halt" },
+    { WARN_INPUT, "improper input" },
+    { WARN_OVERFLOW, "integer overflow" },
+    { WARN_DIVZERO, "division by zero" },
+    { WARN_SIGNEDOVERFLOW, "signed integer overflow"},
+    { WARN_REMAINZERO, "remainder by zero"},
+};
+</code></pre>
+
+<p>Note that <code>WARN_COUNT</code> is not a real warning, but rather a marker to define the size of the array and also for us with error checking on access to that array.</p>
+
+<h2>Use helper functions to clarify code</h2>
+
+<p>The code above uses <code>isOutOfRange</code> which simplifies the code and makes it clear to the reader.  The content is this:</p>
+
+<pre><code>static bool isOutOfRange(int n) {
+    return n &lt; MEM_MIN || n &gt; MEM_MAX;
+}
+</code></pre>
+
+<h2>Use action words for functions</h2>
+
+<p>The functions <code>load</code> and <code>dump</code> are named in a way that suggests their function, but I think <code>simpletron</code> is not as good.  Since they are all dealing with the same underlying machine, I'd suggest naming them as <code>simpletron_load</code>, <code>simpletron_dump</code> and <code>simpletron_run</code>.</p>
+
+<h2>Separate interface from implementation</h2>
+
+<p>I'd suggest splitting the program into three pieces: <code>main.c</code> which would contain <code>main</code> and functions only needed by it, a <code>simpletron.h</code> file that defines the interface to the virtual machine and <code>simpletron.c</code> which would contain the implementation.  Here's how I would define <code>simpletron.h</code>:</p>
+
+<pre><code>#ifndef SIMPLETRON_H
+#define SIMPLETRON_H
+#include &lt;stdio.h&gt;
+#include &lt;stdbool.h&gt;
+
+struct Simpletron {
+    /* Simpletron's memory is simulated with a one-dimensional array */
+    int *memory;
+    size_t memsize;
+
+    /* Simpletron's registers are simulated with the following variables */
+    int acc;     /* accumulator register (value being processed) */
+    size_t pc;   /* program counter points to current instruction */
+    int opcode;  /* current opcode */
+    int operand; /* current operand */
+};
+
+int simpletron_run(struct Simpletron *s, bool trace, bool verbose);
+int simpletron_load(struct Simpletron *s, FILE *fp);
+void simpletron_dump(struct Simpletron *s);
+#endif // SIMPLETRON_H
+</code></pre>
+
+<p>Only the minimal information to use the interface is here.  All of the other details are encapsulated in <code>simpletron.c</code>.  </p>
+
+<h2>Prefer <code>const</code> to <code>#define</code></h2>
+
+<p>Since C99, it's generally better to use <code>const</code> rather than <code>#define</code> for numerical constants.  For instance, I'd put these inside <code>simpletron.c</code>:</p>
+
+<pre><code>static const int MEM_MAX = 9999;
+static const int MEM_MIN = -9999;
+static const int INSTRUCTIONSIZE = 4;
+</code></pre>
+
+<p>This way, we get the benefit of type checking and also limiting scope.</p>
+
+<h2>Consider adding features</h2>
+
+<p>I thought it would be nice to be able to trace the program and also, optionally, to dump the contents of the machine after each instruction.  This heavily modified version of your original <code>simpletron</code> function does just that.</p>
+
+<pre><code>/* run instructions from memory; return 1 if error occurs, return 0 otherwise */
+int simpletron_run(struct Simpletron *s, bool trace, bool verbose) {
+    /* memory location of next instruction */
+    /* simulation begins with the instruction in the location 00 and continues sequentially */
+    s-&gt;pc = 0;
+
+    /* this loop implements the "instruction execution cycle" */
+    while (s-&gt;pc &lt; s-&gt;memsize) {
+        /* opcode is the leftmost two digits of instruction register*/
+        s-&gt;opcode = s-&gt;memory[s-&gt;pc] / 100;
+        /* operand is the rightmost two digits of instruction register*/
+        s-&gt;operand = s-&gt;memory[s-&gt;pc] % 100;
+        /* simple linear scan for opcode */
+        const struct Instruction *op = findop(s-&gt;opcode);
+        if (op == NULL) {
+            warnx("%+05d: invalid instruction", s-&gt;memory[s-&gt;pc]);
+            return 1;
+        }
+        if (trace) {
+            fprintf(stderr, "%05lu: %+05d\t", s-&gt;pc, s-&gt;memory[s-&gt;pc]);
+            fprintf(stderr, op-&gt;mnemonic);
+            fprintf(stderr, op-&gt;printstr, s-&gt;operand);
+            fprintf(stderr, "\n");
+        }
+        int result = op-&gt;exec(s);
+        if (verbose) {
+            simpletron_dump(s);
+        }
+        if (result == WARN_HALT) {
+            return 0;
+        }
+        if (result != WARN_NONE &amp;&amp; result &lt; WARN_COUNT) {
+            warnx(simpletron_errors[result].text);
+            return 1;
+        }
+    }
+    warnx("execution reached end of memory without halting");
+    return 1;
+}
+</code></pre>
+
+<p>Using these features was a simple matter of adding the appropriate arguments for <code>main</code> and passing two boolean values.  Much of this functionality is enabled by the use of the data-driven design, but there's still more.</p>
+
+<h2>Fully use data structures to simplify features</h2>
+
+<p>The posted example code purports to take an average of seven numbers, but it does no such thing.  In fact, it computes a sum of a list of numbers terminated by a sentinel value of zero.  A program that computes an average might look like this in source code form:</p>
+
+<pre><code>READ [13]   ; read a number from the uset
+LOAD [13]   ; acc = number
+ADD [15]    ; add to running sum
+STORE [15]  ; store sum
+LOAD [14]   ; fetch counter
+ADD_I 1     ; increment by one
+STORE [14]  ; save updated count
+BRANCHNEG 0 ; if &lt;0, we're not done yet
+LOAD [15]   ; fetch the running sum
+DIVIDE_I 7  ; divide by seven
+STORE [13]  ; store the updated value
+WRITE [13]  ; write it to stdout
+HALT
++0000       ; this is location 13 used as a scratchpad for input
+-0007       ; this is the value -n (number of numbers to avg)
++0000       ; this is location 15 that holds the running sum
+</code></pre>
+
+<p>It was certainly not obvious from a raw list of numbers what the original code actually did until I added the trace function mentioned above.  It's a relatively simple task to allow the code to accept either this nice source code version or the original raw number version.  Here's an enhanced <code>simpletron_load</code> function that does just that:</p>
+
+<pre><code>int simpletron_load(struct Simpletron *s, FILE *fp) {
+    unsigned linenum = 1;
+    char inst[13];
+    inst[12] = '\0';  // assure it's terminated
+    size_t i = 0;
+    const char* error = NULL;
+    while (!error &amp;&amp; (fscanf(fp, "%12s", inst) == 1)) {
+        // is it a number
+        if (inst[0] == '+' || inst[0] == '-') {
+            int arg;
+            if (sscanf(inst, "%5d", &amp;arg) == 1) {
+                s-&gt;memory[i++] = arg;
+            } else {
+                error = "reading number";
+            }
+        } else {
+            const struct Instruction *in = findmnemonic(inst);
+            if (in) {
+                if (strlen(in-&gt;printstr)) {
+                    int arg = parsearg(in-&gt;printstr, fp);
+                    if (arg &gt;= 0) {
+                        s-&gt;memory[i++] = in-&gt;opcode*100 + arg;
+                    } else {
+                        error = "reading instruction";
+                    }
+                } else {
+                    s-&gt;memory[i++] = in-&gt;opcode*100;
+                }
+            } else {
+                error = "reading instruction";
+            }
+        }
+        // ignore the rest of the line
+        for (int c = getc(fp); c != '\n' &amp;&amp; c != EOF; c = getc(fp)) {
+        }
+        ++linenum;
+        if (i &gt;= s-&gt;memsize) {
+            error = "memory full";
+        }
+    }
+    if (error) {
+        printf("ERROR:%s:%d\n", error, linenum);
+        return 1;
+    }
+    return 0;
+}
+</code></pre>
+
+<h2>Make the machine do the counting</h2>
+
+<p>Rather than fiddling with tedious parsing of formatted output, I generally prefer to let the machine do the counting for me.  To that end, the rewritten <code>simpletron_dump</code> function now looks like this:</p>
+
+<pre><code>/* write a core dump of memory and registers into stdout */
+void simpletron_dump(struct Simpletron *s) {
+    const unsigned linelen = 10;
+    fprintf(stderr, "\nREGISTERS:\n"
+           "accumulator          %+05d\n"
+           "instruction pointer  +%04lu\n"
+           "\nMEMORY:\n  ",
+           s-&gt;acc, s-&gt;pc);
+    for (unsigned i = 0; i &lt; linelen; ++i) {
+        fprintf(stderr, "%7u", i);
+    }
+    unsigned dumpcount = 0;
+    for (size_t i = 0; i &lt; s-&gt;memsize; ++i, --dumpcount) {
+        if (dumpcount == 0) {
+            fprintf(stderr, "\n%2lu  ", i );
+            dumpcount = linelen;
+        }
+        fprintf(stderr, "%+05d  ", s-&gt;memory[i]);
+    }
+    fprintf(stderr, "\n");
+}
+</code></pre>
+
+<p>The code uses the <code>const unsigned linelen</code> to keep track of how many values to print out per line for both the header and for the memory dump.  That also fixes another bug in the original which did not print memory correctly.</p>
+
+<h2>Understand real CPUs</h2>
+
+<p>I know this is all a learning exercise, but one thing that may be useful is to understand a bit more about real CPU architecture.  For example, rather than throwing an error in the event of overflow, real CPUs typically have a <em>carry flag</em> which indicates this and an <em>overflow flag</em> to indicate signed overflow.  Also, it is more typical to have an <em>instruction pointer</em> (sometimes called a <em>program counter</em>) rather than an instruction register that actually holds the current instruction.  Of course internal to the machine, something eventually does fetch and parse the value of the instruction, but it's quite rare for that to be directly accessible from the outside.  This was one reason I changed from <code>ireg</code> to <code>pc</code> as mentioned above.  It keeps things neater and more clearly mimics how real machines work.</p>
+
+<h2>Results</h2>
+
+<p>Here's the revised version of <code>simpletron.c</code>:</p>
+
+<pre class="lang-cpp prettyprint-override"><code>#include "simpletron.h"
+#include &lt;err.h&gt;
+#include &lt;errno.h&gt;
+#include &lt;ctype.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;stdbool.h&gt;
+#include &lt;string.h&gt;
+#include &lt;limits.h&gt;
+#include &lt;unistd.h&gt;
+
+static const int MEM_MAX = 9999;
+static const int MEM_MIN = -9999;
+static const int INSTRUCTIONSIZE = 4;
+
+enum warning { WARN_NONE, WARN_HALT, WARN_INPUT, WARN_OVERFLOW, WARN_DIVZERO, WARN_SIGNEDOVERFLOW, WARN_REMAINZERO, WARN_COUNT };
+static const struct Error {
+    enum warning value;
+    const char *text;
+} simpletron_errors[WARN_COUNT] = {
+    { WARN_NONE, "ok" },
+    { WARN_HALT, "halt" },
+    { WARN_INPUT, "improper input" },
+    { WARN_OVERFLOW, "integer overflow" },
+    { WARN_DIVZERO, "division by zero" },
+    { WARN_SIGNEDOVERFLOW, "signed integer overflow"},
+    { WARN_REMAINZERO, "remainder by zero"},
+};
+
+static bool isOutOfRange(int n) {
+    return n &lt; MEM_MIN || n &gt; MEM_MAX;
+}
+
+/* get instruction from fp; return 0 if instruction is improper */
+static int fetch_number(FILE *fp, int *instruction) {
+    int num = 0;
+    int c;
+    int sign = 1;
+
+    /* get initial blank */
+    while (isblank(c = getc(fp)))
+            ;
+
+    /* get instruction/data sign */
+    switch (c) {
+        case '-':
+            sign = -1;
+            // fall through
+        case '+':
+            c = getc(fp);
+            break;
+        default:   // error condition
+            return 0;
+    }
+
+    /* get instruction/data number */
+    for (int i = INSTRUCTIONSIZE; i; --i) {
+        if (!isdigit(c)) {  // error
+            return 0;
+        }
+        num = num * 10 + c - '0';
+        c = getc(fp);
+    }
+
+    /* get remaining of command line */
+    while (c != '\n' &amp;&amp; c != EOF) {
+        c = getc(fp);
+    }
+
+    *instruction = sign * num;
+    return 1;
+}
+
+static int simple_instr_read(struct Simpletron *s) {
+    if (fetch_number(stdin, &amp;s-&gt;memory[s-&gt;operand]) == 0) {
+        return WARN_INPUT;
+    }
+    ++s-&gt;pc;
+    return WARN_NONE;
+}
+
+static int simple_instr_write(struct Simpletron *s) {
+    printf("%+05d\n", s-&gt;memory[s-&gt;operand]);
+    ++s-&gt;pc;
+    return WARN_NONE;
+}
+static int simple_instr_load(struct Simpletron *s) {
+    s-&gt;acc = s-&gt;memory[s-&gt;operand];
+    ++s-&gt;pc;
+    return WARN_NONE;
+}
+
+static int simple_instr_store(struct Simpletron *s) {
+    s-&gt;memory[s-&gt;operand] = s-&gt;acc;
+    ++s-&gt;pc;
+    return WARN_NONE;
+}
+
+static int simple_instr_add(struct Simpletron *s) {
+    int result = s-&gt;acc + s-&gt;memory[s-&gt;operand];
+    if (isOutOfRange(result)) {
+        return WARN_OVERFLOW;
+    }
+    s-&gt;acc = result;
+    ++s-&gt;pc;
+    return WARN_NONE;
+}
+
+static int simple_instr_subtract(struct Simpletron *s) {
+    int result = s-&gt;acc - s-&gt;memory[s-&gt;operand];
+    if (isOutOfRange(result)) {
+        return WARN_OVERFLOW;
+    }
+    s-&gt;acc = result;
+    ++s-&gt;pc;
+    return WARN_NONE;
+}
+
+static int simple_instr_divide(struct Simpletron *s) {
+    if (s-&gt;memory[s-&gt;operand] == 0) {
+        return WARN_DIVZERO;
+    } else if ((s-&gt;acc == MEM_MIN) &amp;&amp; (s-&gt;memory[s-&gt;operand] == -1)) {
+        return WARN_SIGNEDOVERFLOW;
+    } else {
+        s-&gt;acc /= s-&gt;memory[s-&gt;operand];
+    }
+    ++s-&gt;pc;
+    return WARN_NONE;
+}
+
+static int simple_instr_multiply(struct Simpletron *s) {
+    s-&gt;acc *= s-&gt;memory[s-&gt;operand];
+    if (isOutOfRange(s-&gt;acc)) {
+        return WARN_OVERFLOW;
+    }
+    ++s-&gt;pc;
+    return WARN_NONE;
+}
+
+static int simple_instr_remainder(struct Simpletron *s) {
+    if (s-&gt;memory[s-&gt;operand] == 0) {
+        return WARN_REMAINZERO;
+    } else if ((s-&gt;acc == MEM_MIN) &amp;&amp; (s-&gt;memory[s-&gt;operand] == -1)) {
+        return WARN_SIGNEDOVERFLOW;
+    } else {
+        s-&gt;acc %= s-&gt;memory[s-&gt;operand];
+    }
+    ++s-&gt;pc;
+    return WARN_NONE;
+}
+
+static int simple_instr_add_i(struct Simpletron *s) {
+    int result = s-&gt;acc + s-&gt;operand;
+    if (isOutOfRange(result)) {
+        return WARN_OVERFLOW;
+    }
+    s-&gt;acc = result;
+    ++s-&gt;pc;
+    return WARN_NONE;
+}
+
+static int simple_instr_subtract_i(struct Simpletron *s) {
+    int result = s-&gt;acc - s-&gt;operand;
+    if (isOutOfRange(result)) {
+        return WARN_OVERFLOW;
+    }
+    s-&gt;acc = result;
+    ++s-&gt;pc;
+    return WARN_NONE;
+}
+
+static int simple_instr_divide_i(struct Simpletron *s) {
+    if (s-&gt;operand == 0) {
+        return WARN_DIVZERO;
+    } else if ((s-&gt;acc == MEM_MIN) &amp;&amp; (s-&gt;operand == -1)) {
+        return WARN_SIGNEDOVERFLOW;
+    } else {
+        s-&gt;acc /= s-&gt;operand;
+    }
+    ++s-&gt;pc;
+    return WARN_NONE;
+}
+
+static int simple_instr_multiply_i(struct Simpletron *s) {
+    s-&gt;acc *= s-&gt;operand;
+    if (isOutOfRange(s-&gt;acc)) {
+        return WARN_OVERFLOW;
+    }
+    ++s-&gt;pc;
+    return WARN_NONE;
+}
+
+static int simple_instr_remainder_i(struct Simpletron *s) {
+    if (s-&gt;operand == 0) {
+        return WARN_REMAINZERO;
+    } else if ((s-&gt;acc == MEM_MIN) &amp;&amp; (s-&gt;operand == -1)){
+        return WARN_SIGNEDOVERFLOW;
+    } else {
+        s-&gt;acc %= s-&gt;operand;
+    }
+    ++s-&gt;pc;
+    return WARN_NONE;
+}
+
+static int simple_instr_branch(struct Simpletron *s) {
+    s-&gt;pc = s-&gt;operand;
+    return WARN_NONE;
+}
+
+static int simple_instr_branchneg(struct Simpletron *s) {
+    if (s-&gt;acc &lt; 0) {
+        s-&gt;pc = s-&gt;operand;
+    } else {
+        ++s-&gt;pc;
+    }
+    return WARN_NONE;
+}
+
+static int simple_instr_branchzero(struct Simpletron *s) {
+    if (s-&gt;acc == 0) {
+        s-&gt;pc = s-&gt;operand;
+    } else {
+        ++s-&gt;pc;
+    }
+    return WARN_NONE;
+}
+
+static int simple_instr_halt(struct Simpletron *s) {
+    s=s;
+    return WARN_HALT;
+}
+
+static const struct Instruction {
+    int opcode;
+    const char *mnemonic;
+    const char *printstr;
+    int (*exec)(struct Simpletron* s);
+} instructions[] = {
+    { 10,"READ"," [%2u]", simple_instr_read },
+    { 11,"WRITE"," [%2u]", simple_instr_write },
+    { 20,"LOAD"," [%2u]", simple_instr_load },
+    { 21,"STORE"," [%2u]", simple_instr_store },
+    { 30,"ADD"," [%2u]", simple_instr_add },
+    { 31,"SUBTRACT"," [%2u]", simple_instr_subtract },
+    { 32,"DIVIDE"," [%2u]", simple_instr_divide },
+    { 33,"MULTIPLY"," [%2u]", simple_instr_multiply },
+    { 34,"REMAINDER"," [%2u]", simple_instr_remainder },
+    { 40,"ADD_I"," %2u", simple_instr_add_i },
+    { 41,"SUBTRACT_I"," %2u", simple_instr_subtract_i },
+    { 42,"DIVIDE_I"," %2u", simple_instr_divide_i },
+    { 43,"MULTIPLY_I"," %2u", simple_instr_multiply_i },
+    { 44,"REMAINDER_I"," %2u", simple_instr_remainder_i },
+    { 50,"BRANCH"," %2u", simple_instr_branch },
+    { 51,"BRANCHNEG"," %2u", simple_instr_branchneg },
+    { 52,"BRANCHZERO"," %2u", simple_instr_branchzero },
+    { 53,"HALT","" , simple_instr_halt },
+
+};
+
+static const struct Instruction *findop(int opcode) {
+    for (size_t i=0; i &lt; sizeof(instructions)/sizeof(instructions[0]); ++i) {
+        if (opcode == instructions[i].opcode) {
+            return &amp;instructions[i];
+        }
+    }
+    return NULL;
+}
+
+static const struct Instruction *findmnemonic(const char *mnemonic) {
+    for (size_t i=0; i &lt; sizeof(instructions)/sizeof(instructions[0]); ++i) {
+        if (strcmp(mnemonic, instructions[i].mnemonic) == 0) {
+            return &amp;instructions[i];
+        }
+    }
+    return NULL;
+}
+
+/* run instructions from memory; return 1 if error occurs, return 0 otherwise */
+int
+simpletron_run(struct Simpletron *s, bool trace, bool verbose)
+{
+    /* memory location of next instruction */
+    /* simulation begins with the instruction in the location 00 and continues sequentially */
+    s-&gt;pc = 0;
+
+    /* this loop implements the "instruction execution cycle" */
+    while (s-&gt;pc &lt; s-&gt;memsize) {
+        /* opcode is the leftmost two digits of instruction register*/
+        s-&gt;opcode = s-&gt;memory[s-&gt;pc] / 100;
+        /* operand is the rightmost two digits of instruction register*/
+        s-&gt;operand = s-&gt;memory[s-&gt;pc] % 100;
+        /* simple linear scan for opcode */
+
+        const struct Instruction *op = findop(s-&gt;opcode);
+        if (op == NULL) {
+            warnx("%+05d: invalid instruction", s-&gt;memory[s-&gt;pc]);
+            return 1;
+        }
+        if (trace) {
+            fprintf(stderr, "%05lu: %+05d\t", s-&gt;pc, s-&gt;memory[s-&gt;pc]);
+            fprintf(stderr, op-&gt;mnemonic);
+            fprintf(stderr, op-&gt;printstr, s-&gt;operand);
+            fprintf(stderr, "\n");
+        }
+        int result = op-&gt;exec(s);
+        if (verbose) {
+            simpletron_dump(s);
+        }
+        if (result == WARN_HALT) {
+            return 0;
+        }
+        if (result != WARN_NONE &amp;&amp; result &lt; WARN_COUNT) {
+            warnx(simpletron_errors[result].text);
+            return 1;
+        }
+    }
+    warnx("execution reached end of memory without halting");
+    return 1;
+}
+
+static int parsearg(const char *fmt, FILE *fp) {
+    unsigned arg = 0;
+    int result = fscanf(fp, fmt, &amp;arg);
+    return (result == 1) ? (int)arg : -1;
+}
+
+int simpletron_load(struct Simpletron *s, FILE *fp) {
+    unsigned linenum = 1;
+    char inst[13];
+    inst[12] = '\0';  // assure it's terminated
+    size_t i = 0;
+    const char* error = NULL;
+    while (!error &amp;&amp; (fscanf(fp, "%12s", inst) == 1)) {
+        // is it a number
+        if (inst[0] == '+' || inst[0] == '-') {
+            int arg;
+            if (sscanf(inst, "%5d", &amp;arg) == 1) {
+                s-&gt;memory[i++] = arg;
+            } else {
+                error = "reading number";
+            }
+        } else {
+            const struct Instruction *in = findmnemonic(inst);
+            if (in) {
+                if (strlen(in-&gt;printstr)) {
+                    int arg = parsearg(in-&gt;printstr, fp);
+                    if (arg &gt;= 0) {
+                        s-&gt;memory[i++] = in-&gt;opcode*100 + arg;
+                    } else {
+                        error = "reading instruction";
+                    }
+                } else {
+                    s-&gt;memory[i++] = in-&gt;opcode*100;
+                }
+            } else {
+                error = "reading instruction";
+            }
+        }
+        // ignore the rest of the line
+        for (int c = getc(fp); c != '\n' &amp;&amp; c != EOF; c = getc(fp)) {
+        }
+        ++linenum;
+        if (i &gt;= s-&gt;memsize) {
+            error = "memory full";
+        }
+    }
+    if (error) {
+        printf("ERROR:%s:%d\n", error, linenum);
+        return 1;
+    }
+    return 0;
+}
+
+/* write a core dump of memory and registers into stdout */
+void simpletron_dump(struct Simpletron *s) {
+    fprintf(stderr, "\nREGISTERS:\n"
+           "accumulator          %+05d\n"
+           "instruction pointer  +%04lu\n",
+           s-&gt;acc, s-&gt;pc);
+    fprintf(stderr, "\nMEMORY:\n  ");
+    const unsigned linelen = 10;
+    for (unsigned i = 0; i &lt; linelen; ++i) {
+        fprintf(stderr, "%7u", i);
+    }
+    unsigned dumpcount = 0;
+    for (size_t i = 0; i &lt; s-&gt;memsize; ++i, --dumpcount) {
+        if (dumpcount == 0) {
+            fprintf(stderr, "\n%2lu  ", i );
+            dumpcount = linelen;
+        }
+        fprintf(stderr, "%+05d  ", s-&gt;memory[i]);
+    }
+    fprintf(stderr, "\n");
+}
+<span class="math-container">```</span>
+</code></pre>
+    </div>

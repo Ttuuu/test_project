@@ -1,0 +1,218 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Bugs:</h2>
+
+<ul>
+<li>A lot of memory is allocated (<code>foo = new Container</code>) and never deallocated (<code>delete foo</code>).</li>
+<li>N-puzzle implementations usually make the blank tile the bottom-right corner, while this code puts it at the top-left. Are you sure the solvability conditions are still correct with this change? (I suspect it's currently trying to solve unsolvable problems).</li>
+<li>The linear conflict calculation seems slightly wrong (see below).</li>
+</ul>
+
+<hr>
+
+<h2>Code</h2>
+
+<p><strong>General</strong></p>
+
+<ul>
+<li><p>Use <code>&lt;cmath&gt;</code> not <code>&lt;math.h&gt;</code>. <code>&lt;cmath&gt;</code> defines things in the <code>std::</code> namespace, instead of defining them globally.</p></li>
+<li><p><code>n</code> would be more flexible if it were split into separate width and height (I don't think there's a requirement for these puzzles to be square?). It should also be tied to specific puzzle instances, and not a global variable. At the moment, if you want to test a 3x3 puzzle, and a 4x4 puzzle in the same program, it's impossible to do so.</p></li>
+<li><p>Changing <code>n</code> may silently break the <code>encode</code> function.</p></li>
+<li><p>Consider defining a <code>Point</code> class to store pairs of x and y values. Since converting from index to point (<code>i % n</code>, <code>i / n</code>) is common throughout the code, it would be neater to define something like:</p>
+
+<pre><code>struct Point
+{
+    Point() = delete;
+
+    int x, y;
+};
+
+Point makePoint(int index)
+{
+    assert(index &gt;= 0);
+    assert(index &lt; n * n);
+
+    return{ index % n, index / n };
+}
+
+int makeIndex(Point const&amp; p)
+{
+    assert(p.x &gt;= 0);
+    assert(p.x &lt; n);
+    assert(p.y &gt;= 0);
+    assert(p.y &lt; n);
+
+    return p.y * n + p.x;
+}
+</code></pre>
+
+<p>If you decide to change how the indexing or storage works (e.g. to support variable width / height), you only need to change these two functions, instead of every instance of <code>foo % n</code> throughout the code.</p></li>
+<li><p>Be aware that <code>std::map</code> / <code>std::unordered_map</code> <a href="https://en.cppreference.com/w/cpp/container/unordered_map/operator_at" rel="nofollow noreferrer">subscript operator</a> creates a value in the map if one doesn't already exist with that key. It is usually better to use the <code>count()</code>, and <code>insert()</code> or <code>emplace()</code> functions.</p></li>
+</ul>
+
+<hr>
+
+<p><strong>Manager::Manager()</strong></p>
+
+<ul>
+<li><p>Use the C++11 <code>&lt;random&gt;</code> functionality instead of <code>srand</code> and <code>rand</code>:</p>
+
+<pre><code>auto rng = std::mt19937_64(std::random_device()());
+auto dist = std::uniform_int_distribution&lt;int&gt;(0, (n * n) - 1);
+...
+val = dist(rng);
+</code></pre>
+
+<p>Seeding the random number generator with <code>std::random_device</code> is the equivalent of seeding <code>srand</code> with <code>time</code>. However, omitting this argument will use the default seed, and thus produce the same output sequence every time, which might be useful to examine specific test cases.</p></li>
+<li><p>Define variables as close to their usage as possible. This means you don't have to worry about re-setting values in a loop (e.g. <code>nums</code>, <code>val</code>), and prevents variables being declared, and never used (there are a few of those in this code).</p></li>
+<li><p>There's a simpler way to generate a random test case using algorithms from the standard library:</p>
+
+<pre><code>#include &lt;numeric&gt;
+#include &lt;algorithm&gt;
+...
+    auto rng = std::mt19937_64(std::random_device()());
+
+    do
+    {
+        std::iota(current-&gt;b, current-&gt;b + n * n, 0); // fill current-&gt;b with values 0, 1, 2... (n * n - 1)
+        std::shuffle(current-&gt;b, current-&gt;b + n * n, rng); // randomly shuffle the values!
+
+        findZero();
+
+    } while (!checkSolvable());
+</code></pre></li>
+</ul>
+
+<p><strong>Manager copy constructor and destructor</strong></p>
+
+<ul>
+<li>These should either do something (e.g. clean up allocated memory), or not be defined.</li>
+</ul>
+
+<p><strong>Manager::calculateLinear()</strong></p>
+
+<ul>
+<li><p>The current implementation appears to be incorrect (<a href="https://algorithmsinsight.wordpress.com/graph-theory-2/a-star-in-general/implementing-a-star-to-solve-n-puzzle/" rel="nofollow noreferrer">based on this article</a>):</p>
+
+<ul>
+<li>It counts each conflict twice (because it searches in both directions for every tile).</li>
+<li>It counts the blank space (value zero) in conflicts, which it shouldn't.</li>
+</ul></li>
+<li><p>We can make it a bit simpler by pre-calculating whether each value is in the correct row / column, then search down and right for conflicts:</p>
+
+<pre><code>int Manager::calculateLinear(int b[])
+{
+    auto conflicts = 0;
+
+    {
+        bool in_col[n * n] = { }; // set to true if this value is in the correct column
+        bool in_row[n * n] = { }; // set to true if this value is in the correct row
+
+        for (auto y = 0; y != n; ++y)
+        {
+            for (auto x = 0; x != n; ++x)
+            {
+                auto i = y * n + x;
+
+                auto bx = b[i] % n;
+                auto by = b[i] / n;
+
+                in_col[i] = (bx == x);
+                in_row[i] = (by == y);
+            }
+        }
+
+        for (auto y = 0; y != n; ++y)
+        {
+            for (auto x = 0; x != n; ++x)
+            {
+                auto i = y * n + x;
+
+                if (b[i] == 0) // ignore the empty space
+                    continue;
+
+                if (in_col[i])
+                {
+                    for (auto r = y; r != n; ++r) // check down for conflicts
+                    {
+                        auto j = r * n + x;
+
+                        if (b[j] == 0) // ignore the empty space
+                            continue;
+
+                        if (in_col[j] &amp;&amp; b[j] &lt; b[i])
+                            ++conflicts;
+                    }
+                }
+
+                if (in_row[i])
+                {
+                    for (auto c = x; c != n; ++c) // check right for conflicts
+                    {
+                        auto j = y * n + c;
+
+                        if (b[j] == 0) // ignore the empty space
+                            continue;
+
+                        if (in_row[j] &amp;&amp; b[j] &lt; b[i])
+                            ++conflicts;
+                    }
+                }
+            }
+        }
+    }
+
+    return 2 * conflicts;
+}
+</code></pre></li>
+</ul>
+
+<hr>
+
+<p><strong>Memory Use</strong></p>
+
+<ul>
+<li>Rather than storing booleans in the <code>closed</code> map, we can store the encoded parent. This allows the path to be reconstructed from the <code>closed</code> map, and the <code>Container</code>s themselves don't need to store a parent pointer.</li>
+<li>This means <code>Container</code>s can be stored by value (or at least inside <code>std::unique_ptr</code>s), which will solve the memory leak.</li>
+</ul>
+
+<hr>
+
+<p><strong>Design</strong></p>
+
+<ul>
+<li>Since this is a search algorithm, I'd actually suggest removing the <code>Manager</code> class entirely, and going for a purely functional approach.</li>
+<li><p>Don't use global variables at all. Data structures can be passed between functions by value, reference or const reference as appropriate. This might seem like more work to start with, but it ends up being a lot cleaner as the inputs to each function are immediately apparent. Testing individual parts of the code (e.g. <code>checkSolvable</code>) becomes much simpler as test cases can be passed directly to the function to be tested.</p>
+
+<pre><code>namespace NPuzzles
+{
+
+    using BoardT = std::vector&lt;std::uint8_t&gt;;
+
+    namespace
+    {
+
+        bool solvable(BoardT const&amp; board, std::uint8_t width, std::uint8_t height)
+        {
+            // ...
+        }
+
+        // other functions
+
+    } // anonymous
+
+
+    std::vector&lt;BoardT&gt; solve(BoardT const&amp; board, std::uint8_t width, std::uint8_t height)
+    {
+        if (!solvable(board, width, height))
+            return{ };
+
+        // solve ...
+    }
+
+} // NPuzzles
+</code></pre>
+
+<p><code>solve</code> is the main entry point, and enclosed in a namespace. The inner functions are defined in an anonymous namespace that effectively makes them visible only in this code file. Creating test cases or printing out the solution should be done separately.</p></li>
+<li><p><code>std::vector</code> is much easier to use than c-style arrays (it initializes its contents properly, and can be passed by value if desired).</p></li>
+</ul>
+    </div>

@@ -1,0 +1,125 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<ul>
+<li><p><code>WindowProps</code> and <code>WindowData</code> are effectively identical. We could just use <code>WindowProps</code> for both.</p></li>
+<li><p>We can query the window width and height from GLFW (with <code>glfwGetWindowSize</code>). We should do this instead of storing the width and height ourselves because:</p>
+
+<ul>
+<li><p>If the window is resized, the width and height stored in the class will be incorrect. To update these values, we'd have to use <code>glfwSetWindowSizeCallback</code>.</p></li>
+<li><p>I suspect that <code>glfwSetWindowSize</code> may not set the window size to the requested values if the window has a size limit (so the values stored in <code>SetWindowWidth</code> and <code>SetWindowHeight</code> may be wrong).</p></li>
+</ul></li>
+<li><p>Similarly, <code>GetMonitorWidth()</code> may return unexpected values if a window is moved to a monitor other than the primary monitor.</p></li>
+<li><p>Note that <code>m_MonitorWidth</code> and <code>m_MonitorHeight</code> are set, and never referred to again. These members could be removed.</p></li>
+<li><p>We should initialize <code>m_Window</code> to <code>nullptr</code> in the constructor(s).</p></li>
+<li><p>The window title should be stored in a <code>std::string</code>. We should not require an externally owned <code>char*</code> to be kept alive for the duration of the <code>Window</code> class lifetime.</p></li>
+<li><p>There is no advantage to passing built-in types by <code>const&amp;</code> (e.g. <code>void SetWindowWidth(const unsigned int&amp; windowWidth);</code>, and others).</p></li>
+<li><p>We should not have a publicly accessible <code>DestroyWindow</code> function. If this is called, it leaves us with an invalid <code>Window</code> object, for which none of the functions (setting size, etc.) make sense or work. We should destroy the window in a class destructor instead.</p></li>
+<li><p>Functions defined inside the body of the class do not need the <code>inline</code> keyword (e.g. <code>inline unsigned int GetWindowWidth() const</code>).</p></li>
+<li><p>As noted by <em>programmer</em> in the comments, the use of <code>Window</code> in the function names is unnecessary.</p></li>
+<li><p>I'd suggest that the default values in <code>WindowProps</code> are unnecessary. Asking the user to supply these every time is not a significant burden. We can do this by <code>delete</code>ing the default constructor:</p>
+
+<pre><code>struct WindowProperties
+{
+    unsigned int Width, Height;
+    std::string Title;
+    WindowMode Mode;
+
+    WindowProperties() = delete;
+};
+</code></pre>
+
+<p>We then need only one <code>Window</code> constructor: <code>Window(WindowProperties const&amp; properties);</code> which can be called like so: <code>Window window({ 1024, 768, "blah", WindowMode::FULLSCREEN });</code></p></li>
+<li><p>We need to think about copying and moving the <code>Window</code> class. It's probably easiest to prevent both:</p>
+
+<pre><code>Window(Window const&amp;) = delete;
+Window&amp; operator=(Window const&amp;) = delete;
+Window(Window&amp;&amp;) = delete;
+Window&amp; operator=(Window&amp;&amp;) = delete;
+</code></pre>
+
+<p>However, there might be a case for allowing <code>move</code> construction and assignment.</p></li>
+</ul>
+
+<hr>
+
+<p><strong>Comment reply - passing by value:</strong></p>
+
+<p>In C++ all types are value-types. If we want a reference we have to explicitly request it. So if we define a function like this:</p>
+
+<pre><code>void foo(ValueType value);
+</code></pre>
+
+<p>The <code>ValueType</code> is always copied. If <code>ValueType</code> is defined by <code>typedef int ValueType</code>, this is very cheap. If <code>ValueType</code> is a <code>struct ValueType { int[10000]; };</code> it isn't.</p>
+
+<p>Where copying is expensive, we can pass a reference to the object in the outer scope instead:</p>
+
+<pre><code>void foo(const ValueType&amp; value);
+</code></pre>
+
+<p>We can think of this as passing (a safer version of) a pointer to an object somewhere outside the <code>foo</code> function.</p>
+
+<p>For types where copying is cheap (e.g. built-in types like <code>int</code>, <code>unsigned int</code> etc.) this may introduce overhead, and prevents compiler optimizations. So for types like <code>unsigned int</code> it's best to do the copy. So we should have:</p>
+
+<pre><code>void SetWidth(unsigned int width);
+void SetHeight(unsigned int height);
+void SetSizeLimit(unsigned int minWidth, unsigned int minHeight, unsigned int maxWidth, unsigned int maxHeight);
+</code></pre>
+
+<hr>
+
+<p><strong>Comment reply - destructor:</strong></p>
+
+<p>We should call <code>DestroyWindow</code> from the destructor:</p>
+
+<pre><code>Window::~Window() { DestroyWindow(); }
+</code></pre>
+
+<p>However, <code>DestroyWindow</code> should not be a public function, otherwise we can do this:</p>
+
+<pre><code>myWindow.DestroyWindow();
+myWindow.SetWidth(480); // crash? error? we shouldn't be able to do this here...
+</code></pre>
+
+<p>Many things in C++ are based on the idea of <a href="https://en.cppreference.com/w/cpp/language/raii" rel="nofollow noreferrer">RAII (resource acquisition is initialization)</a>. This attempts to ensure that the lifetime of a resource (the glfw window in this case) has the same lifetime as the object that "owns" it (the <code>Window</code> class). So when the user creates an instance of the <code>Window</code> class, the window is created, and when the user destroys that instance (or it goes out of scope), the window is destroyed.</p>
+
+<pre><code>{
+    Window window(...); &lt;--- window resource created
+    ... ok to do stuff with window
+} &lt;--- window destructor called automatically at end of scope (window destroyed)
+
+... window doesn't exist any more
+</code></pre>
+
+<hr>
+
+<p><strong>Comment reply - copying:</strong></p>
+
+<p>We need to think about what happens if the user does this:</p>
+
+<pre><code>Window window1(1280, 720, "title", WindowMode::WINDOWED);
+Window window2(window1); // copy construction (create new window by copying an existing one)
+Window window3 = window1; // also copy construction
+</code></pre>
+
+<p>Or if the user does this:</p>
+
+<pre><code>Window window1(1280, 720, "title", WindowMode::WINDOWED);
+Window window2(920, 53, "blah", WindowMode::WINDOWED);
+window2 = window3; // copy assignment (assign one existing window to another)
+</code></pre>
+
+<p>These correspond to calling <code>Window</code> member functions with the following signature:</p>
+
+<pre><code>Window(Window const&amp; rhs); // copy construction
+Window&amp; operator=(Window const&amp; rhs); // copy assignment
+</code></pre>
+
+<p>The compiler may automatically generate these for you.</p>
+
+<p>For a class representing a data structure, we can just copy the data inside the class. For a <code>Window</code> class, we don't really want to have multiple <code>Window</code> objects representing the same glfw window. We could open a new glfw window, copying the settings from the old one. However, it's much easier to just prevent copying altogether by deleting these operators (preventing the compiler from defining them).</p>
+
+<pre><code>Window(Window const&amp;) = delete;
+Window&amp; operator=(Window const&amp;) = delete;
+</code></pre>
+
+<p>Moving is similar. It allows an object instance to adopt / steal the internal resources from another (which is much quicker than copying them). This is getting a bit long, so I'm not going to go into detail here.</p>
+    </div>

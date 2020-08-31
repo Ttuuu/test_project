@@ -1,0 +1,175 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Formatting</h1>
+
+<p>The code formatting is good. The only major gripe I have is that there are some long lines (117 chars). Part of this is due to the high level of indenation, which we'll solve in another way, but even with heavily indented code, lines can be shorter. I use the <a href="https://github.com/python/black" rel="noreferrer">black</a> code formatter (with a linelength of 79) to format my code, so I don't have to worry about spacing, long lines or inconsistent quote characters any more</p>
+
+<h1>Try-except</h1>
+
+<p>You should surround the part that can fail (reading the filesize and file_hash) as closely as possible with the <code>try-except</code> clause. If you want to print a debug message and prevent the rest of that iteration to be executed, you can do that by adding a <code>continue</code> after the print</p>
+
+<h1>globals</h1>
+
+<p>as you question it, globals are not the correct way to pass information here. A different approach would be to have parts that</p>
+
+<ol>
+<li>generate the paths to the files to check</li>
+<li>return the hash</li>
+<li>look for duplicates in the hashes</li>
+<li>report the duplicates</li>
+</ol>
+
+<p>Each part can receive the result of the previous step as input</p>
+
+<h1>generate the paths</h1>
+
+<p>Since python 3.4 there is a more convenient way to handle file paths: <a href="https://docs.python.org/3/library/pathlib.html" rel="noreferrer"><code>pathlib.Path</code></a></p>
+
+<pre><code>from pathlib import Path
+def walking(path):
+    return Path(path).glob("**/*")
+</code></pre>
+
+<p>This returns a generator that yields <code>Path</code>s to all of the files under <code>path</code>. Since it is so simple, it can be inlined.</p>
+
+<h1>hashing</h1>
+
+<pre><code>def hashing(paths, chunk=False):
+    for path in paths:
+        filesize = path.stat().st_size
+        if chunk:
+            file_hash = md5_sum(fname, 8192)
+        else:
+            file_hash = md5_simple(fname, file_size &gt; 1000 * 1024 * 1024)
+        yield path, file_hash
+</code></pre>
+
+<h1>magic numbers</h1>
+
+<p>This previous function has some magic numbers <code>8192</code> and <code>1000 * 1024 * 1024</code>.
+Better would be to define those a module level constants:</p>
+
+<pre><code>CHUNKSIZE_DEFAULT = 8192
+MAX_SIZE_BEFORE_CHUNK = 1000 * 1024 * 1024 # files larger than this need to be hashed in chuncks
+
+def hashing(paths, chunk=False):
+    for path in paths:
+        filesize = path.stat().st_size
+        if chunk or file_size &gt; MAX_SIZE_BEFORE_CHUNK:
+            file_hash = md5_sum(fname, CHUNKSIZE_DEFAULT )
+        else:
+            file_hash = md5_simple(fname)
+        yield path, file_hash
+</code></pre>
+
+<p>I'm not 100% happy with <code>MAX_SIZE_BEFORE_CHUNK</code> as variable name, but can't immediately think of a better on</p>
+
+<h1>hoist the OI</h1>
+
+<p>If you look at <a href="https://rhodesmill.org/brandon/talks/#clean-architecture-python" rel="noreferrer">this</a> talk by Brandon Rhodes, it makes sense not to open the file in the method that calculates the hash, but have it accept a filehandle. This is also the approach taken in this <a href="https://codereview.stackexchange.com/a/108362/123200">code review answer</a>
+So to reuse the slightly adapted code from this answer</p>
+
+<pre><code>def read_chunks(file_handle, chunk_size=CHUNKSIZE_DEFAULT):
+    while True:
+        data = file_handle.read(chunk_size)
+        if not data:
+            break
+        yield data
+
+
+def md5(file_handle, chunk_size=None, hex_representation=False):
+    if chunk_size is None:
+        hasher = hashlib.md5(file_handle.read())
+    else:
+        hasher = hashlib.md5()
+        for chunk in read_chunks(file_handle, chunk_size):
+            hasher.update(chunk)
+
+    return hasher.digest() if not hex_representation else hasher.hexdigest()
+</code></pre>
+
+<p>This gets called like this:</p>
+
+<pre><code>def hashing(paths, chunk=False, hex_representation=False):
+    for path in paths:
+        file_size = path.stat().st_size
+        with path.open("rb") as file_handle:
+            chunk_size = (
+                CHUNKSIZE_DEFAULT
+                if chunk or file_size &gt; MAX_SIZE_BEFORE_CHUNK
+                else None
+            )
+            file_hash = md5(
+                file_handle,
+                chunk_size=chunk_size,
+                hex_representation=hex_representation,
+            )
+        yield path, file_hash
+</code></pre>
+
+<h1>looking for duplicates</h1>
+
+<p>Instead of keeping a long string with all the duplicates, you can keep a set of the <code>Path</code>s for each <code>file_hash</code>. A <code>collections.defaultdict(set)</code> is the suited container for this. You add each path to the set at the in the dict. At the end of the function, you filter the keys that have more than 1 entry:</p>
+
+<pre><code>def duplicates(hashings):
+    duplicates = defaultdict(set)
+    for path, file_hash in hashings:
+        duplicates[file_hash].add(path)
+
+    return {
+        filehash: paths
+        for filehash, paths in duplicates.items()
+        if len(paths) &gt; 1
+    }
+</code></pre>
+
+<h1>report the filesizes</h1>
+
+<p>instead of formating the csv-file yourself, you can use the <code>csv</code> module. It even has a <a href="https://docs.python.org/3/library/csv.html#csv.csvwriter.writerows" rel="noreferrer"><code>writerows</code></a>. Instead of defining the lambda function to srt by value, you can use <code>operator.itemgetter</code></p>
+
+<pre><code>import csv
+from operator import itemgetter
+
+
+def report_results(file_handle, filesizes):
+    writer = csv.writer(file_handle, delimiter=",", lineterminator="\n")
+    sorted_sizes = sorted(filesizes.items(), key=itemgetter(1))
+    writer.writerows(sorted_sizes)
+</code></pre>
+
+<p>This method can also be used to save the <code>file_hashes</code></p>
+
+<h1>reporting the duplicates</h1>
+
+<pre><code>def report_duplicates(file_handle, duplicates):
+    writer = csv.writer(file_handle, delimiter=",", lineterminator="\n")
+    for file_hash, duplicate_files in duplicates.items():
+        for file_name in duplicate_files:
+            writer.writerow((file_hash, str(file)))
+</code></pre>
+
+<p>Here I exported a <code>csv</code> file with the hash and filenames of the duplicates. If you want it in another format, you can easily change this method</p>
+
+<h1>bringing it together</h1>
+
+<pre><code>def main(path, chunk=False):
+    files = [file for file in Path(path).glob("**/*") if file.is_file()]
+
+    filesizes = {str(path): path.stat().st_size for path in files}
+    with open("test_filesizes.csv", "w") as file_handle:
+        report_results(file_handle, filesizes)
+    filehashes = dict(hashing(files, chunk=chunk))
+
+    with open("test_hashes.csv", "w") as file_handle:
+        report_results(file_handle, filehashes)
+
+    duplicates = find_duplicates(filehashes.items())
+    with open("test_duplicates.csv", "w") as file_handle:
+        report_duplicates(file_handle, duplicates)
+</code></pre>
+
+<p>And then we put everything behind a <code>__main__</code> guard:</p>
+
+<pre><code>if __name__ == "__main__":
+    main(&lt;path&gt;)
+</code></pre>
+    </div>

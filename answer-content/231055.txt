@@ -1,0 +1,168 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Summary</h2>
+
+<p>Feel free to ignore opinion:  </p>
+
+<h3>Personal opinion</h3>
+
+<p>I don't like "Snake Case" and I don't see it very often in C++ projects (though an argument against me is the C++ standard library does use it).</p>
+
+<p>I also prefer not to use "m_" to identify member variables. It tends to mean that people have not though enough about unique meaningful names elsewhere and need to use the prefix to make things things unique. But on the other hand its not a negative (though I would advice adding build tools to enforce it long term so that half the code uses "m_" and another half the code fails to follow the convention.</p>
+
+<p>I don't like the indention level is only two spaces. Its a bit small and makes it hard to read. I would prefer at least 4 spaces.</p>
+
+<p>Why do half your functions use:</p>
+
+<pre><code>auto function() -&gt; type
+</code></pre>
+
+<p>While half use the:</p>
+
+<pre><code>type function()
+</code></pre>
+
+<p>I would prefer to use one form consistently rather than a mixture. Though if you use the second form you can use the first form for those exceptional situations where it is required that you use the first form.</p>
+
+<h2>Code Review</h2>
+
+<p>Interesting that you even need an <code>Event</code> base if there are no virtual members.</p>
+
+<pre><code>class Event {};
+</code></pre>
+
+<hr>
+
+<p>The class <code>EventLoop</code> is a little dense in terms of code and comments and this makes it hard to read. This is definitely a case where the comments hinder the readability. You should simply remove these.</p>
+
+<pre><code>  [[ noreturn ]] void run() {
+    while (true) {
+      std::unique_lock&lt;std::mutex&gt; lock(m_message_queue_mutex);
+      // Wait for an event
+      m_event_cv.wait(lock, [&amp;]{ return m_message_queue.size() &gt; 0; });
+      // Retrieve the injected event
+      Message message = std::move(m_message_queue.front());
+      m_message_queue.pop();
+      // Unlock before notify, is this necessary? Where did I saw that?
+      lock.unlock();
+      m_event_cv.notify_one();
+      // Call the event listener
+      message.m_event_handler(*message.m_event.get());
+    }
+  }
+</code></pre>
+
+<p>Let's remove the comments and add some vertical white space and break into two logical functions. Note by using <code>getNextEvent()</code> I don't need to explicitly <code>unlock()</code> the <code>lock</code> as this is done as <code>getNextEvent()</code> exits with the destructor of <code>lock</code>.</p>
+
+<pre><code>  private:
+  Message getNextEvent()
+  {
+      std::unique_lock&lt;std::mutex&gt; lock(m_message_queue_mutex);
+      m_event_cv.wait(lock, [&amp;]{ return m_message_queue.size() &gt; 0; });
+
+      Message message = std::move(m_message_queue.front());
+      m_message_queue.pop();
+
+      return message;
+  }
+
+  public:
+  [[ noreturn ]] void run() {
+      while (true) {
+          Message message = getNextEvent();
+
+          m_event_cv.notify_one();
+          message.m_event_handler(*message.m_event.get());
+      }
+  }
+</code></pre>
+
+<hr>
+
+<p>Not sure a <code>noreturn</code> is appropriate.</p>
+
+<pre><code>  [[ noreturn ]] void run() {
+</code></pre>
+
+<p>Most application have a way to exit. So when the user selects exit your event loop should exit. </p>
+
+<hr>
+
+<pre><code>      // Unlock before notify, is this necessary? Where did I saw that?
+      lock.unlock();
+      m_event_cv.notify_one();
+</code></pre>
+
+<p>Is it necessary? No. It will still work either way.</p>
+
+<p>Will it be more efficient? That will depend on the implementation. ITs hard to make a determination either way. But unlocking first will avoid a potential inefficiency. So I would do it this way but that does not provide anything.</p>
+
+<hr>
+
+<p>You don't need an <code>else</code> here</p>
+
+<pre><code>    if (m_event_listeners.find(event_type) == m_event_listeners.end()) {
+      m_event_listeners[event_type] = {
+        [&amp;event_listener](Event&amp; e) { event_listener(static_cast&lt;EventType&amp;&gt;(e)); }
+      };
+    } else {
+      m_event_listeners[event_type].push_back([&amp;event_listener](Event&amp; e) {
+        event_listener(static_cast&lt;EventType&amp;&gt;(e));
+      });
+    }
+</code></pre>
+
+<p>I can simplify this too:</p>
+
+<pre><code>    m_event_listeners[event_type].push_back([&amp;event_listener](Event&amp; e) {
+        event_listener(static_cast&lt;EventType&amp;&gt;(e));
+      });
+</code></pre>
+
+<p>This is because <code>m_event_listeners</code> has <code>operator[]()</code> will automatically insert an empty vector if that value does not exist.</p>
+
+<hr>
+
+<p>To make this work you need to convert an <code>Event</code> object into the functions <code>EventType</code> so you use <code>static_cast</code> to achieve this:</p>
+
+<pre><code>[&amp;event_listener](Event&amp; e) { event_listener(static_cast&lt;EventType&amp;&gt;(e)); }
+</code></pre>
+
+<p>This should be fine in <strong>"Simple"</strong> situations. But there are situations were "Simple" is not going to work. In these case's you are going to need <code>dynamic_cast</code> to make this work in all situations.</p>
+
+<hr>
+
+<p>I don't see anything wrong <code>inject_event()</code> that I can complain about.</p>
+
+<hr>
+
+<p>The one thing I normally see in event driven applications is that some handlers can swallow the event preventing subsequent handlers from performing actions based on the event.</p>
+
+<p>Your code forces every event handler to handle the event. You could prevent this by adding a <code>handled</code> member to the <code>Event</code> base class. Then the lambda can check this value before calling the user provided haandler.</p>
+
+<pre><code> class Event
+ {
+     bool handeled;
+     public:
+     virtual ~Event() {}
+              Event(): handeled(false) {}
+     bool isHandeled() const {return handeled;}
+ };
+
+ // .....
+
+ m_event_listeners[event_type].push_back([&amp;event_listener](Event&amp; e) {
+     try {
+         if (!e.isHandeled()) {
+             event_listener(dynamic_cast&lt;EventType&amp;&gt;(e));
+         }
+     }
+     catch(...) {
+         // Event handlers are not written by me so I don't know how
+         // they will work. I want to make sure exceptions in their
+         // code don't cause the run() method to exit accidentally.
+
+         // Do something to tell user there was an exception.
+     }
+ });
+</code></pre>
+    </div>

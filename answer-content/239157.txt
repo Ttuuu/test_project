@@ -1,0 +1,218 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Thanks for sharing your code.</p>
+
+<p>As you already found out, the only difference in the "map generation blocks" is the names 
+of the variables holding the maps. 
+So it is quite obvious, that you could move this 3 lines into the method <code>buildDtos</code>.</p>
+
+<p>On  the other hand the first line in each "map generation blocks" calls a separate 
+method on the <code>client</code> object. This is an <em>odd ball solution</em> and the proper way to deal with that would be to enable <code>clinet.client.getBaselineValues()</code> to deal with 
+a special String <em>(<strong>Attention!</strong> resist the temptation to use <code>null</code>!)</em> to return the 
+same result as <code>clinet.client.getValues()</code>.</p>
+
+<p>until then we could introduce a <em>FunctionalInterface</em> to mimik that on this side.    This could look like this:</p>
+
+<pre><code>@FunctionalInterface
+interface ValueSelector {
+    Map&lt;String, BigDecimal&gt; selectFrom(
+          Client client, 
+          List&lt;String&gt; ids, 
+          LocalDate startDate, 
+          LocalDate endDate);
+}
+
+public List&lt;ProductValuesDto&gt; main() {
+
+    buildDtos(//
+            dtos,
+            productIds,
+            (client, ids, start, end) -&gt; client.getValues(ids, start, end));
+    buildDtos(
+            dtos,
+            grossProductIds,
+            (client, ids, start, end) -&gt; client.getBaselineValues(ids, start, end, "gross"));
+    buildDtos(//
+            dtos,
+            netProductIds,
+            (client, ids, start, end) -&gt; client.getBaselineValues(ids, start, end, "net"));
+    return dtos;
+
+}
+
+public void buildDtos(List&lt;ProductValuesDto&gt; dtos, List&lt;String&gt; productIds, ValueSelector valueSelector) {
+
+    Map&lt;String, BigDecimal&gt; sevenDayValues = valueSelector
+            .selectFrom(client, productIds, endDate.minusDays(7), endDate);
+    Map&lt;String, BigDecimal&gt; thirtyDayValues = valueSelector
+            .selectFrom(client, productIds, endDate.minusDays(30), endDate);
+    Map&lt;String, BigDecimal&gt; threeHundredSixtyFiveDayValues = valueSelector
+            .selectFrom(client, productIds, endDate.minusDays(365), endDate);
+    Map&lt;String, BigDecimal&gt; ninetyDayNetValues = valueSelector
+            .selectFrom(client, productIds, endDate.minusDays(90), endDate);
+
+    for (String productId : productIds) {
+        ProductValuesDto dto = ProductValuesDto.builder(productId)//
+                .sevenDayValue(sevenDayValues.get(productId))//
+                .thirtyDayValue(thirtyDayValues.get(productId))//
+                .ninetyDayValue(ninetyDayNetValues.get(productId))//
+                .threeHundredSixtyFiveDayValue(threeHundredSixtyFiveDayValues.get(productId))//
+                .build();
+        dtos.add(dto);
+    }
+
+}
+</code></pre>
+
+<hr>
+
+<h1>Update</h1>
+
+<p>Based on that approach we could improve this even further.</p>
+
+<h2>Improvement 1</h2>
+
+<p>Create an <code>enum</code> that provides implementations of the new interface:</p>
+
+<pre><code>enum ClientValues {
+    PLAIN {
+
+        @Override
+        ValueSelector getSelectorForType(String reportType) {
+            return (client, ids, start, end)
+                      -&gt; client.getValues(ids, start, end);
+        }
+    },
+    BASELINE {
+
+        @Override
+        ValueSelector getSelectorForType(String reportType) {
+            return (client, ids, start, end)
+                      -&gt;  client.getBaselineValues(ids, start, end, reportType);
+        }
+    };
+    abstract ValueSelector getSelectorForType(//
+            String reportType);
+}
+</code></pre>
+
+<p>create a <code>Map</code> that assigns this <code>enum</code> constants to the strings used:</p>
+
+<pre><code>    Map&lt;String, ClientValues&gt; valuesByType = new HashMap&lt;&gt;();
+    valuesByType.put("plain", ClientValues.PLAIN);
+</code></pre>
+
+<p>We intentionally leave out the constant that is used most often. </p>
+
+<p>Next we create another map that assignes the Strings used with the respective ID lists:</p>
+
+<pre><code>    Map&lt;String, List&lt;String&gt;&gt; idsByType = new HashMap&lt;&gt;();
+    idsByType.put("plain", productIds);
+    idsByType.put("gross", grossProductIds);
+    idsByType.put("net", netProductIds);
+</code></pre>
+
+<p>Complete mapping this time.</p>
+
+<p>Both maps could even be <em>class members</em> (with <code>static</code> initializers) or <em>object members</em> constructed 
+somewhere else and injected into this class.</p>
+
+<p>Now we can iterate over the entries of the second map using the first one like this:</p>
+
+<pre><code>    for (String idType : idsByType.keySet()) {
+        List&lt;String&gt; ids = idsByType.get(idType);
+        ClientValues clientValues = 
+                       valuesByType.getOrDefault(idType, ClientValues.BASELINE);
+        buildDtos(//
+                dtos,
+                ids,
+                clientValues.getSelectorForType(idType));
+    }
+    return dtos;
+</code></pre>
+
+<p><strong>Advantage:</strong> an new "report type" would only require a new entry in <code>idsByType</code> and 
+maybe a new entry in <code>valuesByType</code> if the client has another special method for fetching 
+than values.</p>
+
+<h2>Improvement 2</h2>
+
+<p>The same approach can simplify <code>buildDtos</code> too.</p>
+
+<p>Again we start by creating an <code>enum</code>:</p>
+
+<pre><code>enum ProductValuesBuilderFacade {
+    SEVEN_DAY_VALUES(7) {
+        ProductValuesDto setValueTo(
+                  ProductValuesDto builder, BigDecimal value) {
+            return builder.sevenDayValue(value);
+        }
+    },
+    THIRTY_DAY_VALUES(30) {
+        ProductValuesDto setValueTo(
+                  ProductValuesDto builder, BigDecimal value) {
+            return builder.thirtyDayValue(value);
+        }
+    },
+    NINETY_DAY_VALUES(90) {
+        ProductValuesDto setValueTo(
+                  ProductValuesDto builder, BigDecimal value) {
+            return builder.ninetyDayValue(value);
+        }
+    },
+    THREE_HUNDRED_SIXTY_FIVE_DAY_VALUES_DAY_VALUES(365) {
+        ProductValuesDto setValueTo(
+                  ProductValuesDto builder, BigDecimal value) {
+            return builder.threeHundredSixtyFiveDayValue(value);
+        }
+    };
+
+    private final long timeOffsetInDays;
+
+    ProductValuesBuilderFacade(long timeOffsetInDays) {
+        this.timeOffsetInDays = timeOffsetInDays;
+    }
+
+    abstract ProductValuesDto setValueTo(
+                 ProductValuesDto builder, BigDecimal bigDecimal);
+
+    public LocalDate getStartDate(LocalDate endDate) {
+        return endDate.minusDays(timeOffsetInDays);
+    }
+}
+</code></pre>
+
+<p>This gives us the opportunity to iterate over its constants inside the method:</p>
+
+<pre><code>public void buildDtos(
+               List&lt;ProductValuesDto&gt; dtos,
+               List&lt;String&gt; productIds,
+               ValueSelector valueSelector) {
+    for (String productId : productIds) {
+        ProductValuesDto dto = ProductValuesDto.builder(productId);
+        ProductValuesBuilderFacade[] productValuesBuilderFacades =
+               ProductValuesBuilderFacade.values();
+        for (ProductValuesBuilderFacade productValuesBuilderFacade 
+               : productValuesBuilderFacades) {
+            Map&lt;String, BigDecimal&gt; allValuesForDate 
+                     = valueSelector.selectFrom(
+                          client,
+                          productIds,
+                          productValuesBuilderFacade
+                                .getStartDate(endDate),
+                          endDate);
+            dto = productValuesBuilderFacade.setValueTo(
+                          dto,
+                          allValuesForDate.getOrDefault(productId, BigDecimal.ZERO));
+        }
+        dtos.add(dto.build());
+    }
+}
+</code></pre>
+
+<p><strong>Advantages</strong>: </p>
+
+<ul>
+<li>again the <code>enum</code> can live in its own file.</li>
+<li>a new setter method in the DTO requires only a new constant in the <code>enum</code>.</li>
+</ul>
+    </div>

@@ -1,0 +1,112 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Before reviewing the code, I want to point out that this kind of functionality already exists in the core Java libraries. A <code>ScheduledExecutorService</code> will run an arbitrary <code>Runnable</code> on a fixed time schedule. Instead of extending <code>RapidExecutor</code>, you just implement the interface and pass it into the service. </p>
+
+<p>Some thoughts on your code:</p>
+
+<p>In my opinion, your code is violating the Single Responsibility Principle. It’s doing three things: defining the interface for something that executes every tick, defining a new type of Thread, and controlling the frequency that this new type of thread executes code. As mentioned above, I’d strongly suggest using <code>ScheduledExecutorService</code>, <code>Thread</code>, and implement <code>Runnable</code> for the code that is currently in subclasses of <code>RapidExecutor</code>.</p>
+
+<p>Your <code>Application app</code> should be private, <code>tick()</code> should be <code>tick(Application app)</code>, and <code>run()</code> should call <code>tick(this.app)</code>. Keep variables contained in scope.</p>
+
+<p>Don’t use UPPERCASE for abbreviations. It’s considered better to use camelCase (<code>tps</code> or <code>tpsCount</code>). And don’t abbreviate when you don’t need to. It took me a bit to figure out that TPS was ticksPerSecond. </p>
+
+<p>Please don’t throw an exception just to catch it to get the stack trace to print it out. Let the caller figure out what to do when you tell them they gave you bad input. They might not care about the error message being written to <code>System.err</code>, or they might actively not want that to happen. And don’t use a generic <code>Exception</code>. <code>IllegalArgumentException</code>, thrown from the constructor, would be better.</p>
+
+<p><code>tick()</code> should be protected, not public. You only want it called from inside <code>RapidExecutor</code>.</p>
+
+<p><code>run()</code> must be <code>final</code>. If it isn’t, anybody who extends <code>RapidExecutor</code> can change what it means for <code>run()</code> to be executed. </p>
+
+<p>It’s considered better form to declare variables on separate lines.</p>
+
+<p>Variables should be declared in the tightest scope possible to reduce cognitive load on readers of your code. <code>startTime</code>, <code>now</code>, and <code>delta</code> should all be declared inside your <code>while</code> loop.</p>
+
+<p>There’s no need to cast <code>delta</code> back to an <code>int</code>. And perhaps <code>sleepTime</code> would be a better variable name than <code>delta</code>? It’s good for variables to clearly express what the represent.</p>
+
+<p>Perhaps storing <code>final long tickDuration = System.currentTimeMillis() - startTime</code> would be better than <code>now</code>.</p>
+
+<p>Perhaps renaming <code>TPSCount</code> to <code>millisecondsPerTick</code> would make it more clear what was being stored.</p>
+
+<p>Again, don’t randomly catch <code>Exception</code>. And if you do handle an exception, reset the state of <code>RapidExecutor</code> to something appropriate. Right now execution stops but <code>this.running</code> is still true. Are you trying to handle the <code>InterruptedException</code>? If so, declare that <code>try-catch</code> block immediately around <code>sleep()</code>. There are well-understood ways to correctly handle <code>InterruptedException</code>, and you should look into them. Are you trying to handle exceptions coming from <code>tick()</code>? If so, put a tight block around <code>this.tick()</code>. Maybe even declaring your own checked exception in this case would be a good idea.</p>
+
+<p>It’s unclear why you stop execution when it takes longer than TPSCount to run a <code>tick()</code>. I’m not convinced that’s a good design. Would it be better to skip a tick and get a choppy frame rate rather than just failing silently? Make sure that this is clearly documented.</p>
+
+<p>Don’t ever synchronize a method using the <code>synchronized</code> keyword. Locking on yourself is never a good idea because somebody else could take out a lock on you, and then <code>stopThread()</code> will never be able to execute. Use a <code>private Object lock</code> along with <code>synchronized(this.lock)</code>, or a more complex approach when warranted.</p>
+
+<p>I also don’t see why you need to synchronize either of the method calls inside <code>stopThread()</code>. Are you sure that’s necessary?</p>
+
+<p>You’ll need to make <code>stopThread()</code> <code>final</code> to prevent subclasses from changing what it means to stop a thread.</p>
+
+<p>Again, make the exception block in <code>stopThread()</code> as tight as possible and handle the most specific exception possible.</p>
+
+<p>If you applied all my suggestions to your code, it might look something like:</p>
+
+<pre><code>public abstract class RapidExecutor extends Thread {
+
+    private final Object lock = new Object();
+    private final Application application;
+    private final int ticksPerSecond;
+
+    private boolean running;
+
+    public RapidExecutor(final Application application, final int ticksPerSecond) {
+
+        this.application = application;
+        this.ticksPerSecond = ticksPerSecond;
+
+        if (ticksPerSecond &gt; 1000 || ticksPerSecond &lt; 1) {
+            throw new IllegalArgumentException("ticksPerSecond must be between 1 and 1000, was " + ticksPerSecond);
+        }
+
+    }
+
+    protected abstract void tick(final Application application) throws TickFailedException;
+
+    @Override
+    public void run() {
+
+        this.running = true;
+        final int millisecondsPerTick = 1000 / this.ticksPerSecond;
+
+        while (this.running) {
+
+            final long startTime = System.currentTimeMillis();
+
+            try {
+                this.tick(this.application);
+            } catch (final TickFailedException | RuntimeException e) {
+                this.running = false;
+                // log the exception ?
+            }
+
+            final long tickDuration = System.currentTimeMillis() - startTime;
+            final long sleepTime = millisecondsPerTick - tickDuration;
+            if (sleepTime &lt; 0) {
+                this.stopThread();
+            }
+
+            try {
+                sleep(sleepTime);
+            } catch (final InterruptedException e) {
+                this.running = false;
+                this.interrupt();
+                // log the exception?
+            }
+        }
+    }
+
+    public final void stopThread() {
+
+        synchronized (this.lock) {
+            this.running = false;
+            try {
+                this.join();
+            } catch (final InterruptedException e) {
+                this.interrupt();
+                e.printStackTrace();
+            }
+        }
+
+    }
+
+}
+</code></pre>
+    </div>

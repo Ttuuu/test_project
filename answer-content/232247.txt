@@ -1,0 +1,75 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>You should split your function up into smaller pieces. This way it gets a lot easier to reason about them individually, and to change them if needed.</p>
+
+<p>You don't really need the <code>image_hash.txt</code> file, unless your number of URLs is more than a million or so. But if that is the case, you are probably better off using a database for this.</p>
+
+<p>Since you are running this in parallel, your output is not deterministic. For two URLs pointing to the same image, the one that is determined to be the "true" URL depends on which is checked first, which may vary from run to run. This just sounds like bad design. Instead, just group image URLs by their image hashes. I opted to return the class name of the exception for invalid URLs, so you can find all of those grouped together as well (and still debug it if you have a <code>NameError</code> or <code>TypeError</code> somewhere in your code).</p>
+
+<p>Instead of getting the filename from the URL and saving to that file, I would just keep the image in memory. This should be a lot faster than writing it to disk, just to immediately read it again for the hashing. Note that if a link to a very large file is passed, this might fill up your RAM (but it would also fill your disk in that case, and for RAM at least the process will be automatically killed by the OS, whereas for disk you won't notice until it is too late and have to do it manually). Fortunately <code>PIL.Image.open</code> can directly deal with a <code>io.BytesIO</code> object, so we don't need to do anything fancy. If you need to check images larger than your RAM, have a look at a previous revision of this answer, where I used a <code>tempfile.SpooledTemporaryFile</code> which gets written to disk in that case.</p>
+
+<p>I personally prefer <code>requests</code> over <code>urllib</code>, since it covers all of the basic usage. Including raising an error if the connection fails, following redirects, etc.</p>
+
+<pre><code>from collections import defaultdict
+import hashlib
+import io
+from itertools import tee
+import multiprocessing
+from PIL import Image
+import requests
+
+
+def get_hash(file):
+    md5hash = hashlib.md5(Image.open(file).tobytes())
+    return md5hash.hexdigest()
+
+def process_url(url):
+    try:
+        r = requests.get(url, allow_redirects=True)
+        r.raise_for_status()
+        return get_hash(io.BytesIO(r.content))
+    except Exception as e:
+        return type(e).__name__
+
+def get_urls(file_name):
+    with open(file_name) as f:
+        return {line.strip() for line in f}
+
+def get_hashes(urls):
+    n = multiprocessing.cpu_count() - 1
+    with multiprocessing.Pool(processes=n) as pool:
+        return pool.map(process_url, urls)
+
+def invert_dict(d):
+    d2 = defaultdict(set)
+    for key, value in d.items():
+        d2[value].add(key)
+    return dict(d2)
+
+def main():
+    urls = get_urls('image_files.txt')
+    hashes = dict(zip(urls, get_hashes(urls)))
+    groups = invert_dict(hashes)
+    print(groups)
+
+if __name__ == "__main__":
+    main()
+</code></pre>
+
+<p>For a file containing the following lines (our two avatars, yours with a slightly different URL as well, and mine with a misspelled URL), the result is as expected:</p>
+
+<pre><code>https://www.gravatar.com/avatar/8d627cb69cbceed874a485cd7cb3fa86?s=328&amp;d=identicon&amp;r=PG&amp;f=1
+https://www.gravatar.com/avatar/8d627cb69cbceed874a485cd7cb3fa86?s=328&amp;d=identicon&amp;r=PG
+https://www.gravatar.com/avatar/b869ca5adc52b16ef56ab1fb6ed5fe97?s=328&amp;d=identicon&amp;r=PG
+https://www.avatar.com/avatar/b869ca5adc52b16ef56ab1fb6ed5fe97?s=328&amp;d=identicon&amp;r=PG
+</code></pre>
+
+
+
+<pre><code>{'242edcfd4ee09f9d734497a32c04fc06': {'https://www.gravatar.com/avatar/8d627cb69cbceed874a485cd7cb3fa86?s=328&amp;d=identicon&amp;r=PG&amp;f=1', 
+                                      'https://www.gravatar.com/avatar/8d627cb69cbceed874a485cd7cb3fa86?s=328&amp;d=identicon&amp;r=PG'},
+ '3b7e2db9a0246462880635b9eeef45f3': {'https://www.gravatar.com/avatar/b869ca5adc52b16ef56ab1fb6ed5fe97?s=328&amp;d=identicon&amp;r=PG'},
+ 'OSError':                          {'https://www.avatar.com/avatar/b869ca5adc52b16ef56ab1fb6ed5fe97?s=328&amp;d=identicon&amp;r=PG'}}
+</code></pre>
+
+<p>This even has both the forward and backward dictionaries around for later, so if you need the hash of a URL, or the URL(s) of a hash, you can get both.   </p>
+    </div>

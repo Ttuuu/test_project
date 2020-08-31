@@ -1,0 +1,186 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Building on JanDotNet's answer, I've revised my code, and the result is as below. I have both rethought the algorithms and the overall design and flow. Especially the validation of input is changed to use the <code>Result&lt;'T,'TError&gt;</code> type - and (I hope) conforms to the "railway" pattern.
+One difference to JanDotNet's is that I return a roman numeral only if the input is valid, else I throw an exception, in contrast to returning a <code>Result&lt;RomanNumeral, string&gt; (Ok(RomaNumeral) or Error("&lt;msg&gt;")</code>. There may be pros and cons for both approaches so it is open for change. I hope the overall impression is a solution that is considerable more stringent and easy to follow and maintain.</p>
+
+<pre><code>module RomanNumerals
+open System
+
+let I = 1
+let V = 5
+let X = 10
+let L = 50
+let C = 100
+let D = 500
+let M = 1000
+
+type RomanNumeral = {
+    Text: string;
+    Value: int 
+}
+
+let private createRoman text value = { Text = text; Value = value }
+
+let private toError&lt;'a&gt; msg (invalidItems: 'a seq) =
+    Error(sprintf "%s: %s" msg (String.Join("; ", invalidItems)))
+
+let private handleResult = function
+    | Ok(rn) -&gt; rn
+    | Error(msg) -&gt; failwith(msg)
+
+let private tryGetValue = function 
+    | 'I' -&gt; Some(I)
+    | 'V' -&gt; Some(V)
+    | 'X' -&gt; Some(X)
+    | 'L' -&gt; Some(L)
+    | 'C' -&gt; Some(C)
+    | 'D' -&gt; Some(D)
+    | 'M' -&gt; Some(M)
+    | _ -&gt; None
+
+let private handleInvalids okResult msg invalids =
+    match invalids |&gt; Seq.isEmpty with
+    | true -&gt; Ok(okResult)
+    | false -&gt; toError msg invalids
+
+let private validateNotEmpty str = 
+    if String.IsNullOrWhiteSpace(str) then Error("The input string is empty")
+    else Ok(str)
+
+let private validateCharacters str = 
+    str 
+    |&gt; Seq.map (fun ch -&gt; (ch, tryGetValue ch)) 
+    |&gt; Seq.where (fun (ch, v) -&gt; v.IsNone)
+    |&gt; Seq.map fst
+    |&gt; handleInvalids str "Invalid Characters"
+
+let private validateDuplicates str = 
+    let tests = [ 'V'; 'L'; 'D' ] 
+    str
+    |&gt; Seq.groupBy (fun ch -&gt; ch)
+    |&gt; Seq.where (fun (key, data) -&gt; tests |&gt; List.contains key &amp;&amp; data |&gt; Seq.length &gt; 1)
+    |&gt; Seq.map fst
+    |&gt; handleInvalids str "These chars can only appear once"
+
+let private validateInvalidSequences str = 
+    [ "IIV"; "IIX"; "IL"; "IC"; "ID"; "IM";
+    "XXL"; "XXC"; "XD"; "XM"; "CCD"; "CCM";
+    "IVV"; "IXX"; "XLL"; "XCC"; "CDD"; "CMM" ] 
+    |&gt; List.where ((string str).Contains)
+    |&gt; handleInvalids str "Invalid sequence(s)"
+
+let private validateString str =
+    str
+    |&gt; validateNotEmpty
+    |&gt; Result.bind validateCharacters
+    |&gt; Result.bind validateDuplicates
+    |&gt; Result.bind validateInvalidSequences
+
+let private convertString str = 
+    let getValue ch = (tryGetValue ch).Value // We know by now, that it will return a valid value
+
+    let folder (sum, prev) current = 
+        if (current &gt; prev) then (sum + current - prev * 2, current)
+        else (sum + current, current)
+
+    let value = 
+        str
+        |&gt; Seq.map getValue
+        |&gt; Seq.fold folder (0, 0)
+        |&gt; fst
+
+    createRoman str value
+
+let private isNaturalNumber num = 
+    match num with 
+    | x when x &gt; 0 -&gt; Ok(num) 
+    | _ -&gt; Error(sprintf "%d is not a natural number &gt; 0" num)
+
+let private validateNumber num = isNaturalNumber num
+
+let private convertNumber num =
+    let limits = 
+        [ (M, "M"); (M-C, "CM"); (D, "D"); (D-C, "CD"); 
+        (C, "C"); (C-X, "XC"); (L, "L"); (L-X, "XL"); 
+        (X, "X"); (X-I, "IX"); (V, "V"); (V-I, "IV"); (I, "I"); ] 
+        |&gt; List.skipWhile (fun (v, s) -&gt; v &gt; num)
+
+    let rec converter lims value result =
+        match value, lims with 
+        | 0, _ -&gt; result
+        | _, (v, s)::_ when value &gt;= v -&gt; converter lims (value - v) (result + s)
+        | _, _::tail -&gt; converter tail value result
+
+    createRoman (converter limits num "") num
+
+let fromString str =
+    str
+    |&gt; validateString
+    |&gt; Result.map (fun s -&gt; convertString s)
+    |&gt; handleResult
+
+let fromNumber num =
+    num
+    |&gt; validateNumber
+    |&gt; Result.map (fun n -&gt; convertNumber n)
+    |&gt; handleResult
+
+let inline private romanOper oper (r1) (r2) = fromNumber (oper r1.Value r2.Value)
+// Extending with operators
+type RomanNumeral with 
+    static member inline (+) (r1, r2) = romanOper (+) r1 r2 
+    static member inline (-) (r1, r2) = romanOper (-) r1 r2
+    static member inline (*) (r1, r2) = romanOper (*) r1 r2
+    static member inline (/) (r1, r2) = romanOper (/) r1 r2
+    static member inline (%) (r1, r2) = romanOper (%) r1 r2    
+</code></pre>
+
+<p><strong>Public Helper Functions</strong></p>
+
+<pre><code>// Returns the minimal representation of an input string roman expression
+let asCanonicalRoman str = fromNumber (fromString str).Value
+
+let romanRange start stop =
+    let decStart = (fromString start).Value
+    let decStop = (fromString stop).Value
+    let step = if decStart &lt;= decStop then 1 else -1
+    seq { for dec in decStart..step..decStop do yield fromNumber dec }
+
+let toString roman = sprintf "%s &lt;-&gt; %d" (roman.Text) (roman.Value)
+let printRoman roman = printfn "%s" (toString roman)
+</code></pre>
+
+<p><strong>Test Cases</strong></p>
+
+<pre><code>printfn "Numbers from 1 to 3999"
+for i in 1..3999 do
+    let roman = fromNumber i
+    let decimal = fromString roman.Text
+    //if roman.Roman &lt;&gt; decimal.Roman || roman.Value &lt;&gt; decimal.Value then
+    printfn "%s &lt;==&gt; %s" (toString roman) (toString decimal)
+
+
+
+//printfn ""
+//printfn "From File: "
+//let path = "&lt;your path&gt;.p089_roman.txt"
+//for line in File.ReadAllLines(path) do
+//    let value = fromString line
+//    let roman = fromNumber value.Value
+//    if roman.Text &lt;&gt; value.Text || roman.Value &lt;&gt; value.Value then
+//        printfn "%s &lt;==&gt; %s" (toString value) (toString roman)
+
+//printfn ""
+//printfn "Operator testing:"
+//let r1 = fromNumber 5
+//let r2 = fromNumber 3
+//printRoman(r1 + r2)
+//printRoman(r1 - r2)
+//printRoman(r1 * r2)
+//printRoman(r1 / r2)
+//printRoman(r1 % r2)
+
+
+//romanRange "X" "C" |&gt; Seq.iter printRoman
+//romanRange "C" "X" |&gt; Seq.iter printRoman
+</code></pre>
+    </div>

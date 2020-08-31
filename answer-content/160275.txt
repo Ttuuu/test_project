@@ -1,0 +1,198 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Okay, so removing the cursor seemed to improve the performance (and I would also argue improves readability. Basically, I added another column to the temp table you already create to track which record we are currently operating on.</p>
+
+<p>I also altered this section of your query:</p>
+
+<pre><code> [CanRebuildOnline] =
+    CASE
+        WHEN si.type_desc = ''CLUSTERED'' THEN
+            CASE WHEN NOT EXISTS 
+            (
+                SELECT 
+                    *
+                FROM 
+                    sys.[tables] AS tbl
+                JOIN 
+                    sys.[all_columns] col ON tbl.[object_id] = col.[object_id]  
+                WHERE 
+                    tbl.[object_id] = si.[object_id] AND 
+                    (
+                        (col.system_type_id IN (34,35,99,241)) OR 
+                        (col.system_type_id IN (167,231,165) AND max_length = -1)
+                    ) 
+            ) THEN 1 ELSE 0 END
+        WHEN si.type_desc &lt;&gt; ''CLUSTERED'' THEN 
+            CASE WHEN NOT EXISTS
+            (
+                SELECT 
+                    * 
+                FROM 
+                    sys.[tables] AS tbl
+                JOIN 
+                    sys.[indexes] idx ON tbl.[object_id] = idx.[object_id]
+                JOIN 
+                    sys.[index_columns] ic ON idx.[object_id] = ic.[object_id] AND 
+                                                idx.[index_id] = ic.[index_id]
+                JOIN 
+                    sys.[all_columns] col ON tbl.[object_id] = col.[object_id] AND 
+                                            ic.[column_id] = col.[column_id]
+                WHERE 
+                        tbl.[object_id] = si.[object_id] AND 
+                        si.[object_id] = idx.[object_id] AND 
+                        si.index_id = idx.index_id AND 
+                        (
+                            (col.system_type_id IN (34,35,99,241)) OR 
+                            (col.system_type_id IN (167,231,165) AND max_length = -1)
+                        ) 
+                ) THEN 1 ELSE 0 END
+            ELSE NULL
+        END
+</code></pre>
+
+<p>into this: </p>
+
+<pre><code> [CanRebuildOnline] =
+    (
+        SELECT
+            CASE 
+                WHEN idx.[type_desc] = ''CLUSTERED'' THEN 0
+                WHEN idx.[type_desc] &lt;&gt; ''CLUSTERED'' THEN 0
+                ELSE 1
+            END
+        FROM sys.[tables] AS tbl
+        INNER JOIN sys.[indexes] idx
+            ON tbl.[object_id] = idx.[object_id]
+        INNER JOIN sys.[index_columns] ic
+            ON idx.[object_id] = ic.[object_id]
+            AND idx.[index_id] = ic.[index_id]
+        INNER JOIN sys.[all_columns] col 
+            ON tbl.[object_id] = col.[object_id]
+            AND ic.[column_id] = col.[column_id]
+        WHERE tbl.[object_id] = si.[object_id] 
+        AND
+        (
+            (col.system_type_id IN (34,35,99,241)) OR 
+            (col.system_type_id IN (167,231,165) AND max_length = -1)
+        )
+    )
+</code></pre>
+
+<p>due to the fact that the dynamic query was too long and caused the query to not run in SQL Server 2016.</p>
+
+<p>Here is the full query I came up with:</p>
+
+<pre><code>DECLARE
+    @iReorganizeMinThreshold INT = NULL, 
+    @iRebuildMinThreshold INT = NULL, 
+    @bAllowOfflineRebuild BIT = 0,
+    @cur_i INT = 1;
+
+PRINT 'Rebuilding/Reorganizing all indexes on every table in every database...'
+
+DECLARE @tblIndexes AS TABLE
+(
+    ID INT IDENTITY,
+    DatabaseName VARCHAR(255),
+    SchemaName VARCHAR(255),
+    TableName VARCHAR(255),
+    IndexName VARCHAR(255),
+    AvgPageFragmentation INT,
+    CanRebuildOnline BIT
+)
+
+PRINT 'Gethering indexes from all databases..'
+INSERT INTO @tblIndexes  
+EXEC sp_MSforeachdb 'USE [?]
+SELECT 
+        [Database] = DB_NAME(dps.DATABASE_ID), 
+        [Schema] = OBJECT_SCHEMA_NAME(dps.OBJECT_ID),
+        [Table] = OBJECT_NAME(dps.OBJECT_ID),  
+        [Index] = si.NAME,
+        [AvgPageFragmentation] = dps.AVG_FRAGMENTATION_IN_PERCENT,
+        [CanRebuildOnline] =
+        CASE WHEN (
+            SELECT tbl.[object_id]
+            FROM sys.[tables] AS tbl
+            INNER JOIN sys.[indexes] idx
+                ON tbl.[object_id] = idx.[object_id]
+            INNER JOIN sys.[index_columns] ic
+                ON idx.[object_id] = ic.[object_id]
+                AND idx.[index_id] = ic.[index_id]
+            INNER JOIN sys.[all_columns] col 
+                ON tbl.[object_id] = col.[object_id]
+                AND ic.[column_id] = col.[column_id]
+            WHERE tbl.[object_id] = si.[object_id] 
+            AND
+            (
+                (col.system_type_id IN (34,35,99,241)) OR 
+                (col.system_type_id IN (167,231,165) AND max_length = -1)
+            )
+        ) IS NOT NULL THEN 0 ELSE 1 END
+FROM sys.indexes si
+INNER JOIN sys.dm_db_index_physical_stats (DB_ID(), NULL, NULL , NULL, NULL) dps
+    ON dps.object_id = si.object_id AND dps.index_id = si.index_id
+INNER JOIN sys.tables t
+    ON t.object_id = dps.object_id
+WHERE t.type = ''U''
+AND dps.alloc_unit_type_desc = ''IN_ROW_DATA''
+AND dps.index_type_desc &lt;&gt; ''HEAP''
+AND DB_NAME(dps.DATABASE_ID) NOT IN (''master'',''msdb'',''tempdb'',''model'',''distribution'')
+ORDER BY
+    [Database],
+    [Schema],
+    [Table];'
+
+SELECT * FROM @tblIndexes;
+
+DECLARE
+    @sDatabase VARCHAR(255),
+    @sSchema VARCHAR(255),
+    @sTable VARCHAR(255),
+    @sIndex VARCHAR(255),
+    @iFragmentation INT,
+    @sAlter varchar(200),
+    @bCanRebuildOnline BIT;
+
+--Iterate through each index, rebuild or reorganize or leave alone based on the amount of fragmentation
+_loop:
+
+SELECT
+    @sDatabase = DatabaseName,
+    @sSchema = SchemaName,
+    @sTable = TableName,
+    @sIndex = IndexName,
+    @iFragmentation = AvgPageFragmentation,
+    @bCanRebuildOnline = CanRebuildOnline
+FROM @tblIndexes
+WHERE ID = @cur_i
+
+IF @iRebuildMinThreshold IS NOT NULL AND @iFragmentation &gt; @iRebuildMinThreshold 
+BEGIN 
+    IF @bCanRebuildOnline = 1
+    BEGIN
+        PRINT CONVERT(VARCHAR, GETDATE(), 121) + ' - Rebuilding index (online) [' + @sIndex + '] ON Table [' + @sDatabase + '].[' + @sSchema + '].[' + @sTable +'], fragmentation is at ' + CAST(@iFragmentation AS VARCHAR(15)) + '%...';
+        SET @sAlter = 'ALTER INDEX [' + @sIndex + '] ON [' + @sDatabase + '].[' + @sSchema + '].[' +  @sTable + '] REBUILD WITH (ONLINE=ON, MAXDOP=1);'; 
+    END
+    ELSE IF @bAllowOfflineRebuild = 1
+    BEGIN
+        PRINT CONVERT(VARCHAR, GETDATE(), 121) + ' - Rebuilding index (offline) [' + @sIndex + '] ON Table [' + @sDatabase + '].[' + @sSchema + '].[' + @sTable +'], fragmentation is at ' + CAST(@iFragmentation AS VARCHAR(15)) + '%...';
+        SET @sAlter = 'ALTER INDEX [' + @sIndex + '] ON [' + @sDatabase + '].[' + @sSchema + '].[' +  @sTable + '] REBUILD;'; 
+    END        
+    ELSE
+    BEGIN
+        PRINT CONVERT(VARCHAR, GETDATE(), 121) + ' - Reorganizing index (online rebuild not possible, offline not allowed) [' + @sIndex + '] ON Table [' + @sDatabase + '].[' + @sSchema + '].[' + @sTable +'], fragmentation is at ' + CAST(@iFragmentation AS VARCHAR(15)) + '%...';
+        SET @sAlter = 'ALTER INDEX [' + @sIndex + '] ON [' + @sDatabase + '].[' + @sSchema + '].[' + @sTable + '] REORGANIZE;';
+    END
+END
+ELSE 
+BEGIN
+    PRINT CONVERT(VARCHAR, GETDATE(), 121) + ' - Skipping INDEX  [' + @sIndex + '] ON Table [' + @sDatabase + '].[' + @sSchema + '].[' + @sTable +'], fragmentation is at ' + CAST(@iFragmentation AS VARCHAR(15)) + '%.';
+END
+
+EXEC(@sAlter);
+
+SELECT @cur_i += 1;
+
+IF @cur_i &lt;= (SELECT MAX(ID) FROM @tblIndexes) GOTO _loop
+</code></pre>
+    </div>

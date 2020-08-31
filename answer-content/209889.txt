@@ -1,0 +1,109 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Looking over the github, one thing that's probably impacting your performance a good bit is memory thrash.  Some of your big, complex functions spend a lot of time creating and assembling new data structures:  for example your <code>pseudo_legal()</code> function (in <a href="https://github.com/basvdvelden/ChessAI/blob/master/chess_functions.py" rel="nofollow noreferrer">chess_functions.py</a>) is creating a new dictionary object every time its called. Along the way it calls <code>range()</code> quite a few times in order to loop over possibilities -- in Python 2, anyway, each of those <code>range()</code> calls is creating a new list.  These short lived objects take time to create and also to destroy when they are no longer needed.  That's a big part of your cost structure.</p>
+
+<p>On a related note, I think you're also paying extra for the way the board is represented.  You're storing the board as an array-of-arrays, which means more objects to be updating and also two lookups for every access.  Your method for scanning involves checking all of the board squares (including the empty squares) to find the string string identifiers for the pieces, and then you parse the display names like 'wN' or 'bBp' before you start collecting possible moves. 
+Taken together all that means every time you want to update the board, you have to do this for a lot of squares:</p>
+
+<ol>
+<li>make a dictionary of possible moves</li>
+<li>get the row list from the board</li>
+<li>get the column entry from the row</li>
+<li>get the string name of the piece there</li>
+<li>parse the string to get the piece type (creating a new lookup string as part of the parsing -- another new object creation)</li>
+<li>(usually) create a list to hold possible moves</li>
+<li>do the logic to calculate possible moves add them to the list</li>
+<li>... which involves more double lookups...</li>
+<li>copy the moves from the list to the dictionary</li>
+</ol>
+
+<p>Between the lookups, the string creation, and the use of temporary lists you're moving a lot of memory around and also creating a lot of disposable objects which will need to be garbage collected.</p>
+
+<p>If you want to speed things up, it might be a good idea to tackle these in a couple of ways.</p>
+
+<h2>sparse board</h2>
+
+<p>There are 64 spaces on the board, but only 32 pieces at max (and fewer as the games goes on).  So you can avoid checking a lot of empty air by representng the board sparsely.   A dictionary whose keys are (x,y) tuples does a nice job of representing the placement of the pieces.  Moving a piece just means doing</p>
+
+<pre><code> board[new_x, new_y] = board[old_x, old_y]
+ del (board[old_x, old_y])
+</code></pre>
+
+<p>which would also automatically 'capture' any piece in <code>new_x, new_y</code> if there was already something there.</p>
+
+<h2>don't indirect the move functions</h2>
+
+<p>Related to using a dictionary is what you put into it. You can save a lot of string splitting and if-checking by just storing the functions which generate a move set in the board itself.  Something like:</p>
+
+<pre><code>def knight(x, y):
+    yield (x - 1, y + 2)
+    yield (x - 2, y + 1)
+    yield (x - 1, y - 2)
+    yield (x - 2, y - 1)
+    yield (x + 1, y + 2)
+    yield (x + 2, y + 1)
+    yield (x + 1, y - 2)
+    yield (x + 2, y - 1)
+
+
+board[0,1] = ('w', knight)
+board[0,6] = ('w', knight)
+board[7,1] = ('b', knight)
+#... etc
+</code></pre>
+
+<p>That way when you want to know what moves are available for the piece in a square you don't need an extra lookup:</p>
+
+<pre><code>get_moves_for(x, y):
+   color, move_set = board[x,y]
+   for move in move_set():
+       # check legality here....
+</code></pre>
+
+<h2>split the logic for the moves</h2>
+
+<p>I used a generator here in my 'knight' function.  That allows me to spit out all of the move combinations for a knight one at a time without having to assemble them into a list.  For any given piece, many of the possible moves will be invalid so we don't want to create a list and then trim it down -- instead we can pass along one possible move at a time and then validate it in isolation, keeping or discarding it as conditions permit.  </p>
+
+<p>A nice thing about splitting things up like this is that you can easily outsource pieces of the logic in bite-size pieces.  For example all of our moves have to be limited to the range 0-7 in both x and y.  Rather than copying that logic around, we can just add a filtering function that only passes along values that are in the right range:</p>
+
+<pre><code> def clip(addr):
+    x, y = addr
+    return -1 &lt; x &lt; 8 and -1 &lt; y &lt; 8
+</code></pre>
+
+<p>For example, you can take the move set for a given piece and location and clip it against the board like this:</p>
+
+<pre><code> color, moves = board[address]
+ valid_moves = (m for m in moves() if clip(m))
+</code></pre>
+
+<p>which will filter out the impossible moves without any reference to what they are.</p>
+
+<p>One thing that's a bit hard to tackle with a pure generator setup like that is the fact that chess moves are -- as you show in your code -- sequential for many kinds of pieces.  A rook, for example, can slide along until it hits a friendly piece or captures an enemy piece. But it's hard for a purely one-step-at-a-time generator to evaluate thing sequentially.  I tried it by making each successive run of moves start with the original home address, so one can make a new generator that resets it's idea of 'blocked-ness' when it runs into that home value again.  I'm sure there are more elegant ways that could be done, this was just a quick way to get it working:</p>
+
+<pre><code>def slide(addresses, our_color):
+    clipped = (m for m  in addresses if clip(m))
+    stopped = False
+    home = None
+    for addr in clipped:
+        if home is None:
+            home = addr
+        if addr == home:
+            stopped = False
+            continue
+        if not stopped:
+            next_square = board.get(addr)
+            stopped = next_square is not None
+            if not stopped or next_square[0] != our_color:
+                yield addr
+</code></pre>
+
+<p>so now when you grab a piece and call slide() it will yield all the moves along its possible vectors, clipped to the limits of the board, and including possible captures (it does not however actually <em>care</em> those moves are captures -- it just says they're legal moves).</p>
+
+<h2>future work</h2>
+
+<p>I put a rough-and-ready approximation of a way it could be done into [this gist](<a href="https://gist.github.com/theodox/ea402db04aedcff607cd816843f3887d" rel="nofollow noreferrer">https://gist.github.com/theodox/ea402db04aedcff607cd816843f3887d</a>.</p>
+
+<p>It's not nearly as fully-featured as yours and I think it's probably got a hidden logic flaw -- white wins by a very lopsided 8:1 margin or so  However it does generate about 2,000 games a minute, averaging around 65 turns each, which suggests that even with a lot more careful attention to detail it should be possible to generate a lot of data without going to C++ code or compiled extensions.  </p>
+
+<p>There are several bits I didn't try to handle: the en-passant rule and castling, for example, and there's no algorithm for a draw.  Those are all good places for tinkering. More importantly, I also brute-forced the calculations for checkmate by basically unioning all of the moves for each side after each turn.  A more selective update of the different zones-of-death would probably double the throughput.  The way I happened to try it is not really the point; it's mostly useful to show that you should be able to shave an order of magnitude or more off the times by paying close attention to limiting memory moves and object creation.</p>
+    </div>

@@ -1,0 +1,202 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>Performance</h1>
+
+<blockquote>
+  <p>[..] winforms is not powerful so it takes 1-2 seconds to refresh the content [..]</p>
+</blockquote>
+
+<p>It's not WinForms because it's actually very fast and I have never had any issues with it. There is a 99.99% chance that the code is inefficient so let's have a look.</p>
+
+<h3>Expression.Compile()</h3>
+
+<p>This is what slows the application down and where the bottle-neck is <em>hidden</em> and where the <code>Expression</code>s bite.</p>
+
+<blockquote>
+<pre><code>private void SortProcesses&lt;T&gt;(Expression&lt;Func&lt;Process, T&gt;&gt; lambda)
+  where T : IComparable
+{
+  orderedProcessesInfo.RemoveAll(p =&gt; p.Value.HasExited);
+
+  orderedProcessesInfo.Sort(
+      (process1, process2) =&gt;
+          lambda.Compile()
+              .Invoke(process1.Value).CompareTo(lambda.Compile()
+                  .Invoke(process2.Value)));
+  if (isAscendingOrder)
+  {
+      orderedProcessesInfo.Reverse();
+  }
+  processesInfo = orderedProcessesInfo.ToDictionary(pair =&gt; pair.Key, pair =&gt; pair.Value);
+
+  UpdateProcessList();
+}
+</code></pre>
+</blockquote>
+
+<p>There are two (!) <code>Compile</code>s. They are very expensive and there is no need for them and the <code>Expression</code> because there is nothing that dynamically changes. You have always a <code>Process</code> and a value to get and to compare. Use just the <code>Func</code>:</p>
+
+<pre><code>private void SortProcesses&lt;T&gt;(Func&lt;Process, T&gt; getProperty)
+    where T : IComparable
+{
+
+    // ...
+
+    orderedProcessesInfo.Sort((process1, process2) =&gt;
+            getProperty(process1.Value)
+            .CompareTo(getProperty(process2.Value))
+    );
+
+    // ...
+}
+</code></pre>
+
+<p>This is a sort method and it needs to run fast. If it doesn't, you'll notice it right away.</p>
+
+<hr>
+
+<p>Here's a link to @Eric's Lippert answer on Stack Overflow explaining what the <code>Compile</code> method does: <a href="https://stackoverflow.com/a/8127224/235671">What does Lambda Expression Compile() method do?</a>.</p>
+
+<p>And one more link to another answer (by someone else) on Stack Overflow comparing execution times of various method calls: <a href="https://stackoverflow.com/a/35805610/235671">Performance of Expression.Compile vs Lambda, direct vs virtual calls</a></p>
+
+<hr>
+
+<p>Another thing that I don't like about it is this</p>
+
+<blockquote>
+<pre><code>orderedProcessesInfo.Reverse()
+</code></pre>
+</blockquote>
+
+<p>The <code>Sort</code> should already produce the right order. The above line looks like the sorting wouldn't work correctly and you need this workaround to <em>fix</em> it instead of fixing the sort function.</p>
+
+<hr>
+
+<h3>ListView.Items.Add()</h3>
+
+<p>The second method that most likely makes you think WinForms wouldn't be performing well is this one:</p>
+
+<blockquote>
+<pre><code>public void UpdateProcessList()
+</code></pre>
+</blockquote>
+
+<p>You call here</p>
+
+<blockquote>
+<pre><code>ListViewProcesses.Clear();
+</code></pre>
+  
+  <p>[..] this method removes all items and columns from the ListView control</p>
+</blockquote>
+
+<p>only to immediately recreate the columns with</p>
+
+<blockquote>
+<pre><code>ListViewProcesses.Columns.Add(..);
+</code></pre>
+</blockquote>
+
+<p>Do you really want to do it each time you refresh the list? You have already created the list-view once. I guess what you really wanted to do is to just remove all the items with <code>ListView.Items.Clear()</code>.</p>
+
+<p>This and adding the many rows to the list in a loop without suspending it really hurt the performance because the list-view keeps refreshing after each change.</p>
+
+<blockquote>
+<pre><code>foreach (var processInfo in processesInfo)
+{     
+    // ..
+    ListViewProcesses.Items.Add(..);
+    // ..
+}
+</code></pre>
+</blockquote>
+
+<p>Consider using the <code>BeginUpdate</code> and <code>EndUpdate</code> methods and adding the rows inbetween or better, use the <code>AddRange</code> method:</p>
+
+<blockquote>
+  <p>The preferred way to add multiple items to a ListView is to use the AddRange method of the ListView.ListViewItemCollection (accessed through the Items property of the ListView). This enables you to add an array of items to the list in a single operation. However, if you want to add items one at a time using the Add method of the ListView.ListViewItemCollection class, you can use the BeginUpdate method to prevent the control from repainting the ListView every time that an item is added. When you have completed the task of adding items to the control, call the EndUpdate method to enable the ListView to repaint. This way of adding items can prevent flickered drawing of the ListView when lots of items are being added to the control.</p>
+</blockquote>
+
+<p><a href="https://msdn.microsoft.com/en-us/library/system.windows.forms.listview.beginupdate(v=vs.110).aspx" rel="nofollow noreferrer">ListView.BeginUpdate Method</a></p>
+
+<hr>
+
+<p>To further improve the performance you could try to derive your own list-view-item from the</p>
+
+<blockquote>
+<pre><code>public class ListViewItem
+</code></pre>
+</blockquote>
+
+<p>that luckily isn't sealed. Then instead of re-adding all items you could just refresh the items and the list-view could just update the values with <code>ListView.Refresh()</code>. To keep track of the list-view-items and processes you could use another dictionaray and if a new process is added or removed you add/remove just this one and not all of them.</p>
+
+<hr>
+
+<h1>Design</h1>
+
+<blockquote>
+<pre><code>private Dictionary&lt;string, Action&gt; sortingActions;
+
+private Dictionary&lt;string, Action&gt; orderingActions;
+
+private bool isAscendingOrder = false;
+</code></pre>
+</blockquote>
+
+<p>I find these three fields very confusing because they sound so similar. </p>
+
+<p>How about this. First rename this one</p>
+
+<pre><code>sortingActions -&gt; selectColumn
+</code></pre>
+
+<p>With the new defintion you selects the column (value) without invoking sorting yet:</p>
+
+<pre><code>private Dictionary&lt;string, Func&lt;Process, IComparable&gt;&gt; selectColumn;
+
+selectColumn = new Dictionary&lt;string, Func&lt;Process, IComparable&gt;&gt;
+{
+    ["Name"] = p =&gt; p.ProcessName,
+    ["Status"] = p =&gt; p.Responding,
+    ["Start Time"] = p =&gt; p.StartTime,
+    ["Total Runtime"] = p =&gt; GetRuntimeOfProcess(p),
+    ["Memory Usage"] = p =&gt; GetMemoryUsageInMB(p),
+    ["Active Time"] = p =&gt; GetActiveTimeOfProcess(p)
+};
+</code></pre>
+
+<p>Then rename the other dictionary to</p>
+
+<pre><code>orderingActions -&gt; orderBy
+</code></pre>
+
+<p>where the key is no longer a string but an enum:</p>
+
+<pre><code>enum OrderBy
+{
+    Ascending,
+    Descending
+}
+</code></pre>
+
+<p>so the new dictionary has now stronger keys and its items trigger the sort function by using the first dictionary to get the delegate for getting the column (value)</p>
+
+<pre><code>orderBy = new Dictionary&lt;OrderBy, Action&gt;
+{
+    [OrderBy.Ascending] = () =&gt;
+    {
+        SortProcesses(selectColumn[orderByColumn]);
+        currentOrderBy = OrderBy.Ascending;
+    },
+    [..]
+}
+</code></pre>
+
+<p>where <code>orderByColumn</code> is the name of the column to be ordered by that you set somewhere.</p>
+
+<p>The <code>isAscendingOrder</code> now becomes <code>currentOrderBy</code></p>
+
+<pre><code>private OrderBy currentOrderBy = OrderBy.Descending;
+</code></pre>
+
+<p><em>(disclaimer: notepad coding, may not be 100% correct yet)</em></p>
+    </div>

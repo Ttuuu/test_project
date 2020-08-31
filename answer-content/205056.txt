@@ -1,0 +1,89 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Your code is clear and concise, there is not much to complain about it, except for one small thing:</p>
+
+<blockquote>
+<pre><code>t = linspace(1, 2, 10)';
+</code></pre>
+</blockquote>
+
+<p>In MATLAB, <code>'</code> is the complex conjugate transpose, whereas <code>.'</code> is the non-conjugate transpose, the simple re-ordering of dimensions. The array it is applied to here is real-valued, so there is no difference, but it is good practice to use <code>.'</code> always when the intention is to change the orientation of a vector. Bugs do appear at times because of the improper use of the <code>'</code> operator.</p>
+
+<hr>
+
+<p><a href="https://codereview.stackexchange.com/questions/192486/applying-correction-to-a-time-series-in-matlab/192805#192805">As I've said before</a>, loops are no longer slow in MATLAB, but often it's still possible to remove them ("vectorize the code") for a time gain. If the vectorization doesn't involve creating intermediate copies of the data, and doesn't involve complex indexing, then vectorization is still profitable.</p>
+
+<p>In this particular case, vectorization involves calling a function one time vs calling it 10x10=100 times, and function calls still have a significant overhead in MATLAB. So cutting down on function calls will be beneficial.</p>
+
+<p>Producing all possible combinations of two values can be accomplished with the <code>bsxfun</code> function in MATLAB. But in this case, we want to produce all combinations of two columns, and there is no function for that. However, you could use it to generate the product of all columns (the argument to <code>trapz</code> in your function <code>ip</code>). This requires a large intermediate matrix to be generated, but in this case (100 vectors of length 4), this is a very mild amount of data, and well worth the price if it means not calling a function 100 times.</p>
+
+<p><a href="https://blogs.mathworks.com/loren/2016/10/24/matlab-arithmetic-expands-in-r2016b/" rel="nofollow noreferrer">Note that <code>bsxfun</code> is, since R2016b, no longer necessary</a>. Everything you could previously do with <code>bsxfun</code> can now be done without it. For example, given <code>x=1:10</code>, you can do:</p>
+
+<pre><code>y = x .* x.';
+</code></pre>
+
+<p>to produce a 10x10 matrix with the product of all combinations of elements of <code>x</code>. This implicit singleton expansion happens automatically when the two arguments to any operator have compatible dimensions. That means that their sizes are identical along each dimension, or one of them has size 1 along a dimension (a singleton dimension). That singleton dimension gets repeated virtually to match the size of the other matrix.</p>
+
+<p>Your function <code>ip</code> is written such that, given two input matrices <code>x</code> and <code>y</code> of compatible dimensions, it will compute your custom inner product along the first dimension, as long as that dimension has a size larger than 1. To make this function safer in use, you can explicitly tell <code>trapz</code> along which dimension to operate:</p>
+
+<pre><code>ip = @(x, y) trapz(x.*y, 1) / (size(x, 1)-1);
+</code></pre>
+
+<p>Now, <code>ip(x,y)</code> will compute many custom inner products at once, if <code>x</code> and <code>y</code> are matrices. However, <code>ip(V, V)</code> will compute the inner product of each column in <code>V</code> with itself, not all combinations of columns. For that, we need to do a little bit of reshaping of the inputs:</p>
+
+<pre><code>function V = cross_apply2(f, V1, V2)
+s1 = size(V1, 2);
+s2 = size(V2, 2);
+V2 = reshape(V2, [], 1, s2);
+V = f(V1, V2);
+V = reshape(V, s1, s2);
+</code></pre>
+
+<p>What this code does is convert the second input matrix of size NxM to a matrix of size Nx1xM (this can be done without copying the data). Now the function <code>f</code> (really <code>ip</code> the way you call it) will use implicit singleton expansion to compute the custom inner product of each combination of columns of <code>V1</code> and <code>V2</code>.</p>
+
+<p>You can verify that <code>cross_apply</code> and <code>cross_apply2</code> yield exactly the same result:</p>
+
+<pre><code>A = cross_apply(ip, V, V);
+b = cross_apply(ip, V, f(t));
+
+A2 = cross_apply2(ip, V, V);
+assert(isequal(A,A2))
+b2 = cross_apply2(ip, V, f(t));
+assert(isequal(b,b2))
+</code></pre>
+
+<p>And we can also see what the time savings are for calling the function <code>ip</code> once instead of 100 times:</p>
+
+<pre><code>timeit(@()cross_apply(ip, V, V))
+timeit(@()cross_apply2(ip, V, V))
+</code></pre>
+
+<p>On my computer this is 1.5016e-04 vs 2.9650e-05, a 5x speedup.</p>
+
+<p><strong>But</strong> <code>cross_apply2</code> is not as general as <code>cross_apply</code>, as it imposes a requirement on the function to be applied to be vectorized.</p>
+
+<hr>
+
+<p><code>trapz</code> is a funny function. In your case, where it is called without an <code>x</code> input argument, it sets <code>x</code> to 1. The trapezoid rule now is simply the sum of the elements of the input vector, minus half the first and half the last element. I don't know what you application even is, but have you considered replacing this with the simple sum? Computing the true dot product is a lot faster.</p>
+
+<p>You can do <code>edit trapz</code> to see how <code>trapz</code> is implemented. For the way you call it, it does:</p>
+
+<pre><code>z = sum((y(1:end-1,:) + y(2:end,:)), 1)/2;
+</code></pre>
+
+<p>This is the same, as I said before, as:</p>
+
+<pre><code>z = sum(y(:,:)) - y(1,:)/2 - y(end,:)/2;
+</code></pre>
+
+<p>But this second form is twice as fast for large arrays: The first form copies the data in <code>y</code> twice (minus one row), adds these results and sums them up, whereas the second form simply adds up all elements, then subtracts half of the first row and half the last row. For a random large array <code>y</code>:</p>
+
+<pre><code>y = rand(1000,100,100);
+z1 = sum((y(1:end-1,:) + y(2:end,:)), 1)/2;
+z2 = sum(y(:,:)) - y(1,:)/2 - y(end,:)/2;
+max(abs(z1(:)-z2(:)))
+timeit(@()sum((y(1:end-1,:) + y(2:end,:)), 1)/2)
+timeit(@()sum(y(:,:)) - y(1,:)/2 - y(end,:)/2)
+</code></pre>
+
+<p>This shows that the largest difference between the two results is rounding errors (4.8317e-13), and the timings are 0.0778 vs 0.0341.</p>
+    </div>

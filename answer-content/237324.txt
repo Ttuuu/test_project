@@ -1,0 +1,102 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>There are a couple of issues with destructors, firstly is the issue with closing pipes on Linux/Unix <a href="https://stackoverflow.com/questions/6564395/why-doesnt-pipe-close-cause-eoferror-during-pipe-recv-in-python-multiproces">as discussed here</a> (though the pipe is actually no longer necessary once we fix the second issue). Secondly the <code>functools.partial</code> method appears to capture a reference to self which causes the wrapper object to not be destructed when expected, I have fixed this using <code>__getattr__</code> however this has the drawback of allowing the class to respond to any method, perhaps a check in that function that the routine_name is valid would be wise, alternatively if this solution is acceptable the inspect code could all be removed simply calling <code>getattr</code> in <code>_process_wrap_event_loop</code>.</p>
+
+<p>This means we can remove the pipe</p>
+
+<pre><code>import inspect
+from multiprocessing import Process, Queue, Pipe
+from threading import Thread
+
+CLOSE_CODE = "_close"
+
+def _process_wrap_event_loop(new_cls, instruction_queue, output_queue, *args, **kwargs):
+    cls = new_cls.__wrapped__
+    obj = cls(*args, **kwargs)
+
+    routines = inspect.getmembers(obj, inspect.isroutine)
+    # Inform the partner class what instructions are valid
+    output_queue.put([r[0] for r in routines if not r[0].startswith("_")])
+    # and record them for the event loop
+    routine_lookup = dict(routines)
+
+    while True:
+        instruction, inst_args, inst_kwargs = instruction_queue.get()
+        if instruction == CLOSE_CODE:
+            break
+        inst_op = routine_lookup[instruction]
+        res = inst_op(*inst_args, **inst_kwargs)
+        output_queue.put(res)
+
+def process_wrap_object(cls):
+    """
+    Class decorator which exposes the same public method interface as the original class,
+    but the object itself resides and runs on a separate process.
+    """
+    class NewCls:
+        def __init__(self, *args, **kwargs):
+            self._instruction_queue = Queue() # Queue format is ({method_name}, {args}, {kwargs})
+            self._output_queue = Queue() # Totally generic queue, will carry the return type of the method
+            self._process = Process(
+                target=_process_wrap_event_loop,
+                args=([NewCls, self._instruction_queue, self._output_queue] + list(args)),
+                kwargs=kwargs
+            )
+            self._process.start()
+
+            routine_names = self._output_queue.get()
+
+            assert CLOSE_CODE not in routine_names, "Cannot wrap class with reserved method name."
+
+        def __getattr__(self, routine_name):
+            def f(*trigger_args, **trigger_kwargs):
+                self._instruction_queue.put((routine_name, trigger_args, trigger_kwargs))
+                return self._output_queue.get()
+            return f
+
+        def __del__(self):
+            # When the holding object gets destroyed,
+            # tell the process to shut down.
+            self._instruction_queue.put((CLOSE_CODE, (), {}))
+            self._process.join()
+
+    for wa in ('__module__', '__name__', '__qualname__', '__doc__'):
+        setattr(NewCls, wa, getattr(cls, wa))
+    setattr(NewCls, "__wrapped__", cls)
+
+    return NewCls
+</code></pre>
+
+<p>This can be demonstrated with the following example</p>
+
+<pre><code>@process_wrap_object
+class Example:
+    """Sample class for demoing stuff"""
+    def __init__(self, a, b):
+        self._a = a
+        self._b = b
+
+    def inc_a(self):
+        self._a += 1
+
+    def inc_b(self, increment=1):
+        self._b += increment
+
+    def id(self):
+        return f"{self._a} - {self._b} = {self._a - self._b}"
+
+    def __del__(self):
+        print("Deleting example")
+
+proc_obj = Example(8, 6)
+print(proc_obj.id())
+proc_obj.inc_a()
+proc_obj.inc_a()
+print(proc_obj.id())
+proc_obj.inc_b()
+print(proc_obj.id())
+proc_obj.inc_b(3)
+print(proc_obj.id())
+
+del proc_obj
+</code></pre>
+    </div>

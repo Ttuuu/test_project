@@ -1,0 +1,135 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h3><em>Reconsidering valid/feasible "sinks"</em></h3>
+
+<p>When reasoning about the crucial idea and recalling the origin Unix <code>tee</code> command the obvious conclusion that comes out is that <code>Sinks</code> item should actually be I/O stream (wheather binary, text or buffered stream or OS-level file object) or optionally, <code>queue.Queue</code> instance. All other types are in-actual/invalid in such context.<br>
+Thus, it's reasonable to validate the input sequences (<code>out</code>, <code>err</code>) if they implementing the main sub-classes of basic <a href="https://docs.python.org/3/library/io.html#io.IOBase" rel="nofollow noreferrer"><code>io.IOBAse</code></a> interface or <code>queue.Queue</code> class at the very start on constructing <strong><code>Sinks</code></strong> instance.<br>
+That will allow to eliminate noisy repetitive checks like <code>if hasattr(sink, 'flush')</code>, <code>hasattr(sink, 'seek')</code>, <code>hasattr(sink, 'write')</code> - assuming that <em>"sinks"</em> items are instances derived from any of <strong><code>(io.RawIOBase, io.BufferedIOBase, io.TextIOBase)</code></strong> which already implement <code>flush/seek/write</code> behavior.<br>
+With that in mind, I'd add the respective static methods to <strong><code>Sinks</code></strong> class:</p>
+
+<pre><code>@staticmethod
+def _validate_sinks(sinks: Sequence[Any]):
+    for sink in sinks:
+        if not isinstance(sink, (io.RawIOBase, io.BufferedIOBase, io.TextIOBase, queue.Queue)):
+            raise TypeError(f'Type `{type(sink)}` is not valid sink type')
+
+@staticmethod
+def is_iostream(sink):
+    return isinstance(sink, (io.RawIOBase, io.BufferedIOBase, io.TextIOBase))
+</code></pre>
+
+<p>Now, the <code>Sinks.__new__</code> method would look as (also see how redundant <code>set</code> reassignment optimized):</p>
+
+<pre><code>def __new__(cls, out: Sequence[Any], err: Sequence[Any]):
+    """Create new sinks."""
+    # Validating I/O streams
+    if out:
+        Sinks._validate_sinks(out)
+    if err:
+        Sinks._validate_sinks(err)
+
+    both: Tuple[Any, ...] = ()
+    if out and err:
+        _out = set(out)
+        _err = set(err)
+        out = tuple(_out - _err)
+        err = tuple(_err - _out)
+        both = tuple(_out &amp; _err)
+    return _Sinks.__new__(cls, out, err, both)
+</code></pre>
+
+<p>Before posting optimized <code>flush</code>, <code>reset_head</code> and <code>_to_callback</code> methods - here are some subtle issues:</p>
+
+<ul>
+<li><p><code>reset_head</code> method. <br>When running your approach <em>"as is"</em> I got <code>OSError: [Errno 29] Illegal seek</code> at the end. <br>Some raw binary stream may not be <a href="https://docs.python.org/3/library/io.html#io.IOBase.seekable" rel="nofollow noreferrer">seeakable</a>.  </p>
+
+<blockquote>
+  <p>If <code>False</code>, seek(), tell() and truncate() will raise OSError.</p>
+</blockquote>
+
+<p>Therefore, let's capture 2 exceptions there <code>except (io.UnsupportedOperation, OSError) as ex:</code> (see the restructured method version below)</p></li>
+<li><p><code>_to_callback</code> method.<br>
+The method is simplified due to preliminary initial validation.</p></li>
+</ul>
+
+<hr>
+
+<p>Considering the above issues and some other minor but redundant moments/conditions like <code>if sinks is None: continue</code>, <code>for sink in sinks or []:</code> the mentioned 3 methods would look as below:</p>
+
+<pre><code>def flush(self) -&gt; None:
+    """Flush all sinks."""
+    for sinks in filter(Sinks.is_iostream, self):
+        for sink in sinks:
+            sink.flush()
+
+def reset_head(self) -&gt; None:
+    """Reset the head of all sinks."""
+    for sinks in filter(Sinks.is_iostream, self):
+        for sink in sinks:
+            try:
+                sink.seek(0)
+            except (io.UnsupportedOperation, OSError) as ex:
+                print(sink, sink.seekable(), ex)
+                pass
+
+@staticmethod
+def _to_callback(
+        sinks: Optional[List[Any]],
+        flush: bool = True,
+) -&gt; Optional[Tuple[TSink, ...]]:
+    """Convert sinks to a callback."""
+    if sinks is None:
+        return None
+    callbacks: List[TSink] = []
+    for sink in sinks:
+        if isinstance(sink, queue.Queue):
+            callbacks.append(sink.put)
+        elif Sinks.is_iostream(sink):
+            callbacks.append(_flushed_write(sink) if flush else sink.write)
+    return tuple(callbacks)
+</code></pre>
+
+<hr>
+
+<p>Sample running (output):</p>
+
+<pre><code>doWlloHer
+HlWd
+lHl o!lreo
+!
+oWd H
+lHlWd
+delWlHlor
+ olrdl!He
+HolWlloe
+!l
+
+
+original
+doWlloHer
+HlWd
+lHl o!lreo
+!
+oWd H
+lHlWd
+delWlHlor
+ olrdl!He
+HolWlloe
+!l
+
+
+std.out
+lHl o!lreo
+!
+oWd H
+lHlWd
+!l
+
+
+std.err
+doWlloHer
+HlWd
+delWlHlor
+ olrdl!He
+HolWlloe
+</code></pre>
+    </div>

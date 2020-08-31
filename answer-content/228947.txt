@@ -1,0 +1,431 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Thank you for an interesting question 😊
+Here is the first part of the answer, I will publish more over the weekend at <a href="https://github.com/dmitrynogin/shopless" rel="nofollow noreferrer">https://github.com/dmitrynogin/shopless</a>. </p>
+
+<p>Let’s talk about storage access first. You need to deal with different types of storages, so let’s abstract:</p>
+
+<pre><code>public abstract class Folder : Enumerable&lt;string&gt;
+{
+    public static Folder Open(Connection @string) =&gt; 
+        @string.Open&lt;Folder&gt;();
+
+    public abstract Stream Write(string file);
+    public abstract Stream Read(string file);
+    public abstract void Delete(string file);
+}
+</code></pre>
+
+<p>Connection string allows you to resolve concrete storage type and content location at run-time using stringly typed configuration parameter. It adds a lot of flexibility when you are testing, even allows to combine different storages.</p>
+
+<p>Connection looks like this:</p>
+
+<pre><code>public sealed class Connection : ValueObject&lt;Connection&gt;
+{
+    public static implicit operator Connection(string @string) =&gt; Parse(@string);
+    public static Connection Parse(string @string) =&gt; new Connection(@string);            
+
+    Connection(string @string)
+    {
+        Values = @string.Split(';')
+           .Select(nv =&gt; nv.Split('='))
+           .ToDictionary(
+                nv =&gt; nv[0].Trim(), 
+                nv =&gt; string.Join("=", nv.Skip(1)).Trim());
+    }
+
+    IReadOnlyDictionary&lt;string, string&gt; Values { get; }
+
+    public T Get&lt;T&gt;(string name, T @default = default(T)) =&gt;
+        Values.TryGetValue(name, out var value) 
+        ? (T)TypeDescriptor.GetConverter(typeof(T)).ConvertFrom(value)
+        : @default;
+
+    public T Open&lt;T&gt;() =&gt; (T)Activator.CreateInstance(
+        Type.GetType(Get&lt;string&gt;("Type")), this);
+
+    protected override IEnumerable&lt;object&gt; EqualityCheckAttributes =&gt; 
+        new object[] { ToString() };
+
+    public override string ToString() =&gt; 
+        string.Join(";", from nv in Values
+                         select $"{nv.Key}={nv.Value}");
+}
+</code></pre>
+
+<p>Where concrete disk folder implementation could look like the following:</p>
+
+<pre><code>public sealed class DiskFolder : Folder
+{
+    public static Connection String(string path) =&gt; 
+        $"Type={typeof(DiskFolder).FullName}, {typeof(DiskFolder).Assembly.GetName().Name};" + 
+        $"Path={path}";
+
+    public DiskFolder()
+        : this(GetTempPath())
+    {
+    }
+
+    public DiskFolder(Connection @string)
+        : this(@string.Get&lt;string&gt;("Path"))
+    {
+    }
+
+    public DiskFolder(string path) 
+    {
+        Path = path ?? throw new ArgumentNullException(nameof(path));
+        if (!Exists(Path))
+            CreateDirectory(Path);
+    }
+
+    public string Path { get; }
+
+    public override IEnumerator&lt;string&gt; GetEnumerator() =&gt; 
+        EnumerateFiles(Path).Select(GetFileName).GetEnumerator();
+
+    public override Stream Write(string file) =&gt; 
+        File.OpenWrite(Combine(Path, file));
+
+    public override Stream Read(string file) =&gt;
+        File.OpenRead(Combine(Path, file));
+
+    public override void Delete(string file) =&gt;
+        File.Delete(Combine(Path, file));
+}
+</code></pre>
+
+<p>The home work would be to create <code>S3BucketFolder</code> – just pack all the required parameters into the connection string.</p>
+
+<p>Helpers to be as DRY as possible are:</p>
+
+<pre><code>public abstract class Enumerable&lt;T&gt; : IEnumerable&lt;T&gt;
+{
+    IEnumerator IEnumerable.GetEnumerator() =&gt; GetEnumerator();
+    public abstract IEnumerator&lt;T&gt; GetEnumerator();
+}
+</code></pre>
+
+<p>And:</p>
+
+<pre><code>public abstract class ValueObject&lt;T&gt; : IEquatable&lt;ValueObject&lt;T&gt;&gt;
+    where T : ValueObject&lt;T&gt;
+{
+    protected abstract IEnumerable&lt;object&gt; EqualityCheckAttributes { get; }
+
+    public override int GetHashCode() =&gt;
+        EqualityCheckAttributes
+            .Aggregate(0, (hash, a) =&gt; unchecked(hash * 31 + (a?.GetHashCode() ?? 0)));
+
+    public override bool Equals(object obj) =&gt;
+        Equals(obj as ValueObject&lt;T&gt;);
+
+    public virtual bool Equals(ValueObject&lt;T&gt; other) =&gt;
+        other != null &amp;&amp;
+        GetType() == other.GetType() &amp;&amp;
+        EqualityCheckAttributes.SequenceEqual(other.EqualityCheckAttributes);
+
+    public static bool operator ==(ValueObject&lt;T&gt; left, ValueObject&lt;T&gt; right) =&gt;
+        Equals(left, right);
+
+    public static bool operator !=(ValueObject&lt;T&gt; left, ValueObject&lt;T&gt; right) =&gt;
+        !Equals(left, right);
+}
+</code></pre>
+
+<p>Please note that all projects in the solution have the same default namespace “Shopless” to reduce amount of required <code>using</code> directives to the minimum.</p>
+
+<p>You could test the folder:</p>
+
+<pre><code>    [TestMethod]
+    public void Stringify()
+    {
+        Connection connection = DiskFolder.String("c:\\proj");
+        Assert.AreEqual(
+            "Type=Shopless.IO.DiskFolder, Shopless.Disk;Path=c:\\proj", 
+            $"{connection}");
+    }
+</code></pre>
+
+<p>And:</p>
+
+<pre><code>    [TestMethod]
+    public void Open()
+    {
+        Folder folder = Folder.Open("Type=Shopless.IO.DiskFolder, Shopless.Disk;Path=c:\\proj");
+        Assert.IsTrue(folder is DiskFolder df &amp;&amp; df.Path == "c:\\proj");
+    }
+</code></pre>
+
+<p>And:</p>
+
+<pre><code>    [TestMethod]
+    public void Manage_Files()
+    {
+        var folder = new DiskFolder();
+        folder.Delete("test.txt");
+        Assert.IsFalse(folder.Contains("test.txt"));
+        folder.Write("test.txt").Dispose();
+        folder.Read("test.txt").Dispose();
+        Assert.IsTrue(folder.Contains("test.txt"));
+        folder.Delete("test.txt");
+        Assert.IsFalse(folder.Contains("test.txt"));
+    }
+</code></pre>
+
+<p>More stuff is coming :)</p>
+
+<p><strong>UPDATE</strong></p>
+
+<p>Let’s now define a configuration mechanism and use it:</p>
+
+<pre><code>public class Config : ValueObject&lt;Config&gt;
+{        
+    public static readonly Config Local = Load("local.json");
+    public static readonly Config Stage = Load("stage.json");
+    public static readonly Config Published = Load("published.json");
+    public static readonly Config Active = Published ?? Stage ?? Local;
+
+    public static Config Load(string file) =&gt;
+        Exists(file) ? JsonConvert.DeserializeObject&lt;Config&gt;(ReadAllText(file)) : null;
+
+    public Config(string uploadFolder, string imageFolder)
+    {
+        UploadFolder = uploadFolder;
+        ImageFolder = imageFolder;
+    }
+
+    public Connection UploadFolder { get; }
+    public Connection ImageFolder { get; }
+
+    protected override IEnumerable&lt;object&gt; EqualityCheckAttributes =&gt;
+        new object[] { UploadFolder, ImageFolder };
+}
+</code></pre>
+
+<p>Now we will have IStorage to represent folder set across the solution to inject where folder access is required:</p>
+
+<pre><code>public interface IStorage
+{
+    Folder Upload { get; }
+    Folder Images { get; } 
+}
+</code></pre>
+
+<p>My default implementation uses active configuration:</p>
+
+<pre><code>[Service]
+public class Storage : IStorage
+{
+    public Folder Upload =&gt; Folder.Open(Config.Active.UploadFolder);
+    public Folder Images =&gt; Folder.Open(Config.Active.ImageFolder);
+}
+</code></pre>
+
+<p>Have a look at <a href="https://github.com/dmitrynogin/shopless/tree/master/Shopless.Autofac" rel="nofollow noreferrer"><code>Shopless.Autofac</code></a> and <a href="https://github.com/dmitrynogin/shopless/tree/master/Demo" rel="nofollow noreferrer"><code>Demo</code></a> projects to see how <a href="https://github.com/dmitrynogin/shopless/blob/master/Shopless.Domain/Base/ServiceAttribute.cs" rel="nofollow noreferrer"><code>ServiceAttribute</code></a> works.</p>
+
+<p>Now it is time to define our service according to the first paragraph of your question:</p>
+
+<pre><code>public interface IImageUploader
+{
+    string Upload(int number, Stream jpeg);
+    void Rename(string product, params string[] images);
+}
+</code></pre>
+
+<p>Where the implementation would be:</p>
+
+<pre><code>[Service]
+public class ImageUploader : IImageUploader
+{
+    public ImageUploader(IStorage storage)
+    {
+        Storage = storage ?? throw new ArgumentNullException(nameof(storage));
+    }
+
+    IStorage Storage { get; }
+
+    public string Upload(int number, Stream jpeg)
+    {
+        var name = TemporaryImageName.New(number);
+        using (var file = Storage.Upload.Write(name))
+            jpeg.CopyTo(file);
+
+        return name;
+    }
+
+    public void Rename(string product, params string[] images)
+    {
+        var pn = ProductName.New(product);
+        foreach (var tin in images.Select(TemporaryImageName.Parse))
+            if(Storage.Upload.Contains(tin))
+            {
+                var pin = ProductImageName.New(tin, pn);
+                Storage.Upload.MoveTo(Storage.Images, tin, pin);
+            }
+    }
+}
+</code></pre>
+
+<p>We will need:</p>
+
+<pre><code>public class ProductName : ValueObject&lt;ProductName&gt;
+{
+    public static ProductName New(string text) =&gt;
+        new ProductName(text.Trim(), Slug.New(text));
+
+    public ProductName(string text, Slug slug)
+    {
+        Text = text ?? throw new ArgumentNullException(nameof(text));
+        Slug = slug ?? throw new ArgumentNullException(nameof(slug));
+    }
+
+    public string Text { get; }
+    public Slug Slug { get; }
+
+    protected override IEnumerable&lt;object&gt; EqualityCheckAttributes =&gt; 
+        new object[] { Slug };
+}
+</code></pre>
+
+<p>And:</p>
+
+<pre><code>public class Slug : ValueObject&lt;Slug&gt;
+{
+    public static Slug New(string text) =&gt;
+        new Slug(text
+            .Trim()
+            .Replace(" ", "-")
+            .ToLowerInvariant());
+
+    public static Slug Parse(string text) =&gt;
+        TryParse(text, out var slug) ? slug : throw new FormatException("Malformed slug.");
+
+    public static bool TryParse(string text, out Slug slug) =&gt;
+        (slug = IsNullOrWhiteSpace(text) ? null : new Slug(text)) != null;
+
+    public Slug(string text)
+    {
+        Text = text;
+    }
+
+    public string Text { get; }
+
+    public override string ToString() =&gt; Text;
+
+    protected override IEnumerable&lt;object&gt; EqualityCheckAttributes =&gt;
+        new object[] { Text };
+}
+</code></pre>
+
+<p>And:</p>
+
+<pre><code>public class TemporaryImageName : ValueObject&lt;TemporaryImageName&gt;
+{
+    public static implicit operator string(TemporaryImageName name) =&gt; $"{name}";
+
+    public static TemporaryImageName New(int number) =&gt;
+        new TemporaryImageName(number, Clock.Time());
+
+    public static TemporaryImageName Parse(string text) =&gt;
+        GetExtension(text) == ".jpg" &amp;&amp;
+        GetFileNameWithoutExtension(text).Split('-') is string[] p &amp;&amp;
+        p.Length == 3 &amp;&amp; p[0] == "tmp" &amp;&amp;
+        int.TryParse(p[1], out var n) &amp;&amp;
+        DateTime.TryParseExact(p[2], "yyyyMMddHHmmssfff", null, DateTimeStyles.None, out var t)
+        ? new TemporaryImageName(n, t)
+        : throw new FormatException("Invalid temporary image name.");
+
+    public TemporaryImageName(int number, DateTime timestamp)
+    {
+        Number = number;
+        Timestamp = timestamp;
+    }
+
+    public int Number { get; }
+    public DateTime Timestamp { get; }
+
+    public override string ToString() =&gt; $"tmp-{Number}-{Timestamp:yyyyMMddHHmmssfff}.jpg";
+
+    protected override IEnumerable&lt;object&gt; EqualityCheckAttributes =&gt;
+        new object[] { Number, Timestamp };
+}
+</code></pre>
+
+<p>And:</p>
+
+<pre><code>public class ProductImageName : ValueObject&lt;ProductImageName&gt;
+{
+    public static implicit operator string(ProductImageName name) =&gt; $"{name}";
+
+    public static ProductImageName New(TemporaryImageName imageName, ProductName productName) =&gt; 
+        new ProductImageName(imageName.Number, imageName.Timestamp, productName.Slug);
+
+    public static ProductImageName Parse(string text) =&gt;
+        GetExtension(text) == ".jpg" &amp;&amp;
+        GetFileNameWithoutExtension(text).Split('-') is string[] p &amp;&amp;
+        p.Length == 4 &amp;&amp; p[0] == "tmp" &amp;&amp;
+        int.TryParse(p[1], out var n) &amp;&amp;
+        DateTime.TryParseExact(p[2], "yyyyMMddHHmmssfff", null, DateTimeStyles.None, out var t) &amp;&amp;
+        Slug.TryParse(p[3], out var slug)             
+        ? new ProductImageName(n, t, slug)
+        : throw new FormatException("Invalid product image name.");
+
+    public ProductImageName(int number, DateTime timestamp, Slug product)
+    {
+        Number = number;
+        Timestamp = timestamp;
+        Product = product ?? throw new ArgumentNullException(nameof(product));
+    }
+
+    public int Number { get; }
+    public DateTime Timestamp { get; }
+    public Slug Product { get; }
+
+    public override string ToString() =&gt; $"img-{Number}-{Timestamp:yyyyMMddHHmmssfff}-{Product}.jpg";
+
+    protected override IEnumerable&lt;object&gt; EqualityCheckAttributes =&gt; 
+        new object[] { Number, Timestamp, Product };
+}
+</code></pre>
+
+<p>Please note that we provide persistability of those types by allowing data flow unmodified through public constructor to public readonly properties. We should use a static factory method to produce a new Slug, etc. This way you are safe to modify factory behavior without invalidating the persistent state when/where available.</p>
+
+<p>The integration test would be:</p>
+
+<pre><code>[TestClass]
+public class ImageUploader_Should
+{
+    [TestMethod]
+    public void Upload()
+    {
+        Clock.Time = () =&gt; new DateTime(2019, 1, 2, 3, 4, 5, 678);
+
+        IStorage storage = new Storage();
+        storage.Upload.Clear();
+        storage.Images.Clear();
+
+        IImageUploader iu = new ImageUploader(storage);
+
+        var tin1 = iu.Upload(1, new MemoryStream());
+        var tin2 = iu.Upload(2, new MemoryStream());
+
+        iu.Rename("Best Pasta Ever", tin1, tin2);
+
+        Assert.IsFalse(storage.Upload.Any());
+
+        Assert.AreEqual(2, storage.Images.Count());
+        Assert.IsTrue(storage.Images.Contains("img-1-20190102030405678-best-pasta-ever.jpg"));
+        Assert.IsTrue(storage.Images.Contains("img-2-20190102030405678-best-pasta-ever.jpg"));
+    }
+}
+</code></pre>
+
+<p>You can see here a use of ambient system time property which is part of our domain logic: </p>
+
+<pre><code>public class Clock
+{
+    public static Func&lt;DateTime&gt; Time { get; set; } = () =&gt; DateTime.Now;
+}
+</code></pre>
+
+<p>Please feel free to ping me in skype if you have any questions: <strong>dmitrynogin</strong></p>
+    </div>

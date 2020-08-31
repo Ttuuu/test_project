@@ -1,0 +1,93 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Since I've explained a lot in the comments, I thought I might distill those comments into an answer, so here goes:</p>
+
+<p>You're definitely improving, <a href="https://codereview.stackexchange.com/questions/31035/how-to-put-xml-results-in-the-mvc-pattern/31085#31085">considering your previous question</a>. Well, to be honest: I must say the difference between your first code example, and the one you posted here now is night and day (in a good way)! The main problem with your code, at this point is that you're still connecting to the DB in the controller. Don't. DB work/logic resides in the model <em>Layer</em>.<br>
+The best way to structure more complex applications (within the confines of the MVC pattern) is by implementing a service layer. Read about it <a href="http://zf-boilerplate.com/documentation/service-orientation/" rel="nofollow noreferrer">here</a>. Use this graph to guide you along:</p>
+
+<p><img src="https://i.stack.imgur.com/hlhOw.png" alt="Schematic Service"></p>
+
+<p>Your DB-related objects are still having to sanitize the request data, which they really shouldn't. Processing the request should've been done way before they even come into play. The last point where you can still work on the request is the controller, as shown in this graph:</p>
+
+<p><img src="https://i.stack.imgur.com/toFYm.png" alt="MVC with responsibilities"></p>
+
+<p>It's important to note that the DB is not part of the controller's responsibility. That's dealt with in the Model LAYER. I can't stress this enough the Model part of MVC isn't an object, it's a LAYER. It can (and IMHO should) consist of various object, each with their own, distinct tasks. No need to try and cram it all into a single object...<br>
+There is, however, one object that can be passed to all other objects in the MVC pattern (save for data models), and that is the object representing the app's configuration. You pass that object around freely: to a DB class constructor, via the service's constructor, or through setters. Each class can then use the <code>Config</code> object to extract whatever data it needs from the instance for it to do its job. Hell: the config can even be global. But connections to DB's is something that is not done in a controller. A controller is something that should contain as little code as possible.</p>
+
+<p><em>On the config:</em><br>
+This can be any old file (ini, xml, yml... doesn't matter), but should be parsed at the very beginning. This config can contain all sorts of information (like where the autoloader is, what routing plugins you're using and the DB connection info). This can be passed around freely, but you only connect to the DB once you know for a fact that you're going to query for data. It's how most MVC frameworks work: Zend, Symfony... they all do this. Just check their source code for examples...</p>
+
+<p>You refer to <a href="https://softwareengineering.stackexchange.com/questions/178831/using-pdo-with-mvc">this answer</a>, because it'd seem to create a DB connection in the controller. Well, in effect, it creates a <em>service</em> instance in the controller, and it's that service's job to connect to the DB, and query it, based on the methods that are called in the controller. These methods then return Data models, back to the controller, where they're passed on to the view. That's standard, by-the-book, MVC. Though the snippet doesn't make mention of any config object, it's quite easy to implement it:</p>
+
+<pre><code>//controller:
+public function someAction(Config $conf)
+{
+    $service = new Repository($conf);
+    $model = $service-&gt;getDataForUser(
+        $this-&gt;request-&gt;get('User', 'guest')//get User param, or guest if User param not found
+    );
+    if ($model === null)
+    {
+        return $this-&gt;redirect('user_invalid_page');
+    }
+    $this-&gt;view-&gt;user = $model;
+}
+//Repository class (=== service)
+class Repository
+{
+    private $config = null;
+    private $conn = null;
+    public function __construct(Config $conf)
+    {
+        $this-&gt;config = $conf;
+    }
+    public function getDataForUser($userName)
+    {//LOGIC HERE!
+        $db = $this-&gt;getDb();//Lazy-loader!
+        $query = $db-&gt;buildQuery(
+            array(
+                'table'  =&gt; 'users',
+                'where'  =&gt; array(
+                    'usrName'  =&gt; $userName
+                )
+            )
+        );
+        $data = $db-&gt;execute($query);
+        if (!$data)
+        {
+            return null;
+        }
+        $model = new UserModel;
+        foreach($data as $field =&gt; $val)
+        {//check my other answers on why I use setters here...
+            $model-&gt;{'set'.$field}($val);
+        }
+        return $model;
+    }
+    private function getDb()
+    {
+        if ($this-&gt;conn === null)
+        {
+            $db = new DBWrapper($this-&gt;config-&gt;database);//pass DB connection config to class
+            $this-&gt;setDb($db);
+        }
+        return $this-&gt;conn;
+    }
+    public function setDb(DBWrapper $db)
+    {//injection =&gt; public
+        if ($this-&gt;conn instanceof DBWrapper)
+        {//close current connection
+            $this-&gt;conn-&gt;close();
+        }
+        $this-&gt;conn = $db;
+        return $this;
+    }
+}
+</code></pre>
+
+<p>This is a (somewhat) crude example of how to implement MVC can be implemented correctly. The DB connection is handled by a DB object. The instance of <code>DBWrapper</code> is created by the service, which also creates the data-models, based on the return values from the DB class. The controller calls upon the service to attempt to retrieve the desired data. What the service needs to do to get to that data is non of the controller's business. Nor does the controller need to know/care what type of DB is being used. That's up to the <code>DBWrapper</code> class.<br>
+Please note how little code the controller actually contains, and how much of the <em>"heavy lifting"</em> is done in the <em>service</em> and the classes this service actually creates. While writing code that goes into the controller, make sure you're not writing your application logic, save it for the service.</p>
+
+<p>The service only cares if the requested data was found, and how it should be poured into objects. If no data was returned, it'll return <code>null</code> to the controller. If data <em>was</em> found, the service will try its very best to return a nice model to the controller. In short: to each class its own tasks/concerns. If you need to add logic, you open and edit the service class, if you need to add a user action, add an action method in the controller, if you want to change/add support for another type of DB, you turn to the <code>DBWrapper</code> class. Easy!</p>
+
+<p><em>Please note, <code>DBWrapper</code> isn't a terrible good name, it suggests it's just a wrapper class for <code>PDO</code> or <code>Mysqli</code>, and <a href="https://codereview.stackexchange.com/questions/29362/very-simple-php-pdo-class/29394#29394">I'm not a fan of such classes</a></em></p>
+    </div>

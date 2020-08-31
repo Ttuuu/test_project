@@ -1,0 +1,102 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>These are good questions!</p>
+
+<h3>1. You should indeed have the copy constructor &amp; assignment operator deleted.</h3>
+
+<p>The "rule of five" tells you to specifically define a copy c'tor and assignment operator - but it doesn't tell you that you have to make the available. It is a perfectly valid choice to decide to <em>not</em> allow your object to be copied or non-move-assigned - only moved. An example of this: <a href="https://en.cppreference.com/w/cpp/memory/unique_ptr" rel="nofollow noreferrer"><code>std::unique_ptr</code></a>.</p>
+
+<p>It's also what I would recommend in your case, because:</p>
+
+<ol>
+<li>Like you said, duplicating a file descriptor is weird and unexpected.</li>
+<li>It's not obvious to the user of your class what the copy behavior <em>should</em> be.</li>
+<li>There don't seem to be - AFAICT - common scenarios in which you would <em>copy</em>, rather than move or pass by <em>reference</em>, a TCP socket.</li>
+</ol>
+
+<h3>2. Consider using <code>std::optional</code> to indicate "no valid value" or "missing" or "none"</h3>
+
+<p>In C (and the C system call bindings on Unix-like systems), it is a convention to use the -1 value for an invalid/missing file descriptor is a convention. We know that the <code>int</code> type is actually larger than the actual space of possible file descriptor values, so we use a junk value, which we assume the OS never uses, to indicate "no valid value". Now, this works fine; and you could choose to, say, define a static class constant:</p>
+
+<pre><code>static constexpr const int no_file_descriptor { -1 };
+</code></pre>
+
+<p>and then write:</p>
+
+<pre><code>close(_s);
+_s = other._s;
+other._s = no_file_descriptor;
+</code></pre>
+
+<p><sub>As @HolyBlackCat suggests, you must get <code>_s</code> to be closed somehow. You could also just swap the two descriptors, but I find that to contradict the element of least surprise.</sub></p>
+
+<p>but you might want to consider the more general (though less space-efficient) solution, which is the <a href="https://en.cppreference.com/w/cpp/utility/optional" rel="nofollow noreferrer"><code>std::optional&lt;T&gt;</code></a> type template. It is intended for exactly your case: Either holding some value of type <code>T</code> (in your case, <code>int</code>), or holding some indication of "no value". Using an optional, you could write:</p>
+
+<pre><code>close(_s.get());
+_s = other._s;
+other._s = std::nullopt;
+</code></pre>
+
+<p>You'll still need to write your move assignment and move construction code, unfortunately (thanks @CassioRenan for noticing these are both necessary).</p>
+
+<h3>Other suggestions</h3>
+
+<ol start="3">
+<li>Don't use a plain <code>int</code>; either find a type definition of a file descriptor from some library you're using, or if you have no definition to borrow, have <code>using file_descriptor = int;</code> or <code>using file_descriptor_index = int</code>.</li>
+<li><code>_s</code> is a bad member name. Use something more explicit, e.g. <code>descriptor_index_</code> or <code>posix_descriptor_index_</code>.</li>
+<li>Always check the return value of library/system calls! And handle errors.</li>
+</ol>
+
+<h3>The modified code</h3>
+
+<pre><code>class tcp_socket {
+protected:
+    void close_if_neccessary() {
+       constexpr auto socket_close_failed { -1 };
+        if (descriptor_index_.has_value()) { 
+            auto retval = close(descriptor_index_.value()); 
+            if (retval == socket_close_failed) { 
+               // throw something here, e.g.:
+               // throw std::system_error(errno, std::system_category(), "close()");
+            }
+    };
+public:
+    using file_descriptor_index = int;
+
+    tcp_socket() : descriptor_index_() { 
+       constexpr auto socket_creation_failed { -1 };
+       auto retval = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+       if (retval == socket_creation_failed) { 
+           // throw std::system_error(errno, std::system_category(), "socket()");
+       }
+       descriptor_index = retval;
+    };
+
+    tcp_socket(const tcp_socket&amp; other) = delete;
+    tcp_socket&amp; operator=(const tcp_socket&amp; other) = delete;
+    tcp_socket&amp; operator=(tcp_socket&amp;&amp; other) noexcept {
+        if (other.descriptor_index_ != descriptor_index_) {
+            close_if_neccessary();
+            descriptor_index_ = other.descriptor_index_;
+            other.descriptor_index_ = std::nullopt;
+        }
+        return this;
+    };
+    tcp_socket(tcp_socket&amp;&amp; other) noexcept :
+        descriptor_index_(other.descriptor_index_) 
+    {
+        other.descriptor_index = std::nullopt;
+    }
+    ~tcp_socket() { 
+        // You might want to wrap this in a try-catch, since
+        // destructors shouldn't throw. Otherwise you're risking
+        // a double-exception and immediate program termination.
+        close_if_necessary(); 
+    }
+
+protected:
+    std::optional&lt;file_descriptor_index&gt; descriptor_index_;
+};
+</code></pre>
+
+<p>See <a href="https://stackoverflow.com/q/12171377/1593077">this StackOverflow question</a> about the weird exception code in the comments:</p>
+    </div>

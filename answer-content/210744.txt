@@ -1,0 +1,208 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h1>OpCodes</h1>
+
+<p>You are initializing your opcode dictionary inside the while loop for fetching instructions.  It only needs to be initialized once; move it before the while loop. </p>
+
+<p>Your opcodes are a set of numbers between 0 &amp; 15.  You index a dictionary based on these numbers to get the method to call.  Why not use an array, instead of a dictionary; it would be faster and take less memory. </p>
+
+<p>Consider building the opcode array (or dictionary) programmatically:</p>
+
+<pre><code>OPCODES = [ 'br', 'add', 'ld', 'st', 'jsr', 'and', 'ldr', 'str',
+            'rti', 'not', 'ldi', 'sti', 'jmp', 'res', 'lea', 'trap'  ]
+
+opcodes = [ getattr(self, f"op_{op}_impl") for op in OPCODES ]
+</code></pre>
+
+<p>Note: requires Python 3.6 for the <code>f"strings"</code>.  Use <code>.format()</code> or <code>%</code> with earlier versions.</p>
+
+<p>Note: this eliminates the need for your <code>class opcodes(IntEnum)</code>.  </p>
+
+<p>Since the <code>op_XXX_impl</code> functions are not meant to be called externally, they should named starting with an underscore.</p>
+
+<p>Even better: move initialization of the <code>opcodes</code> array into your <code>lc3</code> constructor, and store it in the object.  It will help when it comes time to add in tests.</p>
+
+<pre><code>self._opcodes = [ getattr(self, f"op_{op}_impl") for op in OPCODES ]
+</code></pre>
+
+<hr>
+
+<h1>Memory</h1>
+
+<p>You could use the <code>array</code> class for your 16-bit memory; you don’t need to create your own <code>memory</code> class:</p>
+
+<pre><code>self.memory = array.array('H', [0]*65536)
+</code></pre>
+
+<p>The <code>'H'</code> is the type code for 16 bit unsigned values.</p>
+
+<p>Similarly, you code create your registers without a <code>registers</code> class.  <code>'h'</code> is the type code for 16 bit signed values:</p>
+
+<pre><code>self.gprs = array.array('h', [0]*10)
+</code></pre>
+
+<p>This creates 10 register locations, 8 for the "general purpose" registers, and two additional registers: <code>pc</code> and <code>cond</code>, which you could access as <code>self.gprs[8]</code> and <code>self.gprs[9]</code>.   We can improve on this, making them more accessible using <code>@property</code>:</p>
+
+<pre><code>@property
+def pc(self):
+    return self.gprs[8]
+
+@pc.setter
+def pc(self, value):
+    self.gprs[8] = value
+
+@property
+def cond(self):
+    return self.gprs[9]
+
+@cond.setter
+def cond(self, value):
+    self.gprs[9] = value
+</code></pre>
+
+<p>Then you can use and set <code>self.pc</code> and <code>self.cond</code> directly.</p>
+
+<hr>
+
+<h1>Instruction Decoding</h1>
+
+<p>You repeat a lot of code for decoding instructions. You should write helper functions to extract the required values.   Then you could write like:</p>
+
+<pre><code>def op_add_impl(self, instruction):
+    dr, src1, src2 = self.decode_dr_sr2imm(instruction)
+
+    self.gprs[dr] = src1 + src2
+    self.update_flags(dr)
+
+def op_not_impl(self, instruction):
+    dr, src1, _ = self.decode_dr_sr2imm(instruction)
+
+    self.gprs[dr] = ~ src1
+    self.update_flags(dr)
+</code></pre>
+
+<p>Since <code>not</code> doesn’t use <code>sr2</code> or an immediate value, the value returned for <code>src2</code> can be ignored by saving it to the <code>_</code> variable. </p>
+
+<hr>
+
+<h1>Debug output</h1>
+
+<p>Instead of printing to <code>sys.stdout</code>, you should learn and use the Python <code>logging</code> module, for adding (and removing) debug output from your program.</p>
+
+<pre><code>import logging
+LOG = logging.getLogger(__name__)
+
+LOG.debug("100 in hex is %x", 100)
+</code></pre>
+
+<p>In the main program, to enable debug output, use:</p>
+
+<pre><code>logging.basicConfig()
+LOG.setLevel(logging.DEBUG)
+</code></pre>
+
+<hr>
+
+<h1>Testability</h1>
+
+<p>The <code>start()</code> method does a lot.  Too much, in fact.  It loops endlessly, reading instructions from memory, advancing the program counter, and dispatching instructions.</p>
+
+<p>Let's break this down a bit.</p>
+
+<h2>Dispatch</h2>
+
+<p>You want testability.  How about executing just one instruction?   In fact, you don't need to read the instruction from memory, either.</p>
+
+<pre><code>def _execute_instruction(self, instruction):
+    opcode = instruction &gt;&gt; 12
+
+    if LOG.isEnabledFor(logging.DEBUG):
+        LOG.debug("instruction: %04x", instruction)
+        LOG.debug("disassembly: %s", lc3disas.single_ins(self.pc, instruction))
+        self.dump_state()
+
+    try:
+        self._opcode[opcode](instruction)
+    except KeyError:
+        raise NotImplementedError("Invalid opcode")
+</code></pre>
+
+<p>Now you could write a test for an individual instruction.</p>
+
+<pre><code>def test_add():
+    cpu = lc3()
+    cpu.gprs[0] = 22
+    cpu._execute_instruction(0x0000)   # gprs[0] = gprs[0] + gprs[0]
+    assert cpu.gprs[0] == 44
+    assert cpu.cond == condition_flags.p
+</code></pre>
+
+<h2>Single Step</h2>
+
+<p>With dispatcher, above, we can now easily write a single stepper:</p>
+
+<pre><code>def single_step(self):
+    instruction = self.memory[self.pc]
+    self.pc += 1
+    self._execute_instruction(instruction)
+</code></pre>
+
+<p>And again, you can write tests using single stepping:</p>
+
+<pre><code>def test_single_step_add(self):
+
+    cpu = lc3()
+
+    # Setup
+    cpu.gprs[0] = -22
+    cpu.pc = 0x1234
+    cpu.memory[self.pc] = 0x0000
+
+    cpu.single_step()
+
+    assert cpu.gprs[0] == -44
+    assert cpu.cond == condition_flags.n
+    assert cpu.pc == 0x1235
+</code></pre>
+
+<h2>Running</h2>
+
+<p>Using <code>single_step()</code>, it becomes easy to write the <code>start()</code> method.  But lets make it a little better.</p>
+
+<p>Trap #0x25 is a halt instruction, but it also exits the Python interpreter.  That is a little too Draconian.  If a program ever generates that trap, any test framework will come crashing down as the interpreter exits.  Instead, you should use a flag to indicate whether the CPU is running normally, or if it has been halted.</p>
+
+<pre><code>def start(self):
+
+    LOG.debug("Starting")
+
+    self._running = True
+    while self._running:
+        self.single_step()
+
+    LOG.debug("Halted.")
+</code></pre>
+
+<p>The <code>op_trap_impl()</code> function would set <code>self._running = False</code> when the Trap #0x25 is executed.</p>
+
+<p>You can now write a test program that runs, and halts, and check the state of memory when it has halted.</p>
+
+<h2>Input / Output</h2>
+
+<p>Your LC3 is tied to <code>sys.stdin</code> and <code>sys.stdout</code>.  This makes it hard to test; you'd have to intercept the input and output streams when you write your tests.  Or, you could have your LC3 cpu have custom <code>in</code> and <code>out</code> streams, which default to <code>sys.stdin</code> and <code>sys.stdout</code>, but can be replaced with <a href="https://docs.python.org/3/library/io.html?highlight=textio#io.StringIO" rel="nofollow noreferrer"><code>StringIO</code></a>, so your test can feed data to the program, and retrieve output for validation.  The Trap #0x20, #0x21 and #0x22 would need to read/write to the requested io streams.</p>
+
+<pre><code>class LC3():
+
+    def __init__(self, *, input=sys.stdin, output=sys.stdout):
+        self._input = input
+        self._output = output
+
+def test_io():
+    in = io.StringIO("7\n")             # Input test data
+    out = io.StringIO()                 # Capture output to string buffer
+
+    lc3 = LC3(input=in, output=out)
+    lc3.read_program_from_file("fibonnaci.obj")
+    lc3.start()
+
+    assert out.getvalue() == "13\n"     # 13 is the 7th Fibonacci number
+</code></pre>
+    </div>

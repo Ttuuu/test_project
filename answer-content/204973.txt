@@ -1,0 +1,121 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Because I'm delightfully (or annoyingly) pedantic, I rather like having interfaces so that I can mock them for testing purposes. I also changed the constructor to be <code>internal</code> since I don't think outside assembly callers need to be calling it except through the <code>.Create()</code> API:</p>
+
+<p><strong>IFingerprintBuilder.cs</strong></p>
+
+<pre><code>public interface IFingerprintBuilder&lt;T&gt;
+{
+    IFingerprintBuilder&lt;T&gt; For&lt;TProperty&gt;(
+        Expression&lt;Func&lt;T, TProperty&gt;&gt; expression,
+        Expression&lt;Func&lt;TProperty, TProperty&gt;&gt; fingerprint);
+
+    Func&lt;T, byte[]&gt; Build();
+}
+</code></pre>
+
+<p><strong>FingerprintBuilder.cs</strong> (generic type version)</p>
+
+<pre><code>public sealed class FingerprintBuilder&lt;T&gt; : IFingerprintBuilder&lt;T&gt;
+{
+    private readonly Func&lt;byte[], byte[]&gt; _computeHash;
+
+    private readonly IDictionary&lt;string, Func&lt;T, object&gt;&gt; _fingerprints;
+
+    internal FingerprintBuilder(Func&lt;byte[], byte[]&gt; computeHash)
+    {
+        this._computeHash = computeHash ?? throw new ArgumentNullException(nameof(computeHash));
+        this._fingerprints = new SortedDictionary&lt;string, Func&lt;T, object&gt;&gt;(StringComparer.OrdinalIgnoreCase);
+    }
+
+    public static IFingerprintBuilder&lt;T&gt; Create(Func&lt;byte[], byte[]&gt; computeHash) =&gt;
+        new FingerprintBuilder&lt;T&gt;(computeHash);
+
+    public IFingerprintBuilder&lt;T&gt; For&lt;TProperty&gt;(
+        Expression&lt;Func&lt;T, TProperty&gt;&gt; expression,
+        Expression&lt;Func&lt;TProperty, TProperty&gt;&gt; fingerprint)
+    {
+        if (!(expression.Body is MemberExpression memberExpression))
+        {
+            throw new ArgumentException("Expression must be a member expression");
+        }
+
+        if (this._fingerprints.ContainsKey(memberExpression.Member.Name))
+        {
+            throw new ArgumentException($"Member {memberExpression.Member.Name} has already been added.");
+        }
+
+        var getValue = expression.Compile();
+        var getFingerprint = fingerprint.Compile();
+
+        this._fingerprints[memberExpression.Member.Name] = obj =&gt;
+        {
+            var value = getValue(obj);
+
+            return value == null ? default(TProperty) : getFingerprint(getValue(obj));
+        };
+
+        return this;
+    }
+
+    public Func&lt;T, byte[]&gt; Build()
+    {
+        var binaryFormatter = new BinaryFormatter();
+
+        return obj =&gt;
+        {
+            using (var memory = new MemoryStream())
+            {
+                foreach (var item in this._fingerprints)
+                {
+                    binaryFormatter.Serialize(memory, item.Value(obj));
+                }
+
+                return this._computeHash(memory.ToArray());
+            }
+        };
+    }
+}
+</code></pre>
+
+<p><strong>FingerprintBuilder.cs</strong> (anonymous type version)</p>
+
+<pre><code>public static class FingerprintBuilder
+{
+    public static IFingerprintBuilder&lt;T&gt; Create&lt;T&gt;(Func&lt;byte[], byte[]&gt; computeHash, T obj) =&gt;
+        new FingerprintBuilder&lt;T&gt;(computeHash);
+}
+</code></pre>
+
+<p><strong>FingerprintBuilderExtensions.cs</strong></p>
+
+<pre><code>public static class FingerprintBuilderExtensions
+{
+    public static IFingerprintBuilder&lt;T&gt; For&lt;T, TProperty&gt;(
+        this IFingerprintBuilder&lt;T&gt; builder,
+        Expression&lt;Func&lt;T, TProperty&gt;&gt; expression) =&gt; builder.For(expression, _ =&gt; _);
+
+    public static IFingerprintBuilder&lt;T&gt; For&lt;T&gt;(
+        this IFingerprintBuilder&lt;T&gt; builder,
+        Expression&lt;Func&lt;T, string&gt;&gt; expression,
+        bool ignoreCase,
+        bool ignoreWhiteSpace)
+    {
+        Func&lt;string, string&gt; format = input =&gt;
+        {
+            if (ignoreCase)
+            {
+                input = input.ToUpperInvariant();
+            }
+
+            if (ignoreWhiteSpace)
+            {
+                input = input.Trim();
+            }
+
+            return input;
+        };
+
+        return builder.For(expression, input =&gt; format(input));
+    }
+</code></pre>
+    </div>

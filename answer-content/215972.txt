@@ -1,0 +1,123 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<pre><code>class Node {
+  private:
+    int m_data;
+    std::unique_ptr&lt;Node&gt; m_previous;
+  public:
+    Node(int data, std::unique_ptr&lt;Node&gt;&amp; previous) {
+         m_data = data;
+         m_previous = std::move(previous);
+    }
+</code></pre>
+
+<p>Since <code>Node</code> is an implementation detail of <code>Stack</code>, you don't need to hide <code>Node</code>s members <code>data</code> and <code>previous</code> from  <code>Stack</code>. Consider using aggregate initialization so that members can be directly manipulated.</p>
+
+<pre><code>    ~Node() { m_previous.reset(); }
+</code></pre>
+
+<p>Since the destructor isn't doing anything after <code>std::unique_ptr&lt;T&gt;::reset()</code>, it's equivalent to letting the class call the destructor of your <code>std::unique_ptr&lt;Node&gt;</code> member.</p>
+
+<pre><code>    ~Node() { }
+</code></pre>
+
+<p>Now, you have chained your pointers such that the current node is the owner of the previous node which owns the previous node and so on. When we call the destructor, this is essentially what is happening</p>
+
+<pre><code>m_previous.reset() calls 
+🡒 m_previous-&gt;~Node()
+🡒 m_previous-&gt;m_previous-&gt;~Node()
+🡒 m_previous-&gt;m_previous-&gt;m_previous-&gt;~Node()
+🡒 m_previous-&gt;m_previous-&gt;m_previous-&gt;m_previous-&gt;~Node()
+🡒 m_previous-&gt;m_previous-&gt;m_previous-&gt;m_previous-&gt;m_previous-&gt;~Node()
+🡒 and so on
+</code></pre>
+
+<p>And it's correct in that each node gets cleaned up and all the cleanup happens automatically.  Unfortunately, it's also recursive which means its bounded by the stack (memory) depth. To fix this, you'll need to iteratively remove elements.</p>
+
+<p>Whenever you define any of the special member functions (destructor, copy/move constructor, copy/move assignment), you should consider whether your class needs the others. This is commonly known as the rule of five. By providing the destructor, the move operations are not declared. Normally, the copy operations are defaulted, but <code>std::unique_ptr</code> as a data member results in those being implicitly deleted. You'll need to implement the copy and move operations if your stack is to have those value semantics. The general guideline is that if you explicitly declare any of the special member functions, then explicitly declare all of the special member functions and explicitly <code>=default</code> (opt into the implicit behavior), <code>=delete</code> (opt out of the implicit behavior), or user-define each of them.</p>
+
+<pre><code>    const int data() { return m_data; }
+</code></pre>
+
+<p><code>const</code> as a qualifier on the return type is ignored here.</p>
+
+<hr>
+
+<pre><code>class Stack {
+  ...
+  public:
+    ~Stack() { m_top.reset(); }
+</code></pre>
+
+<p>Same issues as node, from recursive destruction to missing copy/move operations.</p>
+
+<pre><code>    void push_back(int data) {
+        m_top = std::unique_ptr&lt;Node&gt;(new Node(data, m_top));
+        ++m_size;
+    }
+</code></pre>
+
+<p>Avoid <code>new</code> and prefer <code>std::make_unique</code> to make <code>std::unique_ptr</code>s. It cuts down on the duplication and enforces consistency when you need safety in more complex initialization sequences.</p>
+
+<pre><code>    void pop_back() {
+        if(!m_top) {
+            throw std::out_of_range("ERROR: Can not pop. Stack empty.");
+        }
+        else {
+            m_top = std::move(m_top-&gt;previous());
+            --m_size;
+        }
+    }
+</code></pre>
+
+<p>Don't use <code>else</code> after language constructs that interrupts control flow (<code>return</code>, <code>break</code>, <code>continue</code>, <code>goto</code>).</p>
+
+<pre><code>    int top() {
+        return m_top.get()-&gt;data();
+    }
+</code></pre>
+
+<p>Be consistent with the naming. If directionality matters to you, then <code>back()</code> would be consistent with <code>push_back()</code> and <code>pop_back()</code>. <code>top()</code> would go better with functions like <code>push()</code>, and <code>pop()</code>.</p>
+
+<p>Be consistent with your exception handling. If you throw on an empty stack <code>pop_back()</code>, then you should throw on an empty stack <code>top()</code>.</p>
+
+<p>In order to modify the top value, the user has to pop (deallocate) and push (allocate). Consider allowing the user to access the top element by reference and modify the element in place.</p>
+
+<pre><code>    bool empty() {
+        return (m_size == 0) ? true : false;
+    }
+</code></pre>
+
+<p><code>m_size == 0</code> will return a boolean that maps to the same exact values in your ternary. The compiler knows that and optimizes it for you, but you could help readers and just do it yourself.</p>
+
+<pre><code>    void swap(Stack&amp; other_stack) {
+        m_top.swap(other_stack.m_top);
+        // Node* other_top = other_stack.m_top.release();
+        // other_stack.m_top = std::move(m_top);
+        // m_top = std::unique_ptr&lt;Node&gt;(new Node(other_top-&gt;data(), other_top-&gt;previous()));
+    }
+</code></pre>
+
+<p>You forgot to swap the size.</p>
+
+<pre><code>    friend std::ostream&amp; operator&lt;&lt;(std::ostream&amp; os, Stack&amp; stack) {
+        std::string stack_string = "";
+        Node* current = stack.m_top.get();
+        for(; current; current = current-&gt;previous().get()) {
+            stack_string = stack_string + '|' + std::to_string(current-&gt;data()) + '|' + '\n';
+        }
+        os &lt;&lt; stack_string;
+        os &lt;&lt; "---\n";
+        return os;
+    }
+</code></pre>
+
+<p><code>stack</code> is passed in as a reference. <code>operator&lt;&lt;</code> doesn't modify the contents of <code>stack</code> and can be qualified with <code>const</code>.</p>
+
+<p>You don't have to convert <code>data</code> (<code>int</code>) to a <code>std::string</code> to stream into a <code>std::ostream</code>. There is already an <a href="https://en.cppreference.com/w/cpp/io/basic_ostream/operator_ltlt" rel="nofollow noreferrer">overload</a> that does this for you.</p>
+
+<p>Do you even need <code>operator&lt;&lt;()</code>? A stack is a last in-first out container. Inspection only exists on the latest element pushed on the stack that hasn't been popped. This function also requires the inclusion of <code>&lt;iostream&gt;</code>. A static constructor is transparently injected into every translation unit that includes this header, whether IOStreams are used or not in the user application.</p>
+
+<hr>
+
+<p>Overall, you should read up on <code>const</code>-correctness and <code>noexcept</code> specification. As for the design of your stack, I would consider splitting the management of the nodes (<code>forward_list</code>?) from the interface of <code>stack</code>, which could be adapted over an existing sequence interface.</p>
+    </div>

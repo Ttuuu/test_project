@@ -1,0 +1,144 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<blockquote>
+  <p>PDF specification ISO 32000-1:2008.</p>
+</blockquote>
+
+<p>Funny, that's a roughly 800 page document if I see that right :)  You
+might want to link to relevant parts if you want a reader to read it,
+otherwise that doesn't really help with the review here.</p>
+
+<p>The refactored version has less nesting, yes, so that's somewhat easier
+to read.  However I've the feeling that the extracted helpers are bit
+too short, essentially they're wrapping the null check and then combine
+that with another attribute; it's not that much shorter after all.  (Edit: Actually maybe they just need better names.  Best if there's no negation in the names, <code>notHidden</code> ... well, that's just <code>visible</code>, isn't it?)</p>
+
+<p>I was also going to make the comment about caching getters.  But.  Clear code is more important and one additional line for <code>x = getX()</code> looks super pointless when <code>x</code> is used only twice (or maybe even three times).  That's all assuming that getters simple return fields and <em>do not</em> have more hidden logic.  Otherwise caching might of course be necessary for performance reasons.</p>
+
+<p>In any case the denesting could go even further, after all there are two
+more <code>if</code>'s of the same nature:</p>
+
+<pre><code>    ...
+    try {
+        PdfFileSpec fileSpec = PdfEncryptedPayloadFileSpecFactory.wrap((PdfDictionary) fileSpecObject);
+        if (fileSpec == null) {
+            return null;
+        }
+        PdfDictionary embeddedDictionary = ((PdfDictionary) fileSpec.getPdfObject()).getAsDictionary(PdfName.EF);
+        PdfStream stream = getPdfStreamUf(embeddedDictionary);
+        if (stream == null) {
+            return null;
+        }
+        return new PdfEncryptedPayloadDocument(stream, fileSpec, documentNameUnicode);
+    } catch (PdfException e) {
+        logger.error(e);
+        return null;
+    }
+}
+</code></pre>
+
+<p>Btw. is the <code>try</code> around the smallest section of the code that can
+throw?  Otherwise It'd help to move it closer to the section that can
+actually fail, possibly allowing some more restructuring too.</p>
+
+<p>Unfortunately all the <code>null</code> checks can't easily be refactored in Java
+like it could be done in e.g. Scala (probably Kotlin).  That also limits
+how this code can be structured as it's a very imperative sequence.</p>
+
+<p>I'd otherwise try and create more meaningful helpers:  If that's at all
+possible I'd consider something like <code>getDocumentName</code>:</p>
+
+<pre><code>private String getDocumentName() {
+    return getCatalog().getCollection().getInitialDocument().toUnicodeString();
+}
+</code></pre>
+
+<p>Clear meaning to what this does (assuming the Unicode bit is less
+important here, otherwise the name would've to encode that).</p>
+
+<p>The casts are always a bit ugly, how about:</p>
+
+<pre><code>private PdfNameTree getEmbeddedFiles() {
+    return getCatalog().getNameTree(PdfName.EmbeddedFiles);
+}
+
+private PdfDictionary getFileSpecDictionary(PdfNameTree embeddedFiles) {
+    PdfObject fileSpecObject = embeddedFiles.getNames().get(getDocumentName());
+    if (fileSpecObject == null || !fileSpecObject.isDictionary()) {
+        return nil;
+    }
+    return (PdfDictionary) fileSpecObject;
+}
+
+private PdfDictionary getEmbeddedDictionary (PdfFileSpec fileSpec) {
+    return ((PdfDictionary) fileSpec.getPdfObject()).getAsDictionary(PdfName.EF);
+}
+</code></pre>
+
+<p>and then called without having to check for anything else but null:</p>
+
+<pre><code>PdfDictionary fileSpecObject = getFileSpecDictionary(getEmbeddedFiles());
+if (fileSpecObject == null) {
+    return null;
+}
+try {
+    PdfFileSpec fileSpec = PdfEncryptedPayloadFileSpecFactory.wrap(fileSpecObject);
+    ...
+}
+</code></pre>
+
+<p>I noticed that <code>fileSpec.getPdfObject()</code> did <em>not</em> check for
+<code>isDictionary</code>, that looks potentially like a problem?  Or perhaps
+it's guaranteed, I wouldn't know.</p>
+
+<p>One thing that's still missing from the refactored version is the
+logger, that should very likely be <code>static final</code> and not be constantly
+fetched (or at least that's the pattern I'm familiar with).  Also, I'm
+kind of expecting that a call <code>logger.error(e)</code> or
+<code>logger.error("Something went wrong", e)</code> would Do What I Mean and not
+require the <code>getMessage()</code> call there.  Passing the exception will then
+also allow you to see stacktraces etc., overall making that a nicer
+experience.  (That's mostly in reference to SLF4J, but that's a guess at
+what library's used here.)</p>
+
+<p>I'm struggling with the name <code>getPdfStreamUf</code>, but I suppose that's a
+technical bit that the reader more familiar with the format would
+understand.</p>
+
+<p>Okay so with those changes it would be a tiny bit more linear:</p>
+
+<pre><code>public PdfEncryptedPayloadDocument getEncryptedPayloadDocument2() {
+    if (readerIsEncrypted(getReader())) {
+        return null;
+    }
+    if (collectionIsNotViewHidden(getCatalog().getCollection())) {
+        return null;
+    }
+    PdfDictionary fileSpecObject = getFileSpecDictionary(getEmbeddedFiles());
+    if (fileSpecObject == null) {
+        return null;
+    }
+    try {
+        PdfFileSpec fileSpec = PdfEncryptedPayloadFileSpecFactory.wrap(fileSpecObject);
+        if (fileSpec == null) {
+            return null;
+        }
+        PdfStream stream = getPdfStreamUf(getEmbeddedDictionary(fileSpec));
+        if (stream == null) {
+            return null;
+        }
+        return new PdfEncryptedPayloadDocument(stream, fileSpec, getDocumentName());
+    } catch (PdfException e) {
+        logger.error(e);
+        return null;
+    }
+}
+</code></pre>
+
+<p>For me the upside is that while this is pretty heavy on the boilerplate,
+each individual step is pretty clear, they also have clear names and
+wherever we <em>don't</em> expect nulls, well, we just call methods and use
+their return values and have the proper types anywhere (no casts
+visible).  Oh yeah and I also backtracked on the small methods issue.  Actually it's pretty readable and the <code>return null</code> statements clearly delimit the steps.</p>
+
+<p>Regarding the <code>get.get.get</code> chains:  It might be worth exploring whether domain specific wrapper classes would help, separate from the business logic here, by exposing the right methods, hiding most of the null checks and focusing on letting the logic here use expressive accessors.  That's somewhat simulated here by the <code>get(get())</code> invocations, e.g. <code>getPdfStreamUf(getEmbeddedDictionary(fileSpec))</code> really wants to look like <code>fileSpec.getEmbeddedDictionary().getPdfStreamUf()</code>.</p>
+    </div>

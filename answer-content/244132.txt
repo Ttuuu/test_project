@@ -1,0 +1,101 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p><strong><code>std::string_view</code></strong></p>
+<p>Firstly, there seems to be some <em>misusages</em> of <code>string_view</code>. <code>string_view</code> is non-owning, and is a view to an allocated char array (such as <code>string</code>).</p>
+<p>The usage</p>
+<pre><code>template &lt;typename Resource&gt;
+class MissingResource : public std::exception {
+    std::string_view fileName{};
+    std::string_view msg{};
+    
+public:
+    [...]
+    template &lt;typename T&gt;
+    void initMsg() {
+        msg = "Failed loading resource: "
+              "{ Type: "    + std::string(typeid(Resource).name()) + ", "
+              "File name: " + fileName.data()                      + " }";
+    }
+    [...]
+};
+</code></pre>
+<p>Is dangerous, since after calling <code>initMsg()</code>, msg will point to an destroyed object (the right hand string is temporary).</p>
+<p>Better change it to be an owning string in this case: <code>std::string_view msg</code> =&gt; <code>std::string msg</code>. I assume you already have it like this, otherwise it would provide the output which you gave in the description.</p>
+<p>Secondly, the other member variable <code>std::string_view fileName</code> does not seem <em>necessary</em>. Since you create the error message for <code>msg</code> with <code>fileName</code> and do not use alone, we can skip it, right?</p>
+<p><strong>General design of <code>MissingResource</code></strong></p>
+<p>Applying the changes above, we have:</p>
+<pre><code>template &lt;typename Resource&gt;
+class MissingResource : public std::exception {
+    std::string msg{};
+    
+public:
+    MissingResource() = default;
+    MissingResource(std::string_view fileName)
+    {
+        initMsg&lt;Resource&gt;();
+    }
+
+    template &lt;typename T&gt;
+    void initMsg(std::string_view fileName) {
+        msg = "Failed loading resource: "
+              "{ Type: "    + std::string(typeid(Resource).name()) + ", "
+              "File name: " + fileName.data()                      + " }";
+    }
+
+    virtual const char* what() const noexcept override {
+        return msg.data();
+    }
+};
+</code></pre>
+<p><code>initMsg</code> is currently a <em>public method</em>, but from what I see, it's only used locally in the constructor. If this is the case, it should rather be a <em>private method</em> - you want to keep the public API for the class as simple and small as possible.</p>
+<p>Another improvement would be to be able to create <code>msg</code> in the constructor list - so that it does not have to be created twice. We can do this by making the initMsg a static method.</p>
+<p>Let's remove the extra unnecessary template for initMsg as well - the entire class already holds the template argument.</p>
+<p>And note that virtual + override is <em>unnecessary</em>. If you mark a method as overrided, it is implicitly virtual. Remove virtual for unnecessary noise.</p>
+<p>We now have something like this:</p>
+<pre><code>template &lt;typename Resource&gt;
+class MissingResource : public std::exception {
+    std::string msg{};
+
+    static std::string initMsg(std::string_view fileName) {
+        return "Failed loading resource: "
+              "{ Type: "    + std::string(typeid(Resource).name()) + ", "
+              "File name: " + fileName.data()                      + " }";
+    }
+    
+public:
+    MissingResource() = default;
+    MissingResource(std::string_view fileName) : msg{initMsg&lt;Resource&gt;()}
+    {}
+
+    const char* what() const noexcept override {
+        return msg.data();
+    }
+};
+</code></pre>
+<p><strong><code>ResourceHolder</code></strong></p>
+<p>Since this review is already long, I will just point out one thing in <code>ResourceHolder</code>, namely in <code>insert</code>. We can avoid separating declaration from initialization for bool loaded (and make it const!) by encapsulating the logic into a separate method. This might be a bit preferential, but it is good practice to avoid separating declaration and initialization.</p>
+<p>Something like this:</p>
+<pre><code>private:
+    bool fromFile(std::string_view fileName, Args&amp;&amp;... args) 
+    {
+    if constexpr (std::is_same&lt;Resource, sf::Music&gt;()) {
+            return resPtr-&gt;openFromFile(resourcesDir + fileName.data(), std::forward&lt;Args&gt;(args)...);
+        } 
+    else {
+            return resPtr-&gt;loadFromFile(resourcesDir + fileName.data(), std::forward&lt;Args&gt;(args)...);
+    }
+
+public:
+    template &lt;typename... Args&gt;
+    void insert(const Key&amp; key, std::string_view fileName, Args&amp;&amp;... args) {
+        auto resPtr = std::make_unique&lt;Resource&gt;();
+    
+        const bool loaded = fromFile(fileName, std::forward&lt;Args&gt;(args)...)
+        
+        /** Called here */
+        if (!loaded) {
+            throw MissingResource&lt;Resource&gt;(fileName);
+        }
+        resources.emplace(key, std::move(resPtr));
+    }
+</code></pre>
+    </div>

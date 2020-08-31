@@ -1,0 +1,165 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>To answer your question if it's thread safe. It is not. When dealing with threads you need to think that the same piece of code could be hit at anytime.  For example two threads could hit the IsFull and both try to submit the logger.   Also one thread could have hit stop on the timer and another one before the next line runs start the  timer.  Now you could have more logs than your array holds. You will need to change your code to do locks or I would suggest look at the producer consumer pattern. </p>
+
+<p>The TPL DataFlow blocks are great for this pattern. It's the <code>System.Threading.Tasks.Dataflow</code> nugget package.   Here's an example using the TPL DataFlow Blocks.  I didn't do a finalizer as I think <code>IDisposable</code> is the pattern you should use.  There is no Clear for the Data Mesh either.   </p>
+
+<pre><code>public class Logger : IDisposable
+{
+    private string _filePath;
+    private BufferBlock&lt;Log&gt; _queueBlock;
+    private bool _isDisposed;
+
+    public Logger(int capacity, TimeSpan interval, string filePath)
+    {
+        if (capacity &lt; 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(capacity));
+        }
+
+        InitializeFilePath(filePath);
+        InitializeDataMesh(capacity, interval);
+    }
+
+    private void InitializeDataMesh(int capacity, TimeSpan interval)
+    {
+        // This will do your grouping
+        var batchBlock = new BatchBlock&lt;Log&gt;(capacity);
+
+        // This timer will handle the sliding time window
+        var timer = new Timer(_ =&gt; batchBlock.TriggerBatch());
+
+        // Block to trigger reset on timer if new value added
+        // see https://stackoverflow.com/a/9423830
+        var resetBlock = new TransformBlock&lt;Log, Log&gt;(value =&gt;
+        {
+            timer.Change(interval, Timeout.InfiniteTimeSpan);
+            return value;
+        });
+
+        var writerBlock = new ActionBlock&lt;Log[]&gt;(logs =&gt; WriteLogs(logs), new ExecutionDataflowBlockOptions()
+        {
+            BoundedCapacity = 1, // only want to have WriteLogs run one at a time
+        });
+
+        // Queue to hold the adds
+        _queueBlock = new BufferBlock&lt;Log&gt;();
+
+        batchBlock.LinkTo(writerBlock, new DataflowLinkOptions()
+        {
+            PropagateCompletion = true
+        });
+
+        resetBlock.LinkTo(batchBlock, new DataflowLinkOptions()
+        {
+            PropagateCompletion = true
+        });
+
+        _queueBlock.LinkTo(resetBlock, new DataflowLinkOptions()
+        {
+            PropagateCompletion = true
+        });
+    }
+
+    private void InitializeFilePath(string filePath)
+    {
+        if (string.IsNullOrWhiteSpace(filePath))
+        {
+            filePath = Path.Combine(
+                Directory.GetCurrentDirectory(),
+                "Logs",
+                DateTime.Today.ToString("yyyyMMdd") + ".log"
+            );
+        }
+
+        string directory = Path.GetDirectoryName(filePath);
+
+        if (!Directory.Exists(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        _filePath = filePath;
+    }
+
+    private void WriteLogs(Log[] logs)
+    {
+        using (StreamWriter writer = new StreamWriter(_filePath, true))
+        {
+            var logDate = DateTime.Now; // Moved log date out of loop
+            foreach (Log log in logs)
+            {
+                writer.WriteLine(log + $" (wrote at {logDate:hh:mm:ss:fff})");
+            }
+            writer.Close();
+        }
+    }
+
+    public void Add(Log log)
+    {
+        if (_isDisposed)
+        {
+            throw new ObjectDisposedException(typeof(Logger).FullName);
+        }
+        _queueBlock.Post(log);
+    }
+
+    public Task AddAsync(Log log, CancellationToken token)
+    {
+        if (_isDisposed)
+        {
+            throw new ObjectDisposedException(typeof(Logger).FullName);
+        }
+
+        return _queueBlock.SendAsync(log, token);
+    }
+
+    public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        if (disposing)
+        {
+            _queueBlock.Complete();
+        }
+
+        _isDisposed = true;
+    }
+}
+</code></pre>
+
+<p>There is no <code>LogCollection</code> now as the DataFlow blocks handle that. </p>
+
+<p>To test in your ConsoleApp </p>
+
+<pre><code>static void Main(string[] args)
+{
+
+    using (var logger = new Logger(100, TimeSpan.FromSeconds(1), string.Empty))
+    {
+        Parallel.ForEach(Enumerable.Range(0, 149), i =&gt; logger.Add($"This is log #{i + 1,0:000}"));
+
+        Thread.Sleep(1500);
+
+        Parallel.ForEach(Enumerable.Range(0, 49), i =&gt; logger.Add($"This is log #{i + 151,0:000}"));
+
+        Thread.Sleep(1500);
+
+        logger.Add($"This is log #{999,0:000}");
+    }
+
+    Console.Write("Done");
+
+
+    Console.ReadLine();
+}
+</code></pre>
+    </div>

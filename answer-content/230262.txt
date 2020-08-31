@@ -1,0 +1,283 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Let's go through the code and see what can be improved.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>#pragma once
+</code></pre>
+</blockquote>
+
+<p>This shouldn't be in a non-header.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>#include &lt;list&gt;
+#include &lt;map&gt;
+#include &lt;string&gt;
+#include &lt;variant&gt;
+#include &lt;vector&gt;
+
+#include &lt;fstream&gt;
+#include &lt;iostream&gt;
+#include &lt;sstream&gt;
+</code></pre>
+</blockquote>
+
+<p>Sort the include directives in alphabetical order.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>namespace json {
+    class Value;
+
+    // six json data types
+    using null_t = std::nullptr_t;
+    using bool_t = bool;
+    using number_t = std::double_t;
+    using string_t = std::string;
+    using array_t = std::vector&lt;Value&gt;;
+    using object_t = std::map&lt;string_t, Value&gt;;
+
+    using aggregate_t = std::variant&lt;
+        null_t,   bool_t,  number_t,
+        string_t, array_t, object_t&gt;;
+</code></pre>
+</blockquote>
+
+<p><code>json</code> is a very common name used by many people, leading to name clashes.  Think of a more unique name.  Maybe <code>unicorn5838::json</code>?</p>
+
+<p>I don't see a reason to use <code>std::nullptr_t</code> for <code>null_t</code>.  <code>std::nullptr_t</code> is a null pointer literal and can implicitly convert to pointers.  Is that plausible?  You can use <code>std::monostate</code> instead, or just <code>struct null_t { };</code>.</p>
+
+<p>You are mixing <code>std::double_t</code> and <code>double</code>.  My advice is to just use <code>double</code>.  Also, consistently use <code>number_t</code> after the alias declaration.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>class Value : protected aggregate_t {
+public:
+    using aggregate_t::variant;
+    // removes spurious E0291
+    Value() = default;
+    // converts int into double rather than bool
+    Value(int integer) : aggregate_t(static_cast&lt;double&gt;(integer)) {}
+    // converts c_string (pointer) into string rather than bool
+    Value(const char* c_string) : aggregate_t(std::string(c_string)) {}
+</code></pre>
+</blockquote>
+
+<p>Hmm ...  Protected inheritance?  Why do you need it in this case?  (You can address this question with a comment if you have a good reason.)</p>
+
+<p>Inheriting the constructors of <code>std::variant</code> doesn't seem to be a good choice here.  I see your effort in fixing the problems, but just providing your own constructors seems easier.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>public:
+    auto operator[](const string_t&amp; key) -&gt; Value&amp; {
+        // transform into object if null
+        if (std::get_if&lt;null_t&gt;(this))
+            *this = object_t();
+        return std::get&lt;object_t&gt;(*this)[key];
+    }
+
+    auto operator[](std::size_t key) -&gt; Value&amp; {
+        // transform into array if null
+        if (std::get_if&lt;null_t&gt;(this))
+            *this = array_t();
+        if (key &gt;= std::get&lt;array_t&gt;(*this).size())
+            std::get&lt;array_t&gt;(*this).resize(key + 1);
+        return std::get&lt;array_t&gt;(*this)[key];
+    }
+</code></pre>
+</blockquote>
+
+<p>Don't use multiple <code>public:</code> labels.</p>
+
+<p>Do not use the trailing return type syntax unless necessary.  (Yeah, I know some people advocate always using a trailing return type, but it arguably makes the code more verbose.)</p>
+
+<p>Your <code>operator[]</code> automatically constructs the element if not existent, much like <code>map::operator[]</code> but not <code>vector::operator[]</code>.  I'm not sure whether this behavior is intuitive enough to justify itself, but anyway ...</p>
+
+<p><code>*this = object_t();</code> should be <code>emplace&lt;object_t&gt;();</code> to prevent an unnecessary move construction.</p>
+
+<p>You do <code>std::get&lt;array_t&gt;(*this)</code> three times, and the complex code for getting the value will be run three times.  Instead, use a reference:</p>
+
+<pre><code>auto&amp; arr = std::get&lt;array_t&gt;(*this);
+if (key &gt;= arr.size())
+    arr.resize(key + 1);
+return arr[key];
+</code></pre>
+
+<p>Also note that <code>key + 1</code> may overflow (well, probably not a real problem).</p>
+
+<blockquote>
+<pre><code>auto save(std::ostream&amp; stream, std::string prefix = "") -&gt; std::ostream&amp; {
+    static const std::string SPACING = "  "; // "\t"; // "    ";
+
+    // depending on the type, write to correct value with format to stream
+    std::visit([&amp;stream, &amp;prefix](auto&amp;&amp; value) {
+            using namespace std;
+            using T = decay_t&lt;decltype(value)&gt;;
+
+            if constexpr (is_same_v&lt;T, nullptr_t&gt;)
+                             stream &lt;&lt; "null";
+            if constexpr (is_same_v&lt;T, bool_t&gt;)
+                             stream &lt;&lt; (value ? "true" : "false");
+            else if constexpr (is_same_v&lt;T, double_t&gt;)
+                                  stream &lt;&lt; value;
+            else if constexpr (is_same_v&lt;T, string&gt;)
+                                  stream &lt;&lt; '"' &lt;&lt; value &lt;&lt; '"';
+            else if constexpr (is_same_v&lt;T, array_t&gt;) {
+                    stream &lt;&lt; "[\n";
+                    auto [indent, remaining] = make_tuple(prefix + SPACING, value.size());
+                    // for every json value, indent and print to stream
+                    for (auto&amp; json : value)
+                        json.save(stream &lt;&lt; indent, indent)
+                            // if jsons remaining (not last), append comma
+                            &lt;&lt; (--remaining ? ",\n" : "\n");
+                    stream &lt;&lt; prefix &lt;&lt; "]";
+                }
+            else if constexpr (is_same_v&lt;T, object_t&gt;) {
+                    stream &lt;&lt; "{\n";
+                    auto [indent, remaining] = make_tuple(prefix + SPACING, value.size());
+                    // for every json value, indent with key and print to stream
+                    for (auto&amp; [key, json] : value)
+                        json.save(stream &lt;&lt; indent &lt;&lt; '"' &lt;&lt; key &lt;&lt; "\" : ", indent)
+                            // if jsons remaining (not last), append comma
+                            &lt;&lt; (--remaining ? ",\n" : "\n");
+                    stream &lt;&lt; prefix &lt;&lt; "}";
+                }
+        }, *static_cast&lt;aggregate_t*&gt;(this));
+    return stream;
+}
+</code></pre>
+</blockquote>
+
+<p>Use <code>null_t</code> and <code>string_t</code>, not <code>nullptr_t</code> and <code>string</code>.  Use <code>const auto&amp;</code> instead of <code>auto&amp;&amp;</code> if you don't need the universal reference semantics.  <code>prefix</code> should be <code>std::string_view</code> instead of by-value <code>std::string</code>.  The spacing should also be an argument instead of hard coded.</p>
+
+<p>This is a very long function.  The long if constexpr chain makes the code much less readable.  Use overload resolution to break it down:</p>
+
+<pre><code>// somewhere
+struct formatter {
+    std::ostream&amp; os;
+    std::string_view prefix;
+    std::string_view indent;
+
+    void operator()(null_t) const;
+    void operator()(bool_t) const;
+    // etc.
+};
+</code></pre>
+
+<p>then you can just do</p>
+
+<pre><code>std::visit(formatter{os, prefix, indent}, static_cast&lt;aggregate_t&amp;&gt;(*this));
+</code></pre>
+
+<p>The string streaming should use <code>std::quoted</code> to properly handle escaping.</p>
+
+<p>Don't do this:</p>
+
+<pre><code>auto [indent, remaining] = make_tuple(prefix + SPACING, value.size());
+</code></pre>
+
+<p>It incurs a lot of overhead, both on performance and readability.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>auto load(std::istream&amp; stream) -&gt; std::istream&amp; {
+    using namespace std;
+
+    switch ((stream &gt;&gt; ws).peek()) {
+    case '"': {
+        // get word surrounded by "
+        stringbuf buffer;
+        stream.ignore(1)
+            .get(buffer, '"')
+            .ignore(1);
+        *this = buffer.str();
+    } break;
+    case '[': {
+        array_t array;
+        for (stream.ignore(1); (stream &gt;&gt; ws).peek() != ']';)
+            // load child json and consume comma if available
+            if ((array.emplace_back().load(stream) &gt;&gt; ws).peek() == ',')
+                stream.ignore(1);
+        stream.ignore(1);
+        *this = move(array);
+    } break;
+    case '{': {
+        object_t object;
+        for (stream.ignore(1); (stream &gt;&gt; ws).peek() != '}';) {
+            // get word surrounded by "
+            stringbuf buffer;
+            stream.ignore(numeric_limits&lt;streamsize&gt;::max(), '"')
+                .get(buffer, '"')
+                .ignore(numeric_limits&lt;streamsize&gt;::max(), ':');
+            // load child json and consume comma if available
+            if ((object[buffer.str()].load(stream) &gt;&gt; ws).peek() == ',')
+                stream.ignore(1);
+        }
+        stream.ignore(1);
+        *this = move(object);
+    } break;
+    default: {
+        if (isdigit(stream.peek()) || stream.peek() == '.') {
+            double_t number;
+            stream &gt;&gt; number;
+            *this = number;
+        }
+        else if (isalpha(stream.peek())) {
+            // get alphabetic word
+            string word;
+            for (; isalpha(stream.peek()); stream.ignore())
+                word.push_back(stream.peek());
+            // set value to look-up table's value
+            static auto keyword_lut = map&lt;string_view, Value&gt;{
+                {"true", true}, {"false", false}, {"null", nullptr}};
+            *this = keyword_lut[word];
+        }
+        else
+            *this = nullptr;
+    } break;
+    }
+
+    return stream;
+}
+</code></pre>
+</blockquote>
+
+<p>Don't use <code>stringbuf</code>.  It's a low level functionality.  Use <code>std::quoted</code> instead:</p>
+
+<pre><code>case '"': {
+    std::string str;
+    stream &gt;&gt; std::quoted(str);
+    emplace&lt;string_t&gt;(str);
+    break;
+}
+</code></pre>
+
+<p><code>.ignore(1)</code> is slower than <code>.get()</code> without aggressive optimization.</p>
+
+<p>The table should be <code>const</code>, and <code>.at</code> (which looks up existing elements) should be used instead of <code>[]</code> (which creates new elements and cannot be used on <code>const</code> maps).  Using a <code>map</code> for three strings is also an overkill and will introduce overhead.</p>
+
+<hr>
+
+<blockquote>
+<pre><code>auto save_to_path(std::string_view file_path) -&gt; void {
+    auto file = std::ofstream(std::string(file_path));
+    save(file);
+}
+
+auto load_from_path(std::string_view file_path) -&gt; void {
+    auto file = std::ifstream(std::string(file_path));
+    load(file);
+}
+</code></pre>
+</blockquote>
+
+<p>Please don't "always use <code>auto</code>".  I know it is suggested by Herb Sutter (right?), but it is really unidiomatic and distracting.</p>
+    </div>

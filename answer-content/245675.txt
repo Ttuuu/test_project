@@ -1,0 +1,232 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<h2>Observation</h2>
+<p>This is a common one beginners do. And to be blunt I wish they would not do this. It would be much better to learn how to sue the system logging tools.</p>
+<h2>Questions</h2>
+<ul>
+<li>Are there any apparent issues with how I implemented the macro?</li>
+</ul>
+<p>I don't see any. But the way you have done it there are no advantages of using the macro over a normal inline function. Also the normal inline function is probably safer and better because of the extra type checking.</p>
+<ul>
+<li>Can there be any improvements made to it?</li>
+</ul>
+<p>Macros if used differently could be good. You can turn them off at compile time and save the cost of evaluating any parameters. Though with modern C++ lambda's you can potentially have the same affect.</p>
+<p>If you want to do this you should log to the syslog rather than your own personal logging system. Now saying that there is nothing wrong with wrapping syslog with your own code is not a bad idea.</p>
+<ul>
+<li>Is the intent clear on its usage?</li>
+</ul>
+<p>Sure. I don't see anything particularly wrong. But it does require that you build the message before hand (there is no way to build the message as part of the message statement (OK you can do some simple stuff, but anything complex would break the macro (i.e. anything with a comma)).</p>
+<ul>
+<li>I'm also interested in any other feedback.</li>
+</ul>
+<p>Sure one second</p>
+<h2>Code Review</h2>
+<p>What are you using <code>msg_</code> for?</p>
+<pre><code>class FileWriter {
+    std::string filename_;
+    std::ostringstream msg_;
+public:
+</code></pre>
+<p>You don't use it in any methods.</p>
+<p>You are forcing people to build a string stream them logging the string you can extract from the stream.</p>
+<pre><code>    void operator()(std::ostringstream&amp; msg) {
+        std::ofstream out("log.txt", std::ios::app);
+        out &lt;&lt; msg.str();        
+    }
+</code></pre>
+<p>Why not just allow people to pass a <code>std::string</code>. They you can pass a simple string without having to build a string stream first. Even better would be allow you to chain a series of objects with the <code>operator&lt;&lt;</code>.</p>
+<p>How about this:</p>
+<pre><code>class LokiFileWriter;
+class LokiFileWriterStream
+{
+    std::ofstream   file;
+    friend class LokiFileWriter;
+
+    // Private so only LokiFileWriter can create one.
+    LokiFileWriterStream(std::ofstream&amp;&amp; output)
+        : file(std::move(output))
+    {}
+    public:
+        LokiFileWriterStream(LokiFileWriterStream&amp;&amp; move) = default;
+        template&lt;typename T&gt;
+        LokiFileWriterStream&amp; operator&lt;&lt;(T const&amp; item)
+        {
+            // Send the T to the file stream.
+            // Then return a reference to allow chaining
+            file &lt;&lt; item;
+            return *this;
+        }
+        ~LokiFileWriterStream()
+        {
+            // When the expression is closed
+            // We will close the file stream.
+            //
+            // But remember that the move constructor is available
+            // So objects that have been moved move the stream object
+            // an object that has been moved from has a file object that
+            // is no longer valid (calling close() will fail in some way)
+            // but it is a valid object that we are allowed to call close on
+            file.close();
+        }
+};
+class LokiFileWriter
+{
+    std::string filename;
+    public:
+    LokiFileWriter(std::string const&amp; filename)
+        : filename(filename)
+    {}
+    template&lt;typename T&gt;
+    LokiFileWriterStream operator&lt;&lt;(T const&amp; item)
+    {
+        // We create a stream object.
+        LokiFileWriterStream stream(std::ofstream(filename, std::ios::app));
+        stream &lt;&lt; item;
+
+        // The stream object is returned forcing a move
+        // of the object to external calling frame.
+        // This means the object inside this function may be
+        // destroyed but the file object it contains has already been
+        // moved and thus not destroyed.
+        return stream;
+    }
+};
+
+int main()
+{
+    LokiFileWriter  out("MyLogFile");
+    // The first &lt;&lt; creates the `LokiFileWriterStream`
+    //    Each subsequent &lt;&lt; returns a reference to the same object.
+    out &lt;&lt; "Test" &lt;&lt; 123 &lt;&lt; " Plop";
+    //    At the end of the expression `LokiFileWriterStream` goes
+    //    out of scope and we destroy the object which calls the
+    //    destructor which then calls the close method.
+}
+</code></pre>
+<hr>
+<p>Sure. This is useful.</p>
+<pre><code>static std::map&lt;MsgTy, std::string&gt; msg_id{
+    {MsgTy::OK, {"OK: "}},
+    {MsgTy::WARNING, {"WARNING: "}},  
+    {MsgTy::ERROR, {"ERROR: "}},
+    {MsgTy::CRITICAL, {"CRITICAL: "}}
+};
+</code></pre>
+<p>But I would put it inside a method to make using it simple:</p>
+<pre><code>std::string const&amp; to_string(MsgTy const&amp; msg)
+{
+    static std::map&lt;MsgTy, std::string&gt; msg_id{
+        {MsgTy::OK, {"OK: "}},
+        {MsgTy::WARNING, {"WARNING: "}},  
+        {MsgTy::ERROR, {"ERROR: "}},
+        {MsgTy::CRITICAL, {"CRITICAL: "}}
+    };
+    return msg_id[msg];
+ }
+</code></pre>
+<p>You may think this is a bit trivial. But think of the situation where your enum is passed to a function that is has a template parameter and it would normally use <code>to_string()</code> to convert to a string.</p>
+<pre><code> template&lt;typename t&gt;
+ void print(T const&amp; object)
+ {
+      using std::to_string;
+      std::cout &lt;&lt; to_string(object);   // This would work for
+                                        // your enum just like all
+                                        // other types that support
+                                        // to_string in the standard.
+ }
+</code></pre>
+<hr>
+<p>I think you have over complicated this:</p>
+<pre><code>#define messaging(MsgTy, msg, log2file) do { \
+    std::ostringstream strm; \
+    ... OK
+    ... WARNING
+    ... ERROR
+    ... CRITICAL
+    }
+</code></pre>
+<p>I would create a separate macro for each type of message:</p>
+<pre><code>    #define messagingOK(msg, log2file)                 \
+    do {                                               \
+        std::ostringstream strm;                       \
+        strm &lt;&lt; to_string(MsgTy::OK) &lt;&lt; (msg) &lt;&lt; "\n"; \
+        std::cout &lt;&lt; strm.str();                       \
+        if((log2file) == true) {                       \
+            FileWriter fw("log.txt", strm);            \
+        }                                              \
+    } while(0)
+</code></pre>
+<p>That way I can turn on/off each macro at compile time. I probably don't want to log <code>OK</code> items in the production version so I would want to turn that off.</p>
+<p>It is no moral difficult to use this than your version.</p>
+<pre><code>    messagingOK("Hi", true);
+    messaging(OK, "Hi", true);
+</code></pre>
+<hr>
+<p>Now the reason to use macros is that you can turn them off and the cost of using the macros is reduced to zero!</p>
+<p>If you had written this as an inline function it would look like this:</p>
+<pre><code>template&lt;typename... Args&gt;
+inline void messagingOK(bool log2File, Args... const&amp; args)
+{
+#if TURNON_OK
+/* STUFF HERE */
+#endif
+}
+</code></pre>
+<p>The trouble here is that all the <code>args</code> are required to be evaluated (even if the function is inlined and the parameters are not used. The language guarantees that all the parameters are fully evaluated.</p>
+<p>This is why we use macros like this:</p>
+<pre><code>#if TURNON_OK
+#define messagingOK(msg, log2file)     /* STUFF HERE */
+#else
+#define messagingOK(msg, log2file)
+#endif
+</code></pre>
+<p>So when you turn the macro off the cost of building the parameters is reduced to zero in this situation as they don't exist.</p>
+<hr>
+<p>OK. So you got the correct reason for using the macro but your function does not allow you to use the macro in a way that makes this possible.</p>
+<pre><code> // notice the brackets around the msg.
+ // This means the expression inside the macros must be expanded first
+ // unfortunately that does not work for the above
+ strm &lt;&lt; msg_id[(MsgTy)] &lt;&lt; (msg) &lt;&lt; '\n';
+
+ // This will fail as the message part
+ // will be included inside the brackets and thus must
+ // be evaluated first with the stream object so you get
+ // a compiler failure.
+ messaging(OK, "OK: " &lt;&lt; 15 &lt;&lt; " Testing", true);
+</code></pre>
+<p>So you could move this into a function and pass the parameters to that and convert to a string.</p>
+<pre><code> // Unfortunatel this also fails.
+ // This time because of the way the macros interacts with commas.
+ messaging(OK, buildString("OK: ", 15, " Testing"), true);
+</code></pre>
+<p>So now you have to build the string external to the macro:</p>
+<pre><code> std::string message = std::string("OK: ") + 15 + " Testing";
+ messaging(OK, message, true);
+</code></pre>
+<p>Now if I turn off the macro <code>messaging</code> we are still evaluating the string <code>message</code> so there is no advantage to  using the macro.</p>
+<hr>
+<p>If we go back to functions we can put off evaluation of parameters by using lambdas.</p>
+<pre><code> inline void message(std::function&lt;void(std::ostream)&gt;&amp;&amp; messagePrinter)
+ {
+ #if TURNON_OK
+     messagePrinter(std::cerr);
+ #endif
+ }
+</code></pre>
+<p>Here we are passing a function object. Creating a function object is usually very cheap so creating this object should be cheap and the cost is only invoked when the function is invoked.</p>
+<pre><code> // The cost of the function `add()` is only payed
+ // if we actually want generate the error message.
+ message([](std::ostream&amp; out){
+     out &lt;&lt; "This " &lt;&lt; add(12, 3) &lt;&lt; " a " &lt;&lt; test &lt;&lt; "\n";
+ });
+</code></pre>
+<hr>
+<p>Sure you want to throw a string?</p>
+<pre><code>throw strm.str();
+</code></pre>
+<p>This throws a <code>std::string</code>. This is not derived from <code>std::exception</code>. So youe code does not get caught in this catch...</p>
+<pre><code>    catch (const std::exception&amp; e) {
+        std::cerr &lt;&lt; e.what() &lt;&lt; std::endl;
+        return EXIT_FAILURE;
+    }
+</code></pre>
+    </div>

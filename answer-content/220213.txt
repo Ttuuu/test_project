@@ -1,0 +1,75 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Before we comment on the speed issue, perhaps we should talk about the multithread correctness of <code>step(from:to:)</code>. You are referencing <code>memory</code> and <code>index</code>. You appear to be updating the same memory from all of your threads. That is not thread-safe. Your don’t want multiple threads updating the same memory reference. If you temporarily turn on the thread sanitizer (known as TSAN, found in “Product” » “Scheme” » “Edit Scheme...” (or press <kbd>⌘</kbd>+<kbd>&lt;</kbd>) and then choose the “Diagnostics” tab), it may well warn you of this problem.</p>
+
+<p>Let’s assume for a second that we get the thread-safety question behind us. The multithreaded performance concerns include:</p>
+
+<ol>
+<li><p>Make sure you are striding to ensure that there is enough work on each thread, to ensure that the parallelism benefits are not outweighed by thread management overhead. That having been said, you are striding already with sufficient work on each thread, so that’s unlikely to be the problem here, but it often plagues naive parallelism attempts.</p></li>
+<li><p>You may want to use <code>concurrentPerform</code> rather than just dispatching a bunch of blocks to a global queue and using a dispatch group to determine when they finished. The <code>concurrentPerform</code> will spin up the correct number of threads appropriate for your hardware, whereas if you write your own dispatching to concurrent queues, you might suboptimize the solution (e.g. you can exhaust the limited number of worker threads if you’re not careful).</p>
+
+<p>In your case, the benefit of <code>concurrentPerform</code> will likely not be material, but it’s the first thing to consider when writing code that is effectively parallelized <code>for</code> loops. See <a href="https://stackoverflow.com/a/46499306/1187415">https://stackoverflow.com/a/46499306/1187415</a> and <a href="https://stackoverflow.com/a/39949292/1271826">https://stackoverflow.com/a/39949292/1271826</a> for introductions to <code>concurrentPerform</code>.</p></li>
+<li><p>The key issue here is that one needs good algorithm design to minimize memory contention issues, cache sloshing, etc.</p>
+
+<p>But let’s assume that you are really accessing/updating different <code>index</code> values through something not shared in your code snippet and are updating adjacent memory addresses. That can still result in problems. See below.</p>
+
+<p>You said:</p>
+
+<blockquote>
+  <p>I believe <code>memory</code> (and “recipe”) are going to need separate instances per “stride”. It's not clear to me exactly how that is slowing things down...</p>
+</blockquote>
+
+<p>Yes, that’s likely the issue in this case. When writing multithreaded code, you have to be sensitive to the memory locations updated by parallel threads. For example, consider the following that adds the numbers between 0 and 100 million, updating an array of four values as it goes along, in parallel:</p>
+
+<pre><code>var array = Array(repeating: 0, count: 4)
+
+DispatchQueue.global().async {
+    DispatchQueue.concurrentPerform(iterations: 4) { index in
+        for i in 0 ..&lt; 100_000_000 {
+            array[index] += i
+        }
+    }
+    ...
+}
+</code></pre>
+
+<p>Optimized for speed, that takes roughly 1.3 seconds on my machine (almost 3× slower than singled-threaded implementation). The issue in this contrived example is that we have multiple threads updating memory addresses very close to each other. You end up having CPU cores “sloshing” memory caches back and forth as the four threads are all trying to update the same block of memory.</p>
+
+<p>For illustration purposes, consider the same code, except that instead of updating items right next to each other, I space them out by padding the array, grabbing the items at index values of 0, 1000, 2000, and 3000 (reducing CPU cache misses):</p>
+
+<pre><code>var array = Array(repeating: 0, count: 4 * 1000)
+
+DispatchQueue.global().async {
+    DispatchQueue.concurrentPerform(iterations: 4) { index in
+        let updatedIndex = index * 1000
+        for i in 0 ..&lt; 100_000_000 {
+            array[updatedIndex] += i
+        }
+    }
+    ...
+}
+</code></pre>
+
+<p>This is deliberately not touching much of the array, just updating four values. This looks absurd (and is not advisable) and one wouldn’t be faulted for assuming that this is far less efficient with all of that wasted memory. But it is actually 5× faster, taking roughly 0.25 seconds on the same machine.</p>
+
+<p>That’s obviously an absurd example, but it illustrates the problem. But we can make it far more efficient like so:</p>
+
+<pre><code>var array = Array(repeating: 0, count: 4)
+
+let synchronizationQueue = DispatchQueue(label: "sync")
+DispatchQueue.global().async {
+    DispatchQueue.concurrentPerform(iterations: 4) { index in
+        var value = synchronizationQueue.sync { array[index] }
+        for i in 0 ..&lt; 100_000_000 {
+            value += i
+        }
+        synchronizationQueue.async { array[index] = value }
+    }
+    ...
+}
+</code></pre>
+
+<p>Even with the extra synchronization code to make sure that I have thread-safe interaction with this <code>array</code>, it’s still now another 5× faster, taking 0.05 seconds. If you can minimize updates to the same block of memory, you can have a material impact on performance, starting to enjoy the benefits of parallelism.</p></li>
+</ol>
+
+<p>Bottom line, you have to be very careful about how multiple threads update shared memory blocks and balance workloads between the threads. It can have a considerable impact on performance. </p>
+    </div>

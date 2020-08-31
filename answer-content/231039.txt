@@ -1,0 +1,490 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>I added</p>
+
+<pre><code>func BenchmarkSearch(b *testing.B) {
+    c := "Hello, we want to find word Guru, so this #phrase has the word Guru."
+    s := "word Guru"
+    for i := 0; i &lt; b.N; i++ {
+        Search(c, s)
+    }
+}
+</code></pre>
+
+<p>Then i ran</p>
+
+<pre><code>$ go test -v -bench=. -benchmem -memprofile=mem.out
+</code></pre>
+
+<p>It yielded </p>
+
+<pre><code>goos: linux
+goarch: amd64
+pkg: test/boyermoor
+BenchmarkSearch-4        2000000           780 ns/op         104 B/op          3 allocs/op
+PASS
+ok      test/boyermoor  2.360s
+</code></pre>
+
+<p>Now i open pprof to get detailed stats</p>
+
+<pre><code>$ go tool pprof mem.out
+
+(pprof) list Sear
+Total: 268.52MB
+ROUTINE ======================== test/boyermoor.BenchmarkSearch in /home/mh-cbon/gow/src/test/boyermoor/main_test.go
+         0   268.52MB (flat, cum)   100% of Total
+         .          .     18:
+         .          .     19:func BenchmarkSearch(b *testing.B) {
+         .          .     20:   c := "Hello, we want to find word Guru, so this #phrase has the word Guru."
+         .          .     21:   s := "word Guru"
+         .          .     22:   for i := 0; i &lt; b.N; i++ {
+         .   268.52MB     23:       Search(c, s)
+         .          .     24:   }
+         .          .     25:}
+ROUTINE ======================== test/boyermoor.Search in /home/mh-cbon/gow/src/test/boyermoor/main.go
+  268.52MB   268.52MB (flat, cum)   100% of Total
+         .          .     36:}
+         .          .     37:
+         .          .     38:func Search(text string, pattern string) []int {
+         .          .     39:
+         .          .     40:   var indexes []int
+  208.52MB   208.52MB     41:   byteText := []byte(text)
+         .          .     42:   bytePattern := []byte(pattern)
+         .          .     43:
+         .          .     44:   textLength := len(byteText)
+         .          .     45:   patternLength := len(bytePattern)
+         .          .     46:
+         .          .     47:   if textLength == 0 || patternLength == 0 || patternLength &gt; textLength {
+         .          .     48:       return indexes
+         .          .     49:   }
+         .          .     50:
+         .          .     51:   lastPatternByte := patternLength - 1
+         .          .     52:
+         .          .     53:   mt := newBadMatchTable(pattern)
+         .          .     54:   index := 0
+         .          .     55:   for index &lt;= (textLength - patternLength) {
+         .          .     56:       for i := lastPatternByte; byteText[index+i] == bytePattern[i]; i-- {
+         .          .     57:           if i == 0 {
+      60MB       60MB     58:               indexes = append(indexes, index)
+         .          .     59:               break
+         .          .     60:           }
+         .          .     61:       }
+         .          .     62:
+         .          .     63:       index += mt.table[byteText[index+lastPatternByte]]
+</code></pre>
+
+<p>You have allocations that are totally superfluous, given current test case, and they could be avoided by changing the input parameters types.</p>
+
+<p>Lets give it a try</p>
+
+<p>The code is updated to</p>
+
+<pre><code>package main
+
+func main() {
+
+}
+
+type badMatchTable struct {
+    table   [256]int
+    pattern []byte
+}
+
+func newBadMatchTable(pattern []byte) *badMatchTable {
+    b := badMatchTable{
+        pattern: pattern,
+    }
+
+    b.table = [256]int{}
+    b.table = b.generateTable()
+
+    return &amp;b
+}
+
+func (b *badMatchTable) generateTable() [256]int {
+
+    for i := 0; i &lt; 256; i++ {
+        b.table[i] = len(b.pattern)
+    }
+
+    lastPatternByte := len(b.pattern) - 1
+
+    for i := 0; i &lt; lastPatternByte; i++ {
+        b.table[int(b.pattern[i])] = lastPatternByte - i
+    }
+
+    return b.table
+}
+
+func Search(text, pattern []byte) []int {
+
+    var indexes []int
+
+    textLength := len(text)
+    patternLength := len(pattern)
+
+    if textLength == 0 || patternLength == 0 || patternLength &gt; textLength {
+        return indexes
+    }
+
+    lastPatternByte := patternLength - 1
+
+    mt := newBadMatchTable(pattern)
+    index := 0
+    for index &lt;= (textLength - patternLength) {
+        for i := lastPatternByte; text[index+i] == pattern[i]; i-- {
+            if i == 0 {
+                indexes = append(indexes, index)
+                break
+            }
+        }
+
+        index += mt.table[text[index+lastPatternByte]]
+    }
+
+    return indexes
+}
+</code></pre>
+
+<p>I behncmarked again</p>
+
+<pre><code>$ go test -v -bench=. -benchmem -memprofile=mem.out
+goos: linux
+goarch: amd64
+pkg: test/boyermoor
+BenchmarkSearch-4        2000000           669 ns/op          24 B/op          2 allocs/op
+PASS
+ok      test/boyermoor  2.023s
+</code></pre>
+
+<p>Those are small improvements.</p>
+
+<p>I change the code again to remove the int slice allocation</p>
+
+<pre><code>package boyermoor
+
+type badMatchTable struct {
+    table   [256]int
+    pattern []byte
+}
+
+func newBadMatchTable(pattern []byte) *badMatchTable {
+    b := badMatchTable{
+        pattern: pattern,
+    }
+
+    b.table = [256]int{}
+    b.table = b.generateTable()
+
+    return &amp;b
+}
+
+func (b *badMatchTable) generateTable() [256]int {
+
+    for i := 0; i &lt; 256; i++ {
+        b.table[i] = len(b.pattern)
+    }
+
+    lastPatternByte := len(b.pattern) - 1
+
+    for i := 0; i &lt; lastPatternByte; i++ {
+        b.table[int(b.pattern[i])] = lastPatternByte - i
+    }
+
+    return b.table
+}
+
+func Search(text, pattern []byte, indexes []int) []int {
+
+    // var indexes []int
+    indexes = indexes[:0]
+
+    textLength := len(text)
+    patternLength := len(pattern)
+
+    if textLength == 0 || patternLength == 0 || patternLength &gt; textLength {
+        return indexes
+    }
+
+    lastPatternByte := patternLength - 1
+
+    mt := newBadMatchTable(pattern)
+    index := 0
+    for index &lt;= (textLength - patternLength) {
+        for i := lastPatternByte; text[index+i] == pattern[i]; i-- {
+            if i == 0 {
+                indexes = append(indexes, index)
+                break
+            }
+        }
+
+        index += mt.table[text[index+lastPatternByte]]
+    }
+
+    return indexes
+}
+</code></pre>
+
+<p>The benchmark is modified to</p>
+
+<pre><code>func BenchmarkSearch(b *testing.B) {
+    indexes := make([]int, 0, 100)
+    c := []byte("Hello, we want to find word Guru, so this #phrase has the word Guru.")
+    s := []byte("word Guru")
+    for i := 0; i &lt; b.N; i++ {
+        indexes = Search(c, s, indexes)
+    }
+}
+</code></pre>
+
+<p>Now i got</p>
+
+<pre><code>goos: linux
+goarch: amd64
+pkg: test/boyermoor
+BenchmarkSearch-4        3000000           597 ns/op           0 B/op          0 allocs/op
+PASS
+ok      test/boyermoor  2.402s
+</code></pre>
+
+<p>That is more substantial.</p>
+
+<p>In the details, you rewrite the generateTable this way to save a few more ops</p>
+
+<pre><code>func (b *badMatchTable) generateTable() [256]int {
+
+    k := len(b.pattern)
+    for i := 0; i &lt; 256; i++ {
+        b.table[i] = k
+    }
+
+    lastPatternByte := k - 1
+
+    for i := 0; i &lt; lastPatternByte; i++ {
+        b.table[b.pattern[i]] = lastPatternByte - i
+    }
+
+    return b.table
+}
+</code></pre>
+
+<p>At that point, consider that your algorithm is 1/ cpu bound 2/ a bunch of tight loops. So to get much out of the runtime, squeeze as many instructions as possible.</p>
+
+<p>Given the last state of the code, let just get ride of the <code>badTable</code> struct. So the whole thing is contained into one function call.</p>
+
+<pre><code>func Search(text, pattern []byte, indexes []int) []int {
+
+    // var indexes []int
+    indexes = indexes[:0]
+
+    textLength := len(text)
+    patternLength := len(pattern)
+
+    if textLength == 0 || patternLength == 0 || patternLength &gt; textLength {
+        return indexes
+    }
+
+    lastPatternByte := patternLength - 1
+
+    table := [256]int{}
+    {
+        k := len(pattern)
+        for i := 0; i &lt; 256; i++ {
+            table[i] = k
+        }
+
+        lastPatternByte := k - 1
+        for i := 0; i &lt; lastPatternByte; i++ {
+            table[pattern[i]] = lastPatternByte - i
+        }
+    }
+
+    index := 0
+    for index &lt;= (textLength - patternLength) {
+        for i := lastPatternByte; text[index+i] == pattern[i]; i-- {
+            if i == 0 {
+                indexes = append(indexes, index)
+                break
+            }
+        }
+
+        index += table[text[index+lastPatternByte]]
+    }
+
+    return indexes
+}
+</code></pre>
+
+<p>And now it gives us</p>
+
+<pre><code>goos: linux
+goarch: amd64
+pkg: test/boyermoor
+BenchmarkSearch-4        5000000           339 ns/op           0 B/op          0 allocs/op
+BenchmarkSearch-4        5000000           340 ns/op           0 B/op          0 allocs/op
+BenchmarkSearch-4        5000000           341 ns/op           0 B/op          0 allocs/op
+BenchmarkSearch-4        5000000           338 ns/op           0 B/op          0 allocs/op
+PASS
+</code></pre>
+
+<p>Now we have a good 2 times improvement.</p>
+
+<p>But this is not all about performance, it is also about usability for other devs. So the API can be presented this way, which produces a decent trade between the two.</p>
+
+<pre><code>type Horspool struct {
+    table   [256]int
+    indexes []int
+}
+
+func (t *Horspool) Search(text, pattern []byte) []int {
+
+    table := t.table
+    indexes := t.indexes
+    if cap(indexes) &lt; 1 {
+        indexes = make([]int, 0, 100)
+    }
+    indexes = indexes[:0]
+
+    textLength := len(text)
+    patternLength := len(pattern)
+
+    if textLength == 0 || patternLength == 0 || patternLength &gt; textLength {
+        t.indexes = indexes
+        return indexes
+    }
+
+    lastPatternByte := patternLength - 1
+
+    {
+        for i := 0; i &lt; 256; i++ {
+            table[i] = patternLength
+        }
+
+        lastPatternByte := patternLength - 1
+        for i := 0; i &lt; lastPatternByte; i++ {
+            table[pattern[i]] = lastPatternByte - i
+        }
+    }
+
+    index := 0
+    for index &lt;= (textLength - patternLength) {
+        for i := lastPatternByte; text[index+i] == pattern[i]; i-- {
+            if i == 0 {
+                indexes = append(indexes, index)
+                break
+            }
+        }
+
+        index += table[text[index+lastPatternByte]]
+    }
+    t.indexes = indexes
+    return indexes
+}
+</code></pre>
+
+<p>It gives me a slightly slower program</p>
+
+<pre><code>BenchmarkSearch-4        5000000           370 ns/op           0 B/op          0 allocs/op
+</code></pre>
+
+<p>I have not tried to understand as to why it is slower because here is a more interesting case involving struct alignment and padding. See this code,</p>
+
+<pre><code>type Horspool struct {
+    indexes []int
+    table   [256]int
+}
+</code></pre>
+
+<p>And check the results</p>
+
+<pre><code>BenchmarkSearch-4        3000000           480 ns/op           0 B/op          0 allocs/op
+</code></pre>
+
+<p>read more: <a href="https://dave.cheney.net/2015/10/09/padding-is-hard" rel="nofollow noreferrer">https://dave.cheney.net/2015/10/09/padding-is-hard</a></p>
+
+<p>FTR, consider this is an old algorithm and that it is not utf-8 valid. Go being utf-8 first, this should be improved.</p>
+
+<p>If my understanding of the algorithm is correct, the fix is rather simple</p>
+
+<pre><code>type Horspool struct {
+    table   map[rune]int
+    indexes []int
+}
+
+func (t *Horspool) Search(text, pattern []rune) []int {
+
+    table := t.table
+    if table == nil {
+        table = map[rune]int{}
+    } else {
+        for r := range table {
+            delete(table, r)
+        }
+    }
+    indexes := t.indexes
+    if cap(indexes) &lt; 1 {
+        indexes = make([]int, 0, 100)
+    }
+    indexes = indexes[:0]
+
+    textLength := len(text)
+    patternLength := len(pattern)
+
+    if textLength == 0 || patternLength == 0 || patternLength &gt; textLength {
+        return indexes
+    }
+
+    lastPatternByte := patternLength - 1
+
+    {
+        for _, r := range pattern {
+            table[r] = patternLength
+        }
+
+        for i := 0; i &lt; lastPatternByte; i++ {
+            table[pattern[i]] = patternLength - 1 - i
+        }
+    }
+
+    index := 0
+    for index &lt;= (textLength - patternLength) {
+        for i := lastPatternByte; text[index+i] == pattern[i]; i-- {
+            if i == 0 {
+                indexes = append(indexes, index)
+                break
+            }
+        }
+        x, ok := table[text[index+lastPatternByte]]
+        if ok {
+            index += x
+        } else {
+            index += lastPatternByte
+        }
+    }
+    t.table = table
+    t.indexes = indexes
+    return indexes
+}
+</code></pre>
+
+<p>But, take care of maps. 
+<a href="https://stackoverflow.com/questions/58475257/map-delete-doesnt-actually-delete-entries">https://stackoverflow.com/questions/58475257/map-delete-doesnt-actually-delete-entries</a></p>
+
+<p>Use a simple counter to free-it-by-allocation regularly.</p>
+
+<p>Finally, as somewhat expected the code is slower by a factor 2</p>
+
+<pre><code>goos: linux
+goarch: amd64
+pkg: test/boyermoor
+BenchmarkSearch-4        2000000           756 ns/op           0 B/op          0 allocs/op
+PASS
+ok      test/boyermoor  2.282s
+</code></pre>
+
+<p>Two notes:</p>
+
+<ul>
+<li>There might be more interesting/subtle optimizations that i m not aware of myself, i did the obvious.</li>
+</ul>
+    </div>

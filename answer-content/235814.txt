@@ -1,0 +1,181 @@
+<div class="s-prose s-prose__disable-spoiler-hover js-post-body" itemprop="text">
+<p>Great. Clean and readable code, following modern C++ programming practices. Good job!</p>
+
+<p>Here are my suggestions on further improvements:</p>
+
+<h1>Tag types</h1>
+
+<p>The point of tags is disambiguation. Instead of reusing <code>std::integral_constant&lt;size_t, Index&gt;</code>, I prefer to use a separate type:</p>
+
+<pre><code>template &lt;std::size_t I&gt;
+struct index_type {
+    explicit index_type() = default;
+};
+template &lt;std::size_t I&gt;
+inline constexpr index_type&lt;I&gt; index{};
+</code></pre>
+
+<h1>About <code>std::conditional_t</code></h1>
+
+<blockquote>
+<pre><code>// Helper for value_t since we cannot specialize a type alias directly and have to prevent the
+// instantiation of std::tuple_element_t&lt;I, tuple_t&gt; for the case of I == size() sinze then this
+// would not compile. Hence, we cannot simply use std::conditional.
+</code></pre>
+</blockquote>
+
+<p>We can.  Just a bit differently:</p>
+
+<pre><code>// somewhere
+template &lt;typename T&gt;
+struct type_identity {
+    using type = T;
+};
+
+struct incomplete;
+</code></pre>
+
+<p>then</p>
+
+<pre><code>using decay_tuple_t = std::decay_t&lt;tuple_t&gt;;  // exposition only
+
+using value_t = typename std::conditional_t&lt;  // note: _t
+    I &lt; size(),
+    std::tuple_element&lt;Index, decay_tuple_t&gt;, // note: no _t
+    incomplete
+&gt;::type;                                      // note: ::type
+using next_t = typename std::conditional_t&lt;
+    I &lt; size(),
+    TupleIter&lt;tuple_t, Index + 1&gt;,
+    incomplete
+&gt;::type;
+</code></pre>
+
+<p>Think of why <code>_t</code> and <code>::type</code> are used at the same time.</p>
+
+<h1>Comparison</h1>
+
+<p>Now, according to your logic, two <code>TupleIter</code>s are equal if and only if they are the same type.  We can already compare types with <code>is_same</code>, so I'd expect the <code>==</code> and <code>!=</code> operators to take the tuple into account as well.  I also prefer to define symmetrical operators as non-members, but that's unimportant in this case:</p>
+
+<pre><code>template &lt;typename Tuple, std::size_t I&gt;
+constexpr auto operator==(const TupleIter&lt;Tuple, I&gt;&amp; lhs, const TupleIter&lt;Tuple, I&gt;&amp; rhs)
+    -&gt; decltype(lhs.get_tuple() == rhs.get_tuple()) // for SFINAE
+{
+    return lhs.get_tuple() == rhs.get_tuple();
+}
+
+template &lt;typename Tuple, std::size_t I&gt;
+constexpr auto operator!=(const TupleIter&lt;Tuple, I&gt;&amp; lhs, const TupleIter&lt;Tuple, I&gt;&amp; rhs)
+    -&gt; decltype(lhs == rhs)
+{
+    return !(lhs == rhs);
+}
+</code></pre>
+
+<h1><code>++</code> and <code>--</code></h1>
+
+<blockquote>
+<pre><code>// These seem a bit weird since they are const de-/increment operators. But we cannot implement
+// operator+(int inc) as one would normally do it, since inc had to be a constant expression. So
+// this seems like the best way to do this. Furthermore it is actually similar to normal iterators,
+// since for them the following would be equivalent:
+//      ++it;       AND       it = ++it;
+// So reassigning the return value is not that weird.
+</code></pre>
+</blockquote>
+
+<p>(You actually cannot reassign because the type changes.)</p>
+
+<p>One sec ... you can implement this:</p>
+
+<pre><code>auto new_iter = it + incr&lt;5&gt;;
+</code></pre>
+
+<p>or even</p>
+
+<pre><code>using namespace tuple_iter::literals;
+auto new_iter = it + 5_i;
+</code></pre>
+
+<p>(Let's pray that <code>it + 5</code> will become implementable in a future standard.)</p>
+
+<h1><code>distance</code></h1>
+
+<p>Don't forget you can implement <code>iter1 - iter2</code>.</p>
+
+<h1><code>is_end</code></h1>
+
+<p>This is convoluted:</p>
+
+<blockquote>
+<pre><code>template&lt;class TupIter, class = std::enable_if_t&lt;is_tuple_iter_v&lt;TupIter&gt;&gt;&gt;
+struct is_end :
+        std::conditional_t&lt;std::decay_t&lt;TupIter&gt;::index() == std::decay_t&lt;TupIter&gt;::size(),
+                           std::true_type, std::false_type&gt; {};
+</code></pre>
+</blockquote>
+
+<p>Consider:</p>
+
+<pre><code>template &lt;class TupIter, class = std::enable_if_t&lt;is_tuple_iter_v&lt;TupIter&gt;&gt;&gt;
+struct is_end :
+        std::bool_constant&lt;std::decay_t&lt;TupIter&gt;::index() == std::decay_t&lt;TupIter&gt;::size()&gt; {};
+</code></pre>
+
+<p>Also, <code>is_end</code> is SFINAE-friendly but <code>is_end_v</code> issues hard errors.</p>
+
+<h1><code>if else if</code></h1>
+
+<blockquote>
+<pre><code>// Type based find algorithm, only works on the types. Pred should be a class template that explicitly converts to bool.
+template&lt;template&lt;class&gt; class Pred, class Begin, class End&gt;
+constexpr auto find_type(Begin begin, End end) noexcept {
+    if constexpr (begin == end) {
+        return end;
+    } else {
+        if constexpr (Pred&lt;typename Begin::value_t&gt;()) {
+            return begin;
+        } else {
+            return find_type&lt;Pred&gt;(++begin, end);
+        }
+    }
+}
+</code></pre>
+</blockquote>
+
+<p>We can use <code>else if</code> to avoid one level of indentation:</p>
+
+<pre><code>template &lt;template &lt;class&gt; class Pred, class Begin, class End&gt;
+constexpr auto find_type(Begin begin, End end) noexcept
+{
+    if constexpr (begin == end) {
+        return end;
+    } else if constexpr (Pred&lt;typename Begin::value_t&gt;()) {
+        return begin;
+    } else {
+        return find_type&lt;Pred&gt;(++begin, end);
+    }
+}
+</code></pre>
+
+<p>You add a level of recursion for every element in the tuple.</p>
+
+<h1>Conversion to <code>bool</code></h1>
+
+<p>The <code>operator bool</code> is a bit weird to me.  <code>if (iter)</code>?  I guess a named function like <code>.is_valid()</code> may be clearer.</p>
+
+<h1>Small issues</h1>
+
+<ul>
+<li><p>Macro names like <code>TUP_ITER_HPP</code> are common and easy to clash. I would append a random sequence of characters: <code>TUP_ITER_HPP_Hfod7C3iAQ</code> (generated with <a href="https://www.random.org/strings/?num=1&amp;len=10&amp;digits=on&amp;upperalpha=on&amp;loweralpha=on&amp;format=html" rel="nofollow noreferrer">Random String Generator</a> on random.org).</p></li>
+<li><p><code>size_t</code> should be <code>std::size_t</code>, and <code>#include &lt;cstddef&gt;</code> is missing.</p></li>
+</ul>
+
+<h1>Stylistic (subjective)</h1>
+
+<p>The points below are purely subjective and can be ignored if they contradict with your established style guidelines.</p>
+
+<ul>
+<li>I don't really like the always-trailing-return style.  I prefer <code>static constexpr std::size_t size() noexcept</code>.  This is especially distracting: <code>auto main() -&gt; int</code>.</li>
+</ul>
+    </div>
