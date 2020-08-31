@@ -9,6 +9,8 @@ class TestspiderSpider(scrapy.Spider):
     allowed_domains = ['codereview.stackexchange.com']
 
     def start_requests(self):
+        #也可选择全体question的question_id然后fetchall并在结果中循环
+        #由于id设置自增 可能发生了某些错误导致未插入数据但id增加 所以id和真实数据个数不匹配
         for i in range(1,66639):
             question_id=getQuestionIdById(i)
             if question_id == 0:
@@ -16,12 +18,12 @@ class TestspiderSpider(scrapy.Spider):
             url='https://codereview.stackexchange.com/questions/{question_id}'.format(question_id=question_id)
             print("processing",question_id)
             yield scrapy.Request(url=url, callback=self.parse)
-            setQuestionVisited(question_id)
+            setQuestionVisited(question_id)#设置该问题为已访问
 
     def parse(self, response):
         question_id=re.search('(?<=questions/)\d+', response.url).group()
         for line in response.xpath('//div[@id="answers"]/div[contains(@class,"answer")]'):
-            # initialize item
+            # 解析html 获取数据
             item = TestProjectItem()
             item['score'] = line.xpath('.//div[@itemprop="upvoteCount"]/text()').extract()
             item['is_accepted'] = line.xpath('@itemprop').extract()

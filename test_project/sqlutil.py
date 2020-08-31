@@ -1,5 +1,8 @@
+'''
+数据库相关操作
+'''
 import pymysql
-    
+    #插入一条问题记录
 def addaAnswerRecord(item):
   db = pymysql.connect("localhost","root","123456","codereview" )
   cursor = db.cursor()    
@@ -15,6 +18,8 @@ def addaAnswerRecord(item):
     db.rollback()
   finally:
     db.close()
+
+#设置某问题为已访问状态
 def setQuestionVisited(question_id):
   db = pymysql.connect("localhost","root","123456","codereview" )
   cursor = db.cursor()    
@@ -27,6 +32,8 @@ def setQuestionVisited(question_id):
     db.rollback()
   finally:
     db.close()
+
+#通过id获取question_id
 def getQuestionIdById(id):
   db = pymysql.connect("localhost","root","123456","codereview" )
   cursor = db.cursor()    

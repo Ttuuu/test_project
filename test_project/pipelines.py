@@ -5,6 +5,9 @@
 
 
 # useful for handling different item types with a single interface
+'''
+scrapy框架的管道 清理数据
+'''
 from itemadapter import ItemAdapter
 from test_project.sqlutil import addaAnswerRecord 
 import re
@@ -12,6 +15,7 @@ import os
 import math
 
 class TestProjectPipeline:
+    #存到txt文件
     def save_content(self,item):
         filepath='./answer-content/{id}.txt'.format(id=item['answer_id'][0])
         path = filepath[0:filepath.rfind("/")]
@@ -22,14 +26,14 @@ class TestProjectPipeline:
         fd.close()
 
     def process_item(self, item, spider):
-        num=item['owner_reputation']
+        num=item['owner_reputation']#可能的值：13.2k 1,223 等（暂时还没有百万级数据）
         if ',' in num:
             num=num.replace(',','')
         if 'k' in num:
             num=num.replace('k','')
             num=math.ceil(float(num)*100)
         item['owner_reputation']=num
-        item['owner_id']=re.search('(?<=/users/)\d+', item['owner_id']).group()
+        item['owner_id']=re.search('(?<=/users/)\d+', item['owner_id']).group()#原有格式为/users/{id}/{username} 通过正则取到id
         self.save_content(item)
-        addaAnswerRecord(item)
+        addaAnswerRecord(item)#调用数据库操作
         return item
