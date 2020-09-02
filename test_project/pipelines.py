@@ -5,16 +5,15 @@
 
 
 # useful for handling different item types with a single interface
-'''
-scrapy框架的管道 清理数据
-'''
-from itemadapter import ItemAdapter
-from test_project.sqlutil import addaAnswerRecord 
+"""scrapy框架的管道 清理数据并调用数据库操作"""
 
+from itemadapter import ItemAdapter
 import re
 import os
-
 import math
+
+from test_project.sqlutil import addaAnswerRecord 
+
 
 class TestProjectPipeline:
 
@@ -30,7 +29,7 @@ class TestProjectPipeline:
 
     def process_item(self, item, spider):
         """数据格式化处理"""
-        num = item['owner_reputation']  #可能的值：13.2k 1,223 等（暂时还没有百万级数据）
+        num = item['owner_reputation']  # 可能的值：13.2k 1,223 等（暂时还没有百万级数据）
         if ',' in num:
             num=num.replace(',','')
         if 'k' in num:

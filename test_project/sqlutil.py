@@ -19,7 +19,12 @@ def addaAnswerRecord(item):
         db.close()
 
 def setQuestionVisited(question_id):
-    """设置某问题为已访问状态"""
+    """设置某问题为已访问状态
+        参数
+        ------
+        question_id : int
+            url中问题的id
+    """
     db = pymysql.connect("localhost","root","123456","codereview" )
     cursor = db.cursor()    
     sql="update questions_set set vis =1  where question_id=%d;"%(question_id)
@@ -33,7 +38,12 @@ def setQuestionVisited(question_id):
         db.close()
 
 def getQuestionIdById(id):
-    """通过id获取question_id"""
+    """通过id获取question_id
+        参数
+        ------
+        id : int
+            数据库记录的id
+    """
     db = pymysql.connect("localhost","root","123456","codereview" )
     cursor = db.cursor()    
     sql="select question_id from questions_set where id=%d and answer_count > 0 and vis =0;"%(id)

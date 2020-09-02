@@ -1,5 +1,3 @@
-""" """
-
 import scrapy
 import re
 
@@ -21,7 +19,7 @@ class TestspiderSpider(scrapy.Spider):
             url = 'https://codereview.stackexchange.com/questions/{question_id}'.format(question_id = question_id)
             print("processing",question_id)
             yield scrapy.Request(url = url, callback = self.parse)
-            setQuestionVisited(question_id)#设置该问题为已访问
+            setQuestionVisited(question_id)  # 设置该问题为已访问
 
     def parse(self, response):
         """解析html"""
